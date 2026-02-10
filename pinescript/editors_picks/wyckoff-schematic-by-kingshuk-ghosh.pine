@@ -1,0 +1,802 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kingshukghosh71
+
+//@version=5
+indicator("Wyckoff Schematic by Kingshuk Ghosh", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, dynamic_requests=true)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Wyckoff Settings
+lookback = input.int(100, "Lookback Period", minval=20, maxval=300, group="Wyckoff Detection")
+volMultiplier = input.float(1.5, "Volume Spike Multiplier", minval=1.0, step=0.1, group="Wyckoff Detection")
+showLabels = input.bool(true, "Show Event Labels", group="Display")
+showPhases = input.bool(true, "Show Phase Boxes", group="Display")
+showLines = input.bool(true, "Show Support/Resistance Lines", group="Display")
+autoDetect = input.bool(true, "Auto-Detect Wyckoff Patterns", group="Detection Mode")
+showZigzag = input.bool(true, "Show Zigzag Line", group="Display")
+minBarsBetweenLabels = input.int(20, "Min Bars Between Labels", minval=5, maxval=100, group="Display", tooltip="Minimum distance between event labels to reduce clutter")
+
+// Visual Settings
+labelSize = input.string("Normal", "Label Size", options=["Small", "Normal", "Large"], group="Display")
+phaseTransparency = input.int(90, "Phase Box Transparency", minval=80, maxval=98, group="Display")
+labelOffsetPct = input.float(2.0, "Label Offset %", minval=0.5, maxval=10.0, step=0.5, group="Display", tooltip="Percentage offset to prevent label overlap with candles")
+
+// Zigzag Settings
+zigzagLength = input.int(4, "Zigzag High/Low Length", minval=2, maxval=20, group="Zigzag Settings")
+
+// 1M Wave View Settings
+showMonthlyWave = input.bool(true, "Show Wave View", group="Wave View")
+waveViewHeight = input.float(0.15, "Wave View Height %", minval=0.05, maxval=0.3, step=0.01, group=" Wave View", tooltip="Height of the 1M Wave View as percentage of chart")
+monthlySwingLegs = input.int(10, "Number of Swing Legs", minval=3, maxval=20, group=" Wave View", tooltip="Number of monthly swing legs to display (default: 10)")
+
+// Swing Points Settings
+showSwingPoints = input.bool(true, "Show Swing Points", group="Wave View", tooltip="Show swing points with trend lines in the 1M Wave View")
+
+// ═══════════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════════
+
+colorPhaseA = color.new(#FF6B6B, phaseTransparency)
+colorPhaseB = color.new(#4ECDC4, phaseTransparency)
+colorPhaseC = color.new(#45B7D1, phaseTransparency)
+colorPhaseD = color.new(#96CEB4, phaseTransparency)
+colorPhaseE = color.new(#FFEAA7, phaseTransparency)
+
+colorBullish = #26a69a
+colorBearish = #ef5350
+colorNeutral = #9E9E9E
+
+txtSize = labelSize == "Small" ? size.small : labelSize == "Normal" ? size.normal : size.large
+
+// ═══════════════════════════════════════════════════════════════════════
+// VOLUME AND PRICE ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════
+
+avgVolume = ta.sma(volume, lookback)
+highVolume = volume > avgVolume * volMultiplier
+climaxVolume = volume > avgVolume * (volMultiplier + 0.5)
+
+// Price Range Analysis
+priceRange = high - low
+avgRange = ta.sma(priceRange, 20)
+narrowRange = priceRange < avgRange * 0.6
+
+// Support and Resistance
+highestHigh = ta.highest(high, lookback)
+lowestLow = ta.lowest(low, lookback)
+rangeSize = highestHigh - lowestLow
+midRange = (highestHigh + lowestLow) / 2
+
+// ═══════════════════════════════════════════════════════════════════════
+// ZIGZAG HIGH LOW DETECTION
+// ═══════════════════════════════════════════════════════════════════════
+
+length = zigzagLength
+h = ta.highest(high, length * 2 + 1)
+l = ta.lowest(low, length * 2 + 1)
+
+f_isMin(len) => 
+    l == low[len]
+
+f_isMax(len) => 
+    h == high[len]
+
+var dirUp = false
+var float lastLow = high * 100
+var float lastHigh = 0.0
+var int timeLow = bar_index
+var int timeHigh = bar_index
+var line li = na
+
+f_drawLine() =>
+    _li_color = dirUp ? color.new(color.teal, 30) : color.new(color.orange, 30)
+    line.new(
+         timeHigh - length, lastHigh, 
+         timeLow - length, lastLow, 
+         xloc=xloc.bar_index, color=_li_color, width=2
+         )
+
+if showZigzag
+    if dirUp
+        if (f_isMin(length) and low[length] < lastLow)
+            lastLow := low[length]
+            timeLow := bar_index
+            line.delete(li)
+            li := f_drawLine()
+        if (f_isMax(length) and high[length] > lastLow)
+            lastHigh := high[length]
+            timeHigh := bar_index
+            dirUp := false
+            li := f_drawLine()
+    if not dirUp
+        if (f_isMax(length) and high[length] > lastHigh)
+            lastHigh := high[length]
+            timeHigh := bar_index
+            line.delete(li)
+            li := f_drawLine()
+        if f_isMin(length) and low[length] < lastHigh
+            lastLow := low[length]
+            timeLow := bar_index
+            dirUp := true
+            li := f_drawLine()
+            if (f_isMax(length) and high[length] > lastLow)
+                lastHigh := high[length]
+                timeHigh := bar_index
+                dirUp := false
+                li := f_drawLine()
+
+// ═══════════════════════════════════════════════════════════════════════
+// HORIZONTAL SUPPORT/RESISTANCE LINES
+// ═══════════════════════════════════════════════════════════════════════
+
+// Variables to track current levels
+var float currentHighestHigh = na
+var float currentLowestLow = na
+var float currentMidRange = na
+
+// Variables to store line IDs
+var line supportLine = na
+var line resistanceLine = na
+var line midRangeLine = na
+
+// Update levels when new high or low is detected
+newHighestHigh = ta.highest(high, lookback)
+newLowestLow = ta.lowest(low, lookback)
+newMidRange = (newHighestHigh + newLowestLow) / 2
+
+// Check if levels have changed
+levelChanged = not na(currentHighestHigh) and (currentHighestHigh != newHighestHigh or currentLowestLow != newLowestLow)
+
+// Initialize on first bar or when levels change
+if na(currentHighestHigh) or levelChanged or barstate.isfirst
+    currentHighestHigh := newHighestHigh
+    currentLowestLow := newLowestLow
+    currentMidRange := newMidRange
+    
+    // Delete old lines
+    if not na(supportLine)
+        line.delete(supportLine)
+    if not na(resistanceLine)
+        line.delete(resistanceLine)
+    if not na(midRangeLine)
+        line.delete(midRangeLine)
+    
+    // Create new horizontal lines that extend across the visible chart
+    if showLines
+        // Support line
+        supportLine := line.new(
+             bar_index - lookback, currentLowestLow,
+             bar_index + 50, currentLowestLow,
+             color=color.new(colorBullish, 30), width=2, style=line.style_solid,
+             extend=extend.right
+         )
+        
+        // Resistance line
+        resistanceLine := line.new(
+             bar_index - lookback, currentHighestHigh,
+             bar_index + 50, currentHighestHigh,
+             color=color.new(colorBearish, 30), width=2, style=line.style_solid,
+             extend=extend.right
+         )
+        
+        // Mid range line
+        midRangeLine := line.new(
+             bar_index - lookback, currentMidRange,
+             bar_index + 50, currentMidRange,
+             color=color.new(colorNeutral, 50), width=1, style=line.style_dashed,
+             extend=extend.right
+         )
+
+// ═══════════════════════════════════════════════════════════════════════
+// WYCKOFF EVENT DETECTION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Track last label bar globally to enforce minimum distance
+var int lastLabelBar = 0
+
+// --- ACCUMULATION EVENTS ---
+
+// Preliminary Support (PS)
+psCondition = low == ta.lowest(low, 50) and highVolume and close > open
+
+// Selling Climax (SC)
+scCondition = climaxVolume and close < open and low <= ta.lowest(low, 30) and close < close[1]
+
+// Automatic Rally (AR)
+arCondition = close > open and volume > avgVolume and low[1] == ta.lowest(low[1], 30) and close > close[1] * 1.01
+
+// Secondary Test (ST)
+stCondition = low < ta.valuewhen(scCondition, low, 0) * 1.005 and low > ta.valuewhen(scCondition, low, 0) * 0.995 and volume < avgVolume and close > open
+
+// Spring
+springCondition = low < ta.lowest(low[1], 20) and close > open and volume > avgVolume and close > low * 1.01
+
+// Test
+testCondition = math.abs(low - ta.valuewhen(scCondition, low, 0)) < rangeSize * 0.02 and volume < avgVolume * 0.8 and narrowRange
+
+// Sign of Strength (SOS)
+sosCondition = close > close[1] and volume > avgVolume * 1.3 and close - open > avgRange and close > midRange
+
+// Last Point of Support (LPS)
+lpsCondition = low > ta.valuewhen(springCondition or stCondition, low, 0) and close > open and volume < avgVolume and close > midRange
+
+// --- DISTRIBUTION EVENTS ---
+
+// Preliminary Supply (PSY)
+psyCondition = high == ta.highest(high, 50) and highVolume and close < open
+
+// Buying Climax (BC)
+bcCondition = climaxVolume and close > open and high >= ta.highest(high, 30)
+
+// Automatic Reaction (AR_DIST)
+arDistCondition = close < open and volume > avgVolume and high[1] == ta.highest(high[1], 30) and close < close[1] * 0.99
+
+// Secondary Test (ST_DIST)
+stDistCondition = high > ta.valuewhen(bcCondition, high, 0) * 0.995 and high < ta.valuewhen(bcCondition, high, 0) * 1.005 and volume < avgVolume
+
+// Upthrust After Distribution (UTAD)
+utadCondition = high > ta.highest(high[1], 20) and close < open and volume > avgVolume and close < high * 0.99
+
+// Last Point of Supply (LPSY)
+lpsyCondition = high < ta.valuewhen(utadCondition or stDistCondition, high, 0) and close < open and volume < avgVolume and close < midRange
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE DETECTION
+// ═══════════════════════════════════════════════════════════════════════
+
+var string currentPhase = "None"
+var int phaseStartBar = na
+var float phaseStartPrice = na
+
+// Track detected patterns
+var string detectedPattern = "None"
+var color patternColor = color.white
+
+// Define solid colors for table display
+var color tablePatternColor = color.white
+
+// Accumulation Phase Detection
+if psCondition or scCondition
+    currentPhase := "Phase A"
+    phaseStartBar := bar_index
+    phaseStartPrice := low
+    detectedPattern := "Accumulation"
+    patternColor := colorPhaseA
+    tablePatternColor := #FF6B6B  
+else if arCondition and currentPhase == "Phase A"
+    currentPhase := "Phase B"
+    phaseStartBar := bar_index
+    detectedPattern := "Accumulation"
+    patternColor := colorPhaseB
+    tablePatternColor := #4ECDC4  
+else if testCondition and currentPhase == "Phase B"
+    currentPhase := "Phase C"
+    phaseStartBar := bar_index
+    detectedPattern := "Accumulation"
+    patternColor := colorPhaseC
+    tablePatternColor := #45B7D1  
+else if springCondition and currentPhase == "Phase C"
+    currentPhase := "Phase C"
+    detectedPattern := "Spring"
+    patternColor := color.lime
+    tablePatternColor := color.lime  
+else if sosCondition and (currentPhase == "Phase C" or currentPhase == "Phase B")
+    currentPhase := "Phase D"
+    phaseStartBar := bar_index
+    detectedPattern := "SOS"
+    patternColor := #00ff00
+    tablePatternColor := #00ff00  
+else if lpsCondition and currentPhase == "Phase D"
+    currentPhase := "Phase E"
+    phaseStartBar := bar_index
+    detectedPattern := "LPS"
+    patternColor := colorPhaseE
+    tablePatternColor := #FFEAA7  
+
+// Distribution Phase Detection
+if psyCondition or bcCondition
+    currentPhase := "Phase A (Dist)"
+    phaseStartBar := bar_index
+    phaseStartPrice := high
+    detectedPattern := "Distribution"
+    patternColor := color.red
+    tablePatternColor := color.red  
+else if arDistCondition and currentPhase == "Phase A (Dist)"
+    currentPhase := "Phase B (Dist)"
+    phaseStartBar := bar_index
+    detectedPattern := "Distribution"
+    patternColor := color.orange
+    tablePatternColor := color.orange  // Already solid
+else if utadCondition and currentPhase == "Phase B (Dist)"
+    currentPhase := "Phase C (Dist)"
+    phaseStartBar := bar_index
+    detectedPattern := "UTAD"
+    patternColor := color.orange
+    tablePatternColor := color.orange  // Already solid
+else if lpsyCondition and currentPhase == "Phase C (Dist)"
+    currentPhase := "Phase D (Dist)"
+    phaseStartBar := bar_index
+    detectedPattern := "LPSY"
+    patternColor := color.red
+    tablePatternColor := color.red 
+
+// ═══════════════════════════════════════════════════════════════════════
+// VISUALIZATION - ONLY CRITICAL EVENTS 
+// ═══════════════════════════════════════════════════════════════════════
+
+// Calculate dynamic offset based on price range
+priceOffset = (highestHigh - lowestLow) * (labelOffsetPct / 100)
+
+// Track individual events to prevent duplicates
+var int lastScBar = 0
+var int lastArBar = 0
+var int lastSpringBar = 0
+var int lastSosBar = 0
+var int lastLpsBar = 0
+var int lastBcBar = 0
+var int lastUtadBar = 0
+var int lastLpsyBar = 0
+
+if showLabels
+    // Only plot critical accumulation events with minimum distance check
+    if scCondition and bar_index - lastScBar > minBarsBetweenLabels and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, low - priceOffset, "SC", style=label.style_label_up, color=color.red, textcolor=color.white, size=txtSize, tooltip="Selling Climax - Major Support")
+        lastScBar := bar_index
+        lastLabelBar := bar_index
+    
+    if arCondition and bar_index - lastArBar > minBarsBetweenLabels * 1.5 and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, high + priceOffset, "AR", style=label.style_label_down, color=colorBullish, textcolor=color.white, size=txtSize, tooltip="Automatic Rally")
+        lastArBar := bar_index
+        lastLabelBar := bar_index
+    
+    if springCondition and bar_index - lastSpringBar > minBarsBetweenLabels and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, low - priceOffset, "Spring", style=label.style_label_up, color=color.lime, textcolor=color.black, size=txtSize, tooltip="Spring - Bullish Reversal Signal")
+        lastSpringBar := bar_index
+        lastLabelBar := bar_index
+    
+    if sosCondition and bar_index - lastSosBar > minBarsBetweenLabels and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, high + priceOffset, "SOS", style=label.style_label_down, color=#00ff00, textcolor=color.black, size=txtSize, tooltip="Sign of Strength - Markup Beginning")
+        lastSosBar := bar_index
+        lastLabelBar := bar_index
+    
+    if lpsCondition and bar_index - lastLpsBar > minBarsBetweenLabels * 1.5 and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, low - priceOffset, "LPS", style=label.style_label_up, color=colorBullish, textcolor=color.white, size=txtSize, tooltip="Last Point of Support")
+        lastLpsBar := bar_index
+        lastLabelBar := bar_index
+    
+    // Only plot critical distribution events with minimum distance check
+    if bcCondition and bar_index - lastBcBar > minBarsBetweenLabels and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, high + priceOffset, "BC", style=label.style_label_down, color=color.red, textcolor=color.white, size=txtSize, tooltip="Buying Climax - Major Resistance")
+        lastBcBar := bar_index
+        lastLabelBar := bar_index
+    
+    if utadCondition and bar_index - lastUtadBar > minBarsBetweenLabels and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, high + priceOffset, "UTAD", style=label.style_label_down, color=color.orange, textcolor=color.white, size=txtSize, tooltip="Upthrust - Bearish Reversal Signal")
+        lastUtadBar := bar_index
+        lastLabelBar := bar_index
+    
+    if lpsyCondition and bar_index - lastLpsyBar > minBarsBetweenLabels * 1.5 and bar_index - lastLabelBar > minBarsBetweenLabels
+        label.new(bar_index, high + priceOffset, "LPSY", style=label.style_label_down, color=colorBearish, textcolor=color.white, size=txtSize, tooltip="Last Point of Supply")
+        lastLpsyBar := bar_index
+        lastLabelBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════
+// VISUALIZATION - PHASE BOXES
+// ═══════════════════════════════════════════════════════════════════════
+
+var box phaseBox = na
+var label phaseLabel = na
+
+if showPhases and not na(phaseStartBar) and currentPhase != "None"
+    isPhaseA = currentPhase == "Phase A" or currentPhase == "Phase A (Dist)"
+    isPhaseB = currentPhase == "Phase B" or currentPhase == "Phase B (Dist)"
+    isPhaseC = currentPhase == "Phase C" or currentPhase == "Phase C (Dist)"
+    isPhaseD = currentPhase == "Phase D" or currentPhase == "Phase D (Dist)"
+    
+    boxColor = color.white
+    if isPhaseA
+        boxColor := colorPhaseA
+    else if isPhaseB
+        boxColor := colorPhaseB
+    else if isPhaseC
+        boxColor := colorPhaseC
+    else if isPhaseD
+        boxColor := colorPhaseD
+    else
+        boxColor := colorPhaseE
+    
+    if not na(phaseBox)
+        box.delete(phaseBox)
+    if not na(phaseLabel)
+        label.delete(phaseLabel)
+    
+    boxTop = highestHigh
+    boxBot = lowestLow
+    boxLeft = phaseStartBar
+    boxRight = bar_index
+    
+    phaseBox := box.new(boxLeft, boxTop, boxRight, boxBot, border_color=color.new(boxColor, 0), bgcolor=boxColor, border_width=1)
+    
+    labelX = int(math.avg(phaseStartBar, bar_index))
+    labelY = highestHigh + priceOffset * 2  // Offset phase labels further
+    phaseLabel := label.new(labelX, labelY, currentPhase, style=label.style_none, color=color.new(color.white, 100), textcolor=color.white, size=size.large, textalign=text.align_center)
+
+// ═══════════════════════════════════════════════════════════════════════
+// MINIATURE ZIGZAG WAVE CHART
+// ═══════════════════════════════════════════════════════════════════════
+
+// Function to format date to dd/MM
+f_formatDate(timestamp) =>
+    _year = year(timestamp)
+    _month = month(timestamp)
+    _day = dayofmonth(timestamp)
+    str.tostring(_day, "00") + "/" + str.tostring(_month, "00")
+
+// Create a simple visual representation using labels and lines
+if barstate.islast and showMonthlyWave
+    // Calculate chart height for sizing
+    chartHeight = highestHigh - lowestLow
+    
+    // MUCH LARGER BOX SIZE - increased by 50%
+    containerTop = lowestLow - (chartHeight * 0.50) 
+    containerBottom = lowestLow - (chartHeight * 0.95)  
+    
+    // WIDER BOX 
+    containerLeft = bar_index - 90  // Increased from 60
+    containerRight = bar_index + 30  // Increased from 20
+    
+    // Create container box 
+    containerBox = box.new(containerLeft, containerTop, containerRight, containerBottom, 
+                          border_color=#ffaa3b, border_width=2, 
+                          bgcolor=color.new(color.black, 100))
+    
+    // Calculate container dimensions
+    containerHeight = containerTop - containerBottom
+    containerWidth = containerRight - containerLeft
+    
+    // Title label - positioned safely inside with margin
+    titleY = containerTop - (containerHeight * 0.08)  // Adjusted for larger box
+    titleX = int(containerLeft + (containerWidth * 0.5))
+    
+    // Format current month for title
+    monthNames = array.from("", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    currentMonthName = array.get(monthNames, month(time))
+    yearName = str.tostring(year(time))
+    titleText = currentMonthName + " " + yearName + " DAILY VIEW"
+    
+    label.new(titleX, titleY, titleText, 
+             color=color.new(color.black, 100), 
+             textcolor=color.yellow, 
+             style=label.style_label_center, 
+             size=size.normal,
+             textalign=text.align_center)
+    
+    // Get DAILY data for the CURRENT MONTH (using fewer calls - max 10 days)
+    // This stays under the 40 request limit
+    d0_high = request.security(syminfo.tickerid, "D", high[0])
+    d0_low = request.security(syminfo.tickerid, "D", low[0])
+    d0_time = request.security(syminfo.tickerid, "D", time[0])
+    
+    d1_high = request.security(syminfo.tickerid, "D", high[1])
+    d1_low = request.security(syminfo.tickerid, "D", low[1])
+    d1_time = request.security(syminfo.tickerid, "D", time[1])
+    
+    d2_high = request.security(syminfo.tickerid, "D", high[2])
+    d2_low = request.security(syminfo.tickerid, "D", low[2])
+    d2_time = request.security(syminfo.tickerid, "D", time[2])
+    
+    d3_high = request.security(syminfo.tickerid, "D", high[3])
+    d3_low = request.security(syminfo.tickerid, "D", low[3])
+    d3_time = request.security(syminfo.tickerid, "D", time[3])
+    
+    d4_high = request.security(syminfo.tickerid, "D", high[4])
+    d4_low = request.security(syminfo.tickerid, "D", low[4])
+    d4_time = request.security(syminfo.tickerid, "D", time[4])
+    
+    d5_high = request.security(syminfo.tickerid, "D", high[5])
+    d5_low = request.security(syminfo.tickerid, "D", low[5])
+    d5_time = request.security(syminfo.tickerid, "D", time[5])
+    
+    d6_high = request.security(syminfo.tickerid, "D", high[6])
+    d6_low = request.security(syminfo.tickerid, "D", low[6])
+    d6_time = request.security(syminfo.tickerid, "D", time[6])
+    
+    d7_high = request.security(syminfo.tickerid, "D", high[7])
+    d7_low = request.security(syminfo.tickerid, "D", low[7])
+    d7_time = request.security(syminfo.tickerid, "D", time[7])
+    
+    d8_high = request.security(syminfo.tickerid, "D", high[8])
+    d8_low = request.security(syminfo.tickerid, "D", low[8])
+    d8_time = request.security(syminfo.tickerid, "D", time[8])
+    
+    d9_high = request.security(syminfo.tickerid, "D", high[9])
+    d9_low = request.security(syminfo.tickerid, "D", low[9])
+    d9_time = request.security(syminfo.tickerid, "D", time[9])
+    
+    // Get current month and year
+    currentMonth = month(time)
+    currentYear = year(time)
+    
+    // Build arrays - add most recent days first, filter by current month
+    dailyHighs = array.new_float()
+    dailyLows = array.new_float()
+    dailyTimes = array.new_int()
+    
+    // Add in reverse order (most recent first) and filter for current month
+    if month(d0_time) == currentMonth and year(d0_time) == currentYear
+        array.push(dailyHighs, d0_high)
+        array.push(dailyLows, d0_low)
+        array.push(dailyTimes, d0_time)
+    
+    if month(d1_time) == currentMonth and year(d1_time) == currentYear
+        array.push(dailyHighs, d1_high)
+        array.push(dailyLows, d1_low)
+        array.push(dailyTimes, d1_time)
+    
+    if month(d2_time) == currentMonth and year(d2_time) == currentYear
+        array.push(dailyHighs, d2_high)
+        array.push(dailyLows, d2_low)
+        array.push(dailyTimes, d2_time)
+    
+    if month(d3_time) == currentMonth and year(d3_time) == currentYear
+        array.push(dailyHighs, d3_high)
+        array.push(dailyLows, d3_low)
+        array.push(dailyTimes, d3_time)
+    
+    if month(d4_time) == currentMonth and year(d4_time) == currentYear
+        array.push(dailyHighs, d4_high)
+        array.push(dailyLows, d4_low)
+        array.push(dailyTimes, d4_time)
+    
+    if month(d5_time) == currentMonth and year(d5_time) == currentYear
+        array.push(dailyHighs, d5_high)
+        array.push(dailyLows, d5_low)
+        array.push(dailyTimes, d5_time)
+    
+    if month(d6_time) == currentMonth and year(d6_time) == currentYear
+        array.push(dailyHighs, d6_high)
+        array.push(dailyLows, d6_low)
+        array.push(dailyTimes, d6_time)
+    
+    if month(d7_time) == currentMonth and year(d7_time) == currentYear
+        array.push(dailyHighs, d7_high)
+        array.push(dailyLows, d7_low)
+        array.push(dailyTimes, d7_time)
+    
+    if month(d8_time) == currentMonth and year(d8_time) == currentYear
+        array.push(dailyHighs, d8_high)
+        array.push(dailyLows, d8_low)
+        array.push(dailyTimes, d8_time)
+    
+    if month(d9_time) == currentMonth and year(d9_time) == currentYear
+        array.push(dailyHighs, d9_high)
+        array.push(dailyLows, d9_low)
+        array.push(dailyTimes, d9_time)
+    
+    // Reverse arrays to get chronological order (oldest to newest)
+    array.reverse(dailyHighs)
+    array.reverse(dailyLows)
+    array.reverse(dailyTimes)
+    
+    // Build zigzag from daily data (alternating highs and lows)
+    monthlyData = array.new_float()
+    monthlyDataTimes = array.new_int()
+    
+    daysInMonth = array.size(dailyHighs)
+    
+    if daysInMonth > 0
+        // Create zigzag pattern by alternating between highs and lows
+        // Limit to monthlySwingLegs points
+        pointsToPlot = math.min(monthlySwingLegs, daysInMonth * 2)
+        
+        for i = 0 to pointsToPlot - 1
+            dayIndex = int(i / 2)
+            
+            if dayIndex < daysInMonth
+                // Alternate between low and high
+                if i % 2 == 0
+                    // Add low
+                    array.push(monthlyData, array.get(dailyLows, dayIndex))
+                    array.push(monthlyDataTimes, array.get(dailyTimes, dayIndex))
+                else
+                    // Add high
+                    array.push(monthlyData, array.get(dailyHighs, dayIndex))
+                    array.push(monthlyDataTimes, array.get(dailyTimes, dayIndex))
+    
+    actualDataCount = array.size(monthlyData)
+    
+    // Calculate wave positions
+    dataCount = actualDataCount
+    if dataCount >= 3
+        maxVal = array.max(monthlyData)
+        minVal = array.min(monthlyData)
+        valRange = maxVal - minVal
+        
+        if valRange > 0
+            // Calculate wave y positions within container with safe margins
+            waveTop = containerTop - (containerHeight * 0.15)  // Adjusted margins
+            waveBottom = containerBottom + (containerHeight * 0.15)
+            waveHeight = waveTop - waveBottom
+            
+            // Calculate x positions with safe margins
+            waveLeft = containerLeft + (containerWidth * 0.08)  // Adjusted margins
+            waveRight = containerRight - (containerWidth * 0.08)
+            xStep = (waveRight - waveLeft) / (dataCount - 1)
+            
+            // Store previous point
+            var float prevY = na
+            var float prevX = na
+            
+            // Calculate levels for support/resistance lines
+            waveMid = (waveTop + waveBottom) / 2
+            waveResistance = waveTop - (waveHeight * 0.25)
+            waveSupport = waveBottom + (waveHeight * 0.25)
+            
+            // Draw horizontal support/resistance lines
+            line.new(containerLeft, waveSupport, containerRight, waveSupport, 
+                   color=color.new(#26a69a, 50), width=1, style=line.style_solid)
+            line.new(containerLeft, waveResistance, containerRight, waveResistance, 
+                   color=color.new(#ef5350, 50), width=1, style=line.style_solid)
+            line.new(containerLeft, waveMid, containerRight, waveMid, 
+                   color=color.new(#9E9E9E, 50), width=1, style=line.style_dashed)
+            
+            // Arrays to store all points
+            var float[] wavePointsY = array.new_float()
+            var float[] wavePointsX = array.new_float()
+            
+            // Draw the wave
+            for i = 0 to dataCount - 1
+                dataValue = array.get(monthlyData, i)
+                // Normalize value to wave height
+                normalized = (dataValue - minVal) / valRange
+                yPos = waveBottom + (normalized * waveHeight)
+                xPos = waveLeft + (i * xStep)
+                
+                // Store point coordinates
+                array.push(wavePointsY, yPos)
+                array.push(wavePointsX, xPos)
+                
+                // Create wave point - Cyan colored dots
+                label.new(int(xPos), yPos, "•", 
+                         color=color.new(color.black, 100), 
+                         textcolor=#00FFFF, 
+                         style=label.style_none, 
+                         size=size.large)
+                
+                // Connect to previous point
+                if not na(prevY)
+                    // Determine line color
+                    lineColor = yPos > prevY ? color.green : color.red
+                    line.new(int(prevX), prevY, int(xPos), yPos, 
+                           color=lineColor, width=2, style=line.style_solid)
+                
+                prevY := yPos
+                prevX := xPos
+            
+            // ==============================================
+            // SWING POINTS WITH DATE STAMPS 
+            // ==============================================
+            if showSwingPoints and dataCount >= 2
+                // Display swing points with tiny date labels
+                for i = 0 to dataCount - 1
+                    if i < array.size(wavePointsY)
+                        swingY = array.get(wavePointsY, i)
+                        swingX = array.get(wavePointsX, i)
+                        swingTime = array.get(monthlyDataTimes, i)
+                        
+                        // Format date
+                        dateStr = f_formatDate(swingTime)
+                        
+                        // Determine if this is a high or low point
+                        isHigh = i % 2 == 1
+                        
+                        // Calculate label position with safe margins
+                        labelYOffset = waveHeight * 0.12  // Adjusted for larger box
+                        lblY = isHigh ? swingY + labelYOffset : swingY - labelYOffset
+                        lblStyle = isHigh ? label.style_label_down : label.style_label_up
+                        
+                        // ENSURE NO COLLISIONS WITH BORDERS
+                        // Define safe zones
+                        topSafeZone = containerTop - (containerHeight * 0.08)
+                        bottomSafeZone = containerBottom + (containerHeight * 0.08)
+                        
+                        // Clamp label position to safe zones
+                        lblY := math.max(bottomSafeZone, math.min(topSafeZone, lblY))
+                        
+                        // Create tiny date label 
+                        label.new(int(swingX), lblY, dateStr,
+                               color=color.new(color.black, 100),
+                               textcolor=color.yellow,
+                               style=lblStyle,
+                               size=size.tiny,
+                               textalign=text.align_center)
+                
+                // Draw trend lines connecting all swing points
+                for i = 0 to dataCount - 2
+                    if i < array.size(wavePointsY) and (i + 1) < array.size(wavePointsY)
+                        x1 = array.get(wavePointsX, i)
+                        y1 = array.get(wavePointsY, i)
+                        x2 = array.get(wavePointsX, i + 1)
+                        y2 = array.get(wavePointsY, i + 1)
+                        
+                        // Determine trend direction
+                        isUptrend = y2 > y1
+                        lineColor = isUptrend ? color.new(#00FF00, 80) : color.new(#FF0000, 80)
+                        
+                        // Draw trend line
+                        line.new(int(x1), y1, int(x2), y2,
+                               color=lineColor,
+                               width=2,
+                               style=line.style_solid)
+            
+            // ==============================================
+            
+            // Add timeline markers 
+            timelineY = containerBottom + (containerHeight * 0.06)  // Adjusted for larger box
+            pastX = int(containerLeft + (containerWidth * 0.12))
+            presentX = int(containerRight - (containerWidth * 0.12))
+            
+            label.new(pastX, timelineY, "◄ Past", 
+                     color=color.new(color.black, 100), 
+                     textcolor=color.gray, 
+                     style=label.style_none, 
+                     size=size.tiny)
+            
+            label.new(presentX, timelineY, "Present ►", 
+                     color=color.new(color.black, 100), 
+                     textcolor=color.gray, 
+                     style=label.style_none, 
+                     size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════
+// TABLE WITH CRITICAL EVENTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Create table with yellow border on all sides
+var table wyckoffTable = table.new(position.top_right, 2, 8, bgcolor=#000000, frame_width=2, frame_color=color.yellow, border_width=1, border_color=color.yellow)
+
+// Update table with current phase, pattern, and critical event legend
+if barstate.islast
+    // Header row
+    table.cell(wyckoffTable, 0, 0, "Wyckoff", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    table.cell(wyckoffTable, 1, 0, "Status", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    
+    // Current status
+    table.cell(wyckoffTable, 0, 1, "Phase:", text_color=color.white, text_size=size.small)
+    table.cell(wyckoffTable, 1, 1, currentPhase, text_color=color.white, text_size=size.small)
+    
+    table.cell(wyckoffTable, 0, 2, "Pattern:", text_color=color.white, text_size=size.small)
+    table.cell(wyckoffTable, 1, 2, detectedPattern, text_color=tablePatternColor, text_size=size.small)
+    
+    // Separator
+    table.cell(wyckoffTable, 0, 3, "Key Events", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    table.cell(wyckoffTable, 1, 3, "Signals", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    
+    // Critical Events Only
+    table.cell(wyckoffTable, 0, 4, "SC/AR", text_color=color.red, text_size=size.small)
+    table.cell(wyckoffTable, 1, 4, "Selling Climax/Rally", text_color=color.gray, text_size=size.small)
+    
+    table.cell(wyckoffTable, 0, 5, "Spring", text_color=color.lime, text_size=size.small)
+    table.cell(wyckoffTable, 1, 5, "Bullish Reversal", text_color=color.gray, text_size=size.small)
+    
+    table.cell(wyckoffTable, 0, 6, "SOS/LPS", text_color=#00ff00, text_size=size.small)
+    table.cell(wyckoffTable, 1, 6, "Strength/Last Support", text_color=color.gray, text_size=size.small)
+    
+    table.cell(wyckoffTable, 0, 7, "BC/UTAD/LPSY", text_color=color.orange, text_size=size.small)
+    table.cell(wyckoffTable, 1, 7, "Distribution Signals", text_color=color.gray, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS - CRITICAL EVENTS ONLY
+// ═══════════════════════════════════════════════════════════════════════
+
+alertcondition(scCondition, "Selling Climax", "SC Detected - Potential Accumulation Start")
+alertcondition(arCondition, "Automatic Rally", "AR Detected - Rally After Climax")
+alertcondition(springCondition, "Spring", "Spring Detected - Bullish Signal")
+alertcondition(sosCondition, "Sign of Strength", "SOS Detected - Markup Beginning")
+alertcondition(lpsCondition, "Last Point of Support", "LPS Detected - Final Support Test")
+alertcondition(bcCondition, "Buying Climax", "BC Detected - Potential Distribution Start")
+alertcondition(utadCondition, "UTAD", "UTAD Detected - Bearish Signal")
+alertcondition(lpsyCondition, "Last Point of Supply", "LPSY Detected - Final Supply Test")
+alertcondition(currentPhase == "Phase E" and currentPhase[1] != "Phase E", "Markup Phase", "Entering Markup Phase")

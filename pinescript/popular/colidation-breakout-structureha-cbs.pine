@@ -1,0 +1,826 @@
+//@version=6
+// ========================================================================= //
+//                        HA Colidation Breakout Structure                   //
+// ========================================================================= //
+indicator(title='HA Colidation Breakout Structure', shorttitle='HA-CBS', overlay=true, max_bars_back=5000, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+////@version=6
+// ========================================================================= //
+//                               Consolidation                               //
+// ========================================================================= //
+// indicator(title='Consolidation', overlay=true, max_bars_back=5000, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+//// ------------------------------------------------------------------------- //
+// Candle Constant
+// ------------------------------------------------------------------------- //
+CANDLE_MARGIN_RATE = 0.015
+
+// ------------------------------------------------------------------------- //
+// Candle Variable
+// ------------------------------------------------------------------------- //
+candle_oc_max = math.max(open, close)
+candle_oc_min = math.min(open, close)
+candle_margin = (high - low) * (CANDLE_MARGIN_RATE)
+candle_is_doji = open > close - candle_margin and open < close + candle_margin
+
+// ------------------------------------------------------------------------- //
+// Candle Function
+// ------------------------------------------------------------------------- //
+candle_highest(int length, int offset=0) =>
+    _x = offset, _y = high[offset]
+    if length > 0
+        for i = offset to offset + length - 1
+            if high[i] > _y
+                _x := i, _y := high[i]
+    [_x, _y]
+
+candle_highest(float _high=high, int length, int offset=0) =>
+    _x = offset, _y = _high[offset]
+    if length > 0
+        for i = offset to offset + length - 1
+            if _high[i] > _y
+                _x := i, _y := _high[i]
+    [_x, _y]
+
+candle_lowest(int length, int offset=0) =>
+    _x = offset, _y = low[offset]
+    if length > 0
+        for i = offset to offset + length - 1
+            if low[i] < _y
+                _x := i, _y := low[i]
+    [_x, _y]
+
+candle_lowest(float _low=low, int length, int offset=0) =>
+    _x = offset, _y = _low[offset]
+    if length > 0
+        for i = offset to offset + length - 1
+            if _low[i] < _y
+                _x := i, _y := _low[i]
+    [_x, _y]
+
+count_consecutive_overlap(float _high=high, _low=low, int offset=0) =>
+    count = 1
+    for i = offset + 1 to offset + 1000
+        if _low[i] <= _high[offset] and _low[offset] <= _high[i]
+            count += 1
+        else
+            break
+    count
+
+// ------------------------------------------------------------------------- //
+// Heikinashi Calculation
+// ------------------------------------------------------------------------- //
+[heikinashi_open, heikinashi_high, heikinashi_low, heikinashi_close] = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, [open, high, low, close])
+heikinashi_oc_max = math.max(heikinashi_open, heikinashi_close)
+heikinashi_oc_min = math.min(heikinashi_open, heikinashi_close)
+heikinashi_margin = (heikinashi_high - heikinashi_low) * (CANDLE_MARGIN_RATE)
+
+////
+//// ------------------------------------------------------------------------- //
+// Rect Constant
+// ------------------------------------------------------------------------- //
+const int RECT_STATUS_INVALID      = -1
+const int RECT_STATUS_NONE         = 0
+const int RECT_STATUS_TOUCH_BOUND  = 1 // touch top or bottom
+const int RECT_STATUS_TOUCH_CENTER = 2 // touch center
+
+const int RECT_DIRECTION_BULLISH = 1
+const int RECT_DIRECTION_BEARISH = 0
+
+// ------------------------------------------------------------------------- //
+// Rect Type Definition
+// ------------------------------------------------------------------------- //
+type Rect
+    int   left      = bar_index
+    float top       = high
+    int   right     = bar_index
+    float bottom    = low
+    float center    = 0.0
+    int   status    = 0 // RECT_STATUS_NONE
+    box   _box      = na
+    line  _line     = na // Center Line
+
+// ------------------------------------------------------------------------- //
+// Rect Function
+// ------------------------------------------------------------------------- //
+rect_status_stoi(string mitigate_line) =>
+    status = switch mitigate_line
+        "Bound"  => RECT_STATUS_TOUCH_BOUND
+        "Center" => RECT_STATUS_TOUCH_CENTER
+
+method show(Rect this, const string border_style=line.style_solid, int border_width=1, map<string, color> color_map) =>
+    if this.status != RECT_STATUS_INVALID
+        if na(this._box)
+            this._box := box.new(this.left, this.top, this.right, this.bottom, border_style=border_style, border_width=border_width, border_color=color_map.get('border'), bgcolor=color_map.get('bg'))
+        else
+            this._box.set_lefttop(this.left, this.top)
+            this._box.set_rightbottom(this.right, this.bottom)
+            this._box.set_border_style(border_style)
+            this._box.set_border_width(border_width)
+            this._box.set_border_color(color_map.get('border'))
+            this._box.set_bgcolor(color_map.get('bg'))
+        if na(this._line)
+            this._line := line.new(this.left, this.center, this.right, this.center, width=border_width, color=color_map.get('center'))
+        else
+            this._line.set_xy1(this.left, this.center)
+            this._line.set_xy2(this.right, this.center)
+            this._line.set_width(border_width)
+            this._line.set_color(color_map.get('center'))
+    this
+
+method hide(Rect this) =>
+    if not na(this._box)
+        box.delete(this._box)
+        this._box := na
+    if not na(this._line)
+        line.delete(this._line)
+        this._line := na
+
+method absolute_coordinate(Rect this) =>
+    this.left := bar_index - this.left, this.right := bar_index - this.right
+    this
+
+method update_right(Rect this, int right) =>
+    this.right := right
+    if this.status != RECT_STATUS_INVALID
+        if not na(this._box)
+            this._box.set_right(this.right)
+        if not na(this._line)
+            this._line.set_x2(this.right)
+
+method check_overlap(Rect this, Rect rect) =>
+    this.left <= rect.right and rect.left <= this.right and this.bottom <= rect.top and rect.bottom <= this.top
+
+method check_overlap(Rect this, int left, float top, int right, float bottom) =>
+    this.left <= right and left <= this.right and this.bottom <= top and bottom <= this.top
+
+method check_collision_vertical(Rect this, Rect rect) =>
+    _collision = this.bottom <= rect.top and rect.bottom <= this.top
+
+// ------------------------------------------------------------------------- //
+// Array of Rect Method
+// ------------------------------------------------------------------------- //
+method add(array<Rect> this, Rect rect, int limit, int status=0) =>
+    this.unshift(rect)
+    if this.size() > limit
+        _rect = this.get(limit)
+        _rect.hide()
+        this.pop()
+
+method remove_invalid(array<Rect> this) =>
+    if this.size() > 0
+        for i = this.size() - 1 to 0
+            _rect = this.get(i)
+            if _rect.status == RECT_STATUS_INVALID
+                _rect.hide()
+                this.remove(i)
+
+method update_status(array<Rect> this, int dir, int mitigate_status) =>
+    mitigated_list = array.new<int>()
+    if this.size() > 0
+        for i = this.size() - 1 to 0
+            _rect = this.get(i)
+            if _rect.status >= RECT_STATUS_NONE
+                if (dir == RECT_DIRECTION_BEARISH and high >= _rect.center) or (dir == RECT_DIRECTION_BULLISH and low <= _rect.center)
+                    _rect.status := RECT_STATUS_TOUCH_CENTER
+                else if (dir == RECT_DIRECTION_BEARISH and high >= _rect.bottom) or (dir == RECT_DIRECTION_BULLISH and low <= _rect.top)
+                    _rect.status := RECT_STATUS_TOUCH_BOUND
+            if _rect.status >= mitigate_status
+                _rect.status := RECT_STATUS_INVALID
+                mitigated_list.push(i)
+    mitigated_list
+
+method update_right(array<Rect> this, int right) =>
+    if this.size() > 0
+        for i = this.size() - 1 to 0
+            this.get(i).update_right(right)
+
+method check_overlap(array<Rect> this, Rect rect) =>
+    index = -1
+    if this.size() > 0
+        for i = 0 to this.size() - 1
+            _rect = this.get(i)
+            if _rect.left <= rect.right and rect.left <= _rect.right and _rect.bottom <= rect.top and rect.bottom <= _rect.top
+                index := i
+                break
+    index
+
+method check_collision_vertical_index(array<Rect> this, Rect rect) =>
+    _index = -1
+    if this.size() > 0
+        for i = 0 to this.size() - 1
+            _rect = this.get(i)
+            if _rect.check_collision_vertical(rect)
+                _index := i
+                break
+    _index
+
+
+// ------------------------------------------------------------------------- //
+// FVG Constant
+// ------------------------------------------------------------------------- //
+const int FVG_SIGNAL_BREAKAWAY_BEARISH    = -2
+const int FVG_SIGNAL_FAIRVALUE_BEARISH    = -1
+const int FVG_SIGNAL_NONE                 = 0
+const int FVG_SIGNAL_FAIRVALUE_BULLISH    = 1
+const int FVG_SIGNAL_BREAKAWAY_BULLISH    = 2
+
+// ------------------------------------------------------------------------- //
+// FVG Input
+// ------------------------------------------------------------------------- //
+fvg_input_group = "FVG"
+fvg_show_fairvalue = input.bool(true, title="FairValue", group=fvg_input_group, inline="fvg_show")
+fvg_show_breakaway = input.bool(true, title="Breakaway", group=fvg_input_group, inline="fvg_show")
+fvg_history = input.int(500, title="History", group=fvg_input_group, inline="fvg_show")
+fvg_period_length = input.int(4, title="Period Length", group=fvg_input_group, inline="fvg_period_length")
+fvg_filter_consolidation = input.bool(true, title="Only Show Break-away from Consolidation", group=fvg_input_group, inline="fvg_filter")
+fvg_mitigate_line = input.string("Center", title="Mitigated By", options=["Bound", "Center"], group=fvg_input_group, inline="fvg_mitigate")
+fvg_mitigate_remove = input.bool(false, title="Remove Mitigated", group=fvg_input_group, inline="fvg_mitigate")
+fvg_color_fairvalue_bullish = map.new<string, color>()
+fvg_color_fairvalue_bullish.put("border", input.color(color.new(#B2FF59, 50), title="FVG Bullish", group=fvg_input_group, inline="fvg_color_fairvalue_bullish"))
+fvg_color_fairvalue_bullish.put("bg", input.color(color.new(#B2FF59, 80), title="", group=fvg_input_group, inline="fvg_color_fairvalue_bullish"))
+fvg_color_fairvalue_bullish.put("center", input.color(color.new(#9598A1, 50), title="", group=fvg_input_group, inline="fvg_color_fairvalue_bullish"))
+fvg_color_fairvalue_bearish = map.new<string, color>()
+fvg_color_fairvalue_bearish.put("border", input.color(color.new(#FFAB40, 50), title="FVG Bearish", group=fvg_input_group, inline="fvg_color_fairvalue_bearish"))
+fvg_color_fairvalue_bearish.put("bg", input.color(color.new(#FFAB40, 80), title="", group=fvg_input_group, inline="fvg_color_fairvalue_bearish"))
+fvg_color_fairvalue_bearish.put("center", input.color(color.new(#9598A1, 50), title="", group=fvg_input_group, inline="fvg_color_fairvalue_bearish"))
+fvg_color_breakaway_bullish = map.new<string, color>()
+fvg_color_breakaway_bullish.put("border", input.color(color.new(#26C6DA, 50), title="Breakaway Bullish", group=fvg_input_group, inline="fvg_color_breakaway_bullish"))
+fvg_color_breakaway_bullish.put("bg", input.color(color.new(#26C6DA, 80), title="", group=fvg_input_group, inline="fvg_color_breakaway_bullish"))
+fvg_color_breakaway_bullish.put("center", input.color(color.new(#9598A1, 50), title="", group=fvg_input_group, inline="fvg_color_breakaway_bullish"))
+fvg_color_breakaway_bearish = map.new<string, color>()
+fvg_color_breakaway_bearish.put("border", input.color(color.new(#E040FB, 50), title="Breakaway Bearish", group=fvg_input_group, inline="fvg_color_breakaway_bearish"))
+fvg_color_breakaway_bearish.put("bg", input.color(color.new(#E040FB, 80), title="", group=fvg_input_group, inline="fvg_color_breakaway_bearish"))
+fvg_color_breakaway_bearish.put("center", input.color(color.new(#9598A1, 50), title="", group=fvg_input_group, inline="fvg_color_breakaway_bearish"))
+
+// ------------------------------------------------------------------------- //
+// FVG Function
+// ------------------------------------------------------------------------- //
+fvg_detect(int period) =>
+    signal = FVG_SIGNAL_NONE, Rect rect = na, left = period, right = 0
+    if high[left] < low[right]
+        rect := Rect.new(left, candle_oc_min[right], right, candle_oc_max[left], math.avg(candle_oc_min[right], candle_oc_max[left]))
+        // rect := Rect.new(left, candle_oc_max[right], right, candle_oc_min[left], math.avg(candle_oc_max[right], candle_oc_min[left]))
+        if high[1] < close[0]
+            signal := FVG_SIGNAL_BREAKAWAY_BULLISH
+        else
+            signal := FVG_SIGNAL_FAIRVALUE_BULLISH
+    else if low[left] > high[right]
+        rect := Rect.new(left, candle_oc_min[left], right, candle_oc_max[right], math.avg(candle_oc_min[left], candle_oc_max[right]))
+        // rect := Rect.new(left, candle_oc_max[left], right, candle_oc_min[right], math.avg(candle_oc_max[left], candle_oc_min[right]))
+        if low[1] > close[0]
+            signal := FVG_SIGNAL_BREAKAWAY_BEARISH
+        else
+            signal := FVG_SIGNAL_FAIRVALUE_BEARISH
+    [signal, rect]
+
+// ------------------------------------------------------------------------- //
+// FVG Calculation
+// ------------------------------------------------------------------------- //
+[fvg_signal, fvg_rect] = fvg_detect(fvg_period_length)
+
+
+// ------------------------------------------------------------------------- //
+// Consolidation Constant
+// ------------------------------------------------------------------------- //
+const int CONSOLIDATION_SIGNAL_BEARISH = -1
+const int CONSOLIDATION_SIGNAL_NONE    = 0
+const int CONSOLIDATION_SIGNAL_BULLISH = 1
+
+// ------------------------------------------------------------------------- //
+// Consolidation Input
+// ------------------------------------------------------------------------- //
+consolidation_input_group = "Consolidation"
+consolidation_show = input.bool(true, title="Show", group=consolidation_input_group, inline="consolidation_show")
+consolidation_history = input.int(500, title="History", group=consolidation_input_group, inline="consolidation_show")
+consolidation_length = input.int(4, title="Consolidation Length", group=consolidation_input_group, inline="consolidation_length")
+consolidation_filter_consecutive = input.bool(true, title="Omit Consecutive", group=consolidation_input_group, inline="consolidation_filter")
+consolidation_filter_candidate_recent = input.bool(true, title="Recent Candidate Only", group=consolidation_input_group, inline="consolidation_filter_candidate_recent")
+consolidation_mitigate_line = input.string("Center", title="Mitigated By", options=["Bound", "Center"], group=consolidation_input_group, inline="consolidation_mitigate")
+consolidation_mitigate_remove = input.bool(false, title="Remove Mitigated", group=consolidation_input_group, inline="consolidation_mitigate")
+consolidation_color_bullish = map.new<string, color>()
+consolidation_color_bullish.put("border", input.color(color.new(#3D5AFE, 50), title="Bullish", group=consolidation_input_group, inline="consolidation_color_bullish"))
+consolidation_color_bullish.put("bg", input.color(color.new(#3D5AFE, 80), title="", group=consolidation_input_group, inline="consolidation_color_bullish"))
+consolidation_color_bullish.put("center", input.color(color.new(#9598A1, 80), title="", group=consolidation_input_group, inline="consolidation_color_bullish"))
+consolidation_color_bearish = map.new<string, color>()
+consolidation_color_bearish.put("border", input.color(color.new(#F50057, 50), title="bearish", group=consolidation_input_group, inline="consolidation_color_bearish"))
+consolidation_color_bearish.put("bg", input.color(color.new(#F50057, 80), title="", group=consolidation_input_group, inline="consolidation_color_bearish"))
+consolidation_color_bearish.put("center", input.color(color.new(#9598A1, 80), title="", group=consolidation_input_group, inline="consolidation_color_bearish"))
+
+// ------------------------------------------------------------------------- //
+// Consolidation Function
+// ------------------------------------------------------------------------- //
+consolidation_detect(int length) =>
+    signal = bar_index > length, Rect rect = na
+    for i = 0 to length - 2
+        if heikinashi_oc_max[length - 1] + candle_margin[length - 1] < heikinashi_oc_max[i] or heikinashi_oc_min[length - 1] - candle_margin[length - 1] > heikinashi_oc_min[i]
+            signal := false
+            break
+    if signal
+        center = math.avg(heikinashi_oc_max[length - 1], heikinashi_oc_min[length - 1])
+        rect := Rect.new(length - 1, heikinashi_oc_max[length - 1] + candle_margin[length - 1], -1, heikinashi_oc_min[length - 1] - candle_margin[length - 1], center).absolute_coordinate()
+    [signal, rect]
+
+// ------------------------------------------------------------------------- //
+// Consolidation Process
+// ------------------------------------------------------------------------- //
+var consolidation_candidate = array.new<Rect>()
+var consolidation_bullish = array.new<Rect>(), var consolidation_bearish = array.new<Rect>()
+array<int> consolidation_bullish_mitigated = na, array<int> consolidation_bearish_mitigated = na
+var consolidation_signal_last = CONSOLIDATION_SIGNAL_NONE, consolidation_signal = CONSOLIDATION_SIGNAL_NONE
+
+[_consolidation_signal, _consolidation_rect] = consolidation_detect(consolidation_length)
+
+if barstate.isnew and consolidation_mitigate_remove
+    consolidation_bullish.remove_invalid()
+    consolidation_bearish.remove_invalid()
+
+if barstate.isconfirmed
+    mitigate_status = rect_status_stoi(consolidation_mitigate_line)
+    consolidation_bullish_mitigated := consolidation_bullish.update_status(RECT_DIRECTION_BULLISH, mitigate_status)
+    consolidation_bearish_mitigated := consolidation_bearish.update_status(RECT_DIRECTION_BEARISH, mitigate_status)
+    consolidation_bullish.update_right(right=bar_index + 1)
+    consolidation_bearish.update_right(right=bar_index + 1)
+    consolidation_candidate.update_right(right=bar_index + 1)
+
+    // Detect Caandidate
+    if _consolidation_signal and _consolidation_signal[1] == false
+        if consolidation_filter_candidate_recent
+            consolidation_candidate.clear()
+        consolidation_candidate.push(_consolidation_rect)
+
+    // Check Breakout
+    if consolidation_candidate.size() > 0
+        added = false
+        for i = consolidation_candidate.size() - 1 to 0
+            _candidate = consolidation_candidate.get(i)
+            _candidate.right := bar_index + 1
+            if fvg_signal > FVG_SIGNAL_NONE and _candidate.top < heikinashi_oc_max[0] // Bullish
+                if consolidation_filter_consecutive ? consolidation_signal_last != CONSOLIDATION_SIGNAL_BULLISH : true
+                    consolidation_bullish.add(_candidate, consolidation_history)
+                    if consolidation_show
+                        consolidation_bullish.get(0).show(color_map=consolidation_color_bullish)
+                    consolidation_signal_last := CONSOLIDATION_SIGNAL_BULLISH, consolidation_signal := CONSOLIDATION_SIGNAL_BULLISH
+                consolidation_candidate.remove(i), added := true
+            else if fvg_signal < FVG_SIGNAL_NONE and _candidate.bottom > heikinashi_oc_min[0] // Bearish
+                if consolidation_filter_consecutive ? consolidation_signal_last != CONSOLIDATION_SIGNAL_BEARISH : true
+                    consolidation_bearish.add(_candidate, consolidation_history)
+                    if consolidation_show
+                        consolidation_bearish.get(0).show(color_map=consolidation_color_bearish)
+                    consolidation_signal_last := CONSOLIDATION_SIGNAL_BEARISH, consolidation_signal := CONSOLIDATION_SIGNAL_BEARISH
+                consolidation_candidate.remove(i), added := true
+        if added
+            consolidation_candidate.clear()
+
+////@version=6
+// ========================================================================= //
+//                                   FVG                                     //
+// ========================================================================= //
+// indicator(title='FVG', overlay=true, max_bars_back=5000, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+//
+//
+
+// ------------------------------------------------------------------------- //
+// FVG Process
+// ------------------------------------------------------------------------- //
+var fvg_fairvalue_bullish = array.new<Rect>(), var fvg_fairvalue_bearish = array.new<Rect>()
+var fvg_breakaway_bullish = array.new<Rect>(), var fvg_breakaway_bearish = array.new<Rect>()
+array<int> fvg_fairvalue_bullish_mitigated = na, array<int> fvg_fairvalue_bearish_mitigated = na
+array<int> fvg_breakaway_bullish_mitigated = na, array<int> fvg_breakaway_bearish_mitigated = na
+
+if barstate.isnew and fvg_mitigate_remove
+    fvg_fairvalue_bullish.remove_invalid()
+    fvg_fairvalue_bearish.remove_invalid()
+    fvg_breakaway_bullish.remove_invalid()
+    fvg_breakaway_bearish.remove_invalid()
+
+if barstate.isconfirmed
+    mitigate_status = rect_status_stoi(fvg_mitigate_line)
+    fvg_fairvalue_bullish_mitigated := fvg_fairvalue_bullish.update_status(RECT_DIRECTION_BULLISH, mitigate_status)
+    fvg_fairvalue_bearish_mitigated := fvg_fairvalue_bearish.update_status(RECT_DIRECTION_BEARISH, mitigate_status)
+    fvg_breakaway_bullish_mitigated := fvg_breakaway_bullish.update_status(RECT_DIRECTION_BULLISH, mitigate_status)
+    fvg_breakaway_bearish_mitigated := fvg_breakaway_bearish.update_status(RECT_DIRECTION_BEARISH, mitigate_status)
+    fvg_fairvalue_bullish.update_right(right=bar_index + 1)
+    fvg_fairvalue_bearish.update_right(right=bar_index + 1)
+    fvg_breakaway_bullish.update_right(right=bar_index + 1)
+    fvg_breakaway_bearish.update_right(right=bar_index + 1)
+
+    filter = fvg_filter_consolidation ? consolidation_signal != CONSOLIDATION_SIGNAL_NONE : true
+    if fvg_signal != FVG_SIGNAL_NONE and filter
+        fvg_rect := fvg_rect.absolute_coordinate()
+        fvg_rect.right := bar_index + 1
+    else
+        fvg_signal := FVG_SIGNAL_NONE
+
+    if fvg_signal == FVG_SIGNAL_FAIRVALUE_BULLISH
+        fvg_fairvalue_bullish.add(fvg_rect, fvg_history)
+        if fvg_show_fairvalue
+            fvg_fairvalue_bullish.get(0).show(color_map=fvg_color_fairvalue_bullish)
+    else if fvg_signal == FVG_SIGNAL_FAIRVALUE_BEARISH
+        fvg_fairvalue_bearish.add(fvg_rect, fvg_history)
+        if fvg_show_fairvalue
+            fvg_fairvalue_bearish.get(0).show(color_map=fvg_color_fairvalue_bearish)
+    else if fvg_signal == FVG_SIGNAL_BREAKAWAY_BULLISH
+        fvg_breakaway_bullish.add(fvg_rect, fvg_history)
+        if fvg_show_breakaway
+            fvg_breakaway_bullish.get(0).show(color_map=fvg_color_breakaway_bullish)
+    else if fvg_signal == FVG_SIGNAL_BREAKAWAY_BEARISH
+        fvg_breakaway_bearish.add(fvg_rect, fvg_history)
+        if fvg_show_breakaway
+            fvg_breakaway_bearish.get(0).show(color_map=fvg_color_breakaway_bearish)
+
+////@version=6
+// ========================================================================= //
+//                              Swing Point                                  //
+// ========================================================================= //
+// indicator(title='Swing Point', shorttitle='SP' overlay=true, max_bars_back=5000, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+//
+//// ------------------------------------------------------------------------- //
+// Point Constant
+// ------------------------------------------------------------------------- //
+const int POINT_STATUS_NONE    = 0
+const int POINT_STATUS_COVERED = 1
+
+const int POINT_DIRECTION_BULLISH = 1
+const int POINT_DIRECTION_BEARISH = 0
+
+// ------------------------------------------------------------------------- //
+// Point Type Definition
+// ------------------------------------------------------------------------- //
+type Point
+    int    x      = bar_index
+    float  y      = close
+    string _text  = na
+    label  _label = na
+    int    status = 0 // POINT_STATUS_NONE
+
+// ------------------------------------------------------------------------- //
+// Point Method
+// ------------------------------------------------------------------------- //
+method show(Point this, style=label.style_label_center, size=size.tiny, map<string, color> color_map) =>
+    if na(this._label) // Comment in Integration
+        this._label := label.new(this.x, this.y, text=this._text, color=color_map.get("bg"), style=label.style_label_center, size=size, textcolor=color_map.get("text"))
+    else
+        this._label.set_xy(this.x, this.y)
+        this._label.set_text(this._text)
+        this._label.set_color(color_map.get("bg"))
+        this._label.set_style(style)
+        this._label.set_size(size)
+        this._label.set_textcolor(color_map.get("text"))
+    this._label
+
+method hide(Point this) =>
+    if not na(this._label)
+        this._label.delete()
+        this._label := na
+
+method update_coordinate(Point this, int x, float y) =>
+    this.x := x, this.y := y
+    if not na(this._label)
+        this._label.set_xy(this.x, this.y)
+    this
+
+method absolute_coordinate(Point this) =>
+    this.x := bar_index - this.x
+    this
+
+// ------------------------------------------------------------------------- //
+// Array of Point Method
+// ------------------------------------------------------------------------- //
+method add(array<Point> this, Point point, int limit) =>
+    this.unshift(point)
+    if this.size() > limit
+        _point = this.get(limit)
+        _point.hide()
+        this.pop()
+
+method update_status(array<Point> this, int dir) =>
+    covered_list = array.new<int>()
+    if this.size() > 0
+        for i = this.size() - 1 to 0
+            _point = this.get(i)
+            if _point.status == POINT_STATUS_NONE
+                if (dir == POINT_DIRECTION_BEARISH and high[0] >= _point.y) or (dir == POINT_DIRECTION_BULLISH and low[0] <= _point.y)
+                    _point.status := POINT_STATUS_COVERED
+                    covered_list.push(i)
+    covered_list
+
+method check_swept(array<Point> this, int dir) =>
+    swept = false
+    covered_list = this.update_status(dir)
+    if this.size() > 0 and covered_list.size() > 0
+        for i = covered_list.size() - 1 to 0
+            _point = this.get(i)
+            if _point.status == POINT_STATUS_NONE
+                if (dir == POINT_DIRECTION_BEARISH and high >= _point.y and close < _point.y) or (dir == POINT_DIRECTION_BULLISH and low <= _point.y and close > _point.y)
+                    swept := true
+                    break
+    swept
+
+
+// ------------------------------------------------------------------------- //
+// Swing Constant
+// ------------------------------------------------------------------------- //
+const int SWING_POINT_SIGNAL_HIGHER_HIGH = 2
+const int SWING_POINT_SIGNAL_LOWER_HIGH = 1
+const int SWING_POINT_SIGNAL_NONE = 0
+const int SWING_POINT_SIGNAL_HIGHER_LOW = -1
+const int SWING_POINT_SIGNAL_LOWER_LOW = -2
+
+const int SWING_POINT_SIGNAL_HIGH = 10
+const int SWING_POINT_SIGNAL_LOW = -10
+
+// ------------------------------------------------------------------------- //
+// Swing Input
+// ------------------------------------------------------------------------- //
+swing_point_input_group = "Swing Point"
+swing_point_show_st = input.bool(false, title="ST", group=swing_point_input_group, inline="swing_point_show")
+swing_point_show_it = input.bool(true, title="IT", group=swing_point_input_group, inline="swing_point_show")
+swing_point_show_lt = input.bool(true, title="LT", group=swing_point_input_group, inline="swing_point_show")
+swing_point_history = input.int(500, title="History", minval=1, maxval=500, group=swing_point_input_group, inline="swing_point_show")
+swing_point_color_high = map.new<string, color>()
+swing_point_color_high.put("bg", input.color(color.new(color.orange, 30), title="High", group=swing_point_input_group, inline="swing_point_color_fairvalue_bullish"))
+swing_point_color_high.put("text", input.color(color.new(color.white, 0), title="", group=swing_point_input_group, inline="swing_point_color_fairvalue_bullish"))
+swing_point_color_low = map.new<string, color>()
+swing_point_color_low.put("bg", input.color(color.new(color.lime, 30), title="Low", group=swing_point_input_group, inline="swing_point_color_fairvalue_bullish"))
+swing_point_color_low.put("text", input.color(color.new(color.white, 0), title="", group=swing_point_input_group, inline="swing_point_color_fairvalue_bullish"))
+
+// ------------------------------------------------------------------------- //
+// Swing Process
+// ------------------------------------------------------------------------- //
+var swing_point_st_signal_last = SWING_POINT_SIGNAL_NONE, var swing_point_st_high = array.new<Point>(), var swing_point_st_low = array.new<Point>()
+var swing_point_it_signal_last = SWING_POINT_SIGNAL_NONE, var swing_point_it_high = array.new<Point>(), var swing_point_it_low = array.new<Point>()
+var swing_point_lt_signal_last = SWING_POINT_SIGNAL_NONE, var swing_point_lt_high = array.new<Point>(), var swing_point_lt_low = array.new<Point>()
+swing_point_st_swept_signal = SWING_POINT_SIGNAL_NONE, swing_point_it_swept_signal = SWING_POINT_SIGNAL_NONE, swing_point_lt_swept_signal = SWING_POINT_SIGNAL_NONE
+
+if barstate.isconfirmed
+    // For Swept Alert
+    if swing_point_st_high.check_swept(POINT_DIRECTION_BEARISH)
+        swing_point_st_swept_signal := SWING_POINT_SIGNAL_HIGH
+    else if swing_point_st_low.check_swept(POINT_DIRECTION_BULLISH)
+        swing_point_st_swept_signal := SWING_POINT_SIGNAL_LOW
+    if swing_point_it_high.check_swept(POINT_DIRECTION_BEARISH)
+        swing_point_it_swept_signal := SWING_POINT_SIGNAL_HIGH
+    else if swing_point_it_low.check_swept(POINT_DIRECTION_BULLISH)
+        swing_point_it_swept_signal := SWING_POINT_SIGNAL_LOW
+    if swing_point_lt_high.check_swept(POINT_DIRECTION_BEARISH)
+        swing_point_lt_swept_signal := SWING_POINT_SIGNAL_HIGH
+    else if swing_point_lt_low.check_swept(POINT_DIRECTION_BULLISH)
+        swing_point_lt_swept_signal := SWING_POINT_SIGNAL_LOW
+
+    // Create Swing Point
+    if consolidation_signal == CONSOLIDATION_SIGNAL_BEARISH and swing_point_st_signal_last[1] <= SWING_POINT_SIGNAL_NONE // STH
+        _length = swing_point_st_low.size() > 0 ? bar_index - swing_point_st_low.get(0).x : bar_index
+        [_x, _y] = candle_highest(_length), _text = "HH"
+        if swing_point_st_high.size() >= 2 and swing_point_st_high.get(0).y >= _y
+            _text := "LH", swing_point_st_signal_last := SWING_POINT_SIGNAL_LOWER_HIGH
+        else
+            _text := "HH", swing_point_st_signal_last := SWING_POINT_SIGNAL_HIGHER_HIGH
+        _point = Point.new(bar_index - _x, _y, _text)
+        swing_point_st_high.add(_point, swing_point_history)
+        if swing_point_show_st
+            swing_point_st_high.get(0).show(color_map=swing_point_color_high)
+    else if consolidation_signal == CONSOLIDATION_SIGNAL_BULLISH and swing_point_st_signal_last[1] >= SWING_POINT_SIGNAL_NONE // STL
+        _length = swing_point_st_high.size() > 0 ? bar_index - swing_point_st_high.get(0).x : bar_index
+        [_x, _y] = candle_lowest(_length), _text = "LL"
+        if swing_point_st_low.size() >= 2 and swing_point_st_low.get(0).y <= _y
+            _text := "HL", swing_point_st_signal_last := SWING_POINT_SIGNAL_HIGHER_LOW
+        else
+            _text := "LL", swing_point_st_signal_last := SWING_POINT_SIGNAL_LOWER_LOW
+        _point = Point.new(bar_index - _x, _y, _text)
+        swing_point_st_low.add(_point, swing_point_history)
+        if swing_point_show_st
+            swing_point_st_low.get(0).show(color_map=swing_point_color_low)
+
+    if swing_point_st_signal_last[1] < SWING_POINT_SIGNAL_NONE and swing_point_st_signal_last[0] > SWING_POINT_SIGNAL_NONE and swing_point_st_high.size() >= 3 // ITH
+        p0 = swing_point_st_high.get(0), p1 = swing_point_st_high.get(1), p2 = swing_point_st_high.get(2)
+        if p0.y <= p1.y and p1.y >= p2.y
+            _text = "HH"
+            if swing_point_it_high.size() >= 2 and swing_point_it_high.get(0).y >= p1.y
+                _text := "LH", swing_point_it_signal_last := SWING_POINT_SIGNAL_LOWER_HIGH
+            else
+                _text := "HH", swing_point_it_signal_last := SWING_POINT_SIGNAL_HIGHER_HIGH
+            _point = Point.new(p1.x, p1.y, _text)
+            swing_point_it_high.add(_point, swing_point_history)
+            if swing_point_show_it
+                swing_point_it_high.get(0).show(color_map=swing_point_color_high, size=size.small)
+    else if swing_point_st_signal_last[1] > SWING_POINT_SIGNAL_NONE and swing_point_st_signal_last[0] < SWING_POINT_SIGNAL_NONE and swing_point_st_low.size() >= 3 // ITL
+        p0 = swing_point_st_low.get(0), p1 = swing_point_st_low.get(1), p2 = swing_point_st_low.get(2)
+        if p0.y >= p1.y and p1.y <= p2.y
+            _text = "LL"
+            if swing_point_it_low.size() >= 2 and swing_point_it_low.get(0).y <= p1.y
+                _text := "HL", swing_point_it_signal_last := SWING_POINT_SIGNAL_HIGHER_LOW
+            else
+                _text := "LL", swing_point_it_signal_last := SWING_POINT_SIGNAL_LOWER_LOW
+            _point = Point.new(p1.x, p1.y, _text)
+            swing_point_it_low.add(_point, swing_point_history)
+            if swing_point_show_it
+                swing_point_it_low.get(0).show(color_map=swing_point_color_low, size=size.small)
+
+    if swing_point_it_signal_last[1] < SWING_POINT_SIGNAL_NONE and swing_point_it_signal_last[0] > SWING_POINT_SIGNAL_NONE and swing_point_it_high.size() >= 3 // LTH
+        p0 = swing_point_it_high.get(0), p1 = swing_point_it_high.get(1), p2 = swing_point_it_high.get(2)
+        if p0.y <= p1.y and p1.y >= p2.y
+            _text = "HH"
+            if swing_point_lt_high.size() >= 2 and swing_point_lt_high.get(0).y >= p1.y
+                _text := "LH", swing_point_lt_signal_last := SWING_POINT_SIGNAL_LOWER_HIGH
+            else
+                _text := "HH", swing_point_lt_signal_last := SWING_POINT_SIGNAL_HIGHER_HIGH
+            _point = Point.new(p1.x, p1.y, _text)
+            swing_point_lt_high.add(_point, swing_point_history)
+            if swing_point_show_lt
+                swing_point_lt_high.get(0).show(color_map=swing_point_color_high, size=size.normal)
+    else if swing_point_it_signal_last[1] > SWING_POINT_SIGNAL_NONE and swing_point_it_signal_last[0] < SWING_POINT_SIGNAL_NONE and swing_point_it_low.size() >= 3 // LTL
+        p0 = swing_point_it_low.get(0), p1 = swing_point_it_low.get(1), p2 = swing_point_it_low.get(2)
+        if p0.y >= p1.y and p1.y <= p2.y
+            _text = "LL"
+            if swing_point_lt_low.size() >= 2 and swing_point_lt_low.get(1).y <= p1.y
+                _text := "HL", swing_point_lt_signal_last := SWING_POINT_SIGNAL_HIGHER_LOW
+            else
+                _text := "LL", swing_point_lt_signal_last := SWING_POINT_SIGNAL_LOWER_LOW
+            _point = Point.new(p1.x, p1.y, _text)
+            swing_point_lt_low.add(_point, swing_point_history)
+            if swing_point_show_lt
+                swing_point_lt_low.get(0).show(color_map=swing_point_color_low, size=size.normal)
+
+////@version=6
+// ========================================================================= //
+//                              Swing Range                                  //
+// ========================================================================= //
+// indicator(title='Swing Range', shorttitle="DR", overlay=true, max_bars_back=5000, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+//// ------------------------------------------------------------------------- //
+// Range Type Definition
+// ------------------------------------------------------------------------- //
+type Range
+    int   left   = 0
+    float top    = 0
+    int   right  = 0
+    float bottom = 0
+    line _line1 = na // top
+    line _line2 = na // center
+    line _line3 = na // bottom
+    line _mtp = na // Most Traded Price
+    line _mts = na // Most Time-Spend Price
+
+// ------------------------------------------------------------------------- //
+// Range Constant
+// ------------------------------------------------------------------------- //
+const int RANGE_SIGNAL_NONE = 0
+const int RANGE_SIGNAL_HIGH = 1
+const int RANGE_SIGNAL_LOW  = 2
+
+const int RANGE_DISTRIBUTION_ROWS = 100
+
+// ------------------------------------------------------------------------- //
+// Range Method
+// ------------------------------------------------------------------------- //
+method set_show(Range this, width=1, map<string, color> color_map) =>
+    if na(this._line1) // Comment in Integration
+        center = math.avg(this.top, this.bottom)
+        this._line1 := line.new(this.left, this.top, this.right, this.top, width=width, color=color_map.get("top")),
+        this._line2 := line.new(this.left, center, this.right, center, width=width, color=color_map.get("center")),
+        this._line3 := line.new(this.left, this.bottom, this.right, this.bottom, width=width, color=color_map.get("bottom"))
+    else
+        center = math.avg(this.top, this.bottom)
+        this._line1.set_xy1(this.left, this.top),  this._line2.set_xy1(this.left, center),  this._line3.set_xy1(this.left, this.bottom)
+        this._line1.set_xy2(this.right, this.top), this._line2.set_xy1(this.right, center), this._line3.set_xy1(this.right, this.bottom)
+        this._line1.set_color(color_map.get("top")), this._line2.set_color(color_map.get("center")), this._line3.set_color(color_map.get("bottom"))
+        this._line1.set_width(width), this._line2.set_width(width), this._line3.set_width(width)
+    this
+
+method set_hide(Range this) =>
+    if not na(this._line1)
+        this._line1.delete(), this._line1 := na
+        this._line2.delete(), this._line2 := na
+        this._line3.delete(), this._line3 := na
+
+method set_mtp(Range this, width=1, map<string, color> color_map) =>
+    volumes = array.new_float(RANGE_DISTRIBUTION_ROWS, 0.0), range_height = this.top - this.bottom, row_size = range_height / RANGE_DISTRIBUTION_ROWS
+    for i = this.left to this.right
+        p = close[bar_index - i], v = volume[bar_index - i]
+        row_index = math.min(RANGE_DISTRIBUTION_ROWS - 1, int((p - this.bottom) / row_size))
+        if row_index >= 0 and row_index < RANGE_DISTRIBUTION_ROWS
+            volumes.set(row_index, volumes.get(row_index) + v)
+    max_row = 0, max_vol = 0.0
+    for j = 0 to RANGE_DISTRIBUTION_ROWS - 1
+        if volumes.get(j) > max_vol
+            max_vol := volumes.get(j), max_row := j
+    mtp = this.bottom + (max_row * row_size) + (row_size / 2)    
+    if na(this._mtp) // Comment in Integration
+        this._mtp := line.new(this.left, mtp, this.right, mtp, width=width, color=color_map.get("mtp")),
+
+method set_mts(Range this, width=1, map<string, color> color_map) =>
+    counts = array.new_int(RANGE_DISTRIBUTION_ROWS, 0), range_height = this.top - this.bottom, row_size = range_height / RANGE_DISTRIBUTION_ROWS
+    for i = this.left to this.right
+        p = close[bar_index - i]
+        row_index = math.min(RANGE_DISTRIBUTION_ROWS - 1, int((p - this.bottom) / row_size))
+        if row_index >= 0 and row_index < RANGE_DISTRIBUTION_ROWS
+            counts.set(row_index, counts.get(row_index) + 1)
+    max_count = 0, max_row = 0
+    for j = 0 to RANGE_DISTRIBUTION_ROWS - 1
+        if counts.get(j) > max_count
+            max_count := counts.get(j), max_row := j
+    mts = this.bottom + (max_row * row_size) + (row_size / 2)    
+    if na(this._mts) // Comment in Integration
+        this._mts := line.new(this.left, mts, this.right, mts, width=width, color=color_map.get("mts")),
+
+method update_right(Range this, right) =>
+    this.right := right
+    this._line1.set_x2(this.right)
+    this._line2.set_x2(this.right)
+    this._line3.set_x2(this.right)
+
+// ------------------------------------------------------------------------- //
+// Array of Range Method
+// ------------------------------------------------------------------------- //
+method add(array<Range> this, Range _range, int limit) =>
+    this.unshift(_range)
+    if this.size() > limit
+        __range = this.get(limit)
+        __range.set_hide()
+        this.pop()
+
+
+// ------------------------------------------------------------------------- //
+// Swing Range Input
+// ------------------------------------------------------------------------- //
+swing_range_input_group = "Swing Range"
+swing_range_show = input.bool(true, title="Show", group=swing_range_input_group, inline="swing_range_show")
+swing_range_history = input.int(1, title="History", group=swing_range_input_group, inline="swing_range_show")
+swing_range_filter_term = input.string("Intermediate", title="Swing", options=["Short", "Intermediate", "Long"], group=swing_range_input_group, inline="swing_range_filter")
+swing_range_color = map.new<string, color>()
+swing_range_color.put("top", input.color(color.new(#9598A1, 25), title="Top", group=swing_range_input_group, inline="swing_range_color"))
+swing_range_color.put("center", input.color(color.new(#9598A1, 25), title="Center", group=swing_range_input_group, inline="swing_range_color"))
+swing_range_color.put("bottom", input.color(color.new(#9598A1, 25), title="Bottom", group=swing_range_input_group, inline="swing_range_color"))
+
+// ------------------------------------------------------------------------- //
+// Swing Range Process
+// ------------------------------------------------------------------------- //
+var swing_range = array.new<Range>()
+swing_range_signal = RANGE_SIGNAL_NONE
+swing_range_swing_signal_last = SWING_POINT_SIGNAL_NONE
+swing_range_swing_high = array.new<Point>(), swing_range_swing_low = array.new<Point>()
+
+if barstate.isconfirmed
+    if swing_range.size() > 0
+        swing_range.get(0).update_right(bar_index + 1)
+
+    if swing_range_filter_term == "Short"
+        swing_range_swing_signal_last := swing_point_st_signal_last, swing_range_swing_high := swing_point_st_high, swing_range_swing_low := swing_point_st_low
+    else if swing_range_filter_term == "Intermediate"
+        swing_range_swing_signal_last := swing_point_it_signal_last, swing_range_swing_high := swing_point_it_high, swing_range_swing_low := swing_point_it_low
+    else if swing_range_filter_term == "Long"
+        swing_range_swing_signal_last := swing_point_lt_signal_last, swing_range_swing_high := swing_point_lt_high, swing_range_swing_low := swing_point_lt_low
+    if swing_range_swing_high.size() > 0 and swing_range_swing_low.size() > 0 and swing_range_swing_signal_last[1] != SWING_POINT_SIGNAL_NONE and
+      swing_range_swing_signal_last[1] != swing_range_swing_signal_last[0] and (swing_range_swing_signal_last[0] == SWING_POINT_SIGNAL_HIGHER_HIGH or swing_range_swing_signal_last[0] == SWING_POINT_SIGNAL_LOWER_LOW)
+        left = math.min(swing_range_swing_high.get(0).x, swing_range_swing_low.get(0).x), right = bar_index + 1
+        top = math.max(swing_range_swing_high.get(0).y, swing_range_swing_low.get(0).y), bottom = math.min(swing_range_swing_high.get(0).y, swing_range_swing_low.get(0).y)
+        _range = Range.new(left, top, right, bottom)
+        swing_range.add(_range, swing_range_history)
+        if swing_range_show
+            swing_range.get(0).set_show(color_map=swing_range_color)
+        if swing_range.size() >= 2
+            _range1 = swing_range.get(1)
+            _range1.update_right(left - 1)
+        swing_range_signal := swing_range_swing_signal_last[0] == SWING_POINT_SIGNAL_HIGHER_HIGH ? RANGE_SIGNAL_HIGH : RANGE_SIGNAL_LOW
+
+
+// ========================================================================= //
+//                                  Alert                                    //
+// ========================================================================= //
+// ------------------------------------------------------------------------- //
+// Alert Input
+// ------------------------------------------------------------------------- //
+alert_input_group = "Alert"
+alert_consolidation_breakaway = input.bool(true, title="Consolidation Break-away", group=alert_input_group)
+alert_consolidation_mitigated = input.bool(true, title="Consolidation Mitigated", group=alert_input_group)
+// alert_fvg_mitigate            = input.bool(false, title="FVG Mitigated", group=alert_input_group)
+
+// ------------------------------------------------------------------------- //
+// Alert Process
+// ------------------------------------------------------------------------- //
+if alert_consolidation_breakaway
+    message = switch
+        consolidation_signal == CONSOLIDATION_SIGNAL_BULLISH => "[CBS] Consolidation Bullish Break-away Confirmed"
+        consolidation_signal == CONSOLIDATION_SIGNAL_BEARISH => "[CBS] Consolidation Bearish Break-away Confirmed"
+        => ""
+    if message != ""
+        alert(message)
+
+if alert_consolidation_mitigated
+    message = switch
+        not na(consolidation_bullish_mitigated) and consolidation_bullish_mitigated.size() > 0 => "[CBS] Consolidation Bullish Mitigated"
+        not na(consolidation_bearish_mitigated) and consolidation_bearish_mitigated.size() > 0 => "[CBS] Consolidation Bearish Mitigated"
+        => ""
+    if message != ""
+        alert(message)
+
+// if alert_fvg_mitigate
+//     message = switch
+//         (not na(fvg_fairvalue_bullish_mitigated) and fvg_fairvalue_bullish_mitigated.size() > 0) or (not na(fvg_breakaway_bullish_mitigated) and fvg_breakaway_bullish_mitigated.size() > 0) => "[CBS] FVG Bullish Mitigated"
+//         (not na(fvg_fairvalue_bearish_mitigated) and fvg_fairvalue_bearish_mitigated.size() > 0) or (not na(fvg_breakaway_bearish_mitigated) and fvg_breakaway_bearish_mitigated.size() > 0) => "[CBS] FVG Bearish Mitigated"
+//         => ""
+//     if message != ""
+//         alert(message)

@@ -1,0 +1,90 @@
+//@version=6
+indicator("Gold AI: Hyper-Frequency [Dynamic TP]", overlay=true, max_labels_count=200)
+
+// --- 1. AI Engine Configuration (Tweakable) ---
+neighbor_count = input.int(8, "K-Neighbors (Lookback)", minval=1, group="AI Engine")
+sensitivity    = input.float(10.0, "AI Sensitivity (Threshold)", group="AI Engine")
+ai_window      = input.int(30, "AI Scan Window (Bars)", minval=5, group="AI Engine")
+
+// --- 2. Feature Engineering Settings (Tweakable) ---
+rsi_len        = input.int(7, "RSI Period", group="Features")
+mfi_len        = input.int(7, "MFI Period", group="Features")
+roc_len        = input.int(3, "ROC Period", group="Features")
+
+// --- 3. Execution & Trend Filters ---
+use_trend_filt = input.bool(false, "Filter by 200 EMA?", group="Execution")
+vol_threshold  = input.float(0.8, "Volume Multiplier (Min)", step=0.1, group="Execution")
+ema_trend_len  = input.int(200, "EMA Trend Length", group="Execution")
+
+// --- 4. Risk & Profit Management ---
+tp_step_1      = input.float(1.0, "Initial TP (ATR)", group="Profit Scaling")
+tp_step_2      = input.float(2.2, "Extension 1 (ATR)", group="Profit Scaling")
+tp_step_3      = input.float(4.5, "Moonshot (ATR)", group="Profit Scaling")
+sl_atr_mult    = input.float(1.5, "Stop Loss (ATR Mult)", group="Risk")
+
+// --- Logic Start ---
+f1 = ta.rsi(close, rsi_len)
+f2 = ta.mfi(close, mfi_len)
+f3 = ta.roc(close, roc_len)
+
+get_prediction() =>
+    int buy_votes = 0
+    int sell_votes = 0
+    for i = 1 to ai_window
+        float d = math.log(1 + math.abs(f1 - f1[i])) + math.log(1 + math.abs(f2 - f2[i])) + math.log(1 + math.abs(f3 - f3[i]))
+        if d < sensitivity
+            if close[i] > close[i+1]
+                buy_votes += 1
+            else
+                sell_votes += 1
+    [buy_votes > sell_votes ? 1 : -1, buy_votes, sell_votes]
+
+[ai_sig, buys, sells] = get_prediction()
+
+// --- Execution Logic ---
+ema_200 = ta.ema(close, ema_trend_len)
+vol_ma  = ta.sma(volume, 20)
+is_vol_ok = volume > vol_ma * vol_threshold
+
+long_entry  = ai_sig == 1 and (not use_trend_filt or close > ema_200) and is_vol_ok
+short_entry = ai_sig == -1 and (not use_trend_filt or close < ema_200) and is_vol_ok
+
+// --- Dynamic Profit State ---
+var float target_p = na
+var float stop_p   = na
+var int tp_stage   = 0
+atr = ta.atr(14)
+
+if (long_entry or short_entry) and na(target_p)
+    tp_stage := 1
+    stop_p   := ai_sig == 1 ? low - (atr * sl_atr_mult) : high + (atr * sl_atr_mult)
+    target_p := ai_sig == 1 ? close + (atr * tp_step_1) : close - (atr * tp_step_1)
+    label.new(bar_index, ai_sig == 1 ? low : high, "AI START", color=ai_sig == 1 ? color.green : color.red, style=ai_sig == 1 ? label.style_label_up : label.style_label_down, size=size.tiny)
+
+// --- Profit Extender ---
+if not na(target_p)
+    is_long = ai_sig == 1
+    if (is_long and high >= target_p) or (not is_long and low <= target_p)
+        if tp_stage == 1
+            tp_stage := 2
+            target_p := is_long ? target_p + (atr * tp_step_2) : target_p - (atr * tp_step_2)
+            stop_p := close 
+        else if tp_stage == 2
+            tp_stage := 3
+            target_p := is_long ? target_p + (atr * tp_step_3) : target_p - (atr * tp_step_3)
+            stop_p := is_long ? low[1] : high[1] 
+
+// Reset on Exit
+if (ai_sig == 1 and low <= stop_p) or (ai_sig == -1 and high >= stop_p)
+    target_p := na
+    stop_p   := na
+    tp_stage := 0
+
+// --- Visuals ---
+plot(target_p, "Dynamic TP", color=color.new(color.lime, 40), style=plot.style_linebr, linewidth=2)
+plot(stop_p, "Trailing SL", color=color.new(color.red, 40), style=plot.style_linebr, linewidth=1)
+plot(use_trend_filt ? ema_200 : na, "200 EMA", color=color.gray)
+
+// --- Alerts ---
+alertcondition(long_entry,  title="Gold AI: Long Entry",  message="Long: {{ticker}} @ {{close}}")
+alertcondition(short_entry, title="Gold AI: Short Entry", message="Short: {{ticker}} @ {{close}}")

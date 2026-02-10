@@ -1,0 +1,441 @@
+//@version=5
+indicator("Target Radar", overlay=true, max_labels_count=120, max_lines_count=120, max_boxes_count=30)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+grpFcst = "━━ Forecast Engine ━━"
+h        = input.int(3, "Forecast Horizon", minval=1, maxval=10, group=grpFcst)
+lookback = input.int(100, "Z-Score Lookback", minval=20, maxval=200, group=grpFcst)
+wTrend   = input.float(0.30, "Weight: Trend", minval=0, maxval=1, step=0.05, group=grpFcst)
+wMom     = input.float(0.30, "Weight: Momentum", minval=0, maxval=1, step=0.05, group=grpFcst)
+wVol     = input.float(0.20, "Weight: Volatility (penalty)", minval=0, maxval=1, step=0.05, group=grpFcst)
+wVpr     = input.float(0.20, "Weight: Volume Pressure", minval=0, maxval=1, step=0.05, group=grpFcst)
+retScale = input.float(1.0, "Return Scale", minval=0.1, maxval=5.0, step=0.1, group=grpFcst)
+
+grpUnc = "━━ Uncertainty Band ━━"
+targetCov   = input.float(0.80, "Target Coverage", minval=0.50, maxval=0.99, step=0.01, group=grpUnc)
+resLookback = input.int(200, "Residual Lookback", minval=50, maxval=500, group=grpUnc)
+minHW       = input.float(0.005, "Min Half-Width (return)", minval=0.0001, maxval=0.05, step=0.001, group=grpUnc)
+uncertTh    = input.float(0.08, "Uncertainty Spike", minval=0.01, maxval=0.20, step=0.01, group=grpUnc)
+dirEps      = input.float(0.001, "Direction epsilon", minval=0.0, maxval=0.01, step=0.0005, group=grpUnc)
+
+grpSig = "━━ Signal Mode ━━"
+sigMode  = input.string("Breakout", "Mode", options=["Trend Pullback","Breakout","Mean Reversion","EMA Cross"], group=grpSig)
+minScore = input.float(0.65, "Min Signal Score", minval=0.0, maxval=1.0, step=0.05, group=grpSig)
+
+grpFilt = "━━ Signal Filters (ACCURACY) ━━"
+useConfGate   = input.bool(true, "Require Forecast Alignment", group=grpFilt)
+useUncertGate = input.bool(true, "Block High Uncertainty", group=grpFilt)
+useRegimeGate = input.bool(true, "Match Regime to Mode", group=grpFilt)
+adxLen        = input.int(14, "ADX Length", minval=5, maxval=50, group=grpFilt)
+trendTh       = input.float(25.0, "Trend Threshold", minval=10, maxval=50, group=grpFilt)
+chopLen       = input.int(14, "Choppiness Length", minval=5, maxval=50, group=grpFilt)
+chaosTh       = input.float(62.0, "Chaos Threshold", minval=40, maxval=80, group=grpFilt)
+
+grpPool = "━━ Support/Resistance Pools ━━"
+showPools  = input.bool(true, "Show S/R Levels", group=grpPool)
+pivotLen   = input.int(5, "Pivot Length", minval=2, maxval=15, group=grpPool)
+mergeATR   = input.float(0.5, "Merge Distance (ATR)", minval=0.1, maxval=2.0, step=0.1, group=grpPool)
+maxPools   = input.int(8, "Max Levels", minval=3, maxval=15, group=grpPool)
+poolExtend = input.int(60, "Line Length (bars)", minval=20, maxval=200, group=grpPool)
+showTarget = input.bool(true, "Show Target", group=grpPool)
+targetMin  = input.float(0.40, "Min Target Score", minval=0.0, maxval=1.0, step=0.05, group=grpPool)
+
+grpVis = "━━ Display ━━"
+showBands = input.bool(true, "Projection Bands", group=grpVis)
+showBox   = input.bool(true, "Forward Box", group=grpVis)
+showDash  = input.bool(true, "Dashboard", group=grpVis)
+dashSize  = input.string("Normal", "Dashboard Size", options=["Small","Normal","Large"], group=grpVis)
+showAura  = input.bool(false, "Candle Coloring (OFF by default)", group=grpVis)
+
+grpCal = "━━ Calibration ━━"
+calibLen = input.int(100, "Coverage Window", minval=30, maxval=300, group=grpCal)
+sigWin   = input.int(50,  "Signal Window", minval=20, maxval=200, group=grpCal)
+
+bool isLast = bar_index == last_bar_index
+
+// Compute table text sizes (NO `size` type keyword)
+txtSize     = dashSize == "Small" ? size.tiny : dashSize == "Large" ? size.normal : size.small
+txtSizeTiny = dashSize == "Large" ? size.small : size.tiny
+
+//──────────────────────────────────────────────────────────────────────────────
+// COLORS
+//──────────────────────────────────────────────────────────────────────────────
+color C_SUPPORT = color.rgb(33, 150, 243)   // Blue
+color C_RESIST  = color.rgb(255, 152, 0)    // Orange
+color C_LONG    = color.rgb(76, 175, 80)    // Green
+color C_SHORT   = color.rgb(244, 67, 54)    // Red
+color C_WARN    = color.rgb(255, 152, 0)
+color C_CYAN    = color.rgb(0, 188, 212)
+color C_MAG     = color.rgb(233, 30, 99)
+color C_DIMTXT  = color.rgb(150, 150, 150)
+color C_BG1     = color.rgb(26, 26, 26)
+color C_BG2     = color.rgb(34, 34, 34)
+color C_HDR     = color.rgb(30, 136, 229)
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELPERS
+//──────────────────────────────────────────────────────────────────────────────
+f_div(float x, float y) =>
+    math.abs(y) < 1e-10 ? 0.0 : x / y
+
+f_z(float x, int len) =>
+    float m = ta.sma(x, len)
+    float sd = ta.stdev(x, len)
+    (x - m) / math.max(sd, 1e-10)
+
+f_bound(float x) =>
+    x / (1.0 + math.abs(x))
+
+f_rollsum(float x, int len) =>
+    float c = ta.cum(nz(x))
+    bar_index >= len ? (c - c[len]) : na
+
+f_log10(float x) =>
+    math.log(x) / math.log(10.0)
+
+f_tr() =>
+    float pc = nz(close[1], close)
+    float a = high - low
+    float b = math.abs(high - pc)
+    float c = math.abs(low - pc)
+    math.max(a, math.max(b, c))
+
+f_chop(int len) =>
+    float trSum = f_rollsum(f_tr(), len)
+    float rng = ta.highest(high, len) - ta.lowest(low, len)
+    float ratio = f_div(trSum, math.max(rng, 1e-10))
+    100.0 * f_div(f_log10(ratio), f_log10(len))
+
+f_zMult(float cov) =>
+    cov <= 0.60 ? 0.25 :
+     cov <= 0.68 ? 1.00 :
+     cov <= 0.80 ? 1.28 :
+     cov <= 0.90 ? 1.64 :
+     cov <= 0.95 ? 1.96 : 2.33
+
+f_prob(float z) =>
+    1.0 / (1.0 + z * z)
+
+//──────────────────────────────────────────────────────────────────────────────
+// FORECAST ENGINE
+//──────────────────────────────────────────────────────────────────────────────
+float emaF = ta.ema(close, 10)
+float emaS = ta.ema(close, 20)
+float trendZ = f_z(f_div(emaF - emaS, math.max(emaS, 1e-10)), lookback)
+
+float rsi = ta.rsi(close, 14)
+float momZ = f_z(rsi - 50.0, lookback)
+
+float atr = ta.atr(14)
+float atrPct = f_div(atr, close)
+float volZ = f_z(atrPct, lookback)
+
+float upV = volume * (close > close[1] ? 1.0 : 0.0)
+float dnV = volume * (close < close[1] ? 1.0 : 0.0)
+float vpr = f_div(ta.sma(upV, 20), math.max(ta.sma(dnV, 20), 1e-10))
+float vprZ = f_z(math.log(math.max(vpr, 1e-10)), lookback)
+
+float wSum = math.max(wTrend + wMom + wVol + wVpr, 1e-10)
+float rawScore = (wTrend/wSum)*trendZ + (wMom/wSum)*momZ - (wVol/wSum)*volZ + (wVpr/wSum)*vprZ
+float fcstRet = f_bound(rawScore) * atrPct * retScale
+
+//──────────────────────────────────────────────────────────────────────────────
+// ADAPTIVE UNCERTAINTY
+//──────────────────────────────────────────────────────────────────────────────
+float realRet = bar_index >= h ? math.log(f_div(close, close[h])) : na
+float predRet = bar_index >= h ? fcstRet[h] : na
+float resid = (bar_index >= h and not na(realRet) and not na(predRet)) ? math.abs(realRet - predRet) : na
+
+float resMu = ta.sma(resid, resLookback)
+float resSd = ta.stdev(resid, resLookback)
+float zM = f_zMult(targetCov)
+
+float hwRaw = (not na(resMu) and not na(resSd)) ? (resMu + zM * resSd) : na
+float hw = not na(hwRaw) ? math.max(hwRaw, minHW) : na
+
+float loR = not na(hw) ? fcstRet - hw : na
+float hiR = not na(hw) ? fcstRet + hw : na
+
+bool isBull = fcstRet > dirEps
+bool isBear = fcstRet < -dirEps
+bool isUncert = not na(hw) and hw >= uncertTh
+
+int confCode = na(hw) ? 9 : isBull ? 2 : isBear ? -2 : 0
+string confStr = confCode == 9 ? "WARMUP" : confCode == 2 ? "BULLISH" : confCode == -2 ? "BEARISH" : "NEUTRAL"
+
+//──────────────────────────────────────────────────────────────────────────────
+// REGIME
+//──────────────────────────────────────────────────────────────────────────────
+[diP, diM, adx] = ta.dmi(adxLen, adxLen)
+float chop = f_chop(chopLen)
+string regime = (not na(adx) and adx > trendTh) ? "TREND" : (chop > chaosTh ? "CHAOS" : "RANGE")
+
+bool regimeOK = true
+if useRegimeGate
+    if regime == "CHAOS"
+        regimeOK := false
+    else if regime == "TREND"
+        regimeOK := sigMode != "Mean Reversion"
+    else
+        regimeOK := sigMode == "Mean Reversion" or sigMode == "EMA Cross"
+
+//──────────────────────────────────────────────────────────────────────────────
+// BASE SIGNALS + SCORING
+//──────────────────────────────────────────────────────────────────────────────
+float ema20 = ta.ema(close, 20)
+float ema50 = ta.ema(close, 50)
+
+bool tpL = (ema20 > ema50) and ta.crossover(rsi, 30) and close > ema20
+bool tpS = (ema20 < ema50) and ta.crossunder(rsi, 70) and close < ema20
+
+float hi20 = ta.highest(high, 20)[1]
+float lo20 = ta.lowest(low, 20)[1]
+bool volOK = volume > ta.sma(volume, 20) * 1.3
+bool boL = ta.crossover(close, hi20) and volOK
+bool boS = ta.crossunder(close, lo20) and volOK
+
+float bb = ta.sma(close, 20)
+float sd = ta.stdev(close, 20)
+float zP = f_div(close - bb, math.max(sd, 1e-10))
+bool mrL = ta.crossover(zP, -2.0)
+bool mrS = ta.crossunder(zP, 2.0)
+
+float e9  = ta.ema(close, 9)
+float e21 = ta.ema(close, 21)
+bool xL = ta.crossover(e9, e21)
+bool xS = ta.crossunder(e9, e21)
+
+bool baseL = sigMode == "Trend Pullback" ? tpL : sigMode == "Breakout" ? boL : sigMode == "Mean Reversion" ? mrL : xL
+bool baseS = sigMode == "Trend Pullback" ? tpS : sigMode == "Breakout" ? boS : sigMode == "Mean Reversion" ? mrS : xS
+
+float scoreL = 0.0
+float scoreS = 0.0
+if baseL
+    scoreL := 0.40 + (useConfGate ? (isBull ? 0.25 : 0.0) : 0.10) + (useUncertGate ? (not isUncert ? 0.15 : 0.0) : 0.10) + (useRegimeGate ? (regimeOK ? 0.20 : 0.0) : 0.10)
+if baseS
+    scoreS := 0.40 + (useConfGate ? (isBear ? 0.25 : 0.0) : 0.10) + (useUncertGate ? (not isUncert ? 0.15 : 0.0) : 0.10) + (useRegimeGate ? (regimeOK ? 0.20 : 0.0) : 0.10)
+
+bool confGateL = useConfGate ? isBull : true
+bool confGateS = useConfGate ? isBear : true
+bool uncGate   = useUncertGate ? not isUncert : true
+bool regGate   = useRegimeGate ? regimeOK : true
+
+bool sigL = baseL and confGateL and uncGate and regGate and scoreL >= minScore
+bool sigS = baseS and confGateS and uncGate and regGate and scoreS >= minScore
+float finalScore = sigL ? scoreL : sigS ? scoreS : 0.0
+
+//──────────────────────────────────────────────────────────────────────────────
+// SUPPORT / RESISTANCE POOLS (finite lines)
+//──────────────────────────────────────────────────────────────────────────────
+var float[] lvls  = array.new_float()
+var int[]   strs  = array.new_int()
+var int[]   sides = array.new_int()
+var line[]  lns   = array.new_line()
+
+float mDist = atr * mergeATR
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+addPool(float lvl, int side) =>
+    int n = array.size(lvls)
+    int best = -1
+    float bestD = 1e10
+
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(sides, i) == side
+                float d = math.abs(array.get(lvls, i) - lvl)
+                if d < bestD
+                    bestD := d
+                    best := i
+
+    if best != -1 and bestD <= mDist
+        array.set(lvls, best, array.get(lvls, best) * 0.8 + lvl * 0.2)
+        array.set(strs, best, array.get(strs, best) + 1)
+    else
+        array.push(lvls, lvl)
+        array.push(strs, 1)
+        array.push(sides, side)
+        array.push(lns, line.new(bar_index, lvl, bar_index, lvl, extend=extend.none, style=line.style_solid, width=1))
+
+    while array.size(lvls) > maxPools
+        line.delete(array.shift(lns))
+        array.shift(lvls)
+        array.shift(strs)
+        array.shift(sides)
+
+    true
+
+if showPools
+    if not na(ph)
+        addPool(ph, +1)
+    if not na(pl)
+        addPool(pl, -1)
+
+if showPools and array.size(lvls) > 0
+    for i = 0 to array.size(lvls) - 1
+        float lvl = array.get(lvls, i)
+        int str   = array.get(strs, i)
+        int side  = array.get(sides, i)
+        line ln   = array.get(lns, i)
+
+        int w = str >= 5 ? 3 : str >= 3 ? 2 : 1
+        int transp = str >= 4 ? 25 : str >= 2 ? 40 : 55
+        color c = side == -1 ? color.new(C_SUPPORT, transp) : color.new(C_RESIST, transp)
+
+        int x1 = bar_index - poolExtend
+        int x2 = bar_index + 2
+
+        line.set_x1(ln, x1)
+        line.set_x2(ln, x2)
+        line.set_y1(ln, lvl)
+        line.set_y2(ln, lvl)
+        line.set_width(ln, w)
+        line.set_color(ln, c)
+        line.set_style(ln, str >= 3 ? line.style_solid : line.style_dotted)
+
+//──────────────────────────────────────────────────────────────────────────────
+// TARGETING (offset label)
+//──────────────────────────────────────────────────────────────────────────────
+var line  tgtLine = na
+var label tgtLbl  = na
+
+float tgtLvl   = na
+float tgtScore = na
+int   tgtStr   = 0
+bool  tgtInside = false
+
+if showTarget and array.size(lvls) > 0 and not na(hw)
+    float bestD = 1e10
+    int bestI = -1
+    for i = 0 to array.size(lvls) - 1
+        float lvl = array.get(lvls, i)
+        bool dirOK = fcstRet >= 0 ? lvl > close : lvl < close
+        if dirOK
+            float d = math.abs(lvl - close)
+            if d < bestD
+                bestD := d
+                bestI := i
+
+    if bestI != -1
+        tgtLvl := array.get(lvls, bestI)
+        tgtStr := array.get(strs, bestI)
+        float projHi = close * math.exp(nz(hiR, 0))
+        float projLo = close * math.exp(nz(loR, 0))
+        tgtInside := tgtLvl <= projHi and tgtLvl >= projLo
+        float distRet = math.log(f_div(tgtLvl, close))
+        float z = f_div(distRet - fcstRet, math.max(hw, 1e-10))
+        tgtScore := f_prob(z) * (tgtInside ? 1.0 : 0.65) * math.min(float(tgtStr) / 3.0, 1.0)
+
+if showTarget and isLast and not na(tgtLvl) and not na(tgtScore) and tgtScore >= targetMin
+    if not na(tgtLine)
+        line.delete(tgtLine)
+    if not na(tgtLbl)
+        label.delete(tgtLbl)
+
+    color tgtCol = tgtInside ? color.new(C_LONG, 20) : color.new(C_WARN, 20)
+    tgtLine := line.new(bar_index, tgtLvl, bar_index + h, tgtLvl, color=tgtCol, width=2, style=line.style_dashed)
+    string tgtTxt = (tgtInside ? "● IN" : "○ OUT") + " | " + str.tostring(tgtScore * 100, "#") + "% | ×" + str.tostring(tgtStr)
+    tgtLbl := label.new(bar_index + h + 3, tgtLvl, tgtTxt, style=label.style_label_left, color=tgtCol, textcolor=color.white, size=size.small)
+
+//──────────────────────────────────────────────────────────────────────────────
+// PROJECTION BANDS + BOX
+//──────────────────────────────────────────────────────────────────────────────
+float pMid = close * math.exp(fcstRet)
+float pHi  = (showBands and not na(hiR)) ? close * math.exp(hiR) : na
+float pLo  = (showBands and not na(loR)) ? close * math.exp(loR) : na
+
+plot(showBands ? pMid : na, "Forecast", color=color.new(color.white, 55), linewidth=1)
+p1 = plot(pHi, "Upper", color=color.new(color.aqua, 65), linewidth=1)
+p2 = plot(pLo, "Lower", color=color.new(color.aqua, 65), linewidth=1)
+fill(p1, p2, color=showBands ? color.new(color.aqua, 92) : na)
+
+var box fwdBox = na
+if showBox and isLast and not na(pHi) and not na(pLo)
+    if na(fwdBox)
+        fwdBox := box.new(bar_index, pHi, bar_index + h, pLo, bgcolor=color.new(color.gray, 94), border_color=color.new(color.white, 80))
+    else
+        box.set_lefttop(fwdBox, bar_index, pHi)
+        box.set_rightbottom(fwdBox, bar_index + h, pLo)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SIGNAL MARKERS
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(sigL, "Long", style=shape.triangleup,   location=location.belowbar, color=color.new(C_LONG, 0),  size=size.normal, text="▲", textcolor=color.white)
+plotshape(sigS, "Short", style=shape.triangledown, location=location.abovebar, color=color.new(C_SHORT, 0), size=size.normal, text="▼", textcolor=color.white)
+
+//──────────────────────────────────────────────────────────────────────────────
+// CANDLE AURA (cyan/magenta, not green/red)
+//──────────────────────────────────────────────────────────────────────────────
+color aura = na
+if showAura
+    aura := isUncert ? color.new(C_WARN, 75) : (confCode == 2 ? color.new(C_CYAN, 75) : (confCode == -2 ? color.new(C_MAG, 75) : na))
+barcolor(aura)
+
+//──────────────────────────────────────────────────────────────────────────────
+// CALIBRATION
+//──────────────────────────────────────────────────────────────────────────────
+float hwPast = bar_index >= h ? hw[h] : na
+float tot = (not na(resid) and not na(hwPast)) ? 1.0 : 0.0
+float hit = (not na(resid) and not na(hwPast) and resid <= hwPast) ? 1.0 : 0.0
+
+float sumT = f_rollsum(tot, calibLen)
+float sumH = f_rollsum(hit, calibLen)
+float achCov = f_div(sumH, math.max(sumT, 1e-10))
+
+float sigSer = (sigL or sigS) ? 1.0 : 0.0
+float sigCnt = f_rollsum(sigSer, sigWin)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD (single display)
+//──────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 12, bgcolor=color.new(C_BG1, 0), border_width=1, border_color=color.new(color.gray, 40))
+
+if showDash and isLast
+    color hdrBg = confCode == 2 ? color.new(C_LONG, 60) : confCode == -2 ? color.new(C_SHORT, 60) : color.new(C_HDR, 70)
+
+    table.cell(dash, 0, 0, "  CCG FIREWALL • PRO CLEAN  ", text_color=color.white, bgcolor=hdrBg, text_size=txtSize)
+    table.cell(dash, 1, 0, confStr, text_color=color.white, bgcolor=hdrBg, text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "Regime", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSize)
+    table.cell(dash, 1, 1, regime,  text_color=color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSize, text_halign=text.align_right)
+
+    color fcCol = fcstRet > 0 ? C_LONG : fcstRet < 0 ? C_SHORT : C_DIMTXT
+    table.cell(dash, 0, 2, "Forecast", text_color=C_DIMTXT, bgcolor=color.new(C_BG1, 0), text_size=txtSize)
+    table.cell(dash, 1, 2, str.tostring(fcstRet * 100, "#.00") + "%", text_color=fcCol, bgcolor=color.new(C_BG1, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 3, "Uncertainty (HalfW)", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSize)
+    table.cell(dash, 1, 3, na(hw) ? "—" : str.tostring(hw * 100, "#.00") + "%", text_color=isUncert ? C_WARN : color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 4, "Achieved Coverage", text_color=C_DIMTXT, bgcolor=color.new(C_BG1, 0), text_size=txtSize)
+    table.cell(dash, 1, 4, na(achCov) ? "—" : str.tostring(achCov * 100, "#.0") + "%", text_color=color.white, bgcolor=color.new(C_BG1, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 5, "Signals (" + str.tostring(sigWin) + ")", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSize)
+    table.cell(dash, 1, 5, na(sigCnt) ? "—" : str.tostring(sigCnt, "#"), text_color=color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 6, "Target Level", text_color=C_DIMTXT, bgcolor=color.new(C_BG1, 0), text_size=txtSize)
+    table.cell(dash, 1, 6, na(tgtLvl) ? "—" : str.tostring(tgtLvl, format.mintick), text_color=tgtInside ? C_LONG : C_WARN, bgcolor=color.new(C_BG1, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 7, "Target Score", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSize)
+    table.cell(dash, 1, 7, na(tgtScore) ? "—" : str.tostring(tgtScore * 100, "#") + "%", text_color=color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSize, text_halign=text.align_right)
+
+    table.cell(dash, 0, 8, "S/R Legend", text_color=C_DIMTXT, bgcolor=color.new(C_BG1, 0), text_size=txtSizeTiny)
+    table.cell(dash, 1, 8, "🔵 Support | 🟠 Resistance", text_color=color.white, bgcolor=color.new(C_BG1, 0), text_size=txtSizeTiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 9, "Pool Strength", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSizeTiny)
+    table.cell(dash, 1, 9, "Width/opacity = touches", text_color=color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSizeTiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 10, "Gates", text_color=C_DIMTXT, bgcolor=color.new(C_BG1, 0), text_size=txtSizeTiny)
+    table.cell(dash, 1, 10, (useConfGate ? "Conf " : "") + (useUncertGate ? "Uncert " : "") + (useRegimeGate ? "Regime" : ""), text_color=color.white, bgcolor=color.new(C_BG1, 0), text_size=txtSizeTiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 11, "Signal Score", text_color=C_DIMTXT, bgcolor=color.new(C_BG2, 0), text_size=txtSizeTiny)
+    table.cell(dash, 1, 11, str.tostring(finalScore, "#.00") + " / " + str.tostring(minScore, "#.00"), text_color=color.white, bgcolor=color.new(C_BG2, 0), text_size=txtSizeTiny, text_halign=text.align_right)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(sigL, "CCG Long", "🟢 CCG LONG | {{ticker}} @ {{close}}")
+alertcondition(sigS, "CCG Short", "🔴 CCG SHORT | {{ticker}} @ {{close}}")
+alertcondition(isUncert, "High Uncertainty", "⚠️ UNCERTAINTY | {{ticker}}")

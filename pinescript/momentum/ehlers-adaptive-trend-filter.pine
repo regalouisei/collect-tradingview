@@ -1,0 +1,440 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TrendMatrix_Labs
+
+// Ehlers Adaptive Trend Filter: Lag-Compensated SuperSmoother
+
+// Based on John Ehlers' "Smoothing The Data" (2014, TASC), 
+// this indicator extends the SuperSmoother with hybrid Butterworth 
+// filters and dynamic lag compensation.
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// KEY FEATURES:
+// 3 Filter Modes (lag: 62/70/88 bars)
+// - 2p+2p (Fast): Responsive, great for scalping
+// - 3p+2p (Hybrid): RECOMMENDED—best risk/reward
+//- 3p+3p (Smooth): Ultra-smooth for macro trends
+
+// Lag-Compensated Momentum
+// Automatically extends lookback window to account for filter delay.
+// Keeps momentum signals responsive despite delay.
+
+// Confirmation-Based Reversals
+// Requires 2+ bars confirmation to filter out false signals.
+// Signal strength ~60% higher than single-bar detection.
+
+// Volatility-Adaptive Thresholds
+// Scales all deviation levels based on realized volatility.
+// Works across crypto, equities, forex, bonds.
+
+// Multi-Timeframe Auto-Calibration
+// Automatically tunes filter periods for your timeframe:
+// - Scalping (<1H): 2p+2p (Fast)
+// - Swing Trading (1D): 3p+2p (Hybrid) ← Default
+// - Position Trading (1W+): 3p+3p (Smooth)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// DISCLAIMER: Educational tool only. Not financial advice. 
+// Test extensively on historical data before live trading. 
+// "Safety" and "Risk" metrics measure technical deviation, 
+// not capital protection.
+
+// Reference:
+// Ehlers, J. (2014). "Smoothing The Data." 
+// Stocks & Commodities Magazine.
+
+//@version=6
+indicator("Ehlers Adaptive Trend Filter", shorttitle="EATFilter", overlay=false, precision=2)
+
+// =============================================================================
+// 1. BRAND IDENTITY & ACCESSIBILITY INPUTS
+// =============================================================================
+// =============================================================================
+// AUTO-OPTIMIZED CALIBRATION
+// =============================================================================
+auto_mode = input.bool(true, "Enable Auto-Optimization", group="Calibration")
+
+// Define local variables for the lengths
+var int dynamic_anchor = 181
+var int dynamic_detox  = 90
+
+if auto_mode
+    // Logic: Tighten for scalping, standard for swing, widen for macro
+    dynamic_detox := timeframe.isweekly ? 52 : 
+                     timeframe.isdaily  ? 126 : 
+                     timeframe.isintraday and timeframe.multiplier < 60 ? 60 : 90
+
+    // Maintain the 2:1 Golden Ratio
+    dynamic_anchor := dynamic_detox * 2
+else
+    // Fallback to your manual input values if auto is off
+    dynamic_anchor := input.int(181, "Manual Anchor", group="Calibration")
+    dynamic_detox  := input.int(90, "Manual Signal", group="Calibration")
+
+m_anchor = dynamic_anchor
+m_detox  = dynamic_detox
+baseline_mult = input.float(1.0, "Baseline Height Multiplier", minval=0.1, maxval=5.0, step=0.05, group="Calibration", tooltip="Scales the height of the support floor. > 1.0 moves it higher, < 1.0 moves it lower.")
+float PI = 2 * math.asin(1.0)
+
+// --- UPDATED CALIBRATION ---
+filter_config = input.string("3p+2p (Hybrid)", "Filter Configuration", 
+     options=["2p+2p (Fast)", "3p+2p (Hybrid)", "3p+3p (Smooth)"], 
+     group="Calibration",
+     tooltip="Lag Metrics:\n- 2p+2p: 62 bars\n- 3p+2p: 70 bars\n- 3p+3p: 88 bars")
+
+// Re-assign to the system logic
+// --- 2-Pole SuperSmoother (Fixed Initialization) ---
+f_ss2_logic(float price, int freq) => 
+    var float filt = 0.0
+    if bar_index < 2
+        filt := price  
+    else
+        float a1 = math.exp(-PI * math.sqrt(2) / freq)
+        float c2 = 2 * a1 * math.cos(math.sqrt(2) * PI / freq)
+        float c3 = -math.pow(a1, 2)
+        float c1 = 1 - c2 - c3
+        filt := c1 * (price + nz(price[1])) / 2 + c2 * nz(filt[1]) + c3 * nz(filt[2])
+    filt
+
+// --- 3-Pole SuperSmoother (Fixed Initialization) ---
+f_ss3_logic(float price, int freq) => 
+    var float filt = 0.0
+    if bar_index < 3
+        filt := price
+    else if bar_index == 3
+        filt := (price + price[1] + price[2]) / 3  // Gentle ramp-in
+    else
+        float r3  = 1.73205081
+        float arg = PI / freq
+        float a1  = math.exp(-arg)
+        float b1  = 2 * a1 * math.cos(r3 * arg)
+        float c1  = math.pow(a1, 2)
+        float coef2 = b1 + c1
+        float coef3 = -(c1 + b1 * c1)
+        float coef4 = math.pow(c1, 2)
+        float coef1 = 1 - coef2 - coef3 - coef4
+        filt := coef1 * price + coef2 * nz(filt[1]) + coef3 * nz(filt[2]) + coef4 * nz(filt[3])
+    filt
+    
+// --- Adaptive Volatility Settings ---
+grp_vol       = "Adaptive Thresholds"
+bool enable_adaptive = input.bool(true, "Enable Volatility-Adaptive Thresholds", tooltip="Automatically scale thresholds based on asset volatility", group=grp_vol)
+bool auto_vol_lb     = input.bool(true, "Auto-Scale Lookback by Timeframe", tooltip="If enabled, ignores manual lookback and uses: 1M=12, 1W=52, 1D=252, 4H=63, 1H=252, <1H=500.", group=grp_vol)
+int manual_vol_lb    = input.int(252, "Manual Volatility Lookback", minval=10, maxval=500, group=grp_vol)
+float vol_percentile = input.float(0.75, "Volatility Percentile", minval=0.25, maxval=0.95, step=0.05, group=grp_vol)
+
+grp_mom = "Momentum Analysis"
+int momentum_lb = input.int(5, "Momentum Lookback (bars)", minval=1, maxval=50, group=grp_mom, tooltip="Bars used to measure momentum strength of the signal path")
+
+// --- Reversal Signal Colors ---
+grp_rev       = "Reversal Signals"
+bool show_reversals = input.bool(true, "Show Reversal Background Highlights", group=grp_rev) // FIX: Added Toggle
+color c_bull_rev = input.color(#00FF00, "Bull Reversal Color", group=grp_rev)
+color c_bear_rev = input.color(#FF0000, "Bear Reversal Color", group=grp_rev)
+int rev_transparency = input.int(60, "Reversal Signal Transparency", minval=0, maxval=100, step=5, group=grp_rev)
+
+// Bull Reversal Settings
+float bull_momentum_threshold = input.float(0.0, "Bull Reversal: Momentum Below (%)", minval=-10.0, maxval=10.0, step=0.1, group=grp_rev, tooltip="Price up but momentum below this level triggers bull reversal")
+int bull_momentum_lookback = input.int(5, "Bull Reversal: Momentum Lookback (bars)", minval=1, maxval=20, group=grp_rev, tooltip="How many bars back to measure momentum change")
+bool bull_require_slope = input.bool(false, "Bull Reversal: Require Positive Slope", group=grp_rev, tooltip="Only signal if support floor is rising")
+
+// Bear Reversal Settings
+float bear_momentum_threshold = input.float(0.0, "Bear Reversal: Momentum Above (%)", minval=-10.0, maxval=10.0, step=0.1, group=grp_rev, tooltip="Price down but momentum above this level triggers bear reversal")
+int bear_momentum_lookback = input.int(5, "Bear Reversal: Momentum Lookback (bars)", minval=1, maxval=20, group=grp_rev, tooltip="How many bars back to measure momentum change. Lower = earlier signal")
+bool bear_require_slope = input.bool(false, "Bear Reversal: Require Negative Slope", group=grp_rev, tooltip="Only signal if support floor is falling")
+
+// --- Plot Styling Settings ---
+grp_vis       = "Plot Styling"
+c_raw         = input.color(#A0A0A0, "Raw Price Color", group=grp_vis)
+t_fill        = input.int(70, "Zone Transparency", minval=0, maxval=100, step=5, group=grp_vis)
+t_base        = input.int(10, "Baseline Transparency", minval=0, maxval=100, step=5, group=grp_vis)
+
+// --- Interface Settings ---
+grp_ui        = "Interface Layout"
+string t_pos  = input.string("Top Right", "Table Position", options=["Bottom Right", "Top Right", "Bottom Left", "Top Left"], group=grp_ui)
+string t_size = input.string("Small", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=grp_ui)
+
+// ---  Visual Theme ---
+grp_theme     = " Terminal Theme"
+color C_BG        = input.color(#000000, "True Black", group=grp_theme)
+color C_HEAD      = input.color(#1C1C1C, "Dark Grey Header", group=grp_theme)
+color C_SEP       = input.color(#333333, "Grid Separator", group=grp_theme)
+color C_BORDER    = input.color(color.new(#333333, 50), "Border", group=grp_theme)
+
+//  Data Highlights
+color C_GOLD      = input.color(#FFB800, "Amber", group=grp_theme)
+color C_TXT       = input.color(#FFFFFF, "Classic White", group=grp_theme)
+color C_DIM       = input.color(#A0A0A0, "Standard Grey", group=grp_theme)
+color C_ACTION    = input.color(#FF8000, " Orange", group=grp_theme)
+color C_SKY       = input.color(#00FFFF, "Terminal Cyan", group=grp_theme)
+
+//  Performance States
+color C_UP        = input.color(#00FF00, "High-Vis Green", group=grp_theme)
+color C_DOWN      = input.color(#FF0000, "High-Vis Red", group=grp_theme)
+color C_FALL      = input.color(#FFB800, "Amber Warning", group=grp_theme)
+
+// =============================================================================
+// 2. SYSTEM INTEGRITY & LOOKBACK
+// =============================================================================
+// Placeholder for future timeframe restrictions (Currently allows all)
+bool is_valid_tf = true 
+
+// Determine Dynamic Lookback
+int vol_lookback = manual_vol_lb
+
+if auto_vol_lb
+    if timeframe.ismonthly
+        vol_lookback := 12
+    else if timeframe.isweekly
+        vol_lookback := 52
+    else if timeframe.isdaily
+        vol_lookback := 252
+    else if timeframe.isintraday
+        if timeframe.multiplier == 240 // 4 Hours
+            vol_lookback := 63
+        else if timeframe.multiplier == 60 // 1 Hour
+            vol_lookback := 252
+        else if timeframe.multiplier < 60 // 15m, 5m, etc.
+            vol_lookback := 500 // Clamped max
+        else
+            vol_lookback := 252
+    else
+        vol_lookback := 252
+
+// Ensure we don't exceed the input max
+vol_lookback := math.min(vol_lookback, 500)
+
+// =============================================================================
+// 3. SYSTEM HARDWARE
+// =============================================================================
+
+// =============================================================================
+// VOLATILITY CALCULATION
+// =============================================================================
+float daily_returns = ta.change(close) / close * 100
+float rolling_vol = ta.stdev(daily_returns, math.min(vol_lookback, bar_index + 1))
+
+// FIX: Percentile Guard for early bars to prevent erratic values
+int effective_vol_lookback = math.min(vol_lookback, bar_index + 1)
+bool vol_ready = effective_vol_lookback >= 50  // Wait for at least 50 samples
+float vol_baseline = vol_ready ? ta.percentile_linear_interpolation(rolling_vol, effective_vol_lookback, vol_percentile) : rolling_vol
+
+// Adaptive thresholds (scale with volatility)
+float adaptive_extended = enable_adaptive ? vol_baseline * 1.5 : 25.0
+float adaptive_expanding = enable_adaptive ? vol_baseline * 0.75 : 5.0
+float adaptive_lagging = enable_adaptive ? vol_baseline * -0.5 : -5.0
+
+float adaptive_perfect = enable_adaptive ? vol_baseline * 1.2 : 12.0
+float adaptive_transition = enable_adaptive ? vol_baseline * 0.6 : 5.0
+
+// =============================================================================
+// 4. PIPELINE & PANE VISUALS
+// =============================================================================
+l_path = switch filter_config
+    "2p+2p (Fast)"   => f_ss2_logic(close, m_detox)
+    "3p+2p (Hybrid)" => f_ss3_logic(close, m_detox)
+    "3p+3p (Smooth)" => f_ss3_logic(close, m_detox)
+    => f_ss3_logic(close, m_detox)
+
+s_floor = switch filter_config
+    "2p+2p (Fast)"   => f_ss2_logic(l_path, m_anchor) * baseline_mult
+    "3p+2p (Hybrid)" => f_ss2_logic(l_path, m_anchor) * baseline_mult 
+    "3p+3p (Smooth)" => f_ss3_logic(l_path, m_anchor) * baseline_mult
+    => f_ss2_logic(l_path, m_anchor) * baseline_mult
+
+// Plot 1: Price Line (Smoothed)
+p_smooth = input.int(5, "Price Line Smoothing", minval=1, group=grp_vis)
+p_draw   = ta.ema(close, p_smooth)
+plot(p_draw, "Actual Asset Price", color=c_raw, linewidth=1, style=plot.style_linebr)
+
+// Plot 2: Smoothed Signal Path (Dynamic Colors)
+// Using  GOLD for Up, CYAN for Down/Neutral
+color C_PATH  = l_path > l_path[1] ? C_UP : C_DOWN 
+p_path = plot(l_path, "Smoothed Signal Path", color=C_PATH, linewidth=3)
+
+// Plot 3: Support Baseline (Area Style)
+p_floor = plot(s_floor, "Support Baseline", color=color.new(C_DOWN, t_base), style=plot.style_line)
+
+// =============================================================================
+// FILL: Zone between Path and Floor
+// =============================================================================
+// Green fill if above, Red fill if below ( Up/Down)
+fill(p_path, p_floor, color=l_path > s_floor ? color.new(C_UP, t_fill) : color.new(C_DOWN, t_fill), title="Price Zone Fill")
+
+// =============================================================================
+// 5. NAVIGATIONAL LOGIC
+// =============================================================================
+
+// --- 1. DYNAMIC MOMENTUM CALIBRATION ---
+// The chosen filter adds group delay (lag). To compensate, we extend the momentum
+// lookback window proportionally. Empirically:
+// - 2p+2p: minimal lag, no adjustment (1.0x)
+// - 3p+2p: ~70 bar lag, extend by 15% (1.15x)
+// - 3p+3p: ~88 bar lag, extend by 45% (1.45x)
+// This keeps momentum signals responsive despite the filter delay.
+int effective_mom_lb = switch filter_config
+    "2p+2p (Fast)"   => math.max(momentum_lb, 3)
+    "3p+2p (Hybrid)" => math.max(math.ceil(momentum_lb * 1.15), 4)
+    "3p+3p (Smooth)" => math.max(math.ceil(momentum_lb * 1.45), 6)
+    => momentum_lb
+
+// --- 2. MOMENTUM CALCULATION ---
+bool mom_ready    = bar_index >= effective_mom_lb and nz(l_path[effective_mom_lb]) != 0
+float w_force_val = mom_ready ? (l_path - l_path[effective_mom_lb]) / l_path[effective_mom_lb] * 100 : na
+
+// --- 3. STATUS & DIVERGENCE LOGIC ---
+asset_mission = l_path > s_floor ? "Good" : "Bad"
+
+string w_force_label = na(w_force_val) ? "Warming Up" : 
+     w_force_val > 1.0 ? "Strong" : 
+     w_force_val > 0.2 ? "Steady" : 
+     w_force_val > 0   ? "Weak"   : "Opposing"
+
+string w_force_display = na(w_force_val) ? "Warming Up" : w_force_label + " (" + str.tostring(w_force_val, "#.##") + "%)"
+// Divergence Detection
+float bull_momentum = (l_path - l_path[bull_momentum_lookback]) / l_path[bull_momentum_lookback] * 100
+float bear_momentum = (l_path - l_path[bear_momentum_lookback]) / l_path[bear_momentum_lookback] * 100
+c_slope = s_floor[1] != 0 ? (s_floor - s_floor[1]) / s_floor[1] * 100 : 0
+
+// Count bars where price is rising
+int bars_up = 0
+if l_path > l_path[1]
+    bars_up := nz(bars_up[1]) + 1
+else
+    bars_up := 0
+
+int min_confirmation_bars = 2  // Require 2+ bars of upside before signal
+
+bool is_bull_divergence = (bars_up >= min_confirmation_bars) and 
+                          (bull_momentum < bull_momentum_threshold) and 
+                          (not bull_require_slope or c_slope > 0)
+
+// Count bars where price is falling
+int bars_down = 0
+if l_path < l_path[1]
+    bars_down := nz(bars_down[1]) + 1
+else
+    bars_down := 0
+
+bool is_bear_divergence = (bars_down >= min_confirmation_bars) and 
+                          (bear_momentum > bear_momentum_threshold) and 
+                          (not bear_require_slope or c_slope < 0)
+
+// Background coloring for reversals (Guarded by user toggle)
+bgcolor(show_reversals and is_bull_divergence and is_valid_tf ? color.new(c_bull_rev, rev_transparency) : 
+        show_reversals and is_bear_divergence and is_valid_tf ? color.new(c_bear_rev, rev_transparency) : na, title="Reversal Signals")
+
+c_diff = math.abs(l_path - s_floor)
+p_diff = math.abs(l_path[3] - s_floor[3])
+
+// Trend Detection
+float trend_pct_change = p_diff != 0 ? ((c_diff - p_diff) / p_diff) * 100 : 0
+w_trend = trend_pct_change > 2.0 ? "Increasing" : trend_pct_change < -2.0 ? "Decreasing" : "Stable"
+
+// Deviation Logic
+var int e_bar = 0
+var float e_price = 0.0
+
+if bar_index == 0
+    e_bar := 0
+    e_price := s_floor
+else if ta.crossover(l_path, s_floor)
+    e_bar := bar_index
+    e_price := s_floor
+
+a_potential = ta.sma(c_slope, 30) * m_anchor 
+
+i_today = e_price != 0 ? (e_price + (e_price * (a_potential / 100) / m_anchor * (bar_index - e_bar))) : l_path
+d_var = i_today != 0 ? ((l_path - i_today) / i_today) * 100 : 0
+
+d_status = d_var > adaptive_extended ? "Extended" : 
+           d_var > adaptive_expanding ? "Expanding" : 
+           d_var > adaptive_lagging ? "On Course" : "Lagging"
+string d_sign = d_var > 0 ? "+" : "" 
+
+h_clear = (l_path - s_floor) / s_floor * 100
+
+a_safety = asset_mission == "Bad" ? "Critical" : 
+           h_clear > adaptive_perfect ? "Perfect" : 
+           h_clear > adaptive_transition ? "Transition" : "Dangerous"
+
+
+// =============================================================================
+// 6. THE BRIDGE CONSOLE (STYLE)
+// =============================================================================
+map_pos  = t_pos == "Top Right" ? position.top_right : t_pos == "Bottom Left" ? position.bottom_left : t_pos == "Top Left" ? position.top_left : position.bottom_right
+map_size = t_size == "Tiny" ? size.tiny : t_size == "Normal" ? size.normal : t_size == "Large" ? size.large : size.small
+
+// Re-indexed table to 14 rows total (0-13)
+var table n_table = table.new(map_pos, 2, 14, bgcolor=C_BG, border_color=C_BORDER, border_width=1)
+
+if barstate.islastconfirmedhistory
+
+    // Row 0: Header Row
+    color head_color = C_HEAD
+    color head_text  = C_GOLD
+    table.merge_cells(n_table, 0, 0, 1, 0)
+    table.cell(n_table, 0, 0, "\n◈ Ehlers Adaptive Trend Filter ◈", 
+               text_color=head_text, bgcolor=head_color, text_size=size.normal)
+    
+    // Row 1: Trend Status
+    table.cell(n_table, 0, 1, "Trend Status", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 1, is_valid_tf ? asset_mission : "Void", text_size=map_size, text_color=asset_mission == "Good" ? C_UP : C_DOWN)
+    
+    // Row 2: Momentum
+    string mom_label = momentum_lb != effective_mom_lb ? 
+                       "Momentum (" + str.tostring(momentum_lb) + "-bar, adj. to " + str.tostring(effective_mom_lb) + ")" : 
+                       "Momentum (" + str.tostring(momentum_lb) + "-bar)"
+    table.cell(n_table, 0, 2, mom_label, text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 2, w_force_label + " (" + str.tostring(w_force_val, "#.##") + "%)", text_size=map_size, text_color=C_GOLD)
+    
+    // Row 3: Momentum Trend
+    table.cell(n_table, 0, 3, "Momentum Trend", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 3, w_trend, text_size=map_size, text_color=C_TXT)
+    
+    // Row 4: Reversal Status
+    table.cell(n_table, 0, 4, "Support Baseline", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 4, is_bull_divergence ? "Bull Reversal" : is_bear_divergence ? "Bear Reversal" : "Aligned", text_size=map_size, text_color=is_bull_divergence ? C_UP : is_bear_divergence ? C_DOWN : C_UP)
+    
+    // Row 5: Support Slope
+    table.cell(n_table, 0, 5, "Support Slope", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 5, (c_slope > 0.01 ? "Positive" : c_slope < -0.01 ? "Negative" : "Neutral") + " (" + str.tostring(c_slope, "#.##") + "%)", text_color=C_TXT, text_size=map_size)
+    
+    // Row 6: Safety Margin
+    table.cell(n_table, 0, 6, "Safety Margin", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 6, str.tostring(h_clear, "#.##") + "%", text_size=map_size, text_color=C_GOLD)
+    
+    // Row 7: Price Deviation
+    table.cell(n_table, 0, 7, "Price Deviation", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 7, d_status + " (" + d_sign + str.tostring(d_var, "#.##") + "%)", text_size=map_size, text_color=C_ACTION)
+    
+    // Row 8: Technical Rating
+    table.cell(n_table, 0, 8, "Technical Rating", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 8, a_safety, text_size=map_size, text_color=a_safety == "Perfect" ? C_UP : a_safety == "Critical" ? C_DOWN : C_FALL)
+
+    // Row 9: Volatility Information
+    table.cell(n_table, 0, 9, "Volatility (Live)", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    string vol_lb_txt = auto_vol_lb ? ("Auto(" + str.tostring(vol_lookback) + ")") : str.tostring(vol_lookback)
+    table.cell(n_table, 1, 9, str.tostring(rolling_vol, "#.##") + "% | Base(" + vol_lb_txt + "): " + str.tostring(vol_baseline, "#.##") + "%", text_size=map_size, text_color=C_SKY)
+
+    // Row 10: Filter Configuration
+    table.cell(n_table, 0, 10, "Filter Config", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    string filter_lag_display = filter_config == "2p+2p (Fast)" ? "2p+2p (62 bars)" : filter_config == "3p+2p (Hybrid)" ? "3p+2p (70 bars)" : "3p+3p (88 bars)"
+    table.cell(n_table, 1, 10, filter_lag_display, text_size=map_size, text_color=C_GOLD)
+
+    // Row 11: Threshold Levels
+    table.cell(n_table, 0, 11, "Threshold Levels", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    threshold_display = (enable_adaptive ? "Adaptive" : "Fixed") + " | Ext: " + str.tostring(adaptive_extended, "#.#") + "%"
+    table.cell(n_table, 1, 11, threshold_display, text_size=map_size, text_color=enable_adaptive ? C_GOLD : C_DIM)
+
+    // Row 12: Analysis Mode
+    string mode_desc = (auto_mode ? "Auto (" + str.tostring(m_detox) + "/" + str.tostring(m_anchor) + ")" : "Manual")
+    table.cell(n_table, 0, 12, "Analysis Mode", text_color=C_TXT, text_size=map_size, text_halign=text.align_left)
+    table.cell(n_table, 1, 12, mode_desc, text_size=map_size, text_color=C_GOLD)
+
+    // Row 13: Footer
+    table.merge_cells(n_table, 0, 13, 1, 13)
+    string system_status = enable_adaptive ? "Adaptive" : "Fixed"
+    string tf_warn = "System Active | " + system_status + " Mode | " + (vol_ready ? "Vol Ready" : "Warming Up")
+    table.cell(n_table, 0, 13, tf_warn, text_color=C_SKY, text_size=size.tiny)

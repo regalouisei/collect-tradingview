@@ -1,0 +1,254 @@
+//@version=6
+indicator("Smart Krypto Futures Daytrade Suite (Final)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ----------------------------------------------------------------------
+// 1. EINSTELLUNGEN
+// ----------------------------------------------------------------------
+
+// GRUPPE: TREND
+grp_trend = "Trend & Momentum"
+showMTF   = input.bool(true, "Zeige MTF EMA 50 (4h & Daily)", group=grp_trend)
+showWMA   = input.bool(true, "Zeige WMA 200 (Trend Support)", group=grp_trend)
+showEMA9  = input.bool(true, "Zeige EMA 9 (Entry Trigger)", group=grp_trend)
+showVWAP  = input.bool(true, "Zeige VWAP (Session)", group=grp_trend)
+
+// GRUPPE: DASHBOARD
+grp_dash = "Dashboard (Daytrade Trend & RSI)"
+showDash = input.bool(true, "Zeige Markt-Dashboard", group=grp_dash)
+posDash  = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left"], group=grp_dash)
+
+// GRUPPE: LIQUIDITÄT
+grp_liq   = "Liquidität & Ziele (Vortag)"
+showPOC   = input.bool(true, "Zeige POC (Point of Control)", group=grp_liq)
+showPDHL  = input.bool(true, "Zeige PDH / PDL (High/Low)", group=grp_liq)
+tpo_mode  = input.string("Typical (Standard)", "POC Methode", options=["Typical (Standard)", "Weighted (Close-Focus)", "Median (Range-Mitte)"], group=grp_liq)
+
+// GRUPPE: STRUKTUR
+grp_struc = "Marktstruktur (HTF)"
+htf       = input.timeframe("60", "Übergeordneter Timeframe", group=grp_struc)
+length    = input.int(50, "Pivot Lookback", minval=10, group=grp_struc)
+showBoxes = input.bool(true, "Zeige HTF Supply/Demand Boxen", group=grp_struc)
+
+// GRUPPE: FVG
+grp_fvg   = "Fair Value Gaps (FVG)"
+showFVG   = input.bool(true, "Zeige FVGs", group=grp_fvg)
+mitigate  = input.bool(true, "Gefüllte FVGs ausblenden?", group=grp_fvg)
+
+// ----------------------------------------------------------------------
+// 2. FARBEN & STIL
+// ----------------------------------------------------------------------
+c_neon_green = #00FF00
+c_neon_red   = #FF0055
+c_neon_blue  = #00E5FF // VWAP (Hellblau/Cyan)
+c_real_blue  = #2962FF // WMA 200 (Royal Blau)
+c_gold       = #FFD700
+c_grey       = #B2B5BE 
+
+// MTF EMA Farben
+c_mtf_4h     = #39ff14 // Neon Grün
+c_mtf_1d     = #aa00ff // Neon Violett
+
+// Zuweisungen
+colorBuy     = color.new(c_neon_green, 85)
+colorSell    = color.new(c_neon_red, 85)
+colorVwap    = color.new(c_neon_blue, 0)
+colorWma     = color.new(c_real_blue, 0)
+colorEmaFast = color.new(color.yellow, 0)
+colorFvgBull = color.new(c_neon_green, 70)
+colorFvgBear = color.new(c_neon_red, 70)
+colorTpoPoc  = color.new(c_gold, 0) 
+
+// ----------------------------------------------------------------------
+// 3. HTF SUPPLY / DEMAND
+// ----------------------------------------------------------------------
+htf_hi = request.security(syminfo.tickerid, htf, ta.highest(high, length))
+htf_lo = request.security(syminfo.tickerid, htf, ta.lowest(low, length))
+
+var box buyBox = box(na)
+var box sellBox = box(na)
+var label labBuy = label(na)
+var label labSell = label(na)
+
+box.delete(buyBox)
+box.delete(sellBox)
+label.delete(labBuy)
+label.delete(labSell)
+
+if not na(htf_hi) and not na(htf_lo)
+    float rng = htf_hi - htf_lo
+    float s_bot = htf_hi - (rng * 0.05)
+    float d_top = htf_lo + (rng * 0.05)
+    
+    if showBoxes
+        sellBox := box.new(bar_index - 5, htf_hi, bar_index + 15, s_bot, border_color=c_neon_red, bgcolor=colorSell, extend=extend.both)
+        buyBox  := box.new(bar_index - 5, htf_lo, bar_index + 15, d_top, border_color=c_neon_green, bgcolor=colorBuy, extend=extend.both)
+        labSell := label.new(bar_index + 15, htf_hi, "SUPPLY", style=label.style_none, textcolor=c_neon_red, size=size.normal, textalign=text.align_left)
+        labBuy  := label.new(bar_index + 15, htf_lo, "DEMAND", style=label.style_none, textcolor=c_neon_green, size=size.normal, textalign=text.align_left)
+
+// ----------------------------------------------------------------------
+// 4. LIQUIDITÄT (POC & PDH/PDL)
+// ----------------------------------------------------------------------
+y_high  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+y_low   = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+y_close = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+var line pocLine = line(na)
+var label pocLabel = label(na)
+var line pdhLine = line(na)
+var label pdhLabel = label(na)
+var line pdlLine = line(na)
+var label pdlLabel = label(na)
+
+if not na(y_close)
+    line.delete(pocLine)
+    label.delete(pocLabel)
+    line.delete(pdhLine)
+    line.delete(pdlLine)
+    label.delete(pdhLabel)
+    label.delete(pdlLabel)
+    
+    // POC
+    float tpo_poc = na
+    if tpo_mode == "Typical (Standard)"
+        tpo_poc := (y_high + y_low + y_close) / 3
+    else if tpo_mode == "Weighted (Close-Focus)"
+        tpo_poc := (y_high + y_low + (2 * y_close)) / 4
+    else 
+        tpo_poc := (y_high + y_low) / 2
+        
+    if showPOC
+        pocLine := line.new(bar_index - 100, tpo_poc, bar_index + 20, tpo_poc, color=colorTpoPoc, width=2, style=line.style_solid)
+        pocLabel := label.new(bar_index + 20, tpo_poc, "POC", style=label.style_label_left, color=color.new(c_gold, 100), textcolor=c_gold, size=size.small)
+
+    if showPDHL
+        pdhLine := line.new(bar_index - 100, y_high, bar_index + 20, y_high, color=c_grey, width=1, style=line.style_dashed)
+        pdhLabel := label.new(bar_index + 20, y_high, "PDH", style=label.style_label_left, color=color.new(c_grey, 100), textcolor=c_grey, size=size.tiny)
+        pdlLine := line.new(bar_index - 100, y_low, bar_index + 20, y_low, color=c_grey, width=1, style=line.style_dashed)
+        pdlLabel := label.new(bar_index + 20, y_low, "PDL", style=label.style_label_left, color=color.new(c_grey, 100), textcolor=c_grey, size=size.tiny)
+
+// ----------------------------------------------------------------------
+// 5. DAYTRADING TOOLS (VWAP, EMA9, WMA200)
+// ----------------------------------------------------------------------
+vwapVal = ta.vwap(close)
+plot(showVWAP ? vwapVal : na, "VWAP", color=colorVwap, linewidth=2)
+
+ema9 = ta.ema(close, 9)
+plot(showEMA9 ? ema9 : na, "EMA 9 (Trigger)", color=colorEmaFast, linewidth=1)
+
+// WMA 200 (NEU: Royal Blue)
+wma200 = ta.wma(close, 200)
+plot(showWMA ? wma200 : na, "WMA 200", color=colorWma, linewidth=2)
+
+// MTF EMAs
+e4 = request.security(syminfo.tickerid, "240", ta.ema(close, 50))
+ed = request.security(syminfo.tickerid, "D",   ta.ema(close, 50))
+
+plot(showMTF ? e4 : na, title="EMA 50 (4h)", color=color.new(c_mtf_4h, 20), linewidth=2)
+plot(showMTF ? ed : na, title="EMA 50 (Daily)", color=color.new(c_mtf_1d, 20), linewidth=3)
+
+// Labels am Chart-Rand
+if barstate.islast
+    // WMA 200 Label
+    if showWMA
+        label.new(bar_index + 3, wma200, "WMA 200", color=color.new(color.black, 100), style=label.style_label_left, textcolor=c_real_blue, size=size.small)
+    // MTF Labels
+    if showMTF
+        label.new(bar_index + 3, e4, "4h Trend", color=color.new(color.black, 100), style=label.style_label_left, textcolor=c_mtf_4h, size=size.small)
+        label.new(bar_index + 3, ed, "Daily Trend", color=color.new(color.black, 100), style=label.style_label_left, textcolor=c_mtf_1d, size=size.normal)
+
+// ----------------------------------------------------------------------
+// 6. FVG
+// ----------------------------------------------------------------------
+var box[] bullBoxes = array.new_box()
+var box[] bearBoxes = array.new_box()
+
+if showFVG
+    if low > high[2] and close[1] > open[1]
+        array.push(bullBoxes, box.new(bar_index - 2, high[2], bar_index + 20, low, border_color=na, bgcolor=colorFvgBull))
+    if high < low[2] and close[1] < open[1]
+        array.push(bearBoxes, box.new(bar_index - 2, low[2], bar_index + 20, high, border_color=na, bgcolor=colorFvgBear))
+        
+    if mitigate
+        if array.size(bullBoxes) > 0
+            for i = array.size(bullBoxes) - 1 to 0
+                box b = array.get(bullBoxes, i)
+                if low < box.get_bottom(b)
+                    box.delete(b)
+                    array.remove(bullBoxes, i)
+        if array.size(bearBoxes) > 0
+            for i = array.size(bearBoxes) - 1 to 0
+                box b = array.get(bearBoxes, i)
+                if high > box.get_top(b)
+                    box.delete(b)
+                    array.remove(bearBoxes, i)
+
+// ----------------------------------------------------------------------
+// 7. DASHBOARD (TREND + RSI)
+// ----------------------------------------------------------------------
+sym_btc   = "BINANCE:BTCUSDT"
+sym_eth   = "BINANCE:ETHUSDT"
+sym_btcd  = "CRYPTOCAP:BTC.D"
+sym_usdtd = "CRYPTOCAP:USDT.D"
+
+// 15m Trend + RSI
+calcDashData(sym) =>
+    cl  = request.security(sym, "15", close)
+    ema = request.security(sym, "15", ta.ema(close, 50)) 
+    rsi = request.security(sym, "15", ta.rsi(close, 14)) 
+    [cl, ema, rsi]
+
+[btc_c, btc_e, btc_r]       = calcDashData(sym_btc)
+[eth_c, eth_e, eth_r]       = calcDashData(sym_eth)
+[btcd_c, btcd_e, btcd_r]    = calcDashData(sym_btcd)
+[usdtd_c, usdtd_e, usdtd_r] = calcDashData(sym_usdtd)
+
+var table tbl = table.new(posDash == "Top Right" ? position.top_right : posDash == "Bottom Right" ? position.bottom_right : position.top_left, 3, 5, bgcolor=color.new(color.black, 40), frame_color=color.black, frame_width=1, border_color=color.black, border_width=1)
+
+getTrendTxt(cl, em) =>
+    if cl > em
+        ["BULL", c_neon_green] 
+    else
+        ["BEAR", c_neon_red]
+
+getRsiCol(val) =>
+    if val >= 70
+        c_neon_red   
+    else if val <= 30
+        c_neon_green 
+    else
+        color.white  
+
+if showDash and barstate.islast
+    table.cell(tbl, 0, 0, "ASSET", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    table.cell(tbl, 1, 0, "TREND", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    table.cell(tbl, 2, 0, "RSI (15m)", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    
+    // BTC
+    [t_btc, col_btc] = getTrendTxt(btc_c, btc_e)
+    table.cell(tbl, 0, 1, "BTC", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 1, t_btc, text_color=col_btc, text_size=size.small)
+    table.cell(tbl, 2, 1, str.tostring(math.round(btc_r)), text_color=getRsiCol(btc_r), text_size=size.small)
+    
+    // ETH
+    [t_eth, col_eth] = getTrendTxt(eth_c, eth_e)
+    table.cell(tbl, 0, 2, "ETH", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 2, t_eth, text_color=col_eth, text_size=size.small)
+    table.cell(tbl, 2, 2, str.tostring(math.round(eth_r)), text_color=getRsiCol(eth_r), text_size=size.small)
+
+    // BTC.D
+    [t_btcd, col_btcd] = getTrendTxt(btcd_c, btcd_e)
+    table.cell(tbl, 0, 3, "BTC.D", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 3, t_btcd, text_color=col_btcd, text_size=size.small)
+    table.cell(tbl, 2, 3, str.tostring(math.round(btcd_r)), text_color=getRsiCol(btcd_r), text_size=size.small)
+
+    // USDT.D
+    [t_usdtd, col_usdtd] = getTrendTxt(usdtd_c, usdtd_e)
+    table.cell(tbl, 0, 4, "USDT.D", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 4, t_usdtd, text_color=col_usdtd, text_size=size.small)
+    table.cell(tbl, 2, 4, str.tostring(math.round(usdtd_r)), text_color=getRsiCol(usdtd_r), text_size=size.small)
+
+// ----------------------------------------------------------------------
+// 8. ALARME
+// ----------------------------------------------------------------------
+bool poc_touch = showPOC and not na(y_close) and (high >= y_close * 0.999 and low <= y_close * 1.001)
+alertcondition(poc_touch, title="ALARM: POC Touch", message="Preis ist am POC!")

@@ -1,0 +1,140 @@
+//@version=5
+strategy("London SR Cleaner WR (TP 0.20)", overlay=true, initial_capital=10000,
+     commission_type=strategy.commission.percent, commission_value=0.0)
+
+//===================== INPUTS =====================
+sessionInput     = input.session("1100-2000", "London Session (Athens UTC+2)")
+retestBars       = input.int(2, "Max bars to wait retest (sniper)", minval=1, maxval=10)
+wickBodyMult     = input.float(1.5, "Rejection: Wick > Body *", step=0.1)
+
+tpPct            = input.float(0.20, "TP % (target)", step=0.05)   // <<< 0.20%
+slBuffer         = input.float(0.3, "SL buffer (price units)", step=0.1)
+
+maxTradesPerDay  = input.int(2, "Max trades/day", minval=1, maxval=10)
+
+emaLen           = input.int(200, "EMA Filter Length", minval=50, maxval=400)
+atrLen           = input.int(14, "ATR Length", minval=5, maxval=50)
+atrBreakMult     = input.float(0.06, "ATR Break Buffer", step=0.01)
+atrCloseAwayMult = input.float(0.12, "ATR Close-away confirm", step=0.01)
+
+//===================== SESSION FLAGS =====================
+inSession = not na(time(timeframe.period, sessionInput))
+
+//===================== FILTERS =====================
+ema200 = ta.ema(close, emaLen)
+atr    = ta.atr(atrLen)
+plot(ema200, "EMA", color=color.new(color.blue, 0))
+
+//===================== PREVIOUS LONDON LEVELS (FIXED) =====================
+var float sessHigh = na
+var float sessLow  = na
+var float prevHigh = na
+var float prevLow  = na
+
+if inSession and not inSession[1]
+    prevHigh := sessHigh
+    prevLow  := sessLow
+    sessHigh := high
+    sessLow  := low
+else if inSession
+    sessHigh := math.max(sessHigh, high)
+    sessLow  := math.min(sessLow, low)
+
+plot(prevHigh, "Prev London High (R)", color=color.red, linewidth=2)
+plot(prevLow,  "Prev London Low (S)",  color=color.green, linewidth=2)
+
+//===================== DAILY LIMIT + ONE TRADE PER LEVEL =====================
+var int tradesToday = 0
+var bool usedHighToday = false
+var bool usedLowToday  = false
+
+if ta.change(time("D"))
+    tradesToday := 0
+    usedHighToday := false
+    usedLowToday  := false
+
+canTrade = tradesToday < maxTradesPerDay
+flat = strategy.position_size == 0
+
+//===================== BREAK & CLOSE (WITH ATR BUFFER) =====================
+breakUp = not na(prevHigh) and close > (prevHigh + atr * atrBreakMult) and close[1] <= prevHigh
+breakDn = not na(prevLow)  and close < (prevLow  - atr * atrBreakMult) and close[1] >= prevLow
+
+//===================== WAIT FOR RETEST =====================
+var bool waitRetestUp = false
+var int  breakUpBar   = na
+var bool waitRetestDn = false
+var int  breakDnBar   = na
+
+if breakUp and not usedHighToday
+    waitRetestUp := true
+    breakUpBar := bar_index
+
+if breakDn and not usedLowToday
+    waitRetestDn := true
+    breakDnBar := bar_index
+
+if waitRetestUp and (bar_index - breakUpBar > retestBars)
+    waitRetestUp := false
+    breakUpBar := na
+
+if waitRetestDn and (bar_index - breakDnBar > retestBars)
+    waitRetestDn := false
+    breakDnBar := na
+
+// Retest touch
+retestTouchUp = waitRetestUp and low <= prevHigh
+retestTouchDn = waitRetestDn and high >= prevLow
+
+// Rejection strength
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bodySize  = math.abs(close - open)
+
+// Close-away confirmation
+closeAwayUp = close > (prevHigh + atr * atrCloseAwayMult)
+closeAwayDn = close < (prevLow  - atr * atrCloseAwayMult)
+
+//===================== FINAL SIGNALS (CLOSE ENTRY) =====================
+buySignal =
+     canTrade and flat and not usedHighToday and
+     retestTouchUp and
+     (close > open) and
+     (lowerWick > bodySize * wickBodyMult) and
+     closeAwayUp and
+     close > ema200
+
+sellSignal =
+     canTrade and flat and not usedLowToday and
+     retestTouchDn and
+     (close < open) and
+     (upperWick > bodySize * wickBodyMult) and
+     closeAwayDn and
+     close < ema200
+
+buySL  = low  - slBuffer
+sellSL = high + slBuffer
+
+buyTP  = close * (1.0 + tpPct/100.0)
+sellTP = close * (1.0 - tpPct/100.0)
+
+//===================== ORDERS + LABELS =====================
+if buySignal
+    tradesToday += 1
+    usedHighToday := true
+    waitRetestUp := false
+    breakUpBar := na
+    strategy.entry("BUY", strategy.long)
+    strategy.exit("BUY-EXIT", "BUY", stop=buySL, limit=buyTP)
+    label.new(bar_index, low, "BUY\nEntry: " + str.tostring(close), style=label.style_label_up,
+         color=color.new(color.green, 0), textcolor=color.white)
+
+if sellSignal
+    tradesToday += 1
+    usedLowToday := true
+    waitRetestDn := false
+    breakDnBar := na
+    strategy.entry("SELL", strategy.short)
+    strategy.exit("SELL-EXIT", "SELL", stop=sellSL, limit=sellTP)
+    label.new(bar_index, high, "SELL\nEntry: " + str.tostring(close), style=label.style_label_down,
+         color=color.new(color.red, 0), textcolor=color.white)

@@ -1,0 +1,344 @@
+//@version=6
+indicator("Gold Breakout Trader", 
+         overlay=true, 
+         max_boxes_count=500, 
+         max_lines_count=500, 
+         max_labels_count=500)
+
+// ==================== USER INPUTS ====================
+// Time Settings
+triggerHour = input.int(7, "Trigger Hour (UTC+1)", minval=0, maxval=23, tooltip="Hour to create daily zones")
+triggerMinute = input.int(0, "Trigger Minute", minval=0, maxval=59)
+extensionMinutes = input.int(10, "Extension Minutes (Left/Right)", minval=1, maxval=120, tooltip="Minutes to extend boxes from reference point")
+enable2HourPlot = input.bool(true, "Plot Every 2 Hours", tooltip="Enable to plot zones every 2 hours instead of once daily")
+
+// Box Settings
+boxHeight = input.float(10.0, "Gray Box Height (USD)", minval=1.0, step=0.5, tooltip="Height of the central gray box in USD")
+showGrayBox = input.bool(true, "Show Gray Box")
+grayBoxColor = input.color(color.new(color.gray, 70), "Gray Box Color")
+
+// Spacing Settings
+stopLineBuffer = input.float(2.0, "Buffer: Gray Box to Stop Lines (USD)", minval=0.0, step=0.5, tooltip="Space between gray box border and dashed stop lines")
+stopToTPGap = input.float(2.0, "Gap: Stop Lines to TP Zones (USD)", minval=0.0, step=0.5, tooltip="Space between dashed stop lines and first TP zone")
+tpZoneGap = input.float(1.0, "Gap Between TP Zones (USD)", minval=0.0, step=0.5, tooltip="Space between each TP zone")
+
+// Dashed Lines
+showDashedLines = input.bool(true, "Show Dashed Lines (Buy/Sell Stop)")
+dashedLineColor = input.color(color.new(color.white, 30), "Dashed Line Color")
+dashedLineWidth = input.int(1, "Dashed Line Width", minval=1, maxval=5)
+
+// TP Zone Settings
+showTPZones = input.bool(true, "Show TP Zones")
+tp1Height = input.float(4.0, "TP1 Zone Height (USD)", minval=0.5, step=0.5)
+tp2Height = input.float(4.0, "TP2 Zone Height (USD)", minval=0.5, step=0.5)
+tp3Height = input.float(4.0, "TP3 Zone Height (USD)", minval=0.5, step=0.5)
+
+// TP Colors - Using ADR10 color scheme
+tp1ColorUp = input.color(#26a69a, "TP1 Up Color", inline="tp1")
+tp1ColorDn = input.color(#b71c1c, "TP1 Down Color", inline="tp1")
+tp2ColorUp = input.color(#00897b, "TP2 Up Color", inline="tp2")
+tp2ColorDn = input.color(#880e4f, "TP2 Down Color", inline="tp2")
+tp3ColorUp = input.color(#004d40, "TP3 Up Color", inline="tp3")
+tp3ColorDn = input.color(#4a148c, "TP3 Down Color", inline="tp3")
+
+tpBoxTransparency = input.int(85, "TP Box Transparency", minval=0, maxval=100)
+tpBorderTransparency = input.int(50, "TP Border Transparency", minval=0, maxval=100)
+
+// Label Settings
+showLabels = input.bool(true, "Show Labels")
+labelSize = input.string("normal", "Label Size", options=["tiny", "small", "normal", "large", "huge"])
+
+// Alert Settings
+enableAlerts = input.bool(true, "Enable Alerts", tooltip="Alert when price closes above Buy Stop or below Sell Stop")
+
+// ==================== HELPER FUNCTIONS ====================
+getLabelSize(sizeStr) =>
+    switch sizeStr
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        "large" => size.large
+        "huge" => size.huge
+        => size.large
+
+// ==================== STORAGE ARRAYS ====================
+var box[] grayBoxes = array.new<box>()
+var line[] buyStopLines = array.new<line>()
+var line[] sellStopLines = array.new<line>()
+var label[] buyStopLabels = array.new<label>()
+var label[] sellStopLabels = array.new<label>()
+
+var box[] tp1UpBoxes = array.new<box>()
+var box[] tp1DnBoxes = array.new<box>()
+var box[] tp2UpBoxes = array.new<box>()
+var box[] tp2DnBoxes = array.new<box>()
+var box[] tp3UpBoxes = array.new<box>()
+var box[] tp3DnBoxes = array.new<box>()
+
+var label[] tp1UpLabels = array.new<label>()
+var label[] tp1DnLabels = array.new<label>()
+var label[] tp2UpLabels = array.new<label>()
+var label[] tp2DnLabels = array.new<label>()
+var label[] tp3UpLabels = array.new<label>()
+var label[] tp3DnLabels = array.new<label>()
+
+// ==================== DETECT TRIGGER TIME ====================
+// Get time in GMT+1 timezone
+currentTime = time + 3600000  // Add 1 hour in milliseconds for UTC+1
+currentHour = hour(currentTime)
+currentMinute = minute(currentTime)
+currentDay = dayofmonth(currentTime)
+
+// Track last trigger to avoid duplicates
+var int lastTriggerTime = na
+
+// Declare buyStop and sellStop variables
+float buyStop = na
+float sellStop = na
+
+// Determine trigger condition based on mode
+isTriggerBar = false
+if enable2HourPlot
+    // Trigger every 2 hours at minute 0
+    isTriggerBar := (currentMinute == 0 and currentHour % 2 == 0)
+else
+    // Trigger once daily at specified hour
+    isTriggerBar := (currentHour == triggerHour and currentMinute == triggerMinute)
+
+// Check if we should trigger (avoid duplicates)
+shouldTrigger = false
+if enable2HourPlot
+    // For 2-hour mode, check if 2 hours have passed
+    if na(lastTriggerTime) or (currentTime - lastTriggerTime) >= 7200000  // 2 hours in milliseconds
+        shouldTrigger := isTriggerBar
+else
+    // For daily mode, check if it's a different day
+    shouldTrigger := isTriggerBar and currentDay != dayofmonth(lastTriggerTime)
+
+if shouldTrigger
+    lastTriggerTime := currentTime
+    
+    // Reference price from current candle close
+    refPrice = close
+    
+    // Calculate bar indices for extension
+    leftBar = bar_index - extensionMinutes
+    rightBar = bar_index + extensionMinutes
+    
+    // Calculate gray box borders
+    halfBoxHeight = boxHeight / 2
+    grayBoxTop = refPrice + halfBoxHeight
+    grayBoxBottom = refPrice - halfBoxHeight
+    
+    // Calculate Buy/Sell Stop lines (with buffer from gray box)
+    buyStop := grayBoxTop + stopLineBuffer
+    sellStop := grayBoxBottom - stopLineBuffer
+    
+    // ========== GRAY BOX ==========
+    if showGrayBox
+        grayBox = box.new(left=leftBar, right=rightBar, 
+                         top=grayBoxTop, bottom=grayBoxBottom,
+                         xloc=xloc.bar_index, 
+                         bgcolor=grayBoxColor,
+                         border_color=color.new(color.gray, 50),
+                         border_width=1)
+        array.push(grayBoxes, grayBox)
+    
+    // ========== DASHED LINES ==========
+    if showDashedLines
+        // Buy Stop Line (above gray box)
+        buyStopLine = line.new(x1=leftBar, y1=buyStop, x2=rightBar, y2=buyStop,
+                               xloc=xloc.bar_index, color=dashedLineColor, 
+                               width=dashedLineWidth, style=line.style_dashed)
+        array.push(buyStopLines, buyStopLine)
+        
+        // Sell Stop Line (below gray box)
+        sellStopLine = line.new(x1=leftBar, y1=sellStop, x2=rightBar, y2=sellStop,
+                                xloc=xloc.bar_index, color=dashedLineColor, 
+                                width=dashedLineWidth, style=line.style_dashed)
+        array.push(sellStopLines, sellStopLine)
+        
+        // Labels on dashed lines
+        if showLabels
+            buyStopLabel = label.new(x=bar_index, y=buyStop, 
+                                    text="Buy Stop " + str.tostring(math.round(buyStop)),
+                                    style=label.style_none, 
+                                    textcolor=tp1ColorUp, 
+                                    size=getLabelSize(labelSize),
+                                    textalign=text.align_center)
+            array.push(buyStopLabels, buyStopLabel)
+            
+            sellStopLabel = label.new(x=bar_index, y=sellStop, 
+                                     text="Sell Stop " + str.tostring(math.round(sellStop)),
+                                     style=label.style_none, 
+                                     textcolor=tp1ColorDn, 
+                                     size=getLabelSize(labelSize),
+                                     textalign=text.align_center)
+            array.push(sellStopLabels, sellStopLabel)
+    
+    // ========== TP ZONES ==========
+    if showTPZones
+        // Calculate TP zone positions with gaps
+        
+        // TP1 UP - starts from buyStop + gap
+        tp1UpBot = buyStop + stopToTPGap
+        tp1UpTop = tp1UpBot + tp1Height
+        tp1UpMid = (tp1UpTop + tp1UpBot) / 2
+        
+        // TP2 UP - starts after TP1 + gap
+        tp2UpBot = tp1UpTop + tpZoneGap
+        tp2UpTop = tp2UpBot + tp2Height
+        tp2UpMid = (tp2UpTop + tp2UpBot) / 2
+        
+        // TP3 UP - starts after TP2 + gap
+        tp3UpBot = tp2UpTop + tpZoneGap
+        tp3UpTop = tp3UpBot + tp3Height
+        tp3UpMid = (tp3UpTop + tp3UpBot) / 2
+        
+        // TP1 DOWN - starts from sellStop - gap
+        tp1DnTop = sellStop - stopToTPGap
+        tp1DnBot = tp1DnTop - tp1Height
+        tp1DnMid = (tp1DnTop + tp1DnBot) / 2
+        
+        // TP2 DOWN - starts after TP1 + gap
+        tp2DnTop = tp1DnBot - tpZoneGap
+        tp2DnBot = tp2DnTop - tp2Height
+        tp2DnMid = (tp2DnTop + tp2DnBot) / 2
+        
+        // TP3 DOWN - starts after TP2 + gap
+        tp3DnTop = tp2DnBot - tpZoneGap
+        tp3DnBot = tp3DnTop - tp3Height
+        tp3DnMid = (tp3DnTop + tp3DnBot) / 2
+        
+        // Create TP1 UP Box
+        tp1UpBox = box.new(left=leftBar, right=rightBar,
+                          top=tp1UpTop, bottom=tp1UpBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp1ColorUp, tpBoxTransparency),
+                          border_color=color.new(tp1ColorUp, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp1UpBoxes, tp1UpBox)
+        
+        if showLabels
+            tp1UpLabel = label.new(x=bar_index, y=tp1UpMid,
+                                  text="TP1 " + str.tostring(math.round(tp1UpMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp1UpLabels, tp1UpLabel)
+        
+        // Create TP1 DOWN Box
+        tp1DnBox = box.new(left=leftBar, right=rightBar,
+                          top=tp1DnTop, bottom=tp1DnBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp1ColorDn, tpBoxTransparency),
+                          border_color=color.new(tp1ColorDn, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp1DnBoxes, tp1DnBox)
+        
+        if showLabels
+            tp1DnLabel = label.new(x=bar_index, y=tp1DnMid,
+                                  text="TP1 " + str.tostring(math.round(tp1DnMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp1DnLabels, tp1DnLabel)
+        
+        // Create TP2 UP Box
+        tp2UpBox = box.new(left=leftBar, right=rightBar,
+                          top=tp2UpTop, bottom=tp2UpBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp2ColorUp, tpBoxTransparency),
+                          border_color=color.new(tp2ColorUp, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp2UpBoxes, tp2UpBox)
+        
+        if showLabels
+            tp2UpLabel = label.new(x=bar_index, y=tp2UpMid,
+                                  text="TP2 " + str.tostring(math.round(tp2UpMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp2UpLabels, tp2UpLabel)
+        
+        // Create TP2 DOWN Box
+        tp2DnBox = box.new(left=leftBar, right=rightBar,
+                          top=tp2DnTop, bottom=tp2DnBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp2ColorDn, tpBoxTransparency),
+                          border_color=color.new(tp2ColorDn, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp2DnBoxes, tp2DnBox)
+        
+        if showLabels
+            tp2DnLabel = label.new(x=bar_index, y=tp2DnMid,
+                                  text="TP2 " + str.tostring(math.round(tp2DnMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp2DnLabels, tp2DnLabel)
+        
+        // Create TP3 UP Box
+        tp3UpBox = box.new(left=leftBar, right=rightBar,
+                          top=tp3UpTop, bottom=tp3UpBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp3ColorUp, tpBoxTransparency),
+                          border_color=color.new(tp3ColorUp, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp3UpBoxes, tp3UpBox)
+        
+        if showLabels
+            tp3UpLabel = label.new(x=bar_index, y=tp3UpMid,
+                                  text="TP3 " + str.tostring(math.round(tp3UpMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp3UpLabels, tp3UpLabel)
+        
+        // Create TP3 DOWN Box
+        tp3DnBox = box.new(left=leftBar, right=rightBar,
+                          top=tp3DnTop, bottom=tp3DnBot,
+                          xloc=xloc.bar_index,
+                          bgcolor=color.new(tp3ColorDn, tpBoxTransparency),
+                          border_color=color.new(tp3ColorDn, tpBorderTransparency),
+                          border_width=1)
+        array.push(tp3DnBoxes, tp3DnBox)
+        
+        if showLabels
+            tp3DnLabel = label.new(x=bar_index, y=tp3DnMid,
+                                  text="TP3 " + str.tostring(math.round(tp3DnMid)),
+                                  style=label.style_none,
+                                  textcolor=color.white,
+                                  size=getLabelSize(labelSize),
+                                  textalign=text.align_center)
+            array.push(tp3DnLabels, tp3DnLabel)
+
+// ==================== ALERTS ====================
+// Track the most recent Buy Stop and Sell Stop levels
+var float latestBuyStop = na
+var float latestSellStop = na
+
+// Update latest levels when new zones are created
+if shouldTrigger
+    latestBuyStop := buyStop
+    latestSellStop := sellStop
+
+// Calculate crossover/crossunder on every bar (outside conditional)
+crossoverBuyStop = ta.crossover(close, latestBuyStop)
+crossunderSellStop = ta.crossunder(close, latestSellStop)
+
+// Alert conditions
+buyStopAlert = enableAlerts and not na(latestBuyStop) and crossoverBuyStop
+sellStopAlert = enableAlerts and not na(latestSellStop) and crossunderSellStop
+
+// Trigger alerts
+if buyStopAlert
+    alert("BUY STOP: Price closed above " + str.tostring(latestBuyStop), alert.freq_once_per_bar_close)
+
+if sellStopAlert
+    alert("SELL STOP: Price closed below " + str.tostring(latestSellStop), alert.freq_once_per_bar_close)

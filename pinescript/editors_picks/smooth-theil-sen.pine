@@ -1,0 +1,549 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © The_Peaceful_Lizard
+
+//@version=6
+indicator("Smooth Theil-Sen", overlay = true, calc_bars_count = 5000, explicit_plot_zorder = true)
+
+
+// HEAD {
+
+
+// enums {
+
+
+//@enum Deviation calculation methods for regression band estimation.
+//@field mad Median Absolute Deviation. Robust to outliers; uses median of absolute residuals.
+//@field rmsd Root Mean Square Deviation. Standard RMS error metric; sensitive to large deviations.
+enum DeviationType
+    mad = "Median Absolute Deviation"
+    rmsd = "Root Mean Square Deviation"
+
+
+//@enum Statistical estimator styles for smoothing slope and residual calculations.
+//@field mean Arithmetic mean. Fully parametric; fast but sensitive to outliers.
+//@field smooth_median Kernel-weighted median. Balances robustness with smoothness via Gaussian kernel.
+//@field median Standard median. Maximum robustness; no smoothing applied.
+enum StatStyle
+    mean = "Mean"
+    smooth_median = "Smooth Median"
+    median = "Median"
+
+
+// enums }
+
+
+// methods {
+
+
+//@function Convert StatStyle enum to numeric blend factor for kernel interpolation.
+//@param self StatStyle enum value.
+//@returns Blend factor: 1 for mean, 0.5 for smooth_median, 0 for median.
+method value(StatStyle self)=>
+    switch self
+        StatStyle.mean => 1
+        StatStyle.smooth_median => 0.5
+        StatStyle.median => 0
+        => 0
+
+
+// methods }
+
+
+// helpers {
+
+
+//@function Exponential interpolation from minimum threshold to endpoint using power curve.
+//@param k Blend factor in [0, 1]. 0 = minimum, 1 = endpoint.
+//@param endpoint Target maximum value when k = 1.
+//@returns Interpolated value with exponential acceleration toward endpoint.
+exponential_interpolation(float k, float endpoint)=>
+    float clamp = math.max(0, math.min(1, k))
+    const float min = 0.5
+    (endpoint - min) * math.pow(1024, clamp - 1) + min
+
+
+//@function Gaussian kernel weight for kernel density estimation.
+//@param source Distance from kernel center.
+//@param bandwidth Kernel bandwidth parameter (standard deviation analogue).
+//@returns Normalized Gaussian weight at given distance.
+gaussian_kernel(float source, float bandwidth)=>
+    float ratio = source / bandwidth
+    math.exp(-math.pow(ratio, 2) / 4) / math.sqrt(2 * math.pi)
+
+
+//@function Compute normalized Gaussian kernel coefficient matrix for weighted median.
+//@param window_size Number of data points in the window.
+//@param blend Interpolation factor for kernel width (0 = narrow, 1 = wide).
+//@returns 1×window_size matrix of normalized Gaussian weights.
+kernel_coef(int window_size, float blend)=>
+    bool change = barstate.isfirst or window_size != nz(window_size[1], window_size) or blend != nz(blend[1], blend)
+    var matrix<float> coef = matrix.new<float>(1, window_size)
+    if change
+        coef := matrix.new<float>(1, window_size)
+        float normalization = 0
+        float width = exponential_interpolation(blend, window_size)
+        for i = 0 to window_size - 1
+            float j = i - (window_size - 1) / 2
+            float weight = gaussian_kernel(j, width)
+            normalization += weight
+            coef.set(0, i, weight)
+        coef := coef.mult(1.0 / normalization)
+    coef
+
+
+//@function Sort array in ascending order (helper for median calculation).
+//@param data Input array to sort.
+//@returns Sorted copy of input array.
+method fix_window(float[] data)=>
+    float[] sorted = data.copy()
+    sorted.sort(order.ascending)
+    sorted
+
+
+//@function Compute smoothed median using kernel-weighted approach or fallback to mean/median.
+//@param data Input array of values.
+//@param blend StatStyle determining estimation method.
+//@returns Smoothed median estimate or mean/median depending on blend setting.
+smooth_median(float[] data, StatStyle blend)=>
+    float smooth_median = na
+    matrix<float> kernel = kernel_coef(data.size(), blend.value())
+
+    if blend == StatStyle.mean
+        smooth_median := data.avg()
+    else if blend == StatStyle.median
+        smooth_median := data.median()
+    else
+        float[] sorted = data.fix_window()
+        smooth_median := kernel.mult(sorted).first()
+
+    smooth_median
+
+
+//@function Exponential moving average (single-pole IIR).
+//@param source Input value.
+//@param period Smoothing period (>0).
+//@returns EMA(source, period).
+ema(float source, float period)=>
+    float alpha = 2 / (1 + period)
+    float beta = 1 - alpha
+    var float ema = nz(source)
+    ema := nz(source) * alpha + nz(ema[1], ema) * beta
+    ema
+
+
+//@function Root-mean-square estimator using EMA of squares.
+//@param source Input value.
+//@param period EMA period for power estimate.
+//@returns RMS estimate.
+rms(float source, float period)=>
+    float error = (period - 1) / period
+    float sqr_avg = ema(nz(math.pow(source, 2)), period)
+    float rms = math.sqrt(sqr_avg * error)
+    rms
+
+
+// helpers }
+
+
+// color {
+
+
+//@function Convert delta to degrees using arctangent scaling with a range.
+//@param source Delta value.
+//@param _range Normalization range.
+//@returns Angle in degrees.
+to_angle(float source, float _range)=>
+    math.todegrees(math.atan(source / _range))
+
+
+//@function Angle → bounded oscillator (approx. ±100 scale).
+//@param source Delta value.
+//@param _range Normalization range used in angle conversion.
+//@returns Oscillator value (roughly in −100..+100).
+to_oscilator(float source, float _range)=>
+    const float to_100 = 10 / 9
+    to_angle(source, _range) * to_100
+
+
+//@function Scale the alpha (transparency) of a color by a reduction percentage.
+//@param self Base color to modify.
+//@param reduction Reduction percentage (0-100). Higher values = more transparent.
+//@returns New color with adjusted transparency.
+method scale_alpha(color self, float reduction)=>
+    float alpha = color.t(self) + (100 - color.t(self)) * (reduction * 0.01)
+    color.rgb(color.r(self), color.g(self), color.b(self), alpha)
+
+
+//@function Generate gradient color based on trend direction and strength.
+//@param source Input series to evaluate trend.
+//@param length Smoothing period for delta and RMS calculations.
+//@param up_color Color for positive trend (default green).
+//@param down_color Color for negative trend (default red).
+//@returns Interpolated color between down_color and up_color based on trend angle.
+trend_color(float source, float length, color up_color = #13FF20, color down_color = #FF0000)=>
+    float period = length * 2
+
+    float delta = source - nz(source[1], source)
+    float avg_delta = rms(delta, period)
+
+    float angle = to_oscilator(delta, avg_delta)
+    float avg_max = rms(nz(angle), period)
+
+    color trend_color = switch
+        angle >= 0 => color.from_gradient(angle, 0, avg_max, chart.fg_color, up_color)
+        => color.from_gradient(angle, -avg_max, 0, down_color, chart.fg_color)
+
+    trend_color
+
+
+// color }
+
+
+// theil sen {
+
+
+//@function Theil-Sen robust linear regression estimator with smoothed slope and intercept.
+//@param source Input time series.
+//@param length Regression window length.
+//@param offset Lookback offset from current bar.
+//@param slope_blend StatStyle for slope estimation (median of pairwise slopes).
+//@param residual_blend StatStyle for intercept estimation (median of residuals).
+//@returns [beta_0, beta_1, predicted] where beta_0 = intercept, beta_1 = slope, predicted = extrapolated value at -offset.
+theil_sen(float source, int length, int offset, StatStyle slope_blend, StatStyle residual_blend)=>
+    float[] pairwise_slopes = array.new<float>()
+
+    for i = offset to length - 2 + offset
+        float source_i = source[i]
+        for j = i + 1 to length - 1 + offset
+            if i != j
+                float slope = (source[j] - source_i) / (j - i)
+                pairwise_slopes.push(slope)
+
+    float beta_1 = smooth_median(pairwise_slopes, slope_blend)
+
+    float[] residuals = array.new<float>()
+    for i = offset to length - 1 + offset
+        int j = i - offset
+        float residual = source[i] - beta_1 * j
+        residuals.push(residual)
+
+    float beta_0 = smooth_median(residuals, residual_blend)
+
+    float predicted = beta_0 + beta_1 * -offset
+    [beta_0, beta_1, predicted]
+
+
+// theil sen }
+
+
+// deviation {
+
+
+//@function Compute Median Absolute Deviation (MAD) of regression residuals.
+//@param source Input time series.
+//@param beta_0 Regression intercept.
+//@param beta_1 Regression slope.
+//@param length Regression window length.
+//@param residual_blend StatStyle for median calculation of absolute errors.
+//@param multiplier Scale factor applied to MAD.
+//@param offset Lookback offset from current bar.
+//@param include_offset Whether to include extrapolated region in deviation calculation.
+//@returns MAD × multiplier.
+mean_absolute_deviation(float source, float beta_0, float beta_1, int length, StatStyle residual_blend, float multiplier, int offset, bool include_offset)=>
+    float[] errors = array.new<float>()
+
+    float absolute_errors = 0
+    int start_point = include_offset ? 0 : offset
+    for i = start_point to length - 1 + offset
+        int j = i - offset
+        float predicted = beta_0 + beta_1 * j
+        float error = math.abs(source[i] - predicted)
+        errors.push(error)
+    float mad = smooth_median(errors, residual_blend) * multiplier
+    mad
+
+
+//@function Compute Root Mean Square Deviation (RMSD) of regression residuals.
+//@param source Input time series.
+//@param beta_0 Regression intercept.
+//@param beta_1 Regression slope.
+//@param length Regression window length.
+//@param multiplier Scale factor applied to RMSD.
+//@param offset Lookback offset from current bar.
+//@param include_offset Whether to include extrapolated region in deviation calculation.
+//@returns RMSD × multiplier.
+root_mean_square_deviation(float source, float beta_0, float beta_1, int length, float multiplier, int offset, bool include_offset)=>
+    float square_errors = 0
+    int start_point = include_offset ? 0 : offset
+    for i = start_point to length - 1 + offset
+        int j = i - offset
+        float predicted = beta_0 + beta_1 * j
+        float error = math.pow(source[i] - predicted, 2)
+        square_errors += error
+
+    int rmsd_length = include_offset ? offset : 0
+    float rmsd = math.sqrt(square_errors / (length + rmsd_length)) * multiplier
+    rmsd
+
+
+//@function Unified deviation calculator dispatching to MAD or RMSD.
+//@param source Input time series.
+//@param beta_0 Regression intercept.
+//@param beta_1 Regression slope.
+//@param length Regression window length.
+//@param residual_blend StatStyle for MAD calculation (ignored for RMSD).
+//@param multiplier Scale factor applied to deviation.
+//@param offset Lookback offset from current bar.
+//@param include_offset Whether to include extrapolated region in deviation calculation.
+//@param deviation_type DeviationType selecting MAD or RMSD method.
+//@returns Computed deviation value.
+deviation(float source, float beta_0, float beta_1, int length, StatStyle residual_blend, float multiplier, int offset, bool include_offset, simple DeviationType deviation_type)=>
+    switch deviation_type
+        DeviationType.mad => mean_absolute_deviation(source, beta_0, beta_1, length, residual_blend, multiplier, offset, include_offset)
+        DeviationType.rmsd => root_mean_square_deviation(source, beta_0, beta_1, length, multiplier, offset, include_offset)
+
+
+// deviation }
+
+
+// draw {
+
+
+//@function Render Theil-Sen regression line and deviation bands as line objects.
+//@param beta_0 Regression intercept.
+//@param beta_1 Regression slope.
+//@param deviation Deviation band width.
+//@param length Regression window length.
+//@param offset Lookback offset from current bar.
+//@param extend Forward extrapolation distance in bars.
+//@param theil_sen_enable Toggle rendering of regression line.
+//@param theil_sen_width Line width for regression line.
+//@param theil_sen_color Line color for regression line.
+//@param deviation_enable Toggle rendering of deviation bands.
+//@param deviation_width Line width for deviation bands.
+//@param deviation_top_color Line color for upper deviation band.
+//@param deviation_bottom_color Line color for lower deviation band.
+//@returns Nothing. Draws lines on chart.
+draw_theil_sen(
+               float beta_0
+             , float beta_1
+             , float deviation
+             , int length
+             , int offset
+             , int extend
+             , bool theil_sen_enable
+             , int theil_sen_width
+             , color theil_sen_color
+             , bool deviation_enable
+             , int deviation_width
+             , color deviation_top_color
+             , color deviation_bottom_color
+             )=>
+
+    var line[] regression_line = array.new<line>()
+    while regression_line.size() > 0
+        regression_line.pop().delete()
+
+    if barstate.islast and (theil_sen_enable or deviation_enable)
+        int x_start = bar_index + extend
+        float y_start = beta_0 + beta_1 * -(offset + extend)
+
+        float y_end = beta_0 + beta_1 * (length - 1)
+        int x_end = math.max(0, bar_index - length + 1 - offset)
+
+        if theil_sen_enable
+            regression_line.push(line.new(x_start, y_start, x_end, y_end, xloc.bar_index, color = theil_sen_color, width = theil_sen_width))
+
+        if deviation_enable
+            regression_line.push(line.new(x_start, y_start + deviation, x_end, y_end + deviation, xloc.bar_index, color = deviation_top_color, width = deviation_width))
+            regression_line.push(line.new(x_start, y_start - deviation, x_end, y_end - deviation, xloc.bar_index, color = deviation_bottom_color, width = deviation_width))
+
+
+// draw }
+
+
+// HEAD }
+
+
+// BODY {
+
+
+// inputs {
+
+
+var const string main_group = "Main Settings"
+
+var const string source_tt = "Input time series for regression.\n"
+ + "Examples: close, hlc3, ohlc4, or any custom signal."
+
+var const string length_tt = "Regression window length.\n"
+ + "Number of historical bars used to compute the Theil-Sen fit.\n"
+ + "Larger values = smoother/more stable; smaller = more responsive to recent changes."
+
+var const string slope_style_tt = "Statistical method for slope estimation.\n\n"
+ + "• Mean - Arithmetic average of pairwise slopes; fast but sensitive to outliers.\n"
+ + "• Smooth Median - Kernel-weighted median; balances robustness with smoothness.\n"
+ + "• Median - Standard median; maximum robustness to outliers."
+
+var const string residual_style_tt = "Statistical method for intercept estimation.\n\n"
+ + "• Mean - Arithmetic average of residuals; fast but sensitive to outliers.\n"
+ + "• Smooth Median - Kernel-weighted median; balances robustness with smoothness.\n"
+ + "• Median - Standard median; maximum robustness to outliers."
+
+var const string offset_tt = "Lookback offset from current bar.\n"
+ + "Shifts the regression window backward by the specified number of bars.\n"
+ + "Useful for reducing lag or analyzing historical fits."
+
+float source = input.source(close, "Source", tooltip = source_tt, group = main_group)
+int length = input.int(25, "Length", minval = 2, tooltip = length_tt, group = main_group)
+var StatStyle slope_style = input.enum(StatStyle.smooth_median, "Slope Style", tooltip = slope_style_tt, group = main_group)
+var StatStyle residual_style = input.enum(StatStyle.smooth_median, "Residual Style", tooltip = residual_style_tt, group = main_group)
+int offset = input.int(0, "Offset", minval = 0, tooltip = offset_tt, group = main_group)
+
+
+var const string deviation_group = "Deviation Settings"
+
+var const string deviation_type_tt = "Method for calculating regression band width.\n\n"
+ + "• MAD (Median Absolute Deviation) - Robust to outliers; uses median of absolute residuals.\n"
+ + "• RMSD (Root Mean Square Deviation) - Standard RMS error; sensitive to large deviations."
+
+var const string deviation_residual_style_tt = "Statistical method for MAD calculation.\n\n"
+ + "• Mean - Arithmetic average of absolute errors.\n"
+ + "• Smooth Median - Kernel-weighted median of absolute errors.\n"
+ + "• Median - Standard median of absolute errors.\n\n"
+ + "Note: Only applies when Deviation Style is set to MAD."
+
+var const string multiplier_tt = "Scale factor applied to deviation bands.\n"
+ + "Standard deviation multiples: 1 ≈ 68%, 2 ≈ 95%, 3 ≈ 99.7% coverage.\n"
+ + "Larger values create wider bands."
+
+var const string include_offset_tt = "Include extrapolated prediction region in deviation calculation.\n\n"
+ + "• Enabled - Deviation includes forecast errors beyond the regression window.\n"
+ + "• Disabled - Deviation only computed over fitted window (more conservative)."
+
+var DeviationType deviation_type = input.enum(DeviationType.mad, "Deviation Style", tooltip = deviation_type_tt, group = deviation_group)
+var StatStyle deviation_residual_style = input.enum(StatStyle.smooth_median, "MAD Style", tooltip = deviation_residual_style_tt, group = deviation_group)
+float multiplier = input.float(2, "Multiplier", minval = 0, step = 0.125, tooltip = multiplier_tt, group = deviation_group)
+bool include_offset = input.bool(false, "Include Prediction in Deviation", tooltip = include_offset_tt, group = deviation_group)
+
+
+var const string plot_group = "Plot Style"
+var const string theil_plot_inline = "Theil Plot Inline"
+var const string deviation_plot_inline = "Deviation Plot Inline"
+
+var const string plot_theil_sen_tt = "Toggle display of the Theil-Sen regression line as a plot series.\n"
+ + "The plot follows the extrapolated prediction at the current bar.\n"
+ + "Colors dynamically based on trend direction and strength."
+
+var const string plot_deviation_tt = "Toggle display of deviation bands as plot series.\n"
+ + "Shows upper and lower confidence bounds around the regression line."
+
+var const string glow_tt = "Enable glow effect for plots.\n\n"
+ + "Adds layered semi-transparent plots and gradient fills for visual depth.\n"
+ + "Creates a softer, more visible appearance on dark or light backgrounds."
+
+bool plot_theil_sen = input.bool(true, "Theil-Sen Plot", inline = theil_plot_inline, group = plot_group)
+int plot_theil_sen_width = input.int(1, "", inline = theil_plot_inline, group = plot_group)
+color plot_theil_sen_color_down = input.color(#BE3149, "", inline = theil_plot_inline, group = plot_group)
+color plot_theil_sen_color_up = input.color(#529686, "", inline = theil_plot_inline, tooltip = plot_theil_sen_tt, group = plot_group)
+
+bool plot_deviation = input.bool(true, "Deviation Plot", inline = deviation_plot_inline, group = plot_group)
+int plot_deviation_width = input.int(1, "", inline = deviation_plot_inline, group = plot_group)
+color plot_deviation_top_color = input.color(#BE3149, "", inline = deviation_plot_inline, group = plot_group)
+color plot_deviation_bottom_color = input.color(#529686, "", inline = deviation_plot_inline, tooltip = plot_deviation_tt, group = plot_group)
+
+bool glow = input.bool(true, "Glow", tooltip = glow_tt, group = plot_group)
+
+
+var const string channel_group = "Channel Style"
+var const string theil_channel_inline = "Theil Channel Inline"
+var const string deviation_channel_inline = "Deviation Channel Inline"
+
+var const string extend_tt = "Forward extrapolation distance in bars.\n"
+ + "Projects the regression line and deviation bands into the future.\n"
+ + "Useful for visualizing trend continuation."
+
+var const string show_theil_sen_tt = "Toggle display of the Theil-Sen regression line as a line object.\n"
+ + "Line extends from the end of the regression window to the extrapolation point."
+
+var const string show_deviation_tt = "Toggle display of deviation bands as line objects.\n"
+ + "Lines extend parallel to the regression line at ±deviation distance."
+
+int extend = input.int(0, "Extrapolate", minval = 0, tooltip = extend_tt, group = channel_group)
+bool show_theil_sen = input.bool(true, "Theil-Sen Line", inline = theil_channel_inline, group = channel_group)
+int theil_sen_width = input.int(2, "", minval = 1, inline = theil_channel_inline, group = channel_group)
+color theil_sen_color = input.color(#ADADAD, "", inline = theil_channel_inline, tooltip = show_theil_sen_tt, group = channel_group)
+
+bool show_deviation = input.bool(true, "Deviation Line", inline = deviation_channel_inline, group = channel_group)
+int deviation_width = input.int(2, "", inline = deviation_channel_inline, group = channel_group)
+color deviation_top_color = input.color(#D35368, "", inline = deviation_channel_inline, group = channel_group)
+color deviation_bottom_color = input.color(#80B9AC, "", inline = deviation_channel_inline, tooltip = show_deviation_tt, group = channel_group)
+
+
+// inputs }
+
+
+// calc {
+
+
+[beta_0, beta_1, predicted] = theil_sen(source, length, offset, slope_style, residual_style)
+float deviation = deviation(source, beta_0, beta_1, length, deviation_residual_style, multiplier, offset, include_offset, deviation_type)
+
+float theil_sen_out = plot_theil_sen ? predicted : na
+float deviation_top_out = plot_deviation ? predicted + deviation : na
+float deviation_bottom_out = plot_deviation ? predicted - deviation : na
+
+float ctr = ta.cum(high - low) / (bar_index + 1)
+float small_ctr = ctr * 0.25
+
+float glow_dev_top = deviation_top_out + ctr
+float glow_dev_bot = deviation_bottom_out - ctr
+
+float glow_theil_sen_top = theil_sen_out + small_ctr
+float glow_theil_sen_bot = theil_sen_out - small_ctr
+
+color center_color = trend_color(theil_sen_out, length + offset, plot_theil_sen_color_up, plot_theil_sen_color_down)
+
+
+// calc }
+
+
+// plot {
+
+
+draw_theil_sen(beta_0, beta_1, deviation, length, offset, extend, show_theil_sen, theil_sen_width, theil_sen_color, show_deviation, deviation_width, deviation_top_color, deviation_bottom_color)
+
+ts = plot(theil_sen_out, "Theil-Sen", center_color, plot_theil_sen_width)
+
+top = plot(deviation_top_out, "Deviation Top", plot_deviation_top_color, plot_deviation_width)
+bot = plot(deviation_bottom_out, "Deviation Bottom", plot_deviation_bottom_color, plot_deviation_width)
+
+glow_display = glow ? display.pane : display.none
+glow_fill_display = glow ? display.all : display.none
+
+plot(theil_sen_out, "Theil-Sen", center_color.scale_alpha(60), math.ceil(plot_theil_sen_width * 2.5), editable = false, display = glow_display)
+plot(theil_sen_out, "Theil-Sen", center_color.scale_alpha(90), math.ceil(plot_theil_sen_width * 3.5), editable = false, display = glow_display)
+
+plot(deviation_top_out, "Deviation Top", plot_deviation_top_color.scale_alpha(60), math.ceil(plot_deviation_width * 2.5), editable = false, display = glow_display)
+plot(deviation_top_out, "Deviation Top", plot_deviation_top_color.scale_alpha(90), math.ceil(plot_deviation_width * 3.5), editable = false, display = glow_display)
+
+plot(deviation_bottom_out, "Deviation Bottom", plot_deviation_bottom_color.scale_alpha(60), math.ceil(plot_deviation_width * 2.5), editable = false, display = glow_display)
+plot(deviation_bottom_out, "Deviation Bottom", plot_deviation_bottom_color.scale_alpha(90), math.ceil(plot_deviation_width * 3.5), editable = false, display = glow_display)
+
+top_ts_glow = plot(glow_theil_sen_top, "Theil-Sen Glow", center_color.scale_alpha(100), plot_deviation_width, editable = false, display = glow_display)
+bottom_ts_glow = plot(glow_theil_sen_bot, "Theil-Sen Glow", center_color.scale_alpha(100), plot_deviation_width, editable = false, display = glow_display)
+
+top_glow = plot(glow_dev_top, "Deviation Top Glow", plot_deviation_top_color.scale_alpha(100), plot_deviation_width, editable = false, display = glow_display)
+bottom_glow = plot(glow_dev_bot, "Deviation Bottom Glow", plot_deviation_bottom_color.scale_alpha(100), plot_deviation_width, editable = false, display = glow_display)
+
+fill(ts, top_ts_glow, math.min(glow_theil_sen_top, deviation_top_out), theil_sen_out, color.new(center_color, 100), center_color.scale_alpha(95), "Theil-Sen Glow", glow_fill_display, true, false)
+fill(ts, bottom_ts_glow, theil_sen_out, math.max(glow_theil_sen_bot, deviation_bottom_out), center_color.scale_alpha(95), color.new(center_color, 100), "Theil-Sen Glow", glow_fill_display, true, false)
+
+fill(top, top_glow, glow_dev_top, theil_sen_out, color.new(plot_deviation_top_color, 100), plot_deviation_top_color.scale_alpha(91), "Deviation Top Glow", glow_fill_display, true, false)
+fill(bot, bottom_glow, theil_sen_out, glow_dev_bot, plot_deviation_bottom_color.scale_alpha(91), color.new(plot_deviation_bottom_color, 100), "Deviation Bottom Glow", glow_fill_display, true, false)
+
+
+// plot }
+
+
+// BODY }

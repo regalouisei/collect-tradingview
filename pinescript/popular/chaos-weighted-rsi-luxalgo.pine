@@ -1,0 +1,156 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Chaos Weighted RSI [LuxAlgo]", "LuxAlgo - Chaos Weighted RSI", precision = 2)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR    = #089981
+color BEAR_COLOR    = #f23645
+color NEUTRAL_COLOR = #787b86
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int rsiLengthInput      = input.int(14, "RSI Length", minval = 1, group = "RSI Settings")
+int disorderLengthInput = input.int(20, "Disorder Lookback", minval = 2, group = "Disorder Settings", tooltip = "Lookback period to calculate price chaos via Fractal Dimension Index.")
+float sensitivityInput  = input.float(1.0, "Weight Sensitivity", minval = 0.1, maxval = 5.0, step = 0.1, group = "Disorder Settings", tooltip = "Adjusts how much the chaos affects the RSI smoothing.")
+
+// Visuals
+color overboughtColor   = input.color(color.new(BEAR_COLOR, 50), "Overbought Fill", group = "Visuals")
+color oversoldColor     = input.color(color.new(BULL_COLOR, 50), "Oversold Fill", group = "Visuals")
+int transparencyInput   = input.int(90, "Background Transparency", minval = 0, maxval = 100, group = "Visuals")
+
+// Divergence Settings
+int divStrengthInput    = input.int(20, "Divergence Strength", minval = 1, group = "Divergence Settings", tooltip = "Number of bars to the left and right of a pivot to confirm it. Set to 20 for rare, highly significant signals.")
+bool showBullDivInput   = input.bool(true, "Show Bullish Divergence", group = "Divergence Settings")
+bool showBearDivInput   = input.bool(true, "Show Bearish Divergence", group = "Divergence Settings")
+bool showDivLinesInput  = input.bool(true, "Show Divergence Lines", group = "Divergence Settings")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions / Methods
+//---------------------------------------------------------------------------------------------------------------------{
+// @function Calculates a measure of price chaos based on Fractal Dimension (Sevcik method)
+get_chaos(float src, int length) =>
+    float max_val = ta.highest(src, length)
+    float min_val = ta.lowest(src, length)
+    float priceRange = max_val - min_val
+    
+    float L = 0.0
+    for i = 0 to length - 2
+        float y1 = priceRange > 0 ? (src[i+1] - min_val) / priceRange : 0.5
+        float y2 = priceRange > 0 ? (src[i] - min_val) / priceRange : 0.5
+        L += math.sqrt(math.pow(y1 - y2, 2) + math.pow(1.0 / (length - 1), 2))
+    
+    float fdi = 1.0 + math.log(L) / math.log(2.0 * (length - 1))
+    math.max(0.0, math.min(1.0, (fdi - 1.0) / 0.5))
+
+// @function Adaptive EMA that uses a variable weight
+adaptive_ema(float src, float alpha) =>
+    var float val = na
+    val := na(val) ? src : val + alpha * (src - val)
+    val
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Calculate Chaos
+float chaos = get_chaos(close, disorderLengthInput)
+
+// Modulate RSI Alpha
+float baseAlpha = 1.0 / rsiLengthInput
+float adjustedAlpha = baseAlpha * math.pow(1.0 - chaos, sensitivityInput)
+adjustedAlpha := math.max(0.001, math.min(1.0, adjustedAlpha))
+
+// RSI Components
+float change = ta.change(close)
+float gain   = math.max(change, 0)
+float loss   = math.max(-change, 0)
+
+// Weighted Smoothing using Adaptive EMA
+float avgGain = adaptive_ema(gain, adjustedAlpha)
+float avgLoss = adaptive_ema(loss, adjustedAlpha)
+
+// Calculate Weighted RSI (WRSI)
+float rs   = avgLoss == 0 ? 0 : avgGain / avgLoss
+float wrsi = avgLoss == 0 ? 100 : 100 - (100 / (1 + rs))
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Divergence Detection
+//---------------------------------------------------------------------------------------------------------------------{
+float pHi = ta.pivothigh(wrsi, divStrengthInput, divStrengthInput)
+float pLo = ta.pivotlow(wrsi, divStrengthInput, divStrengthInput)
+
+// Tracking regular bullish divergence
+var float lastWRSIpLo = na
+var int lastBarpLo = na
+var float lastPricepLo = na
+bool bullDiv = false
+
+if not na(pLo)
+    if not na(lastWRSIpLo) and wrsi[divStrengthInput] > lastWRSIpLo and low[divStrengthInput] < lastPricepLo
+        bullDiv := true
+        if showDivLinesInput
+            line.new(lastBarpLo, lastWRSIpLo, bar_index[divStrengthInput], wrsi[divStrengthInput], color = BULL_COLOR, width = 1, style = line.style_dotted)
+    lastWRSIpLo  := wrsi[divStrengthInput]
+    lastPricepLo := low[divStrengthInput]
+    lastBarpLo   := bar_index[divStrengthInput]
+
+// Tracking regular bearish divergence
+var float lastWRSIpHi = na
+var int lastBarpHi = na
+var float lastPricepHi = na
+bool bearDiv = false
+
+if not na(pHi)
+    if not na(lastWRSIpHi) and wrsi[divStrengthInput] < lastWRSIpHi and high[divStrengthInput] > lastPricepHi
+        bearDiv := true
+        if showDivLinesInput
+            line.new(lastBarpHi, lastWRSIpHi, bar_index[divStrengthInput], wrsi[divStrengthInput], color = BEAR_COLOR, width = 1, style = line.style_dotted)
+    lastWRSIpHi  := wrsi[divStrengthInput]
+    lastPricepHi := high[divStrengthInput]
+    lastBarpHi   := bar_index[divStrengthInput]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+// Reference Levels
+h_ob  = hline(70, "OB Line", color = NEUTRAL_COLOR, linestyle = hline.style_dashed)
+h_os  = hline(30, "OS Line", color = NEUTRAL_COLOR, linestyle = hline.style_dashed)
+h_mid = hline(50, "Mid Line", color = NEUTRAL_COLOR, linestyle = hline.style_dotted)
+
+fill(h_ob, h_os, color.new(NEUTRAL_COLOR, transparencyInput), "Background Fill")
+
+p_ob  = plot(70, "OB Level Plot", color = na, display = display.none)
+p_os  = plot(30, "OS Level Plot", color = na, display = display.none)
+p_mid = plot(50, "Mid Level Plot", color = na, display = display.none)
+
+// RSI Plot with Binary Coloring (Green > 50, Red < 50)
+color wrsiColor = wrsi > 50 ? BULL_COLOR : BEAR_COLOR
+wrsiPlot = plot(wrsi, "Chaos Weighted RSI", color = wrsiColor, linewidth = 1)
+
+// Gradient Fills for Overbought/Oversold zones
+fill(wrsiPlot, p_ob, 100, 70, color.new(BEAR_COLOR, 50), color.new(BEAR_COLOR, 100), "Overbought Gradient")
+fill(wrsiPlot, p_os, 30, 0, color.new(BULL_COLOR, 100), color.new(BULL_COLOR, 50), "Oversold Gradient")
+
+// Center Fill (Vertical transparency gradient aligned with direction)
+isBull = wrsi > 50
+fillColor = isBull ? BULL_COLOR : BEAR_COLOR
+
+fill(wrsiPlot, p_mid, 
+     top_color    = isBull ? color.new(fillColor, 50) : color.new(fillColor, 100), 
+     bottom_color = isBull ? color.new(fillColor, 100) : color.new(fillColor, 50), 
+     top_value    = math.max(wrsi, 50), 
+     bottom_value = math.min(wrsi, 50), 
+     title        = "Center Gradient Fill")
+
+// Dot Markers (Minimalist text-based points)
+if bullDiv and showBullDivInput
+    label.new(bar_index[divStrengthInput], wrsi[divStrengthInput], "•", yloc = yloc.price, color = #00000000, textcolor = BULL_COLOR, style = label.style_label_center, size = size.normal)
+
+if bearDiv and showBearDivInput
+    label.new(bar_index[divStrengthInput], wrsi[divStrengthInput], "•", yloc = yloc.price, color = #00000000, textcolor = BEAR_COLOR, style = label.style_label_center, size = size.normal)
+
+//---------------------------------------------------------------------------------------------------------------------}

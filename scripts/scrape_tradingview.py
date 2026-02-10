@@ -215,7 +215,7 @@ def main():
     categories = [args.category] if args.category else list(CATEGORY_URLS.keys())
     state = load_state()
 
-    print("OpenClaw TradingView Scraper")
+    print("DeepStack TradingView Scraper")
     print("=" * 60)
 
     with sync_playwright() as p:

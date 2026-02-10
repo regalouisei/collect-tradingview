@@ -1,4 +1,4 @@
-"""OpenClaw TradingView — Autonomous backtesting pipeline for TradingView community indicators."""
+"""DeepStack TradingView — Autonomous backtesting pipeline for TradingView community indicators."""
 
 from .data_fetcher import fetch_ohlcv, TICKERS
 from .backtest_engine import run_backtest, run_multi_ticker_backtest

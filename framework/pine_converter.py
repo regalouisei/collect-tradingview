@@ -53,6 +53,10 @@ IMPORTANT RULES:
 - DO NOT use self.position.close() — use self.sell() to exit longs, self.buy() to exit shorts
 - Keep it simple — no optimization parameters, just the raw indicator logic
 - If the indicator requires Volume data, access via self.data.Volume
+- Never use `len(self)`. Always use `len(self.data)` or `len(self.data.Close)` to get the number of bars.
+- pandas_ta does NOT have `highest()` or `lowest()` functions. Instead use: `df['High'].rolling(n).max()` for highest high, and `df['Low'].rolling(n).min()` for lowest low. Wrap these in self.I() lambda calls.
+- Always check if indicator calculation returns None before using it. Some pandas_ta functions return None for insufficient data. Use `if result is not None:` guards, and for self.I() wrappers, provide a fallback: `self.I(lambda: pta.rsi(close, length=14) or pd.Series(50, index=close.index))`
+- Do NOT use pta.supertrend() as it may not exist in all versions. Instead implement supertrend manually using ATR. Also avoid pta.ichimoku() — use manual calculation with rolling means.
 
 TEMPLATE:
 ```python
@@ -89,12 +93,14 @@ PINE SCRIPT:
 def convert_pine_to_python(
     pine_code: str,
     script_name: str = "unknown",
+    previous_error: str | None = None,
 ) -> str:
     """Convert Pine Script to a Python backtesting.py Strategy file.
 
     Args:
         pine_code: Raw Pine Script source code
         script_name: Name of the TradingView script (for the docstring)
+        previous_error: If retrying, the error from the previous attempt
 
     Returns:
         Complete Python source code string
@@ -104,6 +110,10 @@ def convert_pine_to_python(
             "ANTHROPIC_API_KEY not set. Export it or add to .env"
         )
 
+    prompt_content = CONVERSION_PROMPT.replace("{pine_code}", pine_code)
+    if previous_error:
+        prompt_content += f"\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: {previous_error}\nPlease fix the issue and try again."
+
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     response = client.messages.create(
@@ -112,7 +122,7 @@ def convert_pine_to_python(
         messages=[
             {
                 "role": "user",
-                "content": CONVERSION_PROMPT.replace("{pine_code}", pine_code),
+                "content": prompt_content,
             }
         ],
     )

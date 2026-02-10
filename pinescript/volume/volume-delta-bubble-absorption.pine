@@ -1,0 +1,241 @@
+//@version=5
+indicator("Volume Delta Bubble + Absorption", shorttitle="Delta Bubble", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================================
+// USER INPUTS
+// ============================================================================
+
+// Master Switch
+showIndicator = input.bool(true, "Show Indicator", group="🎯 Master Settings")
+
+// Data Settings
+calculationSource = input.string("Volume Delta", "Calculation Source", 
+     options=["Volume Delta", "Candle Delta"], group="📊 Data Settings")
+lowerTF = input.timeframe("1", "Lower Timeframe", group="📊 Data Settings")
+lookbackPeriod = input.int(60, "Lookback Period", minval=10, maxval=200, group="📊 Data Settings")
+
+// Detection Settings
+calcMode = input.string("Adaptive", "Detection Mode", 
+     options=["Adaptive", "Fixed"], group="⚙️ Detection Logic")
+zScoreThreshold = input.float(2.0, "Z-Score Threshold", minval=1.0, maxval=5.0, step=0.1, group="⚙️ Detection Logic")
+minVolumeFixed = input.int(200, "Minimum Volume (Fixed)", minval=50, group="⚙️ Detection Logic")
+
+// Absorption Detection
+detectAbsorption = input.bool(true, "Detect Absorption", group="🔄 Absorption Logic")
+absorptionRatio = input.float(0.6, "Body Size Ratio", minval=0.1, maxval=1.0, step=0.05, 
+     tooltip="Candle body must be less than this percentage of average body", group="🔄 Absorption Logic")
+
+// Visual Settings
+showBullish = input.bool(true, "Show Bullish Signals", group="🎨 Visual Settings")
+showBearish = input.bool(true, "Show Bearish Signals", group="🎨 Visual Settings")
+showAbsLabel = input.bool(true, "Show Absorption Labels", group="🎨 Visual Settings")
+useCircleStyle = input.bool(true, "Use Circle Style", group="🎨 Visual Settings")
+bubbleOpacity = input.int(70, "Bubble Opacity %", minval=0, maxval=100, group="🎨 Visual Settings")
+useSmartPlacement = input.bool(true, "Smart Placement", 
+     tooltip="Automatically adjust label positions to avoid overlap", group="🎨 Visual Settings")
+
+// Color Settings
+bullColor = input.color(color.new(#00E676, 0), "Bullish Color", group="🎨 Color Settings")
+bearColor = input.color(color.new(#FF5252, 0), "Bearish Color", group="🎨 Color Settings")
+absBullColor = input.color(color.new(#4CAF50, 0), "Bullish Absorption", group="🎨 Color Settings")
+absBearColor = input.color(color.new(#F44336, 0), "Bearish Absorption", group="🎨 Color Settings")
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// Get lower timeframe data
+[lo, lh, ll, lc] = request.security(syminfo.tickerid, lowerTF, [open, high, low, close])
+currentVol = volume
+
+// Calculate Volume Delta
+volumeDelta = calculationSource == "Volume Delta" ? 
+     (lc > lo ? currentVol : lc < lo ? -currentVol : currentVol * 0.5 * (lc == lo ? 1 : -1)) : 
+     (close > open ? currentVol : close < open ? -currentVol : currentVol * 0.5 * (close == open ? 1 : -1))
+
+// Statistics
+absDelta = math.abs(volumeDelta)
+deltaMean = ta.ema(absDelta, lookbackPeriod)
+deltaStd = ta.stdev(absDelta, lookbackPeriod)
+zScore = deltaStd > 0 ? (absDelta - deltaMean) / deltaStd : 0
+
+// Track absorption streaks
+var int absorptionStreak = 0
+var string absorptionTrend = ""
+
+// Unusual Volume Detection
+isUnusual = calcMode == "Adaptive" ? math.abs(zScore) >= zScoreThreshold : absDelta >= minVolumeFixed
+
+// Absorption Detection
+candleBody = math.abs(close - open)
+avgBody = ta.sma(candleBody, 20)
+isSmallBody = candleBody < avgBody * absorptionRatio
+isHighVolume = absDelta > deltaMean * 1.5
+
+// Determine absorption direction
+isBullishAbsorption = false
+isBearishAbsorption = false
+
+if detectAbsorption and isUnusual and isSmallBody and isHighVolume
+    // Smart absorption direction detection
+    if volumeDelta > 0 and close < high[1]  // Bullish volume but price rejected
+        isBearishAbsorption := true
+        absorptionStreak := math.max(1, absorptionStreak + 1)
+        absorptionTrend := "BEARISH"
+    else if volumeDelta < 0 and close > low[1]  // Bearish volume but price supported
+        isBullishAbsorption := true
+        absorptionStreak := math.max(1, absorptionStreak + 1)
+        absorptionTrend := "BULLISH"
+    else
+        // Fallback logic
+        isBullishAbsorption := volumeDelta > 0
+        isBearishAbsorption := volumeDelta < 0
+        absorptionStreak := 0
+        absorptionTrend := ""
+else
+    absorptionStreak := 0
+    absorptionTrend := ""
+
+isAbsorption = isBullishAbsorption or isBearishAbsorption
+
+// Regular direction signals (non-absorption)
+isBullish = volumeDelta > 0 and not isAbsorption
+isBearish = volumeDelta < 0 and not isAbsorption
+
+// Calculate percentage above average
+deltaPercent = deltaMean > 0 ? (absDelta / deltaMean - 1) * 100 : 0
+
+// ============================================================================
+// VISUAL ELEMENTS
+// ============================================================================
+
+// Colors with opacity
+DbullColor = color.new(bullColor, 100 - bubbleOpacity)
+DbearColor = color.new(bearColor, 100 - bubbleOpacity)
+DbullAbsColor = color.new(absBullColor, 100 - bubbleOpacity)
+DbearAbsColor = color.new(absBearColor, 100 - bubbleOpacity)
+
+// Text Labels
+volumeText = str.tostring(math.abs(volumeDelta) / 1000000, "#.##") + "M"
+zScoreText = "Z:" + str.tostring(zScore, "#.##")
+deltaPercentText = str.tostring(deltaPercent, "+#.##") + "%"
+streakText = absorptionStreak > 1 ? "(" + str.tostring(absorptionStreak) + ")" : ""
+
+// Main bubble text
+mainLabelText = volumeText + "\n" + zScoreText
+
+// Absorption label text
+absDirection = isBullishAbsorption ? "B-ABS" : "S-ABS"
+absLabelText = absDirection + streakText
+
+// Tooltip text
+tooltipText = "📊 Volume Delta: " + str.tostring(volumeDelta / 1000000, "#.##") + "M" + 
+     "\n📈 Z-Score: " + str.tostring(zScore, "#.##") + 
+     "\n📊 Volume %: " + str.tostring(deltaPercent, "+#.##") + "%" + 
+     "\n🎯 Direction: " + (isBullish ? "Bullish" : isBearish ? "Bearish" : "Neutral") + 
+     (isAbsorption ? "\n🔄 Type: Absorption" : "") + 
+     (isBullishAbsorption ? "\n✅ Absorption: Bullish (buyers absorbing)" : "") + 
+     (isBearishAbsorption ? "\n❌ Absorption: Bearish (sellers absorbing)" : "") + 
+     (absorptionStreak > 1 ? "\n🔢 Streak: " + str.tostring(absorptionStreak) + " bars" : "") + 
+     "\n📏 Body Size: " + str.tostring(candleBody/avgBody*100, "#.##") + "% of avg"
+
+// ============================================================================
+// RENDER LABELS
+// ============================================================================
+
+if showIndicator and isUnusual and barstate.isconfirmed
+    shouldShow = (isBullish and showBullish) or (isBearish and showBearish) or isAbsorption
+    
+    if shouldShow
+        // Calculate Y position
+        float yPos = na
+        if useSmartPlacement
+            candleRange = high - low
+            if isBullish or isBullishAbsorption
+                yPos := low - candleRange * 0.3
+            else if isBearish or isBearishAbsorption
+                yPos := high + candleRange * 0.3
+        else
+            yPos := isBullish or isBullishAbsorption ? low - ta.tr * 0.5 : high + ta.tr * 0.5
+        
+        // Determine bubble color
+        color bubbleColor = na
+        if isAbsorption
+            bubbleColor := isBullishAbsorption ? DbullAbsColor : DbearAbsColor
+        else
+            bubbleColor := isBullish ? DbullColor : DbearColor
+        
+        // Create main bubble
+        label.new(bar_index, yPos, mainLabelText, color=bubbleColor, textcolor=color.white, 
+             style=useCircleStyle ? label.style_circle : label.style_label_center, 
+             size=size.normal, textalign=text.align_center, yloc=yloc.price, tooltip=tooltipText)
+        
+        // Create absorption label if needed
+        if isAbsorption and showAbsLabel
+            float absYOffset = na
+            if useSmartPlacement
+                absYOffset := isBullishAbsorption ? ta.tr * 0.4 : -ta.tr * 0.4
+            else
+                absYOffset := isBullishAbsorption ? ta.tr * 0.2 : -ta.tr * 0.2
+            
+            float absYPos = yPos + absYOffset
+            
+            label.new(bar_index, absYPos, absLabelText, color=color.new(bubbleColor, 30), 
+                 textcolor=color.white, style=label.style_label_center, size=size.small, 
+                 textalign=text.align_center, yloc=yloc.price, tooltip=tooltipText)
+
+// ============================================================================
+// BACKGROUND & SHAPES
+// ============================================================================
+
+// Background for absorption bars
+bgcolor(showIndicator and isAbsorption ? 
+     (isBullishAbsorption ? color.new(absBullColor, 85) : color.new(absBearColor, 85)) : na, 
+     title="Absorption Background")
+
+// Absorption markers
+plotshape(showIndicator and isBullishAbsorption and barstate.isconfirmed, 
+     style=shape.triangleup, location=location.belowbar, color=absBullColor, 
+     size=size.tiny, title="Bullish Absorption")
+
+plotshape(showIndicator and isBearishAbsorption and barstate.isconfirmed, 
+     style=shape.triangledown, location=location.abovebar, color=absBearColor, 
+     size=size.tiny, title="Bearish Absorption")
+
+// ============================================================================
+// INFO TABLE
+// ============================================================================
+
+var table infoTable = table.new(position.top_right, 2, 4, 
+     bgcolor=color.new(color.gray, 90), border_width=1, 
+     frame_color=color.gray, frame_width=1)
+
+if barstate.islast and showIndicator
+    // Header row - create two cells merged by content
+    table.cell(infoTable, 0, 0, "Delta Bubble", text_color=color.white, text_size=size.normal)
+    table.cell(infoTable, 1, 0, "", text_color=color.white, text_size=size.normal)
+    
+    // Absorption Trend
+    table.cell(infoTable, 0, 1, "Absorption Trend:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, absorptionTrend != "" ? absorptionTrend : "None", text_color=absorptionTrend == "BULLISH" ? absBullColor : absorptionTrend == "BEARISH" ? absBearColor : color.gray, text_size=size.small)
+    
+    // Z-Score
+    table.cell(infoTable, 0, 2, "Current Z-Score:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(zScore, "#.##"), 
+         text_color=math.abs(zScore) >= zScoreThreshold ? color.yellow : color.white, text_size=size.small)
+    
+    // Average Volume
+    table.cell(infoTable, 0, 3, "Avg Volume:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(deltaMean / 1000000, "#.##") + "M",  text_color=color.white, text_size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Alert conditions
+alertcondition(showIndicator and isUnusual and barstate.isconfirmed, 
+     title="Unusual Volume Delta", message="{{ticker}} - Unusual Volume Delta detected!")
+
+alertcondition(showIndicator and isAbsorption and barstate.isconfirmed, 
+     title="Absorption Detected", 
+     message="{{ticker}} - {{plot_0}} Absorption detected at {{close}}!")

@@ -1,0 +1,326 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © YourTradingName
+
+//@version=6
+strategy("1-Min Gold Taylor Technique", 
+         overlay=true, 
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100,
+         commission_type=strategy.commission.percent,
+         commission_value=0.02,
+         slippage=2,
+         pyramiding=0)
+
+// ═══════════════════════════════════════════════════════════
+// 📊 INPUTS
+// ═══════════════════════════════════════════════════════════
+
+// Risk Management
+riskRewardRatio = input.float(3.0, "Risk:Reward Ratio", minval=1.0, maxval=10.0, step=0.5, group="Risk Management")
+stopLossPoints = input.float(6.0, "Stop Loss (Points)", minval=1.0, maxval=20.0, step=0.5, group="Risk Management")
+useTrailingStop = input.bool(false, "Use Trailing Stop", group="Risk Management")
+
+// Session Times (GMT)
+asianStart = input.int(0, "Asian Session Start (GMT)", minval=0, maxval=23, group="Session Times")
+asianEnd = input.int(5, "Asian Session End (GMT)", minval=0, maxval=23, group="Session Times")
+londonStart = input.int(6, "London Start (GMT)", minval=0, maxval=23, group="Session Times")
+nyStart = input.int(13, "NY Continuation (GMT)", minval=0, maxval=23, group="Session Times")
+nyEnd = input.int(17, "Trading Day End (GMT)", minval=0, maxval=23, group="Session Times")
+
+// Indicator Settings
+atrLength = input.int(14, "ATR Length", minval=1, group="Indicators")
+atrMultiplier = input.float(2.0, "ATR Multiplier (SuperTrend)", minval=0.5, maxval=5.0, step=0.5, group="Indicators")
+emaLength = input.int(20, "EMA Length", minval=1, group="Indicators")
+sweepBufferPoints = input.float(2.0, "Sweep Buffer (Points)", minval=0.5, maxval=10.0, step=0.5, group="Indicators")
+
+// Visual Settings
+showAsianBox = input.bool(true, "Show Asian Range Box", group="Visuals")
+showVWAP = input.bool(true, "Show VWAP", group="Visuals")
+showEMA = input.bool(true, "Show 20 EMA", group="Visuals")
+showPrevDayLevels = input.bool(true, "Show Previous Day High/Low", group="Visuals")
+
+// ═══════════════════════════════════════════════════════════
+// 🕒 SESSION DETECTION
+// ═══════════════════════════════════════════════════════════
+
+currentHour = hour(time, "GMT")
+currentMinute = minute(time, "GMT")
+
+// Session checks
+isAsianSession = currentHour >= asianStart and currentHour < asianEnd
+isLondonSession = currentHour >= londonStart and currentHour < nyStart
+isNYSession = currentHour >= nyStart and currentHour < nyEnd
+isTradingHours = isLondonSession or isNYSession
+
+// ═══════════════════════════════════════════════════════════
+// 📦 ASIAN RANGE CALCULATION
+// ═══════════════════════════════════════════════════════════
+
+var float asianHigh = na
+var float asianLow = na
+var float asianMid = na
+
+// Detect day change (must be called on every bar and converted to bool)
+newDay = ta.change(time("D")) != 0
+
+// Reset and track Asian range
+if isAsianSession
+    if na(asianHigh) or newDay
+        asianHigh := high
+        asianLow := low
+    else
+        asianHigh := math.max(asianHigh, high)
+        asianLow := math.min(asianLow, low)
+    asianMid := (asianHigh + asianLow) / 2
+
+// Carry forward Asian range throughout the day
+if not isAsianSession and na(asianHigh[1]) == false
+    asianHigh := asianHigh[1]
+    asianLow := asianLow[1]
+    asianMid := asianMid[1]
+
+// ═══════════════════════════════════════════════════════════
+// 📈 PREVIOUS DAY HIGH/LOW
+// ═══════════════════════════════════════════════════════════
+
+var float prevDayHigh = na
+var float prevDayLow = na
+
+if newDay
+    prevDayHigh := high[1]
+    prevDayLow := low[1]
+else if not na(prevDayHigh)
+    prevDayHigh := prevDayHigh[1]
+    prevDayLow := prevDayLow[1]
+
+// ═══════════════════════════════════════════════════════════
+// 📊 INDICATORS
+// ═══════════════════════════════════════════════════════════
+
+// VWAP (Session-based, resets daily)
+vwapValue = ta.vwap(close)
+
+// 20 EMA
+ema20 = ta.ema(close, emaLength)
+
+// SuperTrend for dot signals
+atr = ta.atr(atrLength)
+upperBand = hl2 + (atrMultiplier * atr)
+lowerBand = hl2 - (atrMultiplier * atr)
+
+var float supertrend = na
+var int direction = 1
+
+prevSupertrend = supertrend[1]
+prevDirection = direction[1]
+
+if na(supertrend[1])
+    supertrend := lowerBand
+    direction := 1
+else
+    if prevDirection == 1
+        supertrend := close < prevSupertrend ? upperBand : math.max(lowerBand, prevSupertrend)
+    else
+        supertrend := close > prevSupertrend ? lowerBand : math.min(upperBand, prevSupertrend)
+    
+    direction := close > supertrend ? 1 : -1
+
+supertrendBullish = direction == 1
+supertrendBearish = direction == -1
+supertrendFlipBullish = supertrendBullish and not supertrendBullish[1]
+supertrendFlipBearish = supertrendBearish and not supertrendBearish[1]
+
+// ═══════════════════════════════════════════════════════════
+// 🎯 LIQUIDITY SWEEP DETECTION
+// ═══════════════════════════════════════════════════════════
+
+sweepBuffer = sweepBufferPoints * syminfo.mintick
+
+// Sweep detection
+asianLowSwept = not na(asianLow) and low <= (asianLow - sweepBuffer) and close > asianLow
+asianHighSwept = not na(asianHigh) and high >= (asianHigh + sweepBuffer) and close < asianHigh
+
+prevDayLowSwept = not na(prevDayLow) and low <= (prevDayLow - sweepBuffer) and close > prevDayLow
+prevDayHighSwept = not na(prevDayHigh) and high >= (prevDayHigh + sweepBuffer) and close < prevDayHigh
+
+// Combined sweep conditions
+bullishSweep = (asianLowSwept or prevDayLowSwept) and isTradingHours
+bearishSweep = (asianHighSwept or prevDayHighSwept) and isTradingHours
+
+// ═══════════════════════════════════════════════════════════
+// 📍 ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════
+
+// LONG Setup (Taylor Reversal → Distribution)
+longCondition1_Sweep = bullishSweep
+longCondition2_Reversal = low < low[1] and close > low[1]  // Rejection wick
+longCondition3_SuperTrend = supertrendFlipBullish or (supertrendBullish and supertrendBullish[1])
+longCondition4_VWAPReclaim = close > vwapValue or close > ema20
+
+longEntry = longCondition1_Sweep and longCondition2_Reversal and longCondition3_SuperTrend and longCondition4_VWAPReclaim and isTradingHours
+
+// SHORT Setup (Mirror Logic)
+shortCondition1_Sweep = bearishSweep
+shortCondition2_Reversal = high > high[1] and close < high[1]  // Rejection wick
+shortCondition3_SuperTrend = supertrendFlipBearish or (supertrendBearish and supertrendBearish[1])
+shortCondition4_VWAPReject = close < vwapValue or close < ema20
+
+shortEntry = shortCondition1_Sweep and shortCondition2_Reversal and shortCondition3_SuperTrend and shortCondition4_VWAPReject and isTradingHours
+
+// ═══════════════════════════════════════════════════════════
+// 💰 POSITION MANAGEMENT
+// ═══════════════════════════════════════════════════════════
+
+var float longStopLoss = na
+var float longTP1 = na
+var float longTP2 = na
+var float longTP3 = na
+
+var float shortStopLoss = na
+var float shortTP1 = na
+var float shortTP2 = na
+var float shortTP3 = na
+
+// Calculate position sizes and levels for LONG
+if longEntry and strategy.position_size == 0
+    longStopLoss := low - (stopLossPoints * syminfo.mintick)
+    riskDistance = close - longStopLoss
+    
+    // Targets
+    longTP1 := close + (riskDistance * riskRewardRatio * 0.33)  // VWAP
+    longTP2 := close + (riskDistance * riskRewardRatio * 0.66)  // Asian Mid
+    longTP3 := close + (riskDistance * riskRewardRatio)         // Asian High/PDH
+    
+    strategy.entry("LONG", strategy.long)
+    strategy.exit("TP1", from_entry="LONG", limit=longTP1, stop=longStopLoss, qty_percent=33)
+    strategy.exit("TP2", from_entry="LONG", limit=longTP2, stop=longStopLoss, qty_percent=33)
+    strategy.exit("TP3", from_entry="LONG", limit=longTP3, stop=longStopLoss, qty_percent=34)
+
+// Calculate position sizes and levels for SHORT
+if shortEntry and strategy.position_size == 0
+    shortStopLoss := high + (stopLossPoints * syminfo.mintick)
+    riskDistance = shortStopLoss - close
+    
+    // Targets
+    shortTP1 := close - (riskDistance * riskRewardRatio * 0.33)
+    shortTP2 := close - (riskDistance * riskRewardRatio * 0.66)
+    shortTP3 := close - (riskDistance * riskRewardRatio)
+    
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit("TP1", from_entry="SHORT", limit=shortTP1, stop=shortStopLoss, qty_percent=33)
+    strategy.exit("TP2", from_entry="SHORT", limit=shortTP2, stop=shortStopLoss, qty_percent=33)
+    strategy.exit("TP3", from_entry="SHORT", limit=shortTP3, stop=shortStopLoss, qty_percent=34)
+
+// Close all positions at end of trading day
+if currentHour >= nyEnd and strategy.position_size != 0
+    strategy.close_all("EOD Close")
+
+// ═══════════════════════════════════════════════════════════
+// 🎨 VISUAL ELEMENTS
+// ═══════════════════════════════════════════════════════════
+
+// Asian Range Box
+var box asianBox = na
+if showAsianBox and not na(asianHigh) and not na(asianLow)
+    if not isAsianSession and isAsianSession[1]
+        // Delete old box and create new one
+        if not na(asianBox)
+            box.delete(asianBox)
+        asianBox := box.new(
+             left=bar_index - 1, 
+             top=asianHigh, 
+             right=bar_index, 
+             bottom=asianLow,
+             border_color=color.new(color.yellow, 50),
+             bgcolor=color.new(color.yellow, 90),
+             border_width=1,
+             extend=extend.right
+         )
+    else if not na(asianBox)
+        box.set_right(asianBox, bar_index)
+
+// Asian Midline
+plot(showAsianBox and not na(asianMid) ? asianMid : na, 
+     "Asian Mid", 
+     color=color.new(color.orange, 30), 
+     style=plot.style_circles,
+     linewidth=1)
+
+// Previous Day Levels
+plot(showPrevDayLevels ? prevDayHigh : na, 
+     "PDH", 
+     color=color.new(color.red, 40), 
+     style=plot.style_cross,
+     linewidth=2)
+
+plot(showPrevDayLevels ? prevDayLow : na, 
+     "PDL", 
+     color=color.new(color.green, 40), 
+     style=plot.style_cross,
+     linewidth=2)
+
+// VWAP
+plot(showVWAP ? vwapValue : na, 
+     "VWAP", 
+     color=color.new(color.blue, 0), 
+     linewidth=2)
+
+// 20 EMA
+plot(showEMA ? ema20 : na, 
+     "20 EMA", 
+     color=color.new(color.purple, 0), 
+     linewidth=1)
+
+// SuperTrend (Dots)
+plotshape(supertrendBullish ? supertrend : na, 
+          "Bullish Dot", 
+          shape.circle, 
+          location.absolute, 
+          color.new(color.lime, 0), 
+          size=size.tiny)
+
+plotshape(supertrendBearish ? supertrend : na, 
+          "Bearish Dot", 
+          shape.circle, 
+          location.absolute, 
+          color.new(color.red, 0), 
+          size=size.tiny)
+
+// Entry Signals
+plotshape(longEntry, 
+          "Long Signal", 
+          shape.triangleup, 
+          location.belowbar, 
+          color.new(color.green, 0), 
+          size=size.small,
+          text="LONG")
+
+plotshape(shortEntry, 
+          "Short Signal", 
+          shape.triangledown, 
+          location.abovebar, 
+          color.new(color.red, 0), 
+          size=size.small,
+          text="SHORT")
+
+// ═══════════════════════════════════════════════════════════
+// 📊 SESSION BACKGROUND COLORS
+// ═══════════════════════════════════════════════════════════
+
+asianBg = isAsianSession ? color.new(color.gray, 95) : na
+londonBg = isLondonSession ? color.new(color.orange, 97) : na
+nyBg = isNYSession ? color.new(color.blue, 97) : na
+
+bgcolor(asianBg, title="Asian Session")
+bgcolor(londonBg, title="London Session")
+bgcolor(nyBg, title="NY Session")
+
+// ═══════════════════════════════════════════════════════════
+// 📋 ALERTS
+// ═══════════════════════════════════════════════════════════
+
+alertcondition(longEntry, title="Long Entry Signal", message="🟢 LONG: Taylor Reversal Setup")
+alertcondition(shortEntry, title="Short Entry Signal", message="🔴 SHORT: Taylor Reversal Setup")
+alertcondition(bullishSweep, title="Bullish Sweep Detected", message="💎 Asian/PDL Swept - Watch for Long")
+alertcondition(bearishSweep, title="Bearish Sweep Detected", message="💎 Asian/PDH Swept - Watch for Short")

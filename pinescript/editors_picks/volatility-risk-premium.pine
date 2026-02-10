@@ -1,0 +1,325 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © EdgeTools
+//
+// Volatility Risk Premium (VRP)
+// 
+// Based on academic research:
+// - Carr & Wu (2009): Variance Risk Premiums, Review of Financial Studies
+// - Bollerslev, Tauchen & Zhou (2009): Expected Stock Returns and Variance Risk Premia
+// - Bakshi & Kapadia (2003): Delta-Hedged Gains and the Negative Market Volatility Risk Premium
+//
+// The VRP measures the difference between implied volatility (VIX) and realized volatility.
+// A positive VRP indicates investors pay a premium for volatility protection.
+// Research shows VRP predicts future equity returns and signals market stress when negative.
+
+//@version=6
+indicator("Volatility Risk Premium", shorttitle="VRP", overlay=false, max_bars_back=5000)
+
+// --- Inputs ---
+
+// Core Settings
+rv_length = input.int(20, "Realized Vol Period", minval=5, maxval=63, group="Core Settings")
+rv_method = input.string("Close-to-Close", "RV Calculation Method", 
+     options=["Close-to-Close", "Parkinson", "Garman-Klass"], group="Core Settings")
+vrp_smoothing = input.int(5, "VRP Smoothing (EMA)", minval=1, maxval=21, group="Core Settings")
+vrp_lookback = input.int(252, "Statistical Lookback", minval=60, maxval=1000, group="Core Settings")
+
+// Regime Thresholds
+threshold_high = input.float(5.0, "High VRP (%)", minval=1.0, maxval=15.0, step=0.5, group="Thresholds")
+threshold_extreme = input.float(10.0, "Extreme VRP (%)", minval=5.0, maxval=20.0, step=0.5, group="Thresholds")
+threshold_low = input.float(-2.0, "Low VRP (%)", minval=-10.0, maxval=2.0, step=0.5, group="Thresholds")
+
+// Term Structure
+rv_short = input.int(10, "Short-Term RV Period", minval=5, maxval=20, group="Term Structure")
+rv_long = input.int(60, "Long-Term RV Period", minval=40, maxval=126, group="Term Structure")
+show_term_structure = input.bool(false, "Show Term Structure Lines", group="Term Structure")
+
+// Mean Reversion
+mr_zscore_threshold = input.float(2.0, "Z-Score Threshold", minval=1.0, maxval=3.0, step=0.5, group="Mean Reversion")
+show_mr_signals = input.bool(false, "Show MR Signals", group="Mean Reversion")
+show_bollinger = input.bool(false, "Show VRP Bands", group="Mean Reversion")
+bb_mult = input.float(2.0, "Band Multiplier", minval=1.0, maxval=3.0, step=0.5, group="Mean Reversion")
+
+// Display
+show_histogram = input.bool(true, "Histogram", group="Display")
+show_line = input.bool(false, "Line", group="Display")
+show_components = input.bool(false, "IV/RV Components", group="Display")
+show_table = input.bool(true, "Statistics Panel", group="Display")
+show_thresholds = input.bool(true, "Threshold Lines", group="Display")
+show_background = input.bool(true, "Dynamic Background", group="Display")
+color_candles = input.bool(true, "Color Candles", group="Display")
+show_momentum = input.bool(false, "VRP Momentum", group="Display")
+vrp_momentum_length = input.int(5, "Momentum Period", minval=1, maxval=20, group="Display")
+
+// Appearance
+color_scheme = input.string("EdgeTools", "Theme", 
+     options=["EdgeTools", "Gold", "Ocean", "Fire", "Matrix", "Arctic"], group="Appearance")
+use_dark_mode = input.bool(true, "Dark Mode", group="Appearance")
+background_intensity = input.int(85, "Background Transparency", minval=70, maxval=95, step=5, group="Appearance")
+
+// --- Color Definitions ---
+
+color primary_color = switch color_scheme
+    "EdgeTools" => use_dark_mode ? #3b82f6 : #2563eb
+    "Gold" => use_dark_mode ? #FFD700 : #DAA520
+    "Ocean" => use_dark_mode ? #20B2AA : #008B8B
+    "Fire" => use_dark_mode ? #FF6347 : #DC143C
+    "Matrix" => use_dark_mode ? #00FF41 : #006400
+    "Arctic" => use_dark_mode ? #87CEFA : #4169E1
+    => #3b82f6
+
+color bullish_color = switch color_scheme
+    "EdgeTools" => use_dark_mode ? #22c55e : #16a34a
+    "Gold" => use_dark_mode ? #FFA500 : #FF8C00
+    "Ocean" => use_dark_mode ? #00CED1 : #4682B4
+    "Fire" => use_dark_mode ? #FFD700 : #FF8C00
+    "Matrix" => use_dark_mode ? #39FF14 : #228B22
+    "Arctic" => use_dark_mode ? #00BFFF : #0000CD
+    => #22c55e
+
+color bearish_color = switch color_scheme
+    "EdgeTools" => use_dark_mode ? #ef4444 : #dc2626
+    "Gold" => use_dark_mode ? #FF5252 : #D32F2F
+    "Ocean" => use_dark_mode ? #FF4500 : #B22222
+    "Fire" => use_dark_mode ? #8B0000 : #800000
+    "Matrix" => use_dark_mode ? #FF073A : #8B0000
+    "Arctic" => use_dark_mode ? #FF1493 : #8B008B
+    => #ef4444
+
+color neutral_color = switch color_scheme
+    "EdgeTools" => use_dark_mode ? #737373 : #525252
+    "Gold" => use_dark_mode ? #C0C0C0 : #808080
+    "Ocean" => use_dark_mode ? #87CEEB : #2F4F4F
+    "Fire" => use_dark_mode ? #FFA500 : #CD853F
+    "Matrix" => use_dark_mode ? #00FFFF : #008B8B
+    "Arctic" => use_dark_mode ? #B0E0E6 : #483D8B
+    => #737373
+
+color text_color = use_dark_mode ? #fafafa : #0a0a0a
+color table_bg = use_dark_mode ? #171717 : #f9f9f9
+color header_bg = use_dark_mode ? #262626 : #e5e5e5
+table_transp = use_dark_mode ? 80 : 15
+
+// --- Data Sources ---
+
+vix = request.security("CBOE:VIX", timeframe.period, close, lookahead=barmerge.lookahead_off)
+
+use_chart = syminfo.ticker == "SPY" or syminfo.ticker == "SPX" or syminfo.ticker == "ES1!"
+spy_close = use_chart ? close : request.security("SPY", timeframe.period, close, lookahead=barmerge.lookahead_off)
+spy_high = use_chart ? high : request.security("SPY", timeframe.period, high, lookahead=barmerge.lookahead_off)
+spy_low = use_chart ? low : request.security("SPY", timeframe.period, low, lookahead=barmerge.lookahead_off)
+spy_open = use_chart ? open : request.security("SPY", timeframe.period, open, lookahead=barmerge.lookahead_off)
+
+// --- Realized Volatility Functions ---
+
+log_ret = math.log(spy_close / nz(spy_close[1], spy_close))
+
+calc_rv_ctc(int len) =>
+    ta.stdev(log_ret, len) * math.sqrt(252) * 100
+
+calc_rv_parkinson(int len) =>
+    sum_sq = 0.0
+    for i = 0 to len - 1
+        if not na(spy_high[i]) and not na(spy_low[i]) and spy_low[i] > 0
+            hl = math.log(spy_high[i] / spy_low[i])
+            sum_sq += hl * hl
+    math.sqrt(sum_sq / (4.0 * math.log(2.0) * len) * 252) * 100
+
+calc_rv_gk(int len) =>
+    sum_gk = 0.0
+    for i = 0 to len - 1
+        if not na(spy_high[i]) and not na(spy_low[i]) and not na(spy_open[i]) and not na(spy_close[i])
+            if spy_low[i] > 0 and spy_open[i] > 0
+                hl = math.log(spy_high[i] / spy_low[i])
+                co = math.log(spy_close[i] / spy_open[i])
+                sum_gk += 0.5 * hl * hl - (2 * math.log(2) - 1) * co * co
+    math.sqrt(math.max(sum_gk / len, 0) * 252) * 100
+
+get_rv(int len) =>
+    switch rv_method
+        "Close-to-Close" => calc_rv_ctc(len)
+        "Parkinson" => calc_rv_parkinson(len)
+        "Garman-Klass" => calc_rv_gk(len)
+        => calc_rv_ctc(len)
+
+// --- Core Calculations ---
+
+realized_vol = get_rv(rv_length)
+vrp_raw = vix - realized_vol
+vrp = ta.ema(vrp_raw, vrp_smoothing)
+
+// Statistics
+vrp_mean = ta.sma(vrp, vrp_lookback)
+vrp_stdev = ta.stdev(vrp, vrp_lookback)
+vrp_zscore = (vrp - vrp_mean) / math.max(vrp_stdev, 0.001)
+vrp_percentile = ta.percentrank(vrp, vrp_lookback)
+
+// Term Structure
+rv_short_val = get_rv(rv_short)
+rv_long_val = get_rv(rv_long)
+vrp_short = vix - rv_short_val
+vrp_long = vix - rv_long_val
+rv_slope = rv_long_val - rv_short_val
+
+// Mean Reversion
+vrp_upper = vrp_mean + bb_mult * vrp_stdev
+vrp_lower = vrp_mean - bb_mult * vrp_stdev
+mr_overbought = vrp_zscore >= mr_zscore_threshold
+mr_oversold = vrp_zscore <= -mr_zscore_threshold
+mr_long = mr_oversold and vrp > nz(vrp[1])
+mr_short = mr_overbought and vrp < nz(vrp[1])
+
+// Momentum
+vrp_roc = vrp - nz(vrp[vrp_momentum_length])
+
+// Regime
+var int regime_bars = 0
+var string last_regime = "NORMAL"
+
+get_regime() =>
+    if vrp >= threshold_extreme
+        "EXTREME"
+    else if vrp >= threshold_high
+        "HIGH"
+    else if vrp >= 0
+        "NORMAL"
+    else if vrp >= threshold_low
+        "LOW"
+    else
+        "NEGATIVE"
+
+regime = get_regime()
+regime_change = regime != last_regime
+regime_bars := regime_change ? 1 : regime_bars + 1
+last_regime := regime
+
+// --- Dynamic Colors ---
+
+get_vrp_color() =>
+    if vrp >= threshold_extreme
+        color.from_gradient(vrp, threshold_extreme, threshold_extreme + 5, bullish_color, primary_color)
+    else if vrp >= threshold_high
+        bullish_color
+    else if vrp >= 0
+        color.from_gradient(vrp, 0, threshold_high, neutral_color, bullish_color)
+    else if vrp >= threshold_low
+        color.from_gradient(vrp, threshold_low, 0, bearish_color, neutral_color)
+    else
+        bearish_color
+
+vrp_color = get_vrp_color()
+
+get_bg_color() =>
+    if vrp >= threshold_extreme
+        color.from_gradient(vrp, threshold_extreme, threshold_extreme + 5, primary_color, bullish_color)
+    else if vrp >= threshold_high
+        color.from_gradient(vrp, threshold_high, threshold_extreme, bullish_color, primary_color)
+    else if vrp >= 0
+        color.from_gradient(vrp, 0, threshold_high, neutral_color, bullish_color)
+    else if vrp >= threshold_low
+        color.from_gradient(vrp, threshold_low, 0, bearish_color, neutral_color)
+    else
+        bearish_color
+
+get_bg_opacity() =>
+    abs_v = math.abs(vrp)
+    max_ex = math.max(math.abs(threshold_extreme), math.abs(threshold_low))
+    if abs_v >= max_ex
+        int(math.max(70, math.min(75, 70 + (abs_v - max_ex) * 2)))
+    else if abs_v >= threshold_high
+        int(math.max(80, math.min(85, 80 + (abs_v - threshold_high))))
+    else
+        background_intensity
+
+// --- Plotting ---
+
+bgcolor(show_background ? color.new(get_bg_color(), get_bg_opacity()) : na, title="Background")
+barcolor(color_candles ? vrp_color : na, title="Candles")
+
+plot(show_histogram ? vrp : na, "VRP", vrp_color, style=plot.style_histogram, linewidth=3)
+plot(show_line ? vrp : na, "VRP Line", vrp_color, linewidth=2)
+
+hline(0, "Zero", color.new(neutral_color, 50))
+plot(show_thresholds ? threshold_high : na, "High", color.new(bullish_color, 60))
+plot(show_thresholds ? threshold_extreme : na, "Extreme", color.new(primary_color, 60))
+plot(show_thresholds ? threshold_low : na, "Low", color.new(bearish_color, 60))
+
+plot(show_components ? vix : na, "VIX", color.new(primary_color, 40))
+plot(show_components ? realized_vol : na, "RV", color.new(bearish_color, 40))
+
+plot(show_bollinger ? vrp_upper : na, "Upper Band", color.new(bullish_color, 70))
+plot(show_bollinger ? vrp_lower : na, "Lower Band", color.new(bearish_color, 70))
+plot(show_bollinger ? vrp_mean : na, "Mean", color.new(neutral_color, 50))
+
+plotshape(show_mr_signals and mr_long, title="Buy", location=location.bottom, style=shape.triangleup, size=size.small, color=bullish_color)
+plotshape(show_mr_signals and mr_short, title="Sell", location=location.top, style=shape.triangledown, size=size.small, color=bearish_color)
+
+plot(show_term_structure ? vrp_short : na, "VRP Short", color.new(primary_color, 50))
+plot(show_term_structure ? vrp_long : na, "VRP Long", color.new(neutral_color, 50))
+
+mom_col = vrp_roc > 0 ? color.new(bullish_color, 60) : color.new(bearish_color, 60)
+plot(show_momentum ? vrp_roc : na, "Momentum", mom_col, style=plot.style_histogram, linewidth=2)
+
+// --- Statistics Panel ---
+
+if show_table and barstate.islast
+    var tbl = table.new(position.top_right, 2, 12, border_width=1, bgcolor=color.new(table_bg, table_transp))
+    table.clear(tbl, 0, 0, 1, 11)
+    
+    table.cell(tbl, 0, 0, "VRP Analysis", text_color=text_color, bgcolor=color.new(header_bg, 20), text_size=size.small)
+    table.cell(tbl, 1, 0, "", bgcolor=color.new(header_bg, 20))
+    
+    table.cell(tbl, 0, 1, "VRP", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(vrp, "#.##") + "%", text_color=vrp_color, text_size=size.small)
+    
+    table.cell(tbl, 0, 2, "VIX", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(vix, "#.##") + "%", text_color=color.new(primary_color, 40), text_size=size.small)
+    
+    table.cell(tbl, 0, 3, "Realized Vol", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(realized_vol, "#.##") + "%", text_color=color.new(bearish_color, 40), text_size=size.small)
+    
+    reg_col = regime == "EXTREME" ? primary_color : regime == "HIGH" ? bullish_color : regime == "NORMAL" ? neutral_color : bearish_color
+    table.cell(tbl, 0, 4, "Regime", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 4, regime, text_color=reg_col, text_size=size.small)
+    
+    table.cell(tbl, 0, 5, "Duration", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(regime_bars) + " bars", text_color=neutral_color, text_size=size.small)
+    
+    pct_col = vrp_percentile > 70 ? bullish_color : vrp_percentile < 30 ? bearish_color : neutral_color
+    table.cell(tbl, 0, 6, "Percentile", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 6, str.tostring(vrp_percentile, "#.#") + "%", text_color=pct_col, text_size=size.small)
+    
+    z_col = vrp_zscore > 1 ? bullish_color : vrp_zscore < -1 ? bearish_color : neutral_color
+    table.cell(tbl, 0, 7, "Z-Score", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(vrp_zscore, "#.##"), text_color=z_col, text_size=size.small)
+    
+    slope_col = rv_slope > 0 ? bullish_color : bearish_color
+    table.cell(tbl, 0, 8, "RV Slope", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(rv_slope, "#.##") + "%", text_color=slope_col, text_size=size.small)
+    
+    mom_tbl_col = vrp_roc > 0 ? bullish_color : bearish_color
+    table.cell(tbl, 0, 9, "Momentum", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(vrp_roc, "#.##"), text_color=mom_tbl_col, text_size=size.small)
+    
+    mr_txt = mr_overbought ? "OVERBOUGHT" : mr_oversold ? "OVERSOLD" : "NEUTRAL"
+    mr_col = mr_overbought ? bearish_color : mr_oversold ? bullish_color : neutral_color
+    table.cell(tbl, 0, 10, "MR Status", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 10, mr_txt, text_color=mr_col, text_size=size.small)
+    
+    bias_txt = vrp > threshold_high ? "RISK-ON" : vrp < 0 ? "RISK-OFF" : "NEUTRAL"
+    bias_col = vrp > threshold_high ? bullish_color : vrp < 0 ? bearish_color : neutral_color
+    table.cell(tbl, 0, 11, "Bias", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 11, bias_txt, text_color=bias_col, text_size=size.small)
+
+// --- Alerts ---
+
+alertcondition(vrp >= threshold_extreme, "Extreme VRP", "VRP extreme high - elevated risk aversion")
+alertcondition(vrp >= threshold_high and vrp < threshold_extreme, "High VRP", "VRP above normal - risk premium elevated")
+alertcondition(vrp < threshold_low, "Negative VRP", "VRP negative - realized exceeds implied (stress)")
+alertcondition(ta.cross(vrp, 0), "Zero Cross", "VRP crossed zero line")
+alertcondition(math.abs(vrp_zscore) > 2, "Z-Score Extreme", "VRP statistically extreme")
+alertcondition(mr_long, "MR Buy Signal", "VRP mean reversion buy signal")
+alertcondition(mr_short, "MR Sell Signal", "VRP mean reversion sell signal")
+alertcondition(ta.crossunder(rv_slope, 0), "Term Structure Inversion", "Short-term RV exceeds long-term (stress)")
+alertcondition(ta.crossover(rv_slope, 0), "Term Structure Normal", "Term structure normalized")
+alertcondition(regime_change, "Regime Change", "VRP regime changed")

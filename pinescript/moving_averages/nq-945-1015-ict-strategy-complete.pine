@@ -1,0 +1,317 @@
+//@version=6
+strategy("NQ 9:45-10:15 ICT Strategy - Complete", overlay=true, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=100, 
+         pyramiding=0,
+         max_boxes_count=500,
+         max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════
+dailyBiasType = input.string("Price > EMA20", "Daily Bias", 
+    options=["Price > EMA20", "Prev Close > EMA20"])
+emaLength = input.int(20, "EMA Length")
+riskReward = input.float(2.0, "Risk:Reward Ratio", step=0.5)
+showLevels = input.bool(true, "Show Order Block Levels")
+obRefine = input.string('On', 'Order Block Refine', ['On', 'Off'])
+refineType = input.string('Defensive', 'Refine Type', ['Defensive', 'Aggressive'])
+
+// ═══════════════════════════════════════════════════════════════════════
+// TIME WINDOW: 9:45 AM - 10:15 AM NY TIME
+// ═══════════════════════════════════════════════════════════════════════
+nyHour = hour(time, "America/New_York")
+nyMinute = minute(time, "America/New_York")
+inTimeWindow = (nyHour == 9 and nyMinute >= 45) or (nyHour == 10 and nyMinute <= 15)
+
+// ═══════════════════════════════════════════════════════════════════════
+// DAILY BIAS
+// ═══════════════════════════════════════════════════════════════════════
+dailyEMA = request.security(syminfo.tickerid, "D", ta.ema(close, emaLength))
+prevDailyClose = request.security(syminfo.tickerid, "D", close[1])
+
+bullishBias = dailyBiasType == "Price > EMA20" ? close > dailyEMA : prevDailyClose > dailyEMA
+bearishBias = not bullishBias
+
+plot(dailyEMA, "Daily EMA", color=color.orange, linewidth=2)
+bgcolor(bullishBias ? color.new(color.green, 97) : color.new(color.red, 97))
+
+// ═══════════════════════════════════════════════════════════════════════
+// PREVIOUS DAY HIGH/LOW - For Liquidity Sweep Detection
+// ═══════════════════════════════════════════════════════════════════════
+pdHigh = request.security(syminfo.tickerid, "D", high[1])
+pdLow = request.security(syminfo.tickerid, "D", low[1])
+
+plot(pdHigh, "Prev Day High", color=color.new(color.red, 50), style=plot.style_circles)
+plot(pdLow, "Prev Day Low", color=color.new(color.green, 50), style=plot.style_circles)
+
+// Track if liquidity has been swept
+var bool lowSwept = false
+var bool highSwept = false
+
+// Check for new day
+bool isNewDay = ta.change(time("D")) != 0
+
+// Reset on new day
+if isNewDay
+    lowSwept := false
+    highSwept := false
+
+// Detect liquidity sweep
+if low < pdLow and close > pdLow
+    lowSwept := true
+    
+if high > pdHigh and close < pdHigh
+    highSwept := true
+
+// ═══════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE - Track Swing Highs and Lows
+// ═══════════════════════════════════════════════════════════════════════
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+
+// Detect swing highs and lows (5-bar fractal pattern)
+isFractalHigh = high[2] > high[4] and high[2] > high[3] and high[2] > high[1] and high[2] > high[0]
+isFractalLow = low[2] < low[4] and low[2] < low[3] and low[2] < low[1] and low[2] < low[0]
+
+if isFractalHigh
+    lastSwingHigh := high[2]
+    lastSwingHighBar := bar_index - 2
+
+if isFractalLow
+    lastSwingLow := low[2]
+    lastSwingLowBar := bar_index - 2
+
+// ═══════════════════════════════════════════════════════════════════════
+// BREAK OF STRUCTURE (BoS) / MARKET STRUCTURE SHIFT
+// ═══════════════════════════════════════════════════════════════════════
+var bool bullishMSS = false
+var bool bearishMSS = false
+var int bullMSSBar = 0
+var int bearMSSBar = 0
+
+// Reset MSS on new day
+if isNewDay
+    bullishMSS := false
+    bearishMSS := false
+
+// Bullish Break of Structure: Close above last swing high
+if not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    bullishMSS := true
+    bearishMSS := false
+    bullMSSBar := bar_index
+    
+// Bearish Break of Structure: Close below last swing low
+if not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    bearishMSS := true
+    bullishMSS := false
+    bearMSSBar := bar_index
+
+// Track if MSS just occurred
+bool bullMSSNow = bullishMSS and not bullishMSS[1]
+bool bearMSSNow = bearishMSS and not bearishMSS[1]
+
+plotshape(bullMSSNow and bullishBias, "Bullish MSS", 
+    shape.triangleup, location.belowbar, color.lime, size=size.small)
+plotshape(bearMSSNow and bearishBias, "Bearish MSS", 
+    shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ORDER BLOCK DETECTION (Based on TFlab/TehThomas logic)
+// ═══════════════════════════════════════════════════════════════════════
+var float bullOB_high = na
+var float bullOB_low = na
+var int bullOB_bar = na
+var float bearOB_high = na
+var float bearOB_low = na
+var int bearOB_bar = na
+
+ATR = ta.atr(55)
+
+// Reset order blocks on new day
+if isNewDay
+    bullOB_high := na
+    bullOB_low := na
+    bullOB_bar := na
+    bearOB_high := na
+    bearOB_low := na
+    bearOB_bar := na
+
+// BULLISH ORDER BLOCK: Find the last bearish candle before bullish MSS
+if bullMSSNow and bullishBias
+    // Look back for the last down-close candle (bearish candle)
+    for i = 1 to 20
+        if close[i] < open[i] and not na(close[i])
+            // Order Block refinement logic from TFlab
+            float ob_high = na
+            float ob_low = na
+            
+            if obRefine == 'On'
+                candle_range = high[i] - low[i]
+                candle_body = math.abs(close[i] - open[i])
+                
+                // Defensive refinement
+                if refineType == 'Defensive'
+                    if candle_range <= ATR * 0.5
+                        ob_high := high[i]
+                        ob_low := low[i]
+                    else if candle_range > ATR * 0.5 and candle_range <= ATR
+                        ob_high := close[i]
+                        ob_low := low[i]
+                    else
+                        ob_high := close[i]
+                        ob_low := low[i]
+                else  // Aggressive
+                    ob_high := high[i]
+                    ob_low := low[i]
+            else
+                ob_high := high[i]
+                ob_low := low[i]
+            
+            bullOB_high := ob_high
+            bullOB_low := ob_low
+            bullOB_bar := bar_index - i
+            break
+
+// BEARISH ORDER BLOCK: Find the last bullish candle before bearish MSS
+if bearMSSNow and bearishBias
+    // Look back for the last up-close candle (bullish candle)
+    for i = 1 to 20
+        if close[i] > open[i] and not na(close[i])
+            // Order Block refinement logic from TFlab
+            float ob_high = na
+            float ob_low = na
+            
+            if obRefine == 'On'
+                candle_range = high[i] - low[i]
+                candle_body = math.abs(close[i] - open[i])
+                
+                // Defensive refinement
+                if refineType == 'Defensive'
+                    if candle_range <= ATR * 0.5
+                        ob_high := high[i]
+                        ob_low := low[i]
+                    else if candle_range > ATR * 0.5 and candle_range <= ATR
+                        ob_high := high[i]
+                        ob_low := close[i]
+                    else
+                        ob_high := high[i]
+                        ob_low := close[i]
+                else  // Aggressive
+                    ob_high := high[i]
+                    ob_low := low[i]
+            else
+                ob_high := high[i]
+                ob_low := low[i]
+            
+            bearOB_high := ob_high
+            bearOB_low := ob_low
+            bearOB_bar := bar_index - i
+            break
+
+// Draw order block boxes
+var box bullOB_box = na
+var box bearOB_box = na
+var label bullOB_label = na
+var label bearOB_label = na
+
+if showLevels and not na(bullOB_high) and not na(bullOB_bar)
+    if not na(bullOB_box)
+        box.delete(bullOB_box)
+        label.delete(bullOB_label)
+    bullOB_box := box.new(bullOB_bar, bullOB_high, bar_index + 50, bullOB_low, 
+        border_color=color.green, bgcolor=color.new(color.green, 85), 
+        border_width=1, extend=extend.right)
+    bullOB_label := label.new(bullOB_bar, (bullOB_high + bullOB_low) / 2, "OB+", 
+        color=color.new(color.black, 100), style=label.style_label_center, 
+        textcolor=color.black, size=size.small)
+
+if showLevels and not na(bearOB_high) and not na(bearOB_bar)
+    if not na(bearOB_box)
+        box.delete(bearOB_box)
+        label.delete(bearOB_label)
+    bearOB_box := box.new(bearOB_bar, bearOB_high, bar_index + 50, bearOB_low, 
+        border_color=color.red, bgcolor=color.new(color.red, 85), 
+        border_width=1, extend=extend.right)
+    bearOB_label := label.new(bearOB_bar, (bearOB_high + bearOB_low) / 2, "OB-", 
+        color=color.new(color.black, 100), style=label.style_label_center, 
+        textcolor=color.black, size=size.small)
+
+// Delete mitigated order blocks
+if not na(bullOB_low) and low <= bullOB_low
+    bullOB_high := na
+    bullOB_low := na
+    if not na(bullOB_box)
+        box.delete(bullOB_box)
+        label.delete(bullOB_label)
+
+if not na(bearOB_high) and high >= bearOB_high
+    bearOB_high := na
+    bearOB_low := na
+    if not na(bearOB_box)
+        box.delete(bearOB_box)
+        label.delete(bearOB_label)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+// LONG Setup Requirements:
+longCondition = bullishBias and lowSwept and bullishMSS and inTimeWindow and 
+     not na(bullOB_low) and low <= bullOB_high and close >= bullOB_low
+
+// SHORT Setup Requirements:
+shortCondition = bearishBias and highSwept and bearishMSS and inTimeWindow and 
+     not na(bearOB_low) and high >= bearOB_low and close <= bearOB_high
+
+// ═══════════════════════════════════════════════════════════════════════
+// ONE TRADE PER DAY RULE
+// ═══════════════════════════════════════════════════════════════════════
+var bool tradeTakenToday = false
+
+if isNewDay
+    tradeTakenToday := false
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRADE EXECUTION
+// ═══════════════════════════════════════════════════════════════════════
+
+// LONG ENTRY
+if longCondition and not tradeTakenToday and strategy.position_size == 0
+    stopLoss = bullOB_low
+    entryPrice = close
+    riskAmount = entryPrice - stopLoss
+    takeProfit = entryPrice + (riskAmount * riskReward)
+    
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", "Long", stop=stopLoss, limit=takeProfit)
+    
+    tradeTakenToday := true
+    
+    label.new(bar_index, low, "LONG\nEntry: " + str.tostring(entryPrice) + 
+        "\nSL: " + str.tostring(stopLoss) + "\nTP: " + str.tostring(takeProfit), 
+        color=color.green, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+// SHORT ENTRY
+if shortCondition and not tradeTakenToday and strategy.position_size == 0
+    stopLoss = bearOB_high
+    entryPrice = close
+    riskAmount = stopLoss - entryPrice
+    takeProfit = entryPrice - (riskAmount * riskReward)
+    
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", "Short", stop=stopLoss, limit=takeProfit)
+    
+    tradeTakenToday := true
+    
+    label.new(bar_index, high, "SHORT\nEntry: " + str.tostring(entryPrice) + 
+        "\nSL: " + str.tostring(stopLoss) + "\nTP: " + str.tostring(takeProfit), 
+        color=color.red, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+alertcondition(longCondition, "Long Setup", "NQ Long: Bullish Bias + Sweep + MSS + OB")
+alertcondition(shortCondition, "Short Setup", "NQ Short: Bearish Bias + Sweep + MSS + OB")

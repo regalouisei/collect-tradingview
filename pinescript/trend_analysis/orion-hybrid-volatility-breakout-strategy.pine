@@ -1,0 +1,263 @@
+//@version=5
+strategy("ORION: Hybrid Strategy [Final Fix v33]", overlay=true, process_orders_on_close=true, initial_capital=200000, currency=currency.USD, default_qty_type=strategy.cash, commission_type=strategy.commission.percent, commission_value=0.02, margin_long=1, margin_short=80, slippage=1, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// ⚙️ INPUTS
+// ==========================================
+
+grp_strat = "Strategy Core Logic"
+lookback = input.int(15, "Lookback Period", minval=5, group=grp_strat) 
+atr_mult = input.float(2.5, "Box Width (ATR)", step=0.1, group=grp_strat) 
+slope_thresh = input.float(0.2, "Slope Tolerance", step=0.01, group=grp_strat) 
+cooldown_bars = input.int(5, "Cooldown (Bars)", minval=0, group=grp_strat)
+// --- NEW: MAX BOX DURATION ---
+max_box_life = input.int(45, "Max Box Duration (Bars)", minval=10, group=grp_strat, tooltip="If no breakout happens within X bars, delete the box to prevent 'Zombie' trades.")
+
+grp_ema = "Trend Filter (EMA)"
+use_ema = input.bool(true, "Use EMA Filter", group=grp_ema)
+ema_len = input.int(150, "EMA Length", minval=1, group=grp_ema)
+show_ema = input.bool(true, "Show EMA Line on Chart", group=grp_ema)
+
+grp_time = "Time & FTMO Protections"
+trading_session = input.session("0600-2300", "Trading Session", group=grp_time)
+force_close_day = input.bool(true, "Force Close on Friday Night?", group=grp_time)
+// --- CHANGED: Safer Time (22:00) ---
+force_close_hour = input.int(22, "Force Close Hour (Friday)", minval=18, maxval=23, group=grp_time)
+force_close_min = input.int(00, "Force Close Minute", minval=0, maxval=59, group=grp_time)
+holiday_filter = input.bool(false, "Skip Winter Holidays", group=grp_time)
+
+grp_targets = "Risk Management"
+risk_per_trade = input.float(0.8, "Risk % Per Trade", step=0.1, group=grp_targets) 
+reward_ratio = input.float(1.9, "Risk : Reward Ratio", step=0.1, group=grp_targets)
+
+grp_gold = "Squeeze Detection"
+use_gold = input.bool(true, "Detect Squeeze", group=grp_gold)
+show_gray = input.bool(true, "Show Standard Boxes", group=grp_gold)
+std_len = input.int(20, "StdDev Length", group=grp_gold)
+squeeze_th = input.float(0.6, "Squeeze Threshold", group=grp_gold)
+
+grp_vis = "🎨 Style & Colors"
+txt_size_input = input.string("Normal", "Text Size", options=["Small", "Normal", "Large", "Huge"], group=grp_vis)
+c_squeeze = input.color(#FFD700, "Squeeze Box Color", group=grp_vis)
+c_std = input.color(color.gray, "Standard Box Color", group=grp_vis)
+c_active = input.color(color.blue, "Active Trade Color", group=grp_vis)
+c_win = input.color(color.green, "Win Color", group=grp_vis)
+c_loss = input.color(color.red, "Loss Color", group=grp_vis)
+bg_transp = input.int(80, "Box Transparency", minval=0, maxval=100, group=grp_vis)
+marker_width = input.int(5, "Marker Width", minval=1, group=grp_vis)
+conn_width = input.int(2, "Connector Width", minval=1, group=grp_vis)
+
+
+// ==========================================
+// 📐 CALCULATIONS
+// ==========================================
+
+ema_val = ta.ema(close, ema_len)
+plot(show_ema ? ema_val : na, "Trend EMA", color=color.white, linewidth=2)
+bool trend_long = use_ema ? close > ema_val : true
+bool trend_short = use_ema ? close < ema_val : true
+
+int h = hour
+int m = minute
+int d = dayofweek
+int mo = month
+int dom = dayofmonth
+
+bool in_session = not na(time(timeframe.period, trading_session))
+bool is_friday_late = (d == dayofweek.friday) and (h >= force_close_hour)
+
+bool is_holiday = false
+if holiday_filter
+    if (mo == 12 and dom >= 20) or (mo == 1 and dom <= 10)
+        is_holiday := true
+
+bool can_trade = in_session and not is_friday_late and not is_holiday
+
+// Force Close Logic (Friday 22:00)
+bool is_weekend_close = force_close_day and (d == dayofweek.friday) and (h == force_close_hour) and (m >= force_close_min)
+
+if is_weekend_close
+    strategy.close_all(comment="FTMO Friday Close")
+
+
+// --- BOX LOGIC ---
+atr_val = ta.atr(14)
+high_line = ta.highest(high, lookback)
+low_line = ta.lowest(low, lookback)
+box_h = high_line - low_line
+lrc = ta.linreg(close, lookback, 0)
+prev_lrc = ta.linreg(close, lookback, 1)
+slope = math.abs((lrc - prev_lrc) / close) * 1000 
+std_dev = ta.stdev(close, std_len)
+is_squeeze = std_dev < (atr_val * squeeze_th)
+is_tight = box_h < (atr_val * atr_mult)
+is_flat = slope < slope_thresh
+
+var int last_exit_bar = -999
+var bool box_ready = false
+var float z_high = na
+var float z_low = na
+var int box_start_bar = 0 // შესამოწმებლად: როდის დაიწყო ყუთი?
+var box viz_box = na         
+var label viz_label = na 
+
+bool is_resting = (bar_index - last_exit_bar) < cooldown_bars
+size_final = switch txt_size_input
+    "Small" => size.small
+    "Normal" => size.normal
+    "Large" => size.large
+    "Huge" => size.huge
+    => size.normal
+
+var bool in_trade = false
+var float t_entry = na
+var float t_sl = na
+var float t_tp = na
+var int t_dir = 0
+var float t_qty = 0.0
+var int t_start_bar = 0 
+var int t_box_left = 0  
+var line l_sl_active = na
+var line l_tp_active = na
+
+// 1. MONITORING
+if in_trade
+    bool is_closed = false
+    bool is_win = false
+    float exit_price = na
+    
+    line.set_x2(l_sl_active, bar_index + 3)
+    line.set_x2(l_tp_active, bar_index + 3)
+    
+    if t_dir == 1 
+        if high >= t_tp
+            is_closed := true
+            is_win := true
+            exit_price := t_tp
+        else if low <= t_sl
+            is_closed := true
+            is_win := false
+            exit_price := t_sl
+    else if t_dir == -1 
+        if low <= t_tp
+            is_closed := true
+            is_win := true
+            exit_price := t_tp
+        else if high >= t_sl
+            is_closed := true
+            is_win := false
+            exit_price := t_sl
+            
+    if is_closed
+        in_trade := false
+        color final_bg = is_win ? color.new(c_win, bg_transp) : color.new(c_loss, bg_transp)
+        color final_br = is_win ? c_win : c_loss
+        box.set_bgcolor(viz_box, final_bg)
+        box.set_border_color(viz_box, final_br)
+        
+        float dist = math.abs(exit_price - t_entry)
+        float profit = dist * t_qty
+        string txt_res = is_win ? "WIN +$" + str.tostring(math.round(profit)) : "LOSS -$" + str.tostring(math.round(profit))
+        
+        int final_center = math.round((t_box_left + t_start_bar) / 2)
+        label.set_xy(viz_label, final_center, z_high)
+        label.set_text(viz_label, txt_res)
+        label.set_textcolor(viz_label, final_br)
+        
+        line.new(bar_index, exit_price, bar_index, exit_price, color=color.fuchsia, width=marker_width)
+        line.new(t_start_bar, t_entry, bar_index, exit_price, color=final_br, style=line.style_dotted, width=conn_width)
+        line.delete(l_sl_active)
+        line.delete(l_tp_active)
+
+// 2. ENTRY LOGIC
+if not in_trade and can_trade 
+    
+    if box_ready
+        // --- 1. LIFE CHECK: IS BOX TOO OLD? ---
+        if (bar_index - box_start_bar) > max_box_life
+            // Box expired (Zombie). Delete it.
+            box.delete(viz_box)
+            label.delete(viz_label)
+            box_ready := false
+        
+        else
+            // Box is alive. Check bounds.
+            bool still_in_range = close <= z_high and close >= z_low
+            
+            if still_in_range
+                box.set_right(viz_box, bar_index)
+            else
+                // Breakout Attempt
+                bool break_up = close > z_high
+                bool break_down = close < z_low
+                
+                // EMA FILTER
+                if break_up and not trend_long
+                    break_up := false 
+                if break_down and not trend_short
+                    break_down := false 
+
+                if break_up or break_down
+                    // Valid Entry
+                    box_ready := false
+                    last_exit_bar := bar_index
+                    in_trade := true 
+                    
+                    box.set_bgcolor(viz_box, color.new(c_active, bg_transp))
+                    box.set_border_color(viz_box, c_active)
+                    box.set_border_style(viz_box, line.style_solid)
+                    box.set_border_width(viz_box, 2)
+                    
+                    t_entry := close
+                    t_start_bar := bar_index
+                    t_box_left := box.get_left(viz_box) 
+                    
+                    int fixed_center = math.round((t_box_left + t_start_bar) / 2)
+                    label.set_xy(viz_label, fixed_center, z_high)
+                    label.set_textcolor(viz_label, c_active)
+                    label.set_style(viz_label, label.style_none)
+                    label.set_size(viz_label, size_final)
+                    
+                    if break_up
+                        t_dir := 1
+                        t_sl := z_low
+                        float risk = math.abs(t_entry - t_sl)
+                        t_tp := t_entry + (risk * reward_ratio)
+                        t_qty := (strategy.equity * risk_per_trade / 100) / risk
+                        strategy.entry("Long", strategy.long, qty=t_qty, comment="")
+                        strategy.exit("Exit Long", "Long", stop=t_sl, limit=t_tp, comment="", comment_loss="", comment_profit="")
+                        label.set_text(viz_label, "ACTIVE")
+                        
+                    if break_down
+                        t_dir := -1
+                        t_sl := z_high
+                        float risk = math.abs(t_sl - t_entry)
+                        t_tp := t_entry - (risk * reward_ratio)
+                        t_qty := (strategy.equity * risk_per_trade / 100) / risk
+                        strategy.entry("Short", strategy.short, qty=t_qty, comment="")
+                        strategy.exit("Exit Short", "Short", stop=t_sl, limit=t_tp, comment="", comment_loss="", comment_profit="")
+                        label.set_text(viz_label, "ACTIVE")
+                    
+                    line.new(bar_index, t_entry, bar_index, t_entry, color=c_active, width=marker_width)
+                    l_sl_active := line.new(bar_index, t_sl, bar_index + 5, t_sl, color=color.red, style=line.style_dotted)
+                    l_tp_active := line.new(bar_index, t_tp, bar_index + 5, t_tp, color=color.green, style=line.style_dotted)
+
+                else
+                    // Invalid Breakout (Blocked by EMA) -> DELETE BOX
+                    if not still_in_range
+                        box.delete(viz_box)
+                        label.delete(viz_label)
+                        box_ready := false
+
+    else if is_tight and is_flat and not is_resting
+        box_ready := true
+        box_start_bar := bar_index // ვიმახსოვრებთ დაწყების დროს
+        z_high := high_line
+        z_low := low_line
+        bool is_gold = use_gold and is_squeeze
+        color bg = is_gold ? color.new(c_squeeze, bg_transp) : color.new(c_std, bg_transp)
+        color br = is_gold ? c_squeeze : c_std
+        string txt = is_gold ? "⚠️ SQUEEZE" : ""
+        viz_box := box.new(bar_index - lookback, z_high, bar_index, z_low, border_color=br, bgcolor=bg)
+        int center = math.round(((bar_index - lookback) + bar_index) / 2)
+        viz_label := label.new(center, z_high, txt, textcolor=br, style=label.style_none, size=size.normal)

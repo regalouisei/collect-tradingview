@@ -1,0 +1,148 @@
+//@version=5
+indicator("Cyberpunk Volume Profile Visible Range", shorttitle="Cyberpunk VPVR", overlay=true, max_bars_back=5000)
+
+// --- Settings ---
+grp_general = "General Settings / 基本設定"
+grp_style   = "Cyberpunk Style & Colors / サイバーパンク設定"
+
+rows         = input.int(100, "Rows (Resolution)", minval=10, maxval=500, group=grp_general)
+vp_width     = input.int(40, "Width (%)", minval=1, maxval=100, group=grp_general)
+val_area_pct = input.int(70, "Value Area (%)", minval=0, maxval=100, group=grp_general)
+placement    = input.string("Left", "Placement", options=["Right", "Left"], group=grp_general)
+
+// --- Cyberpunk Neon Palette ---
+colorNeonCyan    = #00fbff // 電脳シアン
+colorNeonMagenta = #ff00ff // 電脳マゼンタ
+colorNeonYellow  = #ffff00 // エレクトリックイエロー
+
+// Color Settings
+up_color       = input.color(color.new(colorNeonCyan, 30), "Up Volume (Inside VA)", group=grp_style)
+down_color     = input.color(color.new(colorNeonMagenta, 30), "Down Volume (Inside VA)", group=grp_style)
+up_color_out   = input.color(color.new(colorNeonCyan, 75), "Up Volume (Outside VA)", group=grp_style)
+down_color_out = input.color(color.new(colorNeonMagenta, 75), "Down Volume (Outside VA)", group=grp_style)
+
+poc_color       = input.color(color.new(colorNeonYellow, 20), "POC (Point of Control)", group=grp_style)
+poc_line_width  = input.int(2, "POC Line Width", minval=0, maxval=5, group=grp_style)
+show_poc_label  = input.bool(true, "Show POC Price Label", group=grp_style)
+
+// --- Variables ---
+var box[] vp_boxes = array.new_box()
+var line[] vp_lines = array.new_line()
+var label poc_label = na 
+
+// --- Calculation Logic ---
+if barstate.islast
+    // Clear drawings
+    if array.size(vp_boxes) > 0
+        for b in vp_boxes
+            box.delete(b)
+        array.clear(vp_boxes)
+    
+    if array.size(vp_lines) > 0
+        for l in vp_lines
+            line.delete(l)
+        array.clear(vp_lines)
+    
+    label.delete(poc_label)
+
+    // Get time range
+    int start_time = chart.left_visible_bar_time
+    int end_time = chart.right_visible_bar_time
+    
+    // Get high/low within range
+    float max_price = -1.0
+    float min_price = 1.0e15
+    int start_bar_index = 0
+    
+    for i = 0 to 4999
+        if time[i] < start_time
+            start_bar_index := i
+            break
+        float h = nz(high[i])
+        float l = nz(low[i])
+        if h > 0 and l > 0
+            max_price := math.max(max_price, h)
+            min_price := math.min(min_price, l)
+
+    float price_range = max_price - min_price
+    
+    if price_range > 0
+        float step = price_range / rows
+        float[] vol_up = array.new_float(rows, 0.0)
+        float[] vol_down = array.new_float(rows, 0.0)
+        float[] vol_total = array.new_float(rows, 0.0)
+        float total_vp_volume = 0.0
+        
+        for i = 0 to start_bar_index
+            float avg_price = (high[i] + low[i]) / 2
+            int row_idx = math.floor((avg_price - min_price) / step)
+            row_idx := math.min(math.max(row_idx, 0), rows - 1)
+            
+            float v = nz(volume[i])
+            if v > 0
+                total_vp_volume += v
+                if close[i] >= open[i]
+                    array.set(vol_up, row_idx, array.get(vol_up, row_idx) + v)
+                else
+                    array.set(vol_down, row_idx, array.get(vol_down, row_idx) + v)
+                array.set(vol_total, row_idx, array.get(vol_total, row_idx) + v)
+
+        float max_vol_in_row = 0.0
+        int poc_idx = -1
+        for i = 0 to rows - 1
+            float v = array.get(vol_total, i)
+            if v > max_vol_in_row
+                max_vol_in_row := v
+                poc_idx := i
+        
+        // Value Area Calculation
+        int va_top_idx = poc_idx
+        int va_bottom_idx = poc_idx
+        float current_va_vol = max_vol_in_row
+        float target_va_vol = total_vp_volume * (val_area_pct / 100.0)
+        
+        int loop_safety = 0
+        while current_va_vol < target_va_vol and loop_safety < rows
+            loop_safety += 1
+            float up_vol = (va_top_idx < rows - 1) ? array.get(vol_total, va_top_idx + 1) : 0.0
+            float down_vol = (va_bottom_idx > 0) ? array.get(vol_total, va_bottom_idx - 1) : 0.0
+            if up_vol == 0 and down_vol == 0
+                break
+            if up_vol >= down_vol
+                va_top_idx += 1
+                current_va_vol += up_vol
+            else
+                va_bottom_idx -= 1
+                current_va_vol += down_vol
+
+        // --- Drawing ---
+        int time_range = end_time - start_time
+        
+        for i = 0 to rows - 1
+            float total_v = array.get(vol_total, i)
+            if total_v > 0
+                float box_bottom = min_price + (step * i)
+                float box_top = min_price + (step * (i + 1))
+                float width_ratio = (total_v / max_vol_in_row) * (vp_width / 100.0)
+                int bar_len_time = math.round(time_range * width_ratio)
+                
+                int box_left = (placement == "Right") ? end_time - bar_len_time : start_time
+                int box_right = (placement == "Right") ? end_time : start_time + bar_len_time
+
+                bool is_va = (i >= va_bottom_idx and i <= va_top_idx)
+                bool is_poc = (i == poc_idx)
+                
+                // Color selection based on Cyberpunk theme
+                color bg_color = is_poc ? poc_color : (is_va ? (array.get(vol_up, i) >= array.get(vol_down, i) ? up_color : down_color) : (array.get(vol_up, i) >= array.get(vol_down, i) ? up_color_out : down_color_out))
+                
+                array.push(vp_boxes, box.new(box_left, box_top, box_right, box_bottom, xloc=xloc.bar_time, border_width=0, bgcolor=bg_color))
+                
+                // POC Line and Label
+                if is_poc
+                    float poc_price = (box_top + box_bottom) / 2
+                    if poc_line_width > 0
+                        array.push(vp_lines, line.new(start_time, poc_price, end_time, poc_price, xloc=xloc.bar_time, color=poc_color, width=poc_line_width))
+                    
+                    if show_poc_label
+                        string price_text = " POC: " + str.tostring(poc_price, format.mintick) + " "
+                        poc_label := label.new(x=(placement == "Right" ? start_time : end_time), y=poc_price, text=price_text, xloc=xloc.bar_time, color=color.new(poc_color, 0), textcolor=color.black, style=(placement == "Right" ? label.style_label_right : label.style_label_left), size=size.small)

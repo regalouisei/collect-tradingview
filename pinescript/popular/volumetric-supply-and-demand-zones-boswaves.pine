@@ -1,0 +1,600 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("Volumetric Supply and Demand [BOSWaves]", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ┌────────────────────────────── BOSWaves ─ Groups ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+const string group_detect  = "Detection Settings"
+const string group_zone    = "Zone Settings"
+const string group_profile = "Volume Profile"
+const string group_visual  = "Visualization"
+
+// ┌────────────────────────────── BOSWaves ─ Tooltips ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+const string tt_swing_len      = "Pivot lookback period for detecting swing highs/lows. Higher = fewer, more significant zones."
+const string tt_impulse_mult   = "Minimum price move (in ATR) required to form a zone. Higher = only strong impulses create zones."
+const string tt_base_lookback  = "Number of candles to include in base zone formation. Higher = wider base zones."
+
+const string tt_atr_length     = "ATR calculation period for zone sizing and merging logic."
+const string tt_max_zone_atr   = "Maximum allowed zone height as multiple of ATR. Prevents excessively tall zones."
+const string tt_max_zones      = "Maximum number of active zones to display. Oldest zones are removed when limit is reached."
+const string tt_extend_bars    = "How many bars to extend zones into the future for visual tracking."
+const string tt_merge_zones    = "Automatically combine overlapping zones of the same type (supply/demand)."
+const string tt_merge_gap_atr  = "Gap tolerance (in ATR) for merging nearby zones. Higher = more aggressive merging."
+const string tt_mitigation     = "Wick: Zone broken when wick crosses boundary. Close: Zone broken when candle closes beyond boundary."
+
+const string tt_profile_rows   = "Number of volume distribution rows within each zone. More rows = finer detail."
+const string tt_profile_width  = "Width of volume profile bars as percentage of zone width. Lower = narrower bars."
+const string tt_show_poc       = "Display Point of Control line at price level with highest volume."
+const string tt_show_delta     = "Show buy/sell pressure (delta) profile on right side of zone."
+const string tt_delta_width    = "Width of delta profile bars as percentage of zone width."
+
+const string tt_supply_color   = "Color for supply (resistance) zones."
+const string tt_demand_color   = "Color for demand (support) zones."
+const string tt_show_info      = "Display info box showing zone statistics (volume, delta, touches, status)."
+const string tt_info_width     = "Width of info box in bars."
+
+// ┌────────────────────────────── BOSWaves ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+swing_len         = input.int(8, "Swing Length", minval=2, group=group_detect, tooltip=tt_swing_len)
+impulse_mult      = input.float(1.2, "Impulse Size (ATR)", minval=0.5, step=0.1, group=group_detect, tooltip=tt_impulse_mult)
+base_lookback     = input.int(3, "Base Lookback Candles", minval=1, maxval=10, group=group_detect, tooltip=tt_base_lookback)
+
+atr_length        = input.int(14, "ATR Length", minval=1, group=group_zone, tooltip=tt_atr_length)
+max_zone_atr      = input.float(4.0, "Maximum Zone Height (ATR)", minval=1.0, maxval=10.0, step=0.5, group=group_zone, tooltip=tt_max_zone_atr)
+max_zones         = input.int(10, "Maximum Zones", minval=1, maxval=30, group=group_zone, tooltip=tt_max_zones)
+extend_bars       = input.int(60, "Extend Zones (bars)", minval=10, maxval=200, group=group_zone, tooltip=tt_extend_bars)
+merge_zones       = input.bool(true, "Merge Overlapping Zones", group=group_zone, tooltip=tt_merge_zones)
+merge_gap_atr     = input.float(0.3, "Merge Gap (ATR)", minval=0.0, step=0.1, group=group_zone, tooltip=tt_merge_gap_atr)
+mitigation_type   = input.string("Wick", "Mitigation Type", options=["Wick", "Close"], group=group_zone, tooltip=tt_mitigation)
+
+profile_rows      = input.int(10, "Profile Rows", minval=4, maxval=30, group=group_profile, tooltip=tt_profile_rows)
+profile_width     = input.float(0.5, "Profile Width (%)", minval=0.2, maxval=0.9, step=0.05, group=group_profile, tooltip=tt_profile_width)
+show_poc          = input.bool(true, "Show POC Line", group=group_profile, tooltip=tt_show_poc)
+show_delta        = input.bool(true, "Show Delta Profile", group=group_profile, tooltip=tt_show_delta)
+delta_width       = input.float(0.35, "Delta Profile Width (%)", minval=0.1, maxval=0.9, step=0.05, group=group_profile, tooltip=tt_delta_width)
+
+supply_color      = input.color(#ff0000, "Supply Color", group=group_visual, tooltip=tt_supply_color)
+demand_color      = input.color(#00ff00, "Demand Color", group=group_visual, tooltip=tt_demand_color)
+show_info_box     = input.bool(true, "Show Zone Info Box", group=group_visual, tooltip=tt_show_info)
+info_box_width    = input.int(40, "Info Box Width (bars)", minval=1, group=group_visual, tooltip=tt_info_width)
+
+// ┌────────────────────────────── BOSWaves ─ Types ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+type VolumeRow
+    float   price_low
+    float   price_high
+    float   volume
+    float   width_pct
+    box     bar
+    bool    is_poc
+
+type DeltaRow
+    float   price_low
+    float   price_high
+    float   delta
+    float   width_pct
+    box     bar
+    bool    is_positive
+
+type SDZone
+    box               zone_box
+    line              poc_line
+    array<VolumeRow>  profile
+    array<DeltaRow>   delta_profile
+    bool              is_demand
+    float             zone_top
+    float             zone_bottom
+    float             poc_price
+    float             total_volume
+    float             total_delta
+    int               touch_count
+    int               creation_time
+    string            status
+    box               info_box
+
+// ┌────────────────────────────── BOSWaves ─ Variables ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var SDZone[] active_zones = array.new<SDZone>()
+
+atr_val = ta.atr(atr_length)
+tf_ms = int(timeframe.in_seconds() * 1000)
+
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low, swing_len, swing_len)
+
+// ┌────────────────────────────── BOSWaves ─ Functions ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+is_impulse_up(int start_bar) =>
+    float move = close - close[start_bar]
+    move >= atr_val * impulse_mult
+
+is_impulse_down(int start_bar) =>
+    float move = close[start_bar] - close
+    move >= atr_val * impulse_mult
+
+format_volume(float vol) =>
+    string result = ""
+    float abs_vol = math.abs(vol)
+    string sign = vol < 0 ? "-" : ""
+    if abs_vol >= 1000000000
+        result := sign + str.tostring(abs_vol / 1000000000, "#.##") + "B"
+    else if abs_vol >= 1000000
+        result := sign + str.tostring(abs_vol / 1000000, "#.##") + "M"
+    else if abs_vol >= 1000
+        result := sign + str.tostring(abs_vol / 1000, "#.##") + "K"
+    else
+        result := sign + str.tostring(abs_vol, "#.##")
+    result
+
+build_info_text(SDZone z) =>
+    string vol_str    = format_volume(z.total_volume)
+    string delta_str  = format_volume(z.total_delta)
+    string status_str = z.status
+    string touch_str  = str.tostring(z.touch_count)
+    string type_str   = z.is_demand ? "DEMAND" : "SUPPLY"
+    type_str + "\n" + status_str + "\nVol: " + vol_str + "\nΔ: " + delta_str + "\nTouches: " + touch_str
+
+delete_zone(SDZone z) =>
+    box.delete(z.zone_box)
+    if not na(z.poc_line)
+        line.delete(z.poc_line)
+    if not na(z.info_box)
+        box.delete(z.info_box)
+    for vr in z.profile
+        if not na(vr.bar)
+            box.delete(vr.bar)
+    for dr in z.delta_profile
+        if not na(dr.bar)
+            box.delete(dr.bar)
+
+build_profile(float top, float bottom, int start_idx, int end_idx, bool is_demand, int left_t, int right_t) =>
+    array<VolumeRow> rows = array.new<VolumeRow>()
+
+    float zone_height = top - bottom
+    float row_height = zone_height / profile_rows
+    float max_vol = 0.0
+    float total_vol = 0.0
+    float poc_price = math.avg(top, bottom)
+    float poc_vol = 0.0
+    int poc_idx = 0
+
+    for r = 0 to profile_rows - 1
+        float row_low = bottom + (r * row_height)
+        float row_high = row_low + row_height
+        float row_vol = 0.0
+
+        int actual_start = math.max(start_idx, end_idx)
+        int actual_end = math.min(start_idx, end_idx)
+
+        for i = actual_end to actual_start
+            if i >= 0 and i < bar_index
+                float bar_high = high[i]
+                float bar_low = low[i]
+                float bar_vol = nz(volume[i], 1.0)
+
+                if bar_high >= row_low and bar_low <= row_high
+                    float overlap_low = math.max(bar_low, row_low)
+                    float overlap_high = math.min(bar_high, row_high)
+                    float bar_range = bar_high - bar_low
+                    float overlap_pct = bar_range > 0 ? (overlap_high - overlap_low) / bar_range : 1.0
+                    row_vol += bar_vol * overlap_pct
+
+        total_vol += row_vol
+        if row_vol > max_vol
+            max_vol := row_vol
+        if row_vol > poc_vol
+            poc_vol := row_vol
+            poc_price := row_low + (row_height / 2)
+            poc_idx := r
+
+        VolumeRow vr = VolumeRow.new(row_low, row_high, row_vol, 0.0, na, false)
+        rows.push(vr)
+
+    color base_col = is_demand ? demand_color : supply_color
+    int zone_width = right_t - left_t
+    int max_bar_width = int(zone_width * profile_width)
+
+    if max_vol > 0
+        for r = 0 to rows.size() - 1
+            VolumeRow vr = rows.get(r)
+            float w_pct = vr.volume / max_vol
+            vr.width_pct := w_pct
+            vr.is_poc := (r == poc_idx)
+
+            int bar_width = int(math.max(tf_ms, max_bar_width * w_pct))
+            int bar_right_t = left_t + bar_width
+
+            int transp = int(93 - (w_pct * 73))
+            color bar_col = vr.is_poc ? color.white : base_col
+            int bar_transp = vr.is_poc ? 5 : transp
+
+            box b = box.new(left_t, vr.price_high, bar_right_t, vr.price_low,
+                 xloc=xloc.bar_time, bgcolor=color.new(bar_col, bar_transp), border_color=na)
+            vr.bar := b
+            rows.set(r, vr)
+
+    [rows, poc_price, total_vol, poc_idx]
+
+// ┌────────────────────────────── BOSWaves ─ Delta Profile ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+build_delta_profile(float top, float bottom, int start_idx, int end_idx, int left_t, int right_t) =>
+    array<DeltaRow> rows = array.new<DeltaRow>()
+
+    float zone_height = top - bottom
+    float row_height = zone_height / profile_rows
+    float max_abs_delta = 0.0
+    float total_delta = 0.0
+
+    for r = 0 to profile_rows - 1
+        float row_low = bottom + (r * row_height)
+        float row_high = row_low + row_height
+        float buy_vol = 0.0
+        float sell_vol = 0.0
+
+        int actual_start = math.max(start_idx, end_idx)
+        int actual_end = math.min(start_idx, end_idx)
+
+        for i = actual_end to actual_start
+            if i >= 0 and i < bar_index
+                float bar_high  = high[i]
+                float bar_low   = low[i]
+                float bar_vol   = nz(volume[i], 1.0)
+                float bar_open  = open[i]
+                float bar_close = close[i]
+
+                if bar_high >= row_low and bar_low <= row_high
+                    float overlap_low  = math.max(bar_low, row_low)
+                    float overlap_high = math.min(bar_high, row_high)
+                    float bar_range    = bar_high - bar_low
+                    float overlap_pct  = bar_range > 0 ? (overlap_high - overlap_low) / bar_range : 1.0
+                    float alloc_vol    = bar_vol * overlap_pct
+
+                    // Approximate delta: up-close bars = buy, down-close = sell
+                    if bar_close > bar_open
+                        buy_vol += alloc_vol
+                    else if bar_close < bar_open
+                        sell_vol += alloc_vol
+                    else
+                        // Doji: split evenly
+                        buy_vol  += alloc_vol * 0.5
+                        sell_vol += alloc_vol * 0.5
+
+        float row_delta = buy_vol - sell_vol
+        total_delta += row_delta
+
+        if math.abs(row_delta) > max_abs_delta
+            max_abs_delta := math.abs(row_delta)
+
+        DeltaRow dr = DeltaRow.new(row_low, row_high, row_delta, 0.0, na, row_delta >= 0)
+        rows.push(dr)
+
+    // Draw delta bars from right side pointing inward (left)
+    int zone_width = right_t - left_t
+    int max_bar_width = int(zone_width * delta_width)
+
+    if max_abs_delta > 0 and show_delta
+        for r = 0 to rows.size() - 1
+            DeltaRow dr = rows.get(r)
+            float w_pct = math.abs(dr.delta) / max_abs_delta
+            dr.width_pct := w_pct
+
+            int bar_width = int(math.max(tf_ms, max_bar_width * w_pct))
+            int bar_left_t = right_t - bar_width
+
+            int transp = int(93 - (w_pct * 73))
+            color bar_col = dr.is_positive ? demand_color : supply_color
+
+            dr.bar := box.new(bar_left_t, dr.price_high, right_t, dr.price_low,
+                 xloc=xloc.bar_time, bgcolor=color.new(bar_col, transp), border_color=na)
+
+            rows.set(r, dr)
+
+    [rows, total_delta]
+
+update_delta_positions(SDZone z, int left_t, int right_t) =>
+    if z.delta_profile.size() > 0 and show_delta
+        int zone_width = right_t - left_t
+        int max_bar_width = int(zone_width * delta_width)
+
+        float zone_height = z.zone_top - z.zone_bottom
+        float row_height = zone_height / z.delta_profile.size()
+
+        float max_abs_delta = 0.0
+        for r = 0 to z.delta_profile.size() - 1
+            DeltaRow dr = z.delta_profile.get(r)
+            if math.abs(dr.delta) > max_abs_delta
+                max_abs_delta := math.abs(dr.delta)
+
+        for r = 0 to z.delta_profile.size() - 1
+            DeltaRow dr = z.delta_profile.get(r)
+
+            float new_row_low  = z.zone_bottom + (r * row_height)
+            float new_row_high = new_row_low + row_height
+            dr.price_low  := new_row_low
+            dr.price_high := new_row_high
+
+            float w_pct = max_abs_delta > 0 ? math.abs(dr.delta) / max_abs_delta : 0.0
+            dr.width_pct := w_pct
+
+            int bar_width  = int(math.max(tf_ms, max_bar_width * w_pct))
+            int bar_left_t = right_t - bar_width
+
+            if not na(dr.bar)
+                box.delete(dr.bar)
+
+            int transp = int(93 - (w_pct * 73))
+            color bar_col = dr.is_positive ? demand_color : supply_color
+
+            dr.bar := box.new(bar_left_t, new_row_high, right_t, new_row_low,
+                 xloc=xloc.bar_time, bgcolor=color.new(bar_col, transp), border_color=na)
+
+            z.delta_profile.set(r, dr)
+
+update_profile_positions(SDZone z, int left_t, int right_t) =>
+    int zone_width = right_t - left_t
+    int max_bar_width = int(zone_width * profile_width)
+    color base_col = z.is_demand ? demand_color : supply_color
+
+    float zone_height = z.zone_top - z.zone_bottom
+    float row_height = zone_height / z.profile.size()
+
+    for r = 0 to z.profile.size() - 1
+        VolumeRow vr = z.profile.get(r)
+
+        float new_row_low = z.zone_bottom + (r * row_height)
+        float new_row_high = new_row_low + row_height
+        vr.price_low := new_row_low
+        vr.price_high := new_row_high
+
+        int bar_width = int(math.max(tf_ms, max_bar_width * vr.width_pct))
+        int bar_right_t = left_t + bar_width
+
+        if not na(vr.bar)
+            box.delete(vr.bar)
+
+            int transp = int(75 - (vr.width_pct * 35))
+            color bar_col = vr.is_poc ? color.white : base_col
+            int bar_transp = vr.is_poc ? 5 : transp
+
+            vr.bar := box.new(left_t, new_row_high, bar_right_t, new_row_low,
+                 xloc=xloc.bar_time, bgcolor=color.new(bar_col, bar_transp), border_color=na)
+
+        z.profile.set(r, vr)
+
+zones_overlap(float top_a, float btm_a, float top_b, float btm_b, float gap) =>
+    float exp_top_a = top_a + gap
+    float exp_btm_a = btm_a - gap
+    float exp_top_b = top_b + gap
+    float exp_btm_b = btm_b - gap
+    (exp_btm_a <= exp_top_b) and (exp_top_a >= exp_btm_b)
+
+// ┌────────────────────────────── BOSWaves ─ Zone Creation ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+create_zone(bool is_demand, int pivot_bar_offset) =>
+    int end_idx = pivot_bar_offset
+    int start_idx = pivot_bar_offset + base_lookback
+
+    float raw_top = high[end_idx]
+    float raw_bottom = low[end_idx]
+
+    for i = end_idx to start_idx
+        raw_top := math.max(raw_top, high[i])
+        raw_bottom := math.min(raw_bottom, low[i])
+
+    float zone_height = raw_top - raw_bottom
+    float max_height = atr_val * max_zone_atr
+
+    if zone_height > max_height
+        float mid = (raw_top + raw_bottom) / 2
+        raw_top := mid + (max_height / 2)
+        raw_bottom := mid - (max_height / 2)
+
+    float zone_top = raw_top
+    float zone_bottom = raw_bottom
+
+    int left_t = time[start_idx]
+    int right_t = time + extend_bars * tf_ms
+
+    color base_col = is_demand ? demand_color : supply_color
+
+    box zb = box.new(left_t, zone_top, right_t, zone_bottom, xloc=xloc.bar_time,
+         bgcolor=color.new(base_col, 90), border_color=color.new(base_col, 50),
+         border_width=1, border_style=line.style_solid)
+
+    [profile_rows_arr, poc, total_vol, poc_idx] = build_profile(zone_top, zone_bottom, start_idx, end_idx, is_demand, left_t, right_t)
+
+    [delta_rows_arr, total_delta] = build_delta_profile(zone_top, zone_bottom, start_idx, end_idx, left_t, right_t)
+
+    line poc_ln = na
+    if show_poc
+        poc_ln := line.new(left_t, poc, right_t, poc, xloc=xloc.bar_time,
+             color=color.new(color.white, 30), style=line.style_solid, width=1)
+
+    SDZone new_z = SDZone.new(zb, poc_ln, profile_rows_arr, delta_rows_arr, is_demand, zone_top, zone_bottom,
+         poc, total_vol, total_delta, 0, left_t, "Fresh", na)
+    new_z
+
+// ┌────────────────────────────── BOSWaves ─ Zone Merging ───────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+merge_into_existing(SDZone new_zone) =>
+    bool merged = false
+    if merge_zones and active_zones.size() > 0
+        float gap = atr_val * merge_gap_atr
+        for i = active_zones.size() - 1 to 0
+            SDZone existing = active_zones.get(i)
+            if existing.is_demand == new_zone.is_demand
+                if zones_overlap(existing.zone_top, existing.zone_bottom, new_zone.zone_top, new_zone.zone_bottom, gap)
+                    float new_top = math.max(existing.zone_top, new_zone.zone_top)
+                    float new_bottom = math.min(existing.zone_bottom, new_zone.zone_bottom)
+
+                    float zone_height = new_top - new_bottom
+                    float max_height = atr_val * max_zone_atr
+                    if zone_height > max_height
+                        float mid = (new_top + new_bottom) / 2
+                        new_top := mid + (max_height / 2)
+                        new_bottom := mid - (max_height / 2)
+
+                    existing.zone_top := new_top
+                    existing.zone_bottom := new_bottom
+                    existing.total_volume += new_zone.total_volume
+                    existing.total_delta += new_zone.total_delta
+
+                    int left_t = existing.creation_time
+                    int right_t = time + extend_bars * tf_ms
+
+                    existing.zone_box.set_top(existing.zone_top)
+                    existing.zone_box.set_bottom(existing.zone_bottom)
+                    existing.zone_box.set_right(right_t)
+
+                    // Merge volume profile
+                    float max_vol = 0.0
+                    int poc_idx = 0
+                    for r = 0 to existing.profile.size() - 1
+                        VolumeRow vr = existing.profile.get(r)
+                        if r < new_zone.profile.size()
+                            VolumeRow nvr = new_zone.profile.get(r)
+                            vr.volume += nvr.volume
+                        if vr.volume > max_vol
+                            max_vol := vr.volume
+                            poc_idx := r
+
+                    for r = 0 to existing.profile.size() - 1
+                        VolumeRow vr = existing.profile.get(r)
+                        vr.width_pct := max_vol > 0 ? vr.volume / max_vol : 0.5
+                        vr.is_poc := (r == poc_idx)
+                        existing.profile.set(r, vr)
+
+                    float row_height = (existing.zone_top - existing.zone_bottom) / existing.profile.size()
+                    existing.poc_price := existing.zone_bottom + (poc_idx * row_height) + (row_height / 2)
+
+                    // Merge delta profile
+                    for r = 0 to existing.delta_profile.size() - 1
+                        DeltaRow dr = existing.delta_profile.get(r)
+                        if r < new_zone.delta_profile.size()
+                            DeltaRow ndr = new_zone.delta_profile.get(r)
+                            dr.delta += ndr.delta
+                            dr.is_positive := dr.delta >= 0
+                        existing.delta_profile.set(r, dr)
+
+                    if not na(existing.poc_line)
+                        existing.poc_line.set_y1(existing.poc_price)
+                        existing.poc_line.set_y2(existing.poc_price)
+                        existing.poc_line.set_x2(right_t)
+
+                    update_profile_positions(existing, left_t, right_t)
+                    update_delta_positions(existing, left_t, right_t)
+                    active_zones.set(i, existing)
+
+                    delete_zone(new_zone)
+                    merged := true
+                    break
+    merged
+
+// ┌────────────────────────────── BOSWaves ─ Detection ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+bool new_demand = not na(pl) and is_impulse_up(swing_len)
+bool new_supply = not na(ph) and is_impulse_down(swing_len)
+
+if new_demand
+    SDZone nz = create_zone(true, swing_len)
+    bool merged = merge_into_existing(nz)
+    if not merged
+        if active_zones.size() >= max_zones
+            SDZone oldest = active_zones.shift()
+            delete_zone(oldest)
+        active_zones.push(nz)
+
+if new_supply
+    SDZone nz = create_zone(false, swing_len)
+    bool merged = merge_into_existing(nz)
+    if not merged
+        if active_zones.size() >= max_zones
+            SDZone oldest = active_zones.shift()
+            delete_zone(oldest)
+        active_zones.push(nz)
+
+// ┌────────────────────────────── BOSWaves ─ Zone Management ────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var bool zone_touch = false
+var bool zone_mitigated = false
+zone_touch := false
+zone_mitigated := false
+
+if active_zones.size() > 0
+    int i = active_zones.size() - 1
+    while i >= 0
+        SDZone z = active_zones.get(i)
+
+        int left_t = z.creation_time
+        int right_t = time + extend_bars * tf_ms
+
+        z.zone_box.set_right(right_t)
+        if not na(z.poc_line)
+            z.poc_line.set_x2(right_t)
+
+        update_profile_positions(z, left_t, right_t)
+        update_delta_positions(z, left_t, right_t)
+
+        bool in_zone = high >= z.zone_bottom and low <= z.zone_top
+        bool was_in_zone = high[1] >= z.zone_bottom and low[1] <= z.zone_top
+
+        if in_zone and not was_in_zone and z.status == "Fresh"
+            z.status := "Tested"
+            z.touch_count += 1
+            zone_touch := true
+        else if in_zone and z.status == "Tested"
+            z.touch_count += 1
+
+        bool mitigated = false
+        if mitigation_type == "Wick"
+            mitigated := z.is_demand ? low < z.zone_bottom : high > z.zone_top
+        else
+            mitigated := z.is_demand ? close < z.zone_bottom : close > z.zone_top
+
+        if mitigated
+            zone_mitigated := true
+            delete_zone(z)
+            active_zones.remove(i)
+        else
+            // ── Rebuild info box to the right of the zone ──
+            if show_info_box
+                if not na(z.info_box)
+                    box.delete(z.info_box)
+                int ib_right_t = right_t + info_box_width * tf_ms
+                color base_col = z.is_demand ? demand_color : supply_color
+                string txt = build_info_text(z)
+                z.info_box := box.new(right_t, z.zone_top, ib_right_t, z.zone_bottom, text_formatting = text.format_bold,
+                     xloc=xloc.bar_time,
+                     bgcolor=color.new(base_col, 88),
+                     border_color=color.new(base_col, 50),
+                     border_width=1,
+                     text=txt,
+                     text_size=size.auto,
+                     text_color=chart.fg_color,
+                     text_halign=text.align_center,
+                     text_valign=text.align_center)
+            active_zones.set(i, z)
+
+        i -= 1
+
+// ┌────────────────────────────── BOSWaves ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+alertcondition(new_demand, "New Demand Zone", "New demand zone formed {{ticker}}")
+alertcondition(new_supply, "New Supply Zone", "New supply zone formed {{ticker}}")
+alertcondition(zone_touch, "Zone Tested", "Supply/Demand zone tested {{ticker}}")
+alertcondition(zone_mitigated, "Zone Mitigated", "Supply/Demand zone mitigated {{ticker}}")

@@ -1,0 +1,500 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © VeloxAlgo
+
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © VeloxAlgo - Enhanced Edition
+
+//@version=6
+indicator('Pro Grid Elite: Advanced Dual-Asset Momentum Matrix', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+group_main = 'Main Symbol Settings'
+rsi_len = input.int(14, 'RSI Length', minval = 2, group = group_main)
+vol_len = input.int(14, 'ATR Length', minval = 1, group = group_main)
+lookback = input.int(200, 'Normalization Lookback', minval = 20, group = group_main)
+use_stoch = input.bool(false, 'Use Stochastic Instead of RSI', group = group_main)
+stoch_k = input.int(14, 'Stochastic K', minval = 1, group = group_main)
+stoch_d = input.int(3, 'Stochastic D', minval = 1, group = group_main)
+
+group_comp = 'Benchmark Symbol'
+show_comp = input.bool(true, 'Show Benchmark Trail', group = group_comp)
+comp_sym = input.symbol('BTCUSDT', 'Benchmark Symbol', group = group_comp)
+
+group_vis = 'Visuals & Grid'
+trail_len = input.int(15, 'Trail Length', minval = 1, maxval = 50, group = group_vis)
+box_width = input.int(35, 'Grid Width (Bars)', minval = 10, maxval = 100, group = group_vis)
+offset_x = input.int(8, 'Grid Offset', minval = 0, maxval = 50, group = group_vis)
+color_scheme = input.string('Neon', 'Color Theme', options = ['Neon', 'Dark', 'Light', 'Matrix', 'Cyberpunk'], group = group_vis)
+show_zones = input.bool(true, 'Show Quadrant Labels', group = group_vis)
+gradient_trail = input.bool(true, 'Gradient Trail Effect', group = group_vis)
+
+group_adv = 'Advanced Features'
+show_velocity = input.bool(true, 'Show Momentum Velocity', group = group_adv)
+velocity_len = input.int(5, 'Velocity Lookback', minval = 2, maxval = 20, group = group_adv)
+show_divergence = input.bool(true, 'Detect Divergences', group = group_adv)
+div_lookback = input.int(5, 'Divergence Lookback', minval = 3, maxval = 20, group = group_adv)
+show_correlation = input.bool(true, 'Show Correlation', group = group_adv)
+corr_len = input.int(20, 'Correlation Length', minval = 5, maxval = 100, group = group_adv)
+
+group_alert = 'Alerts'
+alert_zones = input.bool(true, 'Alert on Zone Changes', group = group_alert)
+alert_div = input.bool(true, 'Alert on Divergences', group = group_alert)
+alert_extreme = input.bool(true, 'Alert on Extreme Readings', group = group_alert)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLOR SCHEMES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+get_colors(scheme) =>
+    var color c_main = na
+    var color c_bench = na
+    var color c_grid = na
+    var color c_bg = na
+
+    if scheme == 'Neon'
+        c_main := #00e5ff
+        c_bench := #ff007b
+        c_grid := color.new(#4a4a4a, 60)
+        c_bg := color.new(color.black, 70)
+        c_bg
+    else if scheme == 'Dark'
+        c_main := #4dabf7
+        c_bench := #ff6b6b
+        c_grid := color.new(color.gray, 80)
+        c_bg := color.new(#1a1a1a, 75)
+        c_bg
+    else if scheme == 'Light'
+        c_main := #228be6
+        c_bench := #ff6b35
+        c_grid := color.new(#d0d0d0, 60)
+        c_bg := color.new(color.white, 85)
+        c_bg
+    else if scheme == 'Matrix'
+        c_main := #00ff41
+        c_bench := #39ff14
+        c_grid := color.new(#003b00, 50)
+        c_bg := color.new(#000000, 80)
+        c_bg
+    else // Cyberpunk
+        c_main := #ff00ff
+        c_bench := #00ffff
+        c_grid := color.new(#330066, 60)
+        c_bg := color.new(#0a0a1a, 75)
+        c_bg
+
+    [c_main, c_bench, c_grid, c_bg]
+
+[c_main, c_bench, c_grid, c_bg] = get_colors(color_scheme)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRAWING OBJECTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var box grid_bg = na
+var array<line> lines_grid = array.new_line()
+var array<label> labels_axis = array.new_label()
+var array<label> labels_zones = array.new_label()
+var array<line> lines_trail_m = array.new_line()
+var array<line> lines_trail_b = array.new_line()
+var label dot_main = na
+var label dot_bench = na
+var label velocity_label = na
+var label div_label = na
+var table dash = table.new(position.top_right, 4, 6, bgcolor = color.new(color.black, 50), border_width = 1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CUSTOM FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Dynamic RSI
+f_rsi_dynamic(src, len) =>
+    change = src - src[1]
+    u = math.max(change, 0)
+    d = -math.min(change, 0)
+    alpha = 1 / math.max(1, len)
+    var float avg_u = na
+    var float avg_d = na
+    if na(avg_u)
+        avg_u := u
+        avg_d := d
+        avg_d
+    else
+        avg_u := alpha * u + (1 - alpha) * avg_u
+        avg_d := alpha * d + (1 - alpha) * avg_d
+        avg_d
+    rs = avg_d == 0 ? 100 : avg_u / avg_d
+    rsi = 100 - 100 / (1 + rs)
+    rsi
+
+// Dynamic Stochastic
+f_stoch_dynamic(src, k_len, d_len) =>
+    lowest_k = ta.lowest(src, k_len)
+    highest_k = ta.highest(src, k_len)
+    k = highest_k - lowest_k != 0 ? (src - lowest_k) / (highest_k - lowest_k) * 100 : 50
+    d = ta.sma(k, d_len)
+    [k, d]
+
+// Dynamic ATR
+f_atr_dynamic(len) =>
+    tr_val = ta.tr
+    alpha = 1 / math.max(1, len)
+    var float avg_tr = na
+    if na(avg_tr)
+        avg_tr := tr_val
+        avg_tr
+    else
+        avg_tr := alpha * tr_val + (1 - alpha) * avg_tr
+        avg_tr
+    avg_tr
+
+// External ATR
+f_atr_dynamic_ext(src_high, src_low, src_close, len) =>
+    tr_val = math.max(math.max(src_high - src_low, math.abs(src_high - src_close[1])), math.abs(src_low - src_close[1]))
+    alpha = 1 / math.max(1, len)
+    var float avg_tr = na
+    if na(avg_tr)
+        avg_tr := tr_val
+        avg_tr
+    else
+        avg_tr := alpha * tr_val + (1 - alpha) * avg_tr
+        avg_tr
+    avg_tr
+
+// Correlation Coefficient
+f_correlation(x, y, len) =>
+    sum_x = math.sum(x, len)
+    sum_y = math.sum(y, len)
+    sum_xy = math.sum(x * y, len)
+    sum_x2 = math.sum(x * x, len)
+    sum_y2 = math.sum(y * y, len)
+    n = len
+    numerator = n * sum_xy - sum_x * sum_y
+    denominator = math.sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y))
+    corr = denominator != 0 ? numerator / denominator : 0
+    corr
+
+// Momentum Velocity (rate of change)
+f_velocity(val_x, val_y, len) =>
+    dx = val_x - val_x[len]
+    dy = val_y - val_y[len]
+    speed = math.sqrt(dx * dx + dy * dy)
+    angle = math.atan(dy / dx) * (180 / math.pi)
+    [speed, angle]
+
+// Divergence Detection
+f_detect_divergence(price, indicator, lookback) =>
+    var string signal = na
+
+    // Find pivot highs and lows
+    ph = ta.pivothigh(price, lookback, lookback)
+    pl = ta.pivotlow(price, lookback, lookback)
+    ih = ta.pivothigh(indicator, lookback, lookback)
+    il = ta.pivotlow(indicator, lookback, lookback)
+
+    // Bullish Divergence: Price makes lower low, indicator makes higher low
+    bullish_div = not na(pl) and not na(il) and pl < pl[lookback] and il > il[lookback]
+
+    // Bearish Divergence: Price makes higher high, indicator makes lower high
+    bearish_div = not na(ph) and not na(ih) and ph > ph[lookback] and ih < ih[lookback]
+
+    if bullish_div
+        signal := 'Bullish Div'
+        signal
+    else if bearish_div
+        signal := 'Bearish Div'
+        signal
+    else
+        signal := 'None'
+        signal
+
+    signal
+
+// Determine Zone
+f_get_zone(x_val, y_val) =>
+    var string zone = na
+    if x_val >= 50 and y_val >= 50
+        zone := 'Strong Bull'
+        zone
+    else if x_val < 50 and y_val >= 50
+        zone := 'Vol Spike'
+        zone
+    else if x_val < 50 and y_val < 50
+        zone := 'Weak Bear'
+        zone
+    else
+        zone := 'Low Vol'
+        zone
+    zone
+
+// Cleanup
+clean_up() =>
+    box.delete(grid_bg)
+    label.delete(dot_main)
+    label.delete(dot_bench)
+    label.delete(velocity_label)
+    label.delete(div_label)
+
+    if array.size(lines_grid) > 0
+        for i = 0 to array.size(lines_grid) - 1 by 1
+            line.delete(array.get(lines_grid, i))
+    array.clear(lines_grid)
+
+    if array.size(labels_axis) > 0
+        for i = 0 to array.size(labels_axis) - 1 by 1
+            label.delete(array.get(labels_axis, i))
+    array.clear(labels_axis)
+
+    if array.size(labels_zones) > 0
+        for i = 0 to array.size(labels_zones) - 1 by 1
+            label.delete(array.get(labels_zones, i))
+    array.clear(labels_zones)
+
+    if array.size(lines_trail_m) > 0
+        for i = 0 to array.size(lines_trail_m) - 1 by 1
+            line.delete(array.get(lines_trail_m, i))
+    array.clear(lines_trail_m)
+
+    if array.size(lines_trail_b) > 0
+        for i = 0 to array.size(lines_trail_b) - 1 by 1
+            line.delete(array.get(lines_trail_b, i))
+    array.clear(lines_trail_b)
+
+// Get Coordinates
+get_coords(val_x, val_y, left_b, b_width, bot_p, p_range) =>
+    clamped_x = math.max(0, math.min(100, val_x))
+    clamped_y = math.max(0, math.min(100, val_y))
+    x = math.round(left_b + clamped_x / 100 * b_width)
+    y = bot_p + clamped_y / 100 * p_range
+    [x, y]
+
+// Draw Trail with Gradient
+draw_series_trail(series_x, series_y, col_base, _arr_lines, left_b, b_width, bot_p, p_range, t_len, use_gradient) =>
+    if t_len > 0
+        for i = 1 to t_len by 1
+            if not na(series_x[i]) and not na(series_y[i])
+                val_x_curr = series_x[i - 1]
+                val_y_curr = series_y[i - 1]
+                val_x_prev = series_x[i]
+                val_y_prev = series_y[i]
+
+                [x1, y1] = get_coords(val_x_curr, val_y_curr, left_b, b_width, bot_p, p_range)
+                [x2, y2] = get_coords(val_x_prev, val_y_prev, left_b, b_width, bot_p, p_range)
+
+                transp = use_gradient ? 20 + i * (75 / t_len) : 40
+                width_val = use_gradient ? math.max(1, 4 - i * 3 / t_len) : 2
+
+                l_col = color.new(col_base, transp)
+                ln = line.new(x1, y1, x2, y2, color = l_col, width = int(width_val))
+                array.push(_arr_lines, ln)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+eff_len = math.min(bar_index + 1, rsi_len)
+eff_lookback = math.min(bar_index + 1, lookback)
+
+// Main Symbol - Choose Indicator
+[stoch_k_main, stoch_d_main] = f_stoch_dynamic(close, stoch_k, stoch_d)
+momentum_main = use_stoch ? stoch_k_main : f_rsi_dynamic(close, eff_len)
+atr_main = f_atr_dynamic(eff_len)
+
+max_atr_m = ta.highest(atr_main, eff_lookback)
+min_atr_m = ta.lowest(atr_main, eff_lookback)
+norm_vol_main = max_atr_m - min_atr_m != 0 ? (atr_main - min_atr_m) / (max_atr_m - min_atr_m) * 100 : 0
+
+// Benchmark
+[b_close, b_high, b_low] = request.security(comp_sym, timeframe.period, [close, high, low], lookahead = barmerge.lookahead_on)
+
+[stoch_k_bench, stoch_d_bench] = f_stoch_dynamic(b_close, stoch_k, stoch_d)
+momentum_bench = use_stoch ? stoch_k_bench : f_rsi_dynamic(b_close, eff_len)
+bench_atr = f_atr_dynamic_ext(b_high, b_low, b_close, eff_len)
+
+max_atr_b = ta.highest(bench_atr, eff_lookback)
+min_atr_b = ta.lowest(bench_atr, eff_lookback)
+norm_vol_bench = max_atr_b - min_atr_b != 0 ? (bench_atr - min_atr_b) / (max_atr_b - min_atr_b) * 100 : 0
+
+// Advanced Metrics
+[vel_speed_main, vel_angle_main] = f_velocity(momentum_main, norm_vol_main, velocity_len)
+[vel_speed_bench, vel_angle_bench] = f_velocity(momentum_bench, norm_vol_bench, velocity_len)
+
+divergence_main = show_divergence ? f_detect_divergence(close, momentum_main, div_lookback) : 'None'
+
+correlation = show_correlation ? f_correlation(momentum_main, momentum_bench, corr_len) : na
+
+zone_main = f_get_zone(momentum_main, norm_vol_main)
+zone_bench = f_get_zone(momentum_bench, norm_vol_bench)
+
+// Track zone changes for alerts
+var string prev_zone_main = na
+zone_changed = zone_main != prev_zone_main
+prev_zone_main := zone_main
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    clean_up()
+
+    // Grid Properties
+    left_bar = bar_index + offset_x
+    right_bar = left_bar + box_width
+
+    safe_atr = nz(atr_main, ta.tr)
+    grid_h = (safe_atr == 0 ? syminfo.mintick * 100 : safe_atr) * 12
+
+    mid_price = close
+    top_price = mid_price + grid_h / 2
+    bot_price = mid_price - grid_h / 2
+    range_p = top_price - bot_price
+
+    // Background Box
+    grid_bg := box.new(left_bar, top_price, right_bar, bot_price, border_color = c_grid, border_width = 2, bgcolor = c_bg)
+
+    // Grid Lines
+    levels = array.from(0, 20, 30, 50, 70, 80, 100)
+    for lvl in levels
+        y_loc = bot_price + range_p * (lvl / 100)
+        x_loc = math.round(left_bar + box_width * (lvl / 100))
+
+        is_mid = lvl == 50
+        is_zone = lvl == 30 or lvl == 70
+        is_ext = lvl == 20 or lvl == 80
+
+        l_col = is_mid ? color.new(color.white, 50) : is_zone ? color.new(color.yellow, 70) : is_ext ? color.new(color.orange, 80) : c_grid
+        l_style = is_mid ? line.style_solid : is_zone or is_ext ? line.style_dashed : line.style_dotted
+        l_width = is_mid ? 2 : 1
+
+        l_h = line.new(left_bar, y_loc, right_bar, y_loc, color = l_col, style = l_style, width = l_width)
+        array.push(lines_grid, l_h)
+        l_v = line.new(x_loc, top_price, x_loc, bot_price, color = l_col, style = l_style, width = l_width)
+        array.push(lines_grid, l_v)
+
+        if lvl == 0 or lvl == 30 or lvl == 50 or lvl == 70 or lvl == 100
+            lbl = label.new(left_bar - 2, y_loc, str.tostring(lvl), style = label.style_none, textcolor = color.gray, size = size.tiny, textalign = text.align_right)
+            array.push(labels_axis, lbl)
+
+        if lvl == 0 or lvl == 50 or lvl == 100
+            lbl_x = label.new(x_loc, bot_price - range_p * 0.05, str.tostring(lvl), style = label.style_none, textcolor = color.gray, size = size.tiny, yloc = yloc.price)
+            array.push(labels_axis, lbl_x)
+
+    // Quadrant Zone Labels
+    if show_zones
+        mid_x = left_bar + box_width / 2
+        mid_y = bot_price + range_p / 2
+
+        quad_offset_x = box_width * 0.25
+        quad_offset_y = range_p * 0.25
+
+        // Top Right: Strong Bull
+        lbl_tr = label.new(math.round(mid_x + quad_offset_x), mid_y + quad_offset_y, 'STRONG\nBULL', style = label.style_none, textcolor = color.new(color.green, 60), size = size.small, textalign = text.align_center)
+        array.push(labels_zones, lbl_tr)
+
+        // Top Left: Vol Spike
+        lbl_tl = label.new(math.round(mid_x - quad_offset_x), mid_y + quad_offset_y, 'VOL\nSPIKE', style = label.style_none, textcolor = color.new(color.orange, 60), size = size.small, textalign = text.align_center)
+        array.push(labels_zones, lbl_tl)
+
+        // Bottom Left: Weak Bear
+        lbl_bl = label.new(math.round(mid_x - quad_offset_x), mid_y - quad_offset_y, 'WEAK\nBEAR', style = label.style_none, textcolor = color.new(color.red, 60), size = size.small, textalign = text.align_center)
+        array.push(labels_zones, lbl_bl)
+
+        // Bottom Right: Low Vol
+        lbl_br = label.new(math.round(mid_x + quad_offset_x), mid_y - quad_offset_y, 'LOW\nVOL', style = label.style_none, textcolor = color.new(color.gray, 60), size = size.small, textalign = text.align_center)
+        array.push(labels_zones, lbl_br)
+
+    // Draw Trails
+    if not na(momentum_main)
+        draw_series_trail(momentum_main, norm_vol_main, c_main, lines_trail_m, left_bar, box_width, bot_price, range_p, trail_len, gradient_trail)
+
+    if show_comp and not na(momentum_bench)
+        draw_series_trail(momentum_bench, norm_vol_bench, c_bench, lines_trail_b, left_bar, box_width, bot_price, range_p, trail_len, gradient_trail)
+
+    // Draw Current Position Dots
+    if not na(momentum_main)
+        [mx, my] = get_coords(momentum_main, norm_vol_main, left_bar, box_width, bot_price, range_p)
+        dot_tooltip = syminfo.ticker + '\n' + zone_main
+        dot_main := label.new(mx, my, '●', style = label.style_none, textcolor = c_main, size = size.large, tooltip = dot_tooltip)
+        dot_main
+
+    if show_comp and not na(momentum_bench)
+        [bx, byy] = get_coords(momentum_bench, norm_vol_bench, left_bar, box_width, bot_price, range_p)
+        bench_tooltip = comp_sym + '\n' + zone_bench
+        dot_bench := label.new(bx, byy, '●', style = label.style_none, textcolor = c_bench, size = size.large, tooltip = bench_tooltip)
+        dot_bench
+
+    // Velocity Vector
+    if show_velocity and not na(vel_speed_main)
+        [vx, vy] = get_coords(momentum_main, norm_vol_main, left_bar, box_width, bot_price, range_p)
+        vel_text = 'V: ' + str.tostring(vel_speed_main, '#.1') + '\n∠' + str.tostring(vel_angle_main, '#.0') + '°'
+        velocity_label := label.new(vx, vy + range_p * 0.08, vel_text, style = label.style_label_down, textcolor = color.white, color = color.new(c_main, 30), size = size.tiny)
+        velocity_label
+
+    // Divergence Signal
+    if show_divergence and divergence_main != 'None'
+        [dx, dy] = get_coords(momentum_main, norm_vol_main, left_bar, box_width, bot_price, range_p)
+        div_color = divergence_main == 'Bullish Div' ? color.green : color.red
+        div_label := label.new(dx, dy - range_p * 0.08, divergence_main, style = label.style_label_up, textcolor = color.white, color = color.new(div_color, 20), size = size.tiny)
+        div_label
+
+    // Dashboard
+    indicator_name = use_stoch ? 'Stoch' : 'RSI'
+
+    table.cell(dash, 0, 0, 'Metric', text_color = color.gray, text_size = size.small, bgcolor = color.new(color.black, 60))
+    table.cell(dash, 1, 0, syminfo.ticker, text_color = c_main, text_size = size.small, bgcolor = color.new(color.black, 60))
+    if show_comp
+        table.cell(dash, 2, 0, comp_sym, text_color = c_bench, text_size = size.small, bgcolor = color.new(color.black, 60))
+
+    table.cell(dash, 0, 1, indicator_name, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    if not na(momentum_main)
+        table.cell(dash, 1, 1, str.tostring(momentum_main, '#.1'), text_color = color.white, text_size = size.small)
+    if show_comp and not na(momentum_bench)
+        table.cell(dash, 2, 1, str.tostring(momentum_bench, '#.1'), text_color = color.white, text_size = size.small)
+
+    table.cell(dash, 0, 2, 'Vol%', text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    if not na(norm_vol_main)
+        table.cell(dash, 1, 2, str.tostring(norm_vol_main, '#.0') + '%', text_color = color.white, text_size = size.small)
+    if show_comp and not na(norm_vol_bench)
+        table.cell(dash, 2, 2, str.tostring(norm_vol_bench, '#.0') + '%', text_color = color.white, text_size = size.small)
+
+    table.cell(dash, 0, 3, 'Zone', text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    zone_color_m = zone_main == 'Strong Bull' ? color.green : zone_main == 'Weak Bear' ? color.red : color.orange
+    table.cell(dash, 1, 3, zone_main, text_color = zone_color_m, text_size = size.tiny)
+    if show_comp
+        zone_color_b = zone_bench == 'Strong Bull' ? color.green : zone_bench == 'Weak Bear' ? color.red : color.orange
+        table.cell(dash, 2, 3, zone_bench, text_color = zone_color_b, text_size = size.tiny)
+
+    if show_velocity
+        table.cell(dash, 0, 4, 'Velocity', text_color = color.white, text_size = size.small, text_halign = text.align_left)
+        if not na(vel_speed_main)
+            table.cell(dash, 1, 4, str.tostring(vel_speed_main, '#.1'), text_color = color.white, text_size = size.small)
+        if show_comp and not na(vel_speed_bench)
+            table.cell(dash, 2, 4, str.tostring(vel_speed_bench, '#.1'), text_color = color.white, text_size = size.small)
+
+    if show_correlation and show_comp
+        table.cell(dash, 0, 5, 'Correlation', text_color = color.white, text_size = size.small, text_halign = text.align_left)
+        corr_color = correlation > 0.5 ? color.green : correlation < -0.5 ? color.red : color.yellow
+        table.cell(dash, 1, 5, str.tostring(correlation, '#.2'), text_color = corr_color, text_size = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Zone Change Alert
+if alert_zones and zone_changed
+    alert('Zone Changed to: ' + zone_main + ' for ' + syminfo.ticker, alert.freq_once_per_bar)
+
+// Divergence Alert
+if alert_div and divergence_main != 'None'
+    alert(divergence_main + ' detected on ' + syminfo.ticker, alert.freq_once_per_bar)
+
+// Extreme Readings Alert
+extreme_high = momentum_main > 80 and norm_vol_main > 70
+extreme_low = momentum_main < 20 and norm_vol_main > 70
+
+if alert_extreme and (extreme_high or extreme_low)
+    alert_msg = extreme_high ? 'Extreme Bullish Reading' : 'Extreme Bearish Reading'
+    alert(alert_msg + ' on ' + syminfo.ticker, alert.freq_once_per_bar)

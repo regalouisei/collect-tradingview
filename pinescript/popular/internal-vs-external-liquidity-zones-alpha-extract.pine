@@ -1,0 +1,421 @@
+//@version=6
+indicator("Internal vs External Liquidity Zones [Alpha Extract]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+TRANSPARENT = color.new(color.white, 100)
+
+// === Structure ===
+groupStructure = "Structure"
+intLen = input.int(3, "Internal Pivot Length", minval=1, group=groupStructure)
+extLen = input.int(10, "External Pivot Length", minval=2, group=groupStructure)
+internalMode = input.string("Equal High/Low", "Internal Zone Mode", options=["Every Pivot", "Equal High/Low"], group=groupStructure)
+eqTolAtr = input.float(0.25, "Equal High/Low Tolerance (ATR)", minval=0.0, step=0.05, group=groupStructure)
+requireInside = input.bool(true, "Require Internal Inside External Range", group=groupStructure)
+resetInternalOnExternal = input.bool(true, "Reset Internal Tracker On New External Pivot", group=groupStructure)
+clearInternalOnExternal = input.bool(false, "Clear Internal Zones On New External Pivot", group=groupStructure)
+
+// === Structure Labels ===
+groupStructLabels = "Structure Labels"
+showExternalStructure = input.bool(true, "Show External BOS/CHoCH", group=groupStructLabels)
+showInternalStructure = input.bool(true, "Show Internal BOS/CHoCH", group=groupStructLabels)
+structureLookbackExternal = input.int(36, "Structure Lookback (External)", minval=2, group=groupStructLabels)
+structureLookbackInternal = input.int(2, "Structure Lookback (Internal)", minval=2, group=groupStructLabels)
+useClosesForStructure = input.bool(true, "Use Closes for Structure", group=groupStructLabels, tooltip="When enabled, uses candle closes instead of wicks for structure analysis.")
+showStructureLines = input.bool(true, "Show Structure Lines", group=groupStructLabels)
+bullStructureColor = input.color(color.rgb(45, 255, 48), "Bullish Structure Color", group=groupStructLabels)
+bearStructureColor = input.color(color.rgb(255, 3, 3), "Bearish Structure Color", group=groupStructLabels)
+
+// === Zones ===
+groupZones = "Zones"
+showExternal = input.bool(true, "Show External Zones", group=groupZones)
+showInternal = input.bool(true, "Show Internal Zones", group=groupZones)
+externalHistory = input.string("Latest Only", "External Zone History", options=["Latest Only", "Keep History"], group=groupZones)
+maxZones = input.int(120, "Max Zones (each)", minval=10, maxval=500, group=groupZones)
+
+zoneSizeMode = input.string("ATR", "Zone Size Mode", options=["Ticks", "ATR"], group=groupZones)
+atrLen = input.int(14, "ATR Length", minval=5, maxval=200, group=groupZones)
+zoneAtrExt = input.float(0.40, "External Zone Size (ATR)", minval=0.05, step=0.05, group=groupZones)
+zoneAtrInt = input.float(0.40, "Internal Zone Size (ATR)", minval=0.05, step=0.05, group=groupZones)
+zoneTicksExt = input.int(20, "External Zone Size (ticks)", minval=1, group=groupZones)
+zoneTicksInt = input.int(10, "Internal Zone Size (ticks)", minval=1, group=groupZones)
+
+// === Sweep Detection ===
+groupSweep = "Sweep Detection"
+sweepMode = input.string("Wick", "Sweep Mode", options=["Wick", "Close", "Wick+Close (Classify)"], group=groupSweep)
+showSweepLabels = input.bool(false, "Show Sweep Labels", group=groupSweep)
+hideFilled = input.bool(true, "Hide Filled Zones", group=groupSweep)
+cutOnTouch = input.bool(true, "Cut Zone On Touch", group=groupSweep)
+
+// === Objectives ===
+groupObjectives = "Objectives"
+showObjectiveArrows = input.bool(true, "Show Objective Arrows", group=groupObjectives)
+
+// === Colors ===
+groupColors = "Colors"
+extHighColor = input.color(color.rgb(255, 0, 20), "External High", group=groupColors)
+extLowColor = input.color(color.rgb(255, 255, 255), "External Low", group=groupColors)
+intHighColor = input.color(color.rgb(77, 209, 224), "Internal High", group=groupColors)
+intLowColor = input.color(color.rgb(9, 143, 222), "Internal Low", group=groupColors)
+
+// === Visual Style ===
+groupStyle = "Visual Style"
+zoneStyle = input.string("Soft Fill", "Zone Style", options=["Soft Fill", "Outline"], group=groupStyle)
+fillActive = input.int(86, "Fill Transparency (Active)", minval=0, maxval=100, group=groupStyle)
+fillSwept = input.int(92, "Fill Transparency (Swept)", minval=0, maxval=100, group=groupStyle)
+fillBreak = input.int(96, "Fill Transparency (Broken)", minval=0, maxval=100, group=groupStyle)
+borderActive = input.int(45, "Border Transparency (Active)", minval=0, maxval=100, group=groupStyle)
+borderSwept = input.int(60, "Border Transparency (Swept)", minval=0, maxval=100, group=groupStyle)
+borderBreak = input.int(70, "Border Transparency (Broken)", minval=0, maxval=100, group=groupStyle)
+
+// === Structure Types ===
+type TrendScore
+    float momentum
+    float strength
+    int direction
+    int confidence
+
+type StructurePoint
+    float price
+    int timeBar
+    bool isBroken
+
+// === Structure Helpers ===
+calculateTrendMomentum(lookback) =>
+    if bar_index < lookback
+        0.0
+    else
+        priceChange = (close - close[lookback]) / close[lookback] * 100
+        avgVolatility = ta.atr(lookback) / close * 100
+        priceChange / (avgVolatility + 0.0001)
+
+calculateTrendStrength(shortPeriod, longPeriod) =>
+    shortMA = ta.sma(close, shortPeriod)
+    longMA = ta.sma(close, longPeriod)
+    separation = math.abs(shortMA - longMA) / longMA * 100
+    shortSlope = (shortMA - shortMA[5]) / shortMA[5] * 100
+    longSlope = (longMA - longMA[10]) / longMA[10] * 100
+    slopeAlignment = shortSlope * longSlope > 0 ? 1.0 : 0.5
+    strength = separation * slopeAlignment
+    math.min(strength, 100.0)
+
+calcTrendState(lookback) =>
+    momentum = calculateTrendMomentum(lookback)
+    strength = calculateTrendStrength(10, 20)
+    direction = momentum > 0.5 ? 1 : momentum < -0.5 ? -1 : 0
+    confidence = math.round(math.min(math.abs(momentum) * 20 + strength, 100))
+    TrendScore.new(momentum, strength, direction, confidence)
+
+drawStructureBreak(int fromBar, float level, string txt, bool isHigh, color col) =>
+    if showStructureLines
+        line.new(x1=fromBar, y1=level, x2=bar_index, y2=level, color=col, style=line.style_dashed, width=1)
+    labelX = math.round((fromBar + bar_index) / 2)
+    labelStyle = isHigh ? label.style_label_down : label.style_label_up
+    label.new(x=labelX, y=level, text=txt, color=TRANSPARENT, style=labelStyle, textcolor=col, size=size.tiny)
+
+atr = ta.atr(atrLen)
+
+zoneHeight(isExternal) =>
+    zoneSizeMode == "ATR" ? atr * (isExternal ? zoneAtrExt : zoneAtrInt) : syminfo.mintick * (isExternal ? zoneTicksExt : zoneTicksInt)
+
+zoneBaseColor(isExternal, isHigh) =>
+    isExternal ? (isHigh ? extHighColor : extLowColor) : (isHigh ? intHighColor : intLowColor)
+
+zoneFillColor(base, state, showZones) =>
+    trans = state == 0 ? fillActive : state == 1 ? fillSwept : fillBreak
+    trans := zoneStyle == "Outline" ? 100 : trans
+    showZones ? color.new(base, trans) : color.new(base, 100)
+
+zoneBorderColor(base, state, showZones) =>
+    trans = state == 0 ? borderActive : state == 1 ? borderSwept : borderBreak
+    showZones ? color.new(base, trans) : color.new(base, 100)
+
+// 0 = active, 1 = swept, 2 = broken
+zoneState(isHigh, top, bottom, prevState) =>
+    if prevState == 2
+        2
+    else
+        newState = prevState
+        if sweepMode == "Wick"
+            hit = isHigh ? high >= bottom : low <= top
+            if hit and prevState == 0
+                newState := 1
+        else if sweepMode == "Close"
+            hit = isHigh ? close >= bottom : close <= top
+            if hit and prevState == 0
+                newState := 1
+        else
+            breakHit = isHigh ? close > top : close < bottom
+            sweepHit = isHigh ? (high >= bottom and close <= top) : (low <= top and close >= bottom)
+            if breakHit
+                newState := 2
+            else if sweepHit and prevState == 0
+                newState := 1
+        newState
+
+// === Zone storage ===
+var box[] extBoxes = array.new<box>()
+var bool[] extIsHigh = array.new<bool>()
+var int[] extState = array.new<int>()
+
+var box[] intBoxes = array.new<box>()
+var bool[] intIsHigh = array.new<bool>()
+var int[] intState = array.new<int>()
+
+// === Structure storage ===
+var StructurePoint[] extUpper = array.new<StructurePoint>()
+var StructurePoint[] extLower = array.new<StructurePoint>()
+var StructurePoint[] intUpper = array.new<StructurePoint>()
+var StructurePoint[] intLower = array.new<StructurePoint>()
+
+var TrendScore extTrendState = TrendScore.new(0, 0, 0, 0)
+var TrendScore intTrendState = TrendScore.new(0, 0, 0, 0)
+
+clearZones(box[] boxes, bool[] highs, int[] states) =>
+    i = array.size(boxes) - 1
+    while i >= 0
+        array.get(boxes, i).delete()
+        array.remove(boxes, i)
+        array.remove(highs, i)
+        array.remove(states, i)
+        i -= 1
+
+clearSideIfLatest(bool isExternal, bool isHigh) =>
+    if isExternal and externalHistory == "Latest Only"
+        i = array.size(extBoxes) - 1
+        while i >= 0
+            if array.get(extIsHigh, i) == isHigh
+                array.get(extBoxes, i).delete()
+                array.remove(extBoxes, i)
+                array.remove(extIsHigh, i)
+                array.remove(extState, i)
+            i -= 1
+
+addZone(bool isExternal, bool isHigh, float level, int leftBar) =>
+    height = zoneHeight(isExternal)
+    half = height * 0.5
+    top = level + half
+    bottom = level - half
+    base = zoneBaseColor(isExternal, isHigh)
+    fillCol = zoneFillColor(base, 0, isExternal ? showExternal : showInternal)
+    borderCol = zoneBorderColor(base, 0, isExternal ? showExternal : showInternal)
+    b = box.new(leftBar, top, bar_index, bottom, bgcolor=fillCol, border_color=borderCol)
+    if isExternal
+        array.push(extBoxes, b)
+        array.push(extIsHigh, isHigh)
+        array.push(extState, 0)
+        if array.size(extBoxes) > maxZones
+            old = array.shift(extBoxes)
+            old.delete()
+            array.shift(extIsHigh)
+            array.shift(extState)
+    else
+        array.push(intBoxes, b)
+        array.push(intIsHigh, isHigh)
+        array.push(intState, 0)
+        if array.size(intBoxes) > maxZones
+            old = array.shift(intBoxes)
+            old.delete()
+            array.shift(intIsHigh)
+            array.shift(intState)
+
+updateZones(box[] boxes, bool[] highs, int[] states, bool isExternal, bool showZones, bool cutOnTouch, bool showObjectives, float targetHigh, float targetLow) =>
+    i = 0
+    while i < array.size(boxes)
+        b = array.get(boxes, i)
+        top = b.get_top()
+        bottom = b.get_bottom()
+        isHigh = array.get(highs, i)
+        prevState = array.get(states, i)
+        base = zoneBaseColor(isExternal, isHigh)
+        newState = zoneState(isHigh, top, bottom, prevState)
+        // Extend until first touch/break, then freeze right edge if enabled
+        if not cutOnTouch or prevState == 0
+            b.set_right(bar_index)
+        if cutOnTouch and prevState == 0 and newState > 0
+            b.set_right(bar_index)
+        if newState != prevState
+            array.set(states, i, newState)
+            if showSweepLabels and newState > 0
+                txt = sweepMode == "Wick+Close (Classify)" ? (newState == 2 ? "B" : "S") : "S"
+                lblStyle = label.style_label_center
+                y = isHigh ? top : bottom
+                label.new(bar_index, y, txt, style=lblStyle, textcolor=base, color=TRANSPARENT, size=size.normal)
+            if showObjectives and not isExternal and prevState == 0 and newState > 0
+                target = isHigh ? targetHigh : targetLow
+                if not na(target)
+                    txt = isHigh ? "->ExtH" : "->ExtL"
+                    lblStyle = isHigh ? label.style_label_up : label.style_label_down
+                    y = isHigh ? low : high
+                    label.new(bar_index, y, txt, style=lblStyle, textcolor=base, color=TRANSPARENT, size=size.normal)
+        fillCol = zoneFillColor(base, newState, showZones)
+        borderCol = zoneBorderColor(base, newState, showZones)
+        b.set_bgcolor(fillCol)
+        b.set_border_color(borderCol)
+        if hideFilled and newState > 0
+            b.delete()
+            array.remove(boxes, i)
+            array.remove(highs, i)
+            array.remove(states, i)
+            continue
+        i += 1
+
+// === External structure ===
+var float extHigh = na
+var float extLow = na
+var float lastIntHigh = na
+var float lastIntLow = na
+
+pivotHighExt = ta.pivothigh(high, extLen, extLen)
+pivotLowExt = ta.pivotlow(low, extLen, extLen)
+
+if not na(pivotHighExt)
+    extHigh := pivotHighExt
+    leftBar = bar_index[extLen]
+    if showExternal
+        clearSideIfLatest(true, true)
+        addZone(true, true, pivotHighExt, leftBar)
+    if resetInternalOnExternal
+        lastIntHigh := na
+        lastIntLow := na
+    if clearInternalOnExternal
+        clearZones(intBoxes, intIsHigh, intState)
+
+if not na(pivotLowExt)
+    extLow := pivotLowExt
+    leftBar = bar_index[extLen]
+    if showExternal
+        clearSideIfLatest(true, false)
+        addZone(true, false, pivotLowExt, leftBar)
+    if resetInternalOnExternal
+        lastIntHigh := na
+        lastIntLow := na
+    if clearInternalOnExternal
+        clearZones(intBoxes, intIsHigh, intState)
+
+rangeTop = (not na(extHigh) and not na(extLow)) ? math.max(extHigh, extLow) : na
+rangeBottom = (not na(extHigh) and not na(extLow)) ? math.min(extHigh, extLow) : na
+
+// === Internal structure ===
+tol = atr * eqTolAtr
+
+pivotHighInt = ta.pivothigh(high, intLen, intLen)
+pivotLowInt = ta.pivotlow(low, intLen, intLen)
+
+inRange(v) =>
+    not requireInside or (not na(rangeTop) and v <= rangeTop and v >= rangeBottom)
+
+if not na(pivotHighInt)
+    leftBar = bar_index[intLen]
+    if inRange(pivotHighInt)
+        if showInternal
+            if internalMode == "Every Pivot"
+                addZone(false, true, pivotHighInt, leftBar)
+            else
+                if not na(lastIntHigh) and math.abs(pivotHighInt - lastIntHigh) <= tol
+                    level = (pivotHighInt + lastIntHigh) * 0.5
+                    addZone(false, true, level, leftBar)
+                lastIntHigh := pivotHighInt
+
+if not na(pivotLowInt)
+    leftBar = bar_index[intLen]
+    if inRange(pivotLowInt)
+        if showInternal
+            if internalMode == "Every Pivot"
+                addZone(false, false, pivotLowInt, leftBar)
+            else
+                if not na(lastIntLow) and math.abs(pivotLowInt - lastIntLow) <= tol
+                    level = (pivotLowInt + lastIntLow) * 0.5
+                    addZone(false, false, level, leftBar)
+                lastIntLow := pivotLowInt
+
+// === Structure analysis (BOS/CHoCH) ===
+structureHighExt = useClosesForStructure ? ta.pivothigh(close, structureLookbackExternal, structureLookbackExternal) : ta.pivothigh(high, structureLookbackExternal, structureLookbackExternal)
+structureLowExt = useClosesForStructure ? ta.pivotlow(close, structureLookbackExternal, structureLookbackExternal) : ta.pivotlow(low, structureLookbackExternal, structureLookbackExternal)
+
+if not na(structureHighExt)
+    array.push(extUpper, StructurePoint.new(structureHighExt, bar_index[structureLookbackExternal], false))
+    if array.size(extUpper) > 8
+        array.shift(extUpper)
+
+if not na(structureLowExt)
+    array.push(extLower, StructurePoint.new(structureLowExt, bar_index[structureLookbackExternal], false))
+    if array.size(extLower) > 8
+        array.shift(extLower)
+
+structureHighInt = useClosesForStructure ? ta.pivothigh(close, structureLookbackInternal, structureLookbackInternal) : ta.pivothigh(high, structureLookbackInternal, structureLookbackInternal)
+structureLowInt = useClosesForStructure ? ta.pivotlow(close, structureLookbackInternal, structureLookbackInternal) : ta.pivotlow(low, structureLookbackInternal, structureLookbackInternal)
+
+if not na(structureHighInt)
+    array.push(intUpper, StructurePoint.new(structureHighInt, bar_index[structureLookbackInternal], false))
+    if array.size(intUpper) > 8
+        array.shift(intUpper)
+
+if not na(structureLowInt)
+    array.push(intLower, StructurePoint.new(structureLowInt, bar_index[structureLookbackInternal], false))
+    if array.size(intLower) > 8
+        array.shift(intLower)
+
+// External BOS/CHoCH
+calcExtTrend = calcTrendState(structureLookbackExternal)
+if array.size(extUpper) > 0 and array.size(extLower) > 0
+    latestHigh = array.get(extUpper, array.size(extUpper) - 1)
+    latestLow = array.get(extLower, array.size(extLower) - 1)
+
+    bullishBreak = (useClosesForStructure ? close > latestHigh.price : high > latestHigh.price) and not latestHigh.isBroken
+    bearishBreak = (useClosesForStructure ? close < latestLow.price : low < latestLow.price) and not latestLow.isBroken
+
+    if bullishBreak
+        breakType = ""
+        if extTrendState.direction == 1 and calcExtTrend.direction == 1
+            breakType := "BOS"
+        else if extTrendState.direction == -1 and calcExtTrend.direction == 1
+            breakType := "CHoCH"
+        if breakType != "" and showExternalStructure
+            drawStructureBreak(latestHigh.timeBar, latestHigh.price, "e" + breakType, true, bullStructureColor)
+        array.set(extUpper, array.size(extUpper) - 1, StructurePoint.new(latestHigh.price, latestHigh.timeBar, true))
+
+    if bearishBreak
+        breakType = ""
+        if extTrendState.direction == -1 and calcExtTrend.direction == -1
+            breakType := "BOS"
+        else if extTrendState.direction == 1 and calcExtTrend.direction == -1
+            breakType := "CHoCH"
+        if breakType != "" and showExternalStructure
+            drawStructureBreak(latestLow.timeBar, latestLow.price, "e" + breakType, false, bearStructureColor)
+        array.set(extLower, array.size(extLower) - 1, StructurePoint.new(latestLow.price, latestLow.timeBar, true))
+
+extTrendState := calcExtTrend
+
+// Internal BOS/CHoCH
+calcIntTrend = calcTrendState(structureLookbackInternal)
+if array.size(intUpper) > 0 and array.size(intLower) > 0
+    latestHigh = array.get(intUpper, array.size(intUpper) - 1)
+    latestLow = array.get(intLower, array.size(intLower) - 1)
+
+    bullishBreak = (useClosesForStructure ? close > latestHigh.price : high > latestHigh.price) and not latestHigh.isBroken
+    bearishBreak = (useClosesForStructure ? close < latestLow.price : low < latestLow.price) and not latestLow.isBroken
+
+    if bullishBreak
+        breakType = ""
+        if intTrendState.direction == 1 and calcIntTrend.direction == 1
+            breakType := "BOS"
+        else if intTrendState.direction == -1 and calcIntTrend.direction == 1
+            breakType := "CHoCH"
+        if breakType != "" and showInternalStructure
+            drawStructureBreak(latestHigh.timeBar, latestHigh.price, "i" + breakType, true, bullStructureColor)
+        array.set(intUpper, array.size(intUpper) - 1, StructurePoint.new(latestHigh.price, latestHigh.timeBar, true))
+
+    if bearishBreak
+        breakType = ""
+        if intTrendState.direction == -1 and calcIntTrend.direction == -1
+            breakType := "BOS"
+        else if intTrendState.direction == 1 and calcIntTrend.direction == -1
+            breakType := "CHoCH"
+        if breakType != "" and showInternalStructure
+            drawStructureBreak(latestLow.timeBar, latestLow.price, "i" + breakType, false, bearStructureColor)
+        array.set(intLower, array.size(intLower) - 1, StructurePoint.new(latestLow.price, latestLow.timeBar, true))
+
+intTrendState := calcIntTrend
+
+// === Update zones ===
+updateZones(extBoxes, extIsHigh, extState, true, showExternal, cutOnTouch, false, na, na)
+updateZones(intBoxes, intIsHigh, intState, false, showInternal, cutOnTouch, showObjectiveArrows, extHigh, extLow)

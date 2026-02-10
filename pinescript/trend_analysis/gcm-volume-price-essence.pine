@@ -1,0 +1,222 @@
+//@version=6
+indicator("GCM Volume-Price Essence", shorttitle="GCM VPE", overlay=false, precision=2)
+// ──────────────────────────────────────────────────────────────────
+// INPUT PARAMETERS
+// ──────────────────────────────────────────────────────────────────
+// Group: Core Settings
+lengthFast   = input.int(8, "Fast Period", minval=2, maxval=50, group="Core Settings")
+lengthSlow   = input.int(21, "Slow Period", minval=5, maxval=100, group="Core Settings")
+lengthVolume = input.int(14, "Volume Period", minval=5, maxval=50, group="Core Settings")
+volImpact    = input.float(1.5, "Volume Impact Factor", minval=0.1, maxval=5.0, step=0.1, tooltip="Higher = Indicator reacts faster to Volume Spikes", group="Core Settings")
+
+// Group: Visual Settings
+smoothing      = input.int(5, "Component Smoothing", minval=1, maxval=20, group="Visual Settings")
+finalSmoothing = input.int(3, "Final Line Smoothing", minval=1, maxval=20, group="Visual Settings")
+showSignal     = input.bool(true, "Show Quantum Base Line", group="Visual Settings")
+signalPeriod   = input.int(12, "Base Line Period", minval=1, maxval=50, group="Visual Settings")
+showZones      = input.bool(true, "Show Dynamic Zones", group="Visual Settings")
+showSignals    = input.bool(true, "Show Anticipation Signals", group="Visual Settings")
+
+// Group: Divergence Settings
+showDiv        = input.bool(true, "Show Candle Divergence", group="Divergence Settings") 
+divLookback    = input.int(3, "Divergence Lookback Candles", minval=2, maxval=10, tooltip="How many consecutive candles must trend before detecting a reversal?", group="Divergence Settings")
+
+// Group: Color Theme
+colBullStrong = input.color(#2dff00, "Bullish Strong wave", group="Color Theme")
+colBullWeak   = input.color(#4caf50, "Bullish Weak wave",   group="Color Theme")
+colBearStrong = input.color(#ff0000, "Bearish Strong wave", group="Color Theme")
+colBearWeak   = input.color(#f7525f, "Bearish Weak wave",   group="Color Theme")
+colOverFill   = input.color(#5b9cf6, "Quantum Bull wave",   group="Color Theme")
+colUnderFill  = input.color(#ffb74d, "Quantum Bear wave",   group="Color Theme")
+colZoneLine   = input.color(#9c9c9c, "Zone Lines & Zero",   group="Color Theme")
+
+// ──────────────────────────────────────────────────────────────────
+// CORE CALCULATIONS
+// ──────────────────────────────────────────────────────────────────
+volumeRatio = ta.sma(volume, 3) / ta.sma(volume, lengthVolume)
+priceChange = ta.change(close)
+volumeWeightedMomentum = priceChange * math.log(1 + (volumeRatio * volImpact))
+
+fastFlow = ta.ema(volumeWeightedMomentum, lengthFast)
+slowFlow = ta.ema(volumeWeightedMomentum, lengthSlow)
+quantumFlow = ta.ema(fastFlow - slowFlow, smoothing)
+
+priceVelocity = (close - close[lengthFast]) / lengthFast
+priceAcceleration = ta.change(priceVelocity)
+flowStrength = ta.ema(priceVelocity * volumeRatio + priceAcceleration, smoothing) * 100
+trendPressure = ta.ema(ta.rsi(close, lengthFast) - 50, smoothing)
+
+rawComposite = (quantumFlow * 50 + flowStrength + trendPressure) / 3
+compositeIndex = ta.wma(rawComposite, finalSmoothing)
+baseLine = ta.ema(compositeIndex, signalPeriod)
+
+// ──────────────────────────────────────────────────────────────────
+// ANTICIPATION LOGIC
+// ──────────────────────────────────────────────────────────────────
+flowDivergence = ta.cross(fastFlow, slowFlow)
+momentumBuilding = ta.rising(compositeIndex, 2) and compositeIndex < -20
+momentumFading = ta.falling(compositeIndex, 2) and compositeIndex > 20
+
+bullishAnticipation = flowDivergence and fastFlow > slowFlow and compositeIndex < 0
+bearishAnticipation = flowDivergence and fastFlow < slowFlow and compositeIndex > 0
+bullishContinuation = momentumBuilding and volumeRatio > 1.2
+bearishContinuation = momentumFading and volumeRatio > 1.2
+
+// ──────────────────────────────────────────────────────────────────
+// DYNAMIC DIVERGENCE LOGIC
+// ──────────────────────────────────────────────────────────────────
+pricePushingDown = ta.falling(low, divLookback - 1)
+pricePushingUp   = ta.rising(high, divLookback - 1)
+
+indRising = compositeIndex > compositeIndex[1]
+indFalling = compositeIndex < compositeIndex[1]
+
+divBull = pricePushingDown and indRising
+divBear = pricePushingUp and indFalling
+
+// ──────────────────────────────────────────────────────────────────
+// DYNAMIC ZONES (NON-REPAINTING FIX)
+// ──────────────────────────────────────────────────────────────────
+recentHigh = ta.highest(compositeIndex, 50)[1] 
+recentLow  = ta.lowest(compositeIndex, 50)[1]
+volatilityFactor = (recentHigh - recentLow) / 2
+
+upperZone = math.min(60, 30 + volatilityFactor * 0.3)
+lowerZone = math.max(-60, -30 - volatilityFactor * 0.3)
+
+// ──────────────────────────────────────────────────────────────────
+// VISUAL OUTPUT
+// ──────────────────────────────────────────────────────────────────
+
+// Determine Colors
+indexColor = compositeIndex > 0 ? (compositeIndex > upperZone ? colBullStrong : colBullWeak) : (compositeIndex < lowerZone ? colBearStrong : colBearWeak)
+baseColor = baseLine >= 0 ? colOverFill : colUnderFill
+
+// 1. MAIN PLOTS
+p_qfi  = plot(compositeIndex, "Quantum Flow Index", color=indexColor, linewidth=1)
+p_base = plot(showSignal ? baseLine : na, "Quantum Base Line", color=baseColor, linewidth=1)
+
+// 2. LAYER CALCULATION (QFI vs BASE)
+diff = compositeIndex - baseLine
+
+m1 = baseLine + diff * 0.125
+m2 = baseLine + diff * 0.250
+m3 = baseLine + diff * 0.375
+m4 = baseLine + diff * 0.500
+m5 = baseLine + diff * 0.625
+m6 = baseLine + diff * 0.750
+m7 = baseLine + diff * 0.875
+
+// Plot intermediate lines (HIDDEN)
+p1 = plot(m1, display=display.none, editable=false)
+p2 = plot(m2, display=display.none, editable=false)
+p3 = plot(m3, display=display.none, editable=false)
+p4 = plot(m4, display=display.none, editable=false)
+p5 = plot(m5, display=display.none, editable=false)
+p6 = plot(m6, display=display.none, editable=false)
+p7 = plot(m7, display=display.none, editable=false)
+
+// 3. LAYER FILLS
+fill(p_qfi, p7, color=color.new(indexColor, 20), title="Grad 8")
+fill(p7, p6,    color=color.new(indexColor, 30), title="Grad 7")
+fill(p6, p5,    color=color.new(indexColor, 40), title="Grad 6")
+fill(p5, p4,    color=color.new(indexColor, 50), title="Grad 5")
+fill(p4, p3,    color=color.new(indexColor, 60), title="Grad 4")
+fill(p3, p2,    color=color.new(indexColor, 70), title="Grad 3")
+fill(p2, p1,    color=color.new(indexColor, 80), title="Grad 2")
+fill(p1, p_base, color=color.new(indexColor, 95), title="Grad 1")
+
+// ──────────────────────────────────────────────────────────────────
+// STATIC ZONES
+// ──────────────────────────────────────────────────────────────────
+hline(0, "Equilibrium", color=color.new(colZoneLine, 50), linestyle=hline.style_dotted)
+
+upperBand = plot(showZones ? upperZone : na, "Upper Zone", color=color.new(colZoneLine, 50), linewidth=1)
+lowerBand = plot(showZones ? lowerZone : na, "Lower Zone", color=color.new(colZoneLine, 50), linewidth=1)
+zeroLine  = plot(showZones ? 0 : na,        "Zero Line",  color=color.new(colZoneLine, 80), linewidth=1)
+
+fill(upperBand, zeroLine, color=color.new(colBullStrong, 85), title="Bullish Zone")
+fill(lowerBand, zeroLine, color=color.new(colBearStrong, 85), title="Bearish Zone")
+
+// ──────────────────────────────────────────────────────────────────
+// DYNAMIC ZONE FILLS (BASE vs ZONES)
+// ──────────────────────────────────────────────────────────────────
+dUp = baseLine - upperZone
+dDn = lowerZone - baseLine
+
+// Gradient Anchors (Shortened)
+u1 = baseLine - dUp * 0.125, u2 = baseLine - dUp * 0.250, u3 = baseLine - dUp * 0.375, u4 = baseLine - dUp * 0.500
+u5 = baseLine - dUp * 0.625, u6 = baseLine - dUp * 0.750, u7 = baseLine - dUp * 0.875
+
+l1 = baseLine + dDn * 0.125, l2 = baseLine + dDn * 0.250, l3 = baseLine + dDn * 0.375, l4 = baseLine + dDn * 0.500
+l5 = baseLine + dDn * 0.625, l6 = baseLine + dDn * 0.750, l7 = baseLine + dDn * 0.875
+
+pu1 = plot(u1, display=display.none, editable=false), pu2 = plot(u2, display=display.none, editable=false), pu3 = plot(u3, display=display.none, editable=false)
+pu4 = plot(u4, display=display.none, editable=false), pu5 = plot(u5, display=display.none, editable=false), pu6 = plot(u6, display=display.none, editable=false), pu7 = plot(u7, display=display.none, editable=false)
+
+pl1 = plot(l1, display=display.none, editable=false), pl2 = plot(l2, display=display.none, editable=false), pl3 = plot(l3, display=display.none, editable=false)
+pl4 = plot(l4, display=display.none, editable=false), pl5 = plot(l5, display=display.none, editable=false), pl6 = plot(l6, display=display.none, editable=false), pl7 = plot(l7, display=display.none, editable=false)
+
+f_c_up(t) => baseLine > upperZone ? color.new(colOverFill, t) : color.new(colOverFill, 100)
+f_c_dn(t) => lowerZone > baseLine ? color.new(colUnderFill, t) : color.new(colUnderFill, 100)
+
+fill(p_base, pu1, color=f_c_up(20), title="Z-Grad Up 1"), fill(pu1, pu2, color=f_c_up(30), title="Z-Grad Up 2"), fill(pu2, pu3, color=f_c_up(40), title="Z-Grad Up 3"), fill(pu3, pu4, color=f_c_up(50), title="Z-Grad Up 4")
+fill(pu4, pu5, color=f_c_up(60), title="Z-Grad Up 5"), fill(pu5, pu6, color=f_c_up(70), title="Z-Grad Up 6"), fill(pu6, pu7, color=f_c_up(80), title="Z-Grad Up 7"), fill(pu7, upperBand, color=f_c_up(95), title="Z-Grad Up 8")
+
+fill(p_base, pl1, color=f_c_dn(20), title="Z-Grad Dn 1"), fill(pl1, pl2, color=f_c_dn(30), title="Z-Grad Dn 2"), fill(pl2, pl3, color=f_c_dn(40), title="Z-Grad Dn 3"), fill(pl3, pl4, color=f_c_dn(50), title="Z-Grad Dn 4")
+fill(pl4, pl5, color=f_c_dn(60), title="Z-Grad Dn 5"), fill(pl5, pl6, color=f_c_dn(70), title="Z-Grad Dn 6"), fill(pl6, pl7, color=f_c_dn(80), title="Z-Grad Dn 7"), fill(pl7, lowerBand, color=f_c_dn(95), title="Z-Grad Dn 8")
+
+// ──────────────────────────────────────────────────────────────────
+// SIGNALS (ANTI-OVERLAP & FIXED TOOLTIPS)
+// ──────────────────────────────────────────────────────────────────
+var string txtBull = ""
+var string txtBear = ""
+var string tipBull = ""
+var string tipBear = ""
+
+// Reset string variables for current bar
+txtBull := ""
+txtBear := ""
+tipBull := ""
+tipBear := ""
+
+// Check if bar is confirmed (Closed) to prevent flashing signals
+if showSignals and barstate.isconfirmed
+    // --- Bullish Signal Construction ---
+    if bullishAnticipation
+        txtBull := txtBull + "◆"
+        tipBull := tipBull + "• Anticipation: Momentum Crossing Up\n"
+    if showDiv and divBull
+        txtBull := (txtBull != "" ? txtBull + "\n" : "") + "⚡"
+        tipBull := tipBull + "• Divergence: " + str.tostring(divLookback) + "-Candle Bull Div\n"
+    if bullishContinuation
+        txtBull := (txtBull != "" ? txtBull + "\n" : "") + "▲"
+        tipBull := tipBull + "• Continuation: Strong Volume Push\n"
+
+    // --- Bearish Signal Construction ---
+    if bearishAnticipation
+        txtBear := txtBear + "◆"
+        tipBear := tipBear + "• Anticipation: Momentum Crossing Down\n"
+    if showDiv and divBear
+        txtBear := (txtBear != "" ? txtBear + "\n" : "") + "⚡"
+        tipBear := tipBear + "• Divergence: " + str.tostring(divLookback) + "-Candle Bear Div\n"
+    if bearishContinuation
+        txtBear := (txtBear != "" ? txtBear + "\n" : "") + "▼"
+        tipBear := tipBear + "• Continuation: Strong Volume Drop\n"
+
+    // --- Plotting with Dynamic Tooltips ---
+    if txtBull != ""
+        label.new(bar_index, compositeIndex - 2, txtBull, color=color.new(color.white, 100), textcolor=colBullStrong, style=label.style_label_up, size=size.large, tooltip=tipBull)
+
+    if txtBear != ""
+        label.new(bar_index, compositeIndex + 2, txtBear, color=color.new(color.white, 100), textcolor=colBearStrong, style=label.style_label_down, size=size.large, tooltip=tipBear)
+
+// ──────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────
+alertcondition(bullishAnticipation, title="Bullish Flow", message="Quantum Flow: Bullish momentum detected")
+alertcondition(bearishAnticipation, title="Bearish Flow", message="Quantum Flow: Bearish momentum detected")
+alertcondition(divBull, title="Candle Bull Div", message="Quantum Flow: Bullish Candle Divergence Detected!")
+alertcondition(divBear, title="Candle Bear Div", message="Quantum Flow: Bearish Candle Divergence Detected!")
+alertcondition(ta.crossover(compositeIndex, baseLine), title="Base Line Cross Bullish", message="Quantum Flow: Crossed above Quantum Base Line")
+alertcondition(ta.crossunder(compositeIndex, baseLine), title="Base Line Cross Bearish", message="Quantum Flow: Crossed below Quantum Base Line")

@@ -1,0 +1,171 @@
+//@version=6
+indicator("Apex / ChartFanatics Bubbles + Clusters + Sweeps", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+// ────────────────────── INPUTS ──────────────────────
+bubbleQuant = input.int(10, "Bubble Quantiles", minval=3, maxval=15)
+bubbleOpacity = input.int(75, "Bubble Opacity %", minval=0, maxval=100)
+volLookback = input.int(200, "Volume Lookback", minval=50, maxval=500)
+showClusters = input.bool(true, "Show Volume Clusters")
+clusterMinVol = input.int(200, "Min Volume for Cluster")
+clusterWidth = input.int(4, "Cluster Width (bars)", minval=1, maxval=10)
+showSweeps = input.bool(true, "Show Liquidity Sweeps")
+showZones = input.bool(true, "Show S/D Zones")
+zoneLookback = input.int(20, "Zone Pivot Lookback")
+
+// ────────────────────── CORE ──────────────────────
+vol = volume
+delta = close - open
+isGreen = close > open
+
+// Calculate ATR once per bar for consistency
+atrValue = ta.atr(14)
+
+// ────────────────── QUANTILE THRESHOLDS ──────────────────
+var float[] thresholds = array.new_float()
+
+if barstate.isfirst
+    for i = 0 to bubbleQuant - 1
+        array.push(thresholds, 0.0)
+
+// Get volume statistics
+vMin = ta.lowest(vol, volLookback)
+vMax = ta.highest(vol, volLookback)
+vRange = vMax - vMin
+
+// Update thresholds dynamically
+if vRange > 0
+    for i = 0 to bubbleQuant - 1
+        percentile = i / (bubbleQuant - 1)
+        threshold = vMin + (vRange * percentile)
+        array.set(thresholds, i, threshold)
+
+// ────────────────── BUBBLE SIZE & COLOR ──────────────────
+// Find which quantile bucket this volume falls into
+bucket = 0
+if array.size(thresholds) > 0
+    for i = 0 to array.size(thresholds) - 1
+        if vol >= array.get(thresholds, i)
+            bucket := i + 1
+
+// Calculate size based on bucket
+sizeRatio = bucket / bubbleQuant
+
+// More granular size selection
+bubbleSize = sizeRatio < 0.15 ? size.tiny : 
+             sizeRatio < 0.30 ? size.small : 
+             sizeRatio < 0.50 ? size.normal : 
+             sizeRatio < 0.70 ? size.large : 
+             sizeRatio < 0.85 ? size.huge : size.huge
+
+// Colors: bright green for bullish, bright red for bearish
+greenColor = color.new(#00ff00, 100 - bubbleOpacity)
+redColor = color.new(#ff0000, 100 - bubbleOpacity)
+bubbleColor = isGreen ? greenColor : redColor
+
+// ────────────────── DRAW BUBBLES ──────────────────
+if vol > vMin * 1.2  // Only show bubbles above minimum threshold
+    label.new(
+         bar_index, 
+         high + (high - low) * 0.1,  // Slightly above the high
+         "", 
+         style = label.style_circle, 
+         size = bubbleSize, 
+         color = bubbleColor, 
+         textcolor = color.new(color.white, 100),
+         tooltip = "Vol: " + str.tostring(vol, "#,###") + 
+                   "\nDelta: " + str.tostring(delta, "+#.##;-#.##") +
+                   "\nQuantile: " + str.tostring(bucket) + "/" + str.tostring(bubbleQuant)
+     )
+
+// ────────────────── VOLUME CLUSTERS ──────────────────
+if showClusters and vol >= clusterMinVol
+    clusterColor = color.new(isGreen ? #00ff00 : #ff0000, 70)
+    box.new(
+         bar_index, 
+         high, 
+         bar_index + clusterWidth, 
+         low, 
+         border_color = color.new(color.gray, 50),
+         border_width = 1,
+         bgcolor = clusterColor
+     )
+
+// ────────────────── LIQUIDITY SWEEPS ──────────────────
+if showSweeps and bar_index > 1
+    // Bull sweep: high exceeds previous high but closes lower
+    bullSweep = high > high[1] and close < high[1] and close < open
+    
+    // Bear sweep: low breaks previous low but closes higher  
+    bearSweep = low < low[1] and close > low[1] and close > open
+    
+    if bullSweep
+        label.new(
+             bar_index, 
+             high, 
+             "★", 
+             style = label.style_label_down, 
+             size = size.small, 
+             color = color.new(#ffeb3b, 0), 
+             textcolor = color.black,
+             tooltip = "Bullish Liquidity Sweep"
+         )
+    
+    if bearSweep
+        label.new(
+             bar_index, 
+             low, 
+             "★", 
+             style = label.style_label_up, 
+             size = size.small, 
+             color = color.new(#ffeb3b, 0), 
+             textcolor = color.black,
+             tooltip = "Bearish Liquidity Sweep"
+         )
+
+// ────────────────── SUPPLY/DEMAND ZONES ──────────────────
+var box[] supplyZones = array.new_box()
+var box[] demandZones = array.new_box()
+
+if showZones
+    ph = ta.pivothigh(high, zoneLookback, zoneLookback)
+    pl = ta.pivotlow(low, zoneLookback, zoneLookback)
+    
+    if not na(ph)
+        // Supply zone (resistance)
+        zoneTop = ph
+        zoneBottom = ph - atrValue * 2.0
+        b = box.new(
+             bar_index - zoneLookback, 
+             zoneTop, 
+             bar_index + 30, 
+             zoneBottom, 
+             border_color = color.new(#8b4513, 60),
+             border_width = 1,
+             bgcolor = color.new(#8b4513, 85)
+         )
+        array.push(supplyZones, b)
+    
+    if not na(pl)
+        // Demand zone (support)
+        zoneTop = pl + atrValue * 2.0
+        zoneBottom = pl
+        b = box.new(
+             bar_index - zoneLookback, 
+             zoneTop, 
+             bar_index + 30, 
+             zoneBottom, 
+             border_color = color.new(#228b22, 60),
+             border_width = 1,
+             bgcolor = color.new(#228b22, 85)
+         )
+        array.push(demandZones, b)
+
+// Extend supply zones to current bar
+if array.size(supplyZones) > 0
+    for i = 0 to array.size(supplyZones) - 1
+        box.set_right(array.get(supplyZones, i), bar_index + 30)
+
+// Extend demand zones to current bar
+if array.size(demandZones) > 0
+    for i = 0 to array.size(demandZones) - 1
+        box.set_right(array.get(demandZones, i), bar_index + 30)

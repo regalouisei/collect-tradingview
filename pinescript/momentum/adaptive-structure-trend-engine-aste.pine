@@ -1,0 +1,210 @@
+//@version=6
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Adaptive Structure Trend Engine (ASTE)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  DESCRIPTION
+//  --------------------------------------------------------------------
+//  Adaptive Structure Trend Engine (ASTE) is a multi-layer trend analysis
+//  tool designed to identify high-quality directional opportunities
+//  using market structure and adaptive moving averages.
+//
+//  The indicator combines:
+//   • FRAMA (Fractal Adaptive Moving Average) for structure & slope
+//   • KAMA (Kaufman Adaptive MA) for regime efficiency
+//   • JMA (Jurik Moving Average) for smooth momentum confirmation
+//   • EMA hierarchy (21/50 + 50/100/150/200) for trend validation
+//   • Optional higher-timeframe (3× TF) FRAMA slope confirmation
+//
+//  Signals are state-based (non-spamming) and displayed as stacked
+//  triangles to visually represent signal strength.
+//
+//  SIGNAL TYPES
+//  --------------------------------------------------------------------
+//  1️⃣ Base Signal (Single Tiny Triangle)
+//     - Same timeframe structure + momentum alignment
+//
+//  2️⃣ Strong Signal (Two Stacked Triangles)
+//     - Base signal + EMA 50/100/150/200 confluence
+//
+//  (HTF logic is retained internally but not visualized)
+//
+//  DISCLAIMER
+//  --------------------------------------------------------------------
+//  This indicator is for educational and analytical purposes only.
+//  It does NOT provide financial advice or trade recommendations.
+//  Always combine with proper risk management and additional analysis.
+//  Past performance does not guarantee future results.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+indicator("Adaptive Structure Trend Engine (ASTE)", shorttitle="ASTE", overlay=true, max_bars_back=5000)
+
+//────────────────────────────────────
+// PARAMETERS
+//────────────────────────────────────
+//────────────────────────────────────
+// USER PARAMETERS
+//────────────────────────────────────
+lenSwing = input.int(100, "FRAMA Length", minval=20, maxval=300)
+kamaLen  = input.int(30,  "KAMA Length",  minval=5,  maxval=100)
+jmaLen   = input.int(20,  "JMA Length",   minval=5,  maxval=100)
+jmaPhase = input.int(2,   "JMA Phase",    minval=0,  maxval=5)
+
+
+//────────────────────────────────────
+// EMA SETS (LOGIC + VISUAL)
+//────────────────────────────────────
+//────────────────────────────────────
+// EMA INPUTS
+//────────────────────────────────────
+emaFastLen  = input.int(21,  "EMA Fast")
+emaMidLen   = input.int(50,  "EMA Mid")
+ema100Len   = input.int(100, "EMA 100")
+ema150Len   = input.int(150, "EMA 150")
+ema200Len   = input.int(200, "EMA 200")
+
+ema21  = ta.ema(close, emaFastLen)
+ema50  = ta.ema(close, emaMidLen)
+ema100 = ta.ema(close, ema100Len)
+ema150 = ta.ema(close, ema150Len)
+ema200 = ta.ema(close, ema200Len)
+//────────────────────────────────────
+// VISUAL CONTROLS
+//────────────────────────────────────
+showEMAs        = input.bool(true, "Show EMA Band")
+showBaseSignals = input.bool(true, "Show Base Signals (1 Triangle)")
+showStrongSignals = input.bool(true, "Show Strong Signals (2 Triangles)")
+
+
+emaBullBase = ema21 > ema50 and ema21 > ema21[1]
+emaBearBase = ema21 < ema50 and ema21 < ema21[1]
+
+emaBullStrong = ema50 > ema100 and ema100 > ema150 and ema150 > ema200
+emaBearStrong = ema50 < ema100 and ema100 < ema150 and ema150 < ema200
+
+//────────────────────────────────────
+// FRAMA
+//────────────────────────────────────
+f_frama(src, len) =>
+    n = math.max(len, 2)
+    half = math.round(n / 2)
+    hi1 = ta.highest(src, n)
+    lo1 = ta.lowest(src, n)
+    hi2 = ta.highest(src, half)
+    lo2 = ta.lowest(src, half)
+    hi3 = ta.highest(src[half], half)
+    lo3 = ta.lowest(src[half], half)
+    dim = (math.log((hi2 - lo2) + (hi3 - lo3)) - math.log(hi1 - lo1)) / math.log(2)
+    alpha = math.max(0.01, math.min(math.exp(-4.6 * (dim - 1)), 1))
+    var float fr = na
+    fr := na(fr[1]) ? src : alpha * src + (1 - alpha) * fr[1]
+
+// Base TF FRAMA
+frHi  = f_frama(high, lenSwing)
+frLo  = f_frama(low,  lenSwing)
+frMid = (frHi + frLo) / 2
+
+frUp   = frMid > frMid[1]
+frDown = frMid < frMid[1]
+
+//────────────────────────────────────
+// KAMA
+//────────────────────────────────────
+f_kama(src, len) =>
+    change = math.abs(src - src[len])
+    vol = 0.0
+    for i = 0 to len - 1
+        vol += math.abs(src[i] - src[i + 1])
+    er = vol != 0 ? change / vol : 0
+    sc = math.pow(er * (2.0/3 - 2.0/31) + 2.0/31, 2)
+    var float k = na
+    k := na(k[1]) ? src : k[1] + sc * (src - k[1])
+
+kama = f_kama(close, kamaLen)
+kamaUp   = kama > kama[1]
+kamaDown = kama < kama[1]
+
+//────────────────────────────────────
+// JMA
+//────────────────────────────────────
+f_jma(src, len, phase) =>
+    beta = 0.45 * (len - 1) / (0.45 * (len - 1) + 2)
+    alpha = math.pow(beta, phase)
+    var float j = na
+    j := na(j[1]) ? src : (1 - alpha) * src + alpha * j[1]
+
+jma = f_jma(close, jmaLen, jmaPhase)
+jmaUp   = jma > jma[1]
+jmaDown = jma < jma[1]
+
+//────────────────────────────────────
+// BASE & STRONG LOGIC (CURRENT TF)
+//────────────────────────────────────
+bullBase   = frUp and kamaUp and jmaUp and emaBullBase
+bearBase   = frDown and kamaDown and jmaDown and emaBearBase
+
+bullStrong = bullBase and emaBullStrong
+bearStrong = bearBase and emaBearStrong
+
+//────────────────────────────────────
+// HTF (3× TF) — LOGIC KEPT (NON-VISUAL)
+//────────────────────────────────────
+htfTF = timeframe.isdaily ? "D" : str.tostring(timeframe.multiplier * 3)
+
+htfFrMid = request.security(
+     syminfo.tickerid,
+     htfTF,
+     (f_frama(high, lenSwing) + f_frama(low, lenSwing)) / 2
+)
+
+//────────────────────────────────────
+// STATE MACHINES (NO SIGNAL SPAM)
+//────────────────────────────────────
+var int s1 = 0
+var int s2 = 0
+
+b1 = bullBase   and s1 != 1
+r1 = bearBase   and s1 != -1
+if b1
+    s1 := 1
+else if r1
+    s1 := -1
+
+b2 = bullStrong and s2 != 1
+r2 = bearStrong and s2 != -1
+if b2
+    s2 := 1
+else if r2
+    s2 := -1
+
+//────────────────────────────────────
+// VISUALS — EMA CONTEXT (GRADUAL BAND)
+//────────────────────────────────────
+plot(showEMAs ? ema50  : na, color=color.new(color.green,  35), linewidth=1, title="EMA 50")
+plot(showEMAs ? ema100 : na, color=color.new(color.yellow, 40), linewidth=1, title="EMA 100")
+plot(showEMAs ? ema150 : na, color=color.new(color.orange, 45), linewidth=1, title="EMA 150")
+plot(showEMAs ? ema200 : na, color=color.new(color.red,    50), linewidth=1, title="EMA 200")
+
+//────────────────────────────────────
+// VISUALS — SIGNALS (1 & 2 TRIANGLES)
+//────────────────────────────────────
+
+// 1️⃣ Base
+plotshape(showBaseSignals and b1, style=shape.triangleup,
+          location=location.belowbar, size=size.tiny, color=color.lime)
+
+plotshape(showBaseSignals and r1, style=shape.triangledown,
+          location=location.abovebar, size=size.tiny, color=color.red)
+
+
+// 2️⃣ Strong
+plotshape(showStrongSignals and b2, style=shape.triangleup,
+          location=location.belowbar, size=size.small, color=color.lime)
+
+plotshape(showStrongSignals and b2, style=shape.triangleup,
+          location=location.belowbar, size=size.tiny,  color=color.lime)
+
+plotshape(showStrongSignals and r2, style=shape.triangledown,
+          location=location.abovebar, size=size.small, color=color.red)
+
+plotshape(showStrongSignals and r2, style=shape.triangledown,
+          location=location.abovebar, size=size.tiny,  color=color.red)

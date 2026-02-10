@@ -1,0 +1,194 @@
+//@version=5
+indicator("XAU_Scalper_Conservative (EMA 9/21/200 + VWAP + BOS + HTF)", overlay=true, shorttitle="XAU CONS")
+
+// ===================== Inputs =====================
+// Core MAs & VWAP
+grp1 = "EMAs & VWAP"
+emaFastLen  = input.int(9,  "EMA fast", group=grp1, minval=1)
+emaSlowLen  = input.int(21, "EMA slow", group=grp1, minval=1)
+emaTrendLen = input.int(200,"EMA trend (filter)", group=grp1, minval=50)
+useVWAPFilter = input.bool(true, "Filter direction by VWAP", group=grp1)
+
+// Volume & trend strength
+grp2 = "Volume & Trend Strength"
+useVolFilter = input.bool(true, "Enable volume filter", group=grp2)
+volLen = input.int(50, "Volume MA length", group=grp2, minval=5)
+volFactor = input.float(1.4, "Volume spike factor (x MA)", group=grp2, step=0.1)
+minAdx = input.float(15.0, "Min ADX(14) for trend", group=grp2, step=0.5)
+
+// Session filter
+grp3 = "Session filter (optional)"
+useSessionFilter = input.bool(true, "Enable session filter", group=grp3)
+sess1 = input.session("0800-1100", "Session 1 (London)", group=grp3)
+sess2 = input.session("1430-1700", "Session 2 (NY open)", group=grp3)
+
+// Structure & BOS gating
+grp4 = "Structure & BOS (conservative)"
+useStructure = input.bool(true, "Enable micro-structure + BOS mode", group=grp4)
+bosLookback = input.int(40, "Bars after last BOS to keep bias", group=grp4, minval=5)
+
+// HTF filter
+grp5 = "Higher Timeframe (HTF) filter"
+useHTF = input.bool(true, "Enable HTF filter", group=grp5)
+htf = input.timeframe("15", "HTF timeframe (e.g., 15)", group=grp5)
+htfFastLen = input.int(50, "HTF EMA fast", group=grp5, minval=10)
+htfSlowLen = input.int(200,"HTF EMA slow", group=grp5, minval=20)
+
+// Conservative confirmations
+grp6 = "Conservative entry confirmations"
+requireTouch21 = input.bool(true, "Pullback MUST touch EMA21", group=grp6)
+reclaimCandle = input.string("prevHighBreak", "Candle confirmation",
+     options=["prevHighBreak","engulf","pinbar"], group=grp6,
+     tooltip="prevHighBreak: close > high[1] for long / close < low[1] for short\nengulf: body engulfs previous body\npinbar: long wick against entry + proper close")
+slopeLen = input.int(6, "EMA21 slope length (bars)", group=grp6)
+slopeMinPct = input.float(0.03, "Min EMA21 slope (% over length)", step=0.01, group=grp6)
+minDist200Pct = input.float(0.06, "Min distance from EMA200 (%)", step=0.01, group=grp6)
+
+// ===================== Core calc =====================
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+
+vwap = timeframe.isintraday ? ta.vwap(hlc3) : na
+
+longBiasMA  = close > emaTrend and emaFast > emaSlow
+shortBiasMA = close < emaTrend and emaFast < emaSlow
+
+// Distance from EMA200
+pctDist200 = math.abs(close - emaTrend) / close * 100.0
+farFrom200 = pctDist200 >= minDist200Pct
+
+// Volume filter
+volMA   = ta.sma(volume, volLen)
+volOkay = not useVolFilter or (volume > volMA * volFactor)
+
+// VWAP filter
+vwapLongOkay  = not useVWAPFilter or (not na(vwap) and close >= vwap)
+vwapShortOkay = not useVWAPFilter or (not na(vwap) and close <= vwap)
+
+// Session filter
+inSess = not useSessionFilter or (not na(time(timeframe.period, sess1)) or not na(time(timeframe.period, sess2)))
+
+// ===================== ADX filter (manual computation) =====================
+// Manual ADX( len ) using Wilder's smoothing (RMA):
+adxManual(len) =>
+    // True Range
+    tr1 = high - low
+    tr2 = math.abs(high - close[1])
+    tr3 = math.abs(low  - close[1])
+    tr  = math.max(tr1, math.max(tr2, tr3))
+
+    // Directional Movement
+    upMove   = high - high[1]
+    downMove = low[1] - low
+    plusDM   = (upMove   > 0 and upMove   >  downMove) ? upMove   : 0.0
+    minusDM  = (downMove > 0 and downMove >= upMove  ) ? downMove : 0.0
+
+    // Wilder's smoothing (RMA)
+    atr     = ta.rma(tr, len)
+    plusDI  = atr == 0.0 ? 0.0 : 100.0 * ta.rma(plusDM,  len) / atr
+    minusDI = atr == 0.0 ? 0.0 : 100.0 * ta.rma(minusDM, len) / atr
+
+    // DX and ADX
+    diSum = plusDI + minusDI
+    dx    = diSum == 0.0 ? 0.0 : math.abs(plusDI - minusDI) / diSum * 100.0
+    ta.rma(dx, len)
+
+adx = adxManual(14)
+adxOkay = adx >= minAdx
+
+// ===================== HTF filter =====================
+htfClose = request.security(syminfo.tickerid, htf, close)
+htfFast  = request.security(syminfo.tickerid, htf, ta.ema(close, htfFastLen))
+htfSlow  = request.security(syminfo.tickerid, htf, ta.ema(close, htfSlowLen))
+htfLongOK  = not useHTF or (htfFast > htfSlow and htfClose > htfFast)
+htfShortOK = not useHTF or (htfFast < htfSlow and htfClose < htfFast)
+
+// ===================== Structure & BOS =====================
+ph = ta.pivothigh(high, 2, 2)
+pl = ta.pivotlow(low,  2, 2)
+
+var float lastPL = na
+var float lastPH = na
+if not na(pl)
+    lastPL := pl
+if not na(ph)
+    lastPH := ph
+
+bosUp   = useStructure and not na(lastPH) and high > lastPH
+bosDown = useStructure and not na(lastPL) and low  < lastPL
+
+// BOS regime gating
+var int lastBosUpBar = na
+var int lastBosDnBar = na
+if bosUp
+    lastBosUpBar := bar_index
+if bosDown
+    lastBosDnBar := bar_index
+
+bosUpActive   = useStructure and not na(lastBosUpBar) and bar_index - lastBosUpBar <= bosLookback and (na(lastBosDnBar) or lastBosUpBar > lastBosDnBar)
+bosDownActive = useStructure and not na(lastBosDnBar) and bar_index - lastBosDnBar <= bosLookback and (na(lastBosUpBar) or lastBosDnBar > lastBosUpBar)
+
+// ===================== Conservative confirmations =====================
+// EMA21 slope
+slopePct = ta.roc(emaSlow, slopeLen)  // % change over slopeLen bars
+slopeUp   = slopePct >= slopeMinPct
+slopeDown = slopePct <= -slopeMinPct
+
+// Pullback logic
+inZone = low <= math.max(emaFast, emaSlow) and high >= math.min(emaFast, emaSlow)
+touched21Long  = low <= emaSlow
+touched21Short = high >= emaSlow
+
+pullbackOKLong  = (requireTouch21 ? touched21Long  : inZone)
+pullbackOKShort = (requireTouch21 ? touched21Short : inZone)
+
+// Candle confirmations
+prevHighBreakLong  = close > high[1]
+prevHighBreakShort = close < low[1]
+
+engulfLong  = (close > open) and (open <= close[1]) and (close >= open[1])
+engulfShort = (close < open) and (open >= close[1]) and (close <= open[1])
+
+pinbarLong  = (low <= math.min(open, close)) and ((high - math.max(open, close)) <= (math.min(open, close) - low))
+pinbarShort = (high >= math.max(open, close)) and ((math.min(open, close) - low) <= (high - math.max(open, close)))
+
+confirmLong = switch reclaimCandle
+    "prevHighBreak" => prevHighBreakLong
+    "engulf"        => engulfLong
+    => pinbarLong
+
+confirmShort = switch reclaimCandle
+    "prevHighBreak" => prevHighBreakShort
+    "engulf"        => engulfShort
+    => pinbarShort
+
+// Reclaim EMA9
+reclaim9Long  = close > emaFast
+reclaim9Short = close < emaFast
+
+// Final conservative signals
+signalLongCons  = longBiasMA and bosUpActive and pullbackOKLong  and reclaim9Long  and confirmLong  and vwapLongOkay  and volOkay and inSess and slopeUp   and farFrom200 and adxOkay and htfLongOK
+signalShortCons = shortBiasMA and bosDownActive and pullbackOKShort and reclaim9Short and confirmShort and vwapShortOkay and volOkay and inSess and slopeDown and farFrom200 and adxOkay and htfShortOK
+
+// ===================== Plots =====================
+colTrend = longBiasMA ? color.new(color.green, 85) : shortBiasMA ? color.new(color.red, 85) : color.new(color.gray, 90)
+plot(emaFast,  "EMA 9",  color=color.teal,   linewidth=2)
+plot(emaSlow,  "EMA 21", color=color.orange, linewidth=2)
+plot(emaTrend, "EMA 200",color=color.purple, linewidth=2)
+plot(vwap, "VWAP", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+
+bgcolor(colTrend)
+plotshape(signalLongCons,  title="CONS Long PB",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="L-PB CONS")
+plotshape(signalShortCons, title="CONS Short PB", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,  0), size=size.tiny, text="S-PB CONS")
+
+// Mark BOS events
+plotshape(bosUp,   title="BOS Up",   style=shape.labelup,   location=location.belowbar, color=color.new(color.green, 0), text="BOS UP", textcolor=color.white, size=size.tiny)
+plotshape(bosDown, title="BOS Down", style=shape.labeldown, location=location.abovebar, color=color.new(color.red,   0), text="BOS DN", textcolor=color.white, size=size.tiny)
+
+// ===================== Alerts =====================
+alertcondition(signalLongCons,  title="CONSERVATIVE LONG Pullback 9/21 (BOS/HTF/Volume/ADX)",
+     message="XAU CONS | LONG | {{ticker}} @ {{close}} | TF={{interval}} | Filters: BOS/HTF/VWAP/ADX/Vol/EMA21 touch")
+
+alertcondition(signalShortCons, title="CONSERVATIVE SHORT Pullback 9/21 (BOS/HTF/Volume/ADX)",
+     message="XAU CONS | SHORT | {{ticker}} @ {{close}} | TF={{interval}} | Filters: BOS/HTF/VWAP/ADX/Vol/EMA21 touch")

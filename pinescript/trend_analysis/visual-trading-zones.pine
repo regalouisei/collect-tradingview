@@ -1,0 +1,178 @@
+//@version=6
+indicator("Visual Trading Zones", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+//========================
+// Inputs
+//========================
+stepValue       = input.int(10, "Step", minval=1, group="Main")
+stepUnit        = input.string("Ticks", "Step Unit", options=["Ticks", "Pips (FX)"], group="Main")
+subLevels       = input.int(0, "SubLevels", minval=0, maxval=20, group="Main")
+showZones       = input.bool(true, "Show Zones", group="Main")
+showLines       = input.bool(false, "Show Lines", group="Main")
+showPrices      = input.bool(false, "Show Prices", group="Main")
+pricesShiftBars = input.int(0, "Prices Shift (bars, + -> right labels)", minval=0, maxval=500, group="Main")
+
+dimGray          = color.rgb(105, 105, 105)
+zoneColor        = input.color(color.rgb(39, 39, 39), "Zone Color", group="Style")
+zoneTransparency = input.int(85, "Zone Transparency (0-100)", minval=0, maxval=100, group="Style")
+levelColor       = input.color(dimGray, "Level Color", group="Style")
+levelLineWidth   = input.int(1, "Level Line Width", minval=1, maxval=4, group="Style")
+levelLineStyle   = input.string("Solid", "Level Line Style", options=["Solid", "Dashed", "Dotted"], group="Style")
+subLevelColor    = input.color(dimGray, "SubLevel Color", group="Style")
+subLevelLineWidth= input.int(1, "SubLevel Line Width", minval=1, maxval=4, group="Style")
+subLevelLineStyle= input.string("Dotted", "SubLevel Line Style", options=["Solid", "Dashed", "Dotted"], group="Style")
+pricesColor      = input.color(dimGray, "Prices Color", group="Style")
+
+rangeBars = input.int(2000, "Range bars to build levels", minval=200, maxval=20000, group="Range")
+maxZones  = input.int(120, "Max zones (object limit protection)", minval=10, maxval=300, group="Range")
+
+//========================
+// Helpers
+//========================
+f_line_style(_s) =>
+    st = line.style_solid
+    if _s == "Dashed"
+        st := line.style_dashed
+    else if _s == "Dotted"
+        st := line.style_dotted
+    st
+
+tick = syminfo.mintick
+
+// FX-эвристика: pip ≈ 10 тиков для 0.00001 / 0.001, иначе pip = 1 тик
+pip = tick
+if tick == 0.00001 or tick == 0.001
+    pip := tick * 10.0
+
+unit = tick
+if stepUnit == "Pips (FX)"
+    unit := pip
+
+step = stepValue * unit
+subStep = subLevels > 0 ? (step / (subLevels + 1)) : na
+
+f_norm(p) => math.round(p / tick) * tick
+
+//========================
+// Range bounds
+//========================
+lo = ta.lowest(low, rangeBars)
+hi = ta.highest(high, rangeBars)
+
+canDraw = not na(lo) and not na(hi) and step > 0
+
+lowBase  = canDraw ? f_norm(math.floor(lo / step) * step) : na
+highBase = canDraw ? f_norm(math.ceil(hi / step) * step) : na
+
+//========================
+// Build levels array
+//========================
+var float[] allPrices = array.new_float()
+
+f_rebuild_prices() =>
+    array.clear(allPrices)
+    if canDraw
+        cur = lowBase
+        zones = 0
+        while cur <= highBase and zones < maxZones
+            array.push(allPrices, f_norm(cur))
+            array.push(allPrices, f_norm(cur + step))
+
+            if subLevels > 0
+                for i = 1 to subLevels
+                    array.push(allPrices, f_norm(cur + subStep * i))
+                for i = 1 to subLevels
+                    array.push(allPrices, f_norm(cur + step + subStep * i))
+
+            cur += step * 2
+            zones += 1
+
+//========================
+// Objects storage
+//========================
+var box[]   zoneBoxes   = array.new_box()
+var line[]  levelLines  = array.new_line()
+var label[] priceLabels = array.new_label()
+
+f_clear_all() =>
+    nB = array.size(zoneBoxes)
+    if nB > 0
+        for i = 0 to nB - 1
+            box.delete(array.get(zoneBoxes, i))
+        array.clear(zoneBoxes)
+
+    nL = array.size(levelLines)
+    if nL > 0
+        for i = 0 to nL - 1
+            line.delete(array.get(levelLines, i))
+        array.clear(levelLines)
+
+    nT = array.size(priceLabels)
+    if nT > 0
+        for i = 0 to nT - 1
+            label.delete(array.get(priceLabels, i))
+        array.clear(priceLabels)
+
+//========================
+// Draw (last bar only)
+//========================
+if barstate.islast
+    f_rebuild_prices()
+    f_clear_all()
+
+    if canDraw and (showZones or showLines or showPrices)
+        leftX  = bar_index - rangeBars
+        rightX = bar_index
+
+        // Zones
+        if showZones
+            cur = lowBase
+            zones = 0
+            while cur <= highBase and zones < maxZones
+                b = box.new(leftX, cur + step, rightX, cur,
+                    xloc=xloc.bar_index,
+                    bgcolor=color.new(zoneColor, zoneTransparency),
+                    border_color=color.new(zoneColor, 100))
+                array.push(zoneBoxes, b)
+                cur += step * 2
+                zones += 1
+
+        // Styles (once)
+        mainStyle = f_line_style(levelLineStyle)
+        subStyle  = f_line_style(subLevelLineStyle)
+
+        // Lines + Labels
+        if showLines or showPrices
+            maxPricesToDraw = 450
+            n = math.min(array.size(allPrices), maxPricesToDraw)
+
+            for i = 0 to n - 1
+                p = array.get(allPrices, i)
+
+                // main or sublevel
+                isMain = math.abs((p - lowBase) / step - math.round((p - lowBase) / step)) < 1e-6
+
+                if showLines
+                    clr = isMain ? levelColor : subLevelColor
+                    w   = isMain ? levelLineWidth : subLevelLineWidth
+                    sty = isMain ? mainStyle : subStyle
+
+                    ln = line.new(leftX, p, rightX, p,
+                        xloc=xloc.bar_index, extend=extend.none,
+                        color=clr, width=w, style=sty)
+                    array.push(levelLines, ln)
+
+                if showPrices and (showLines or showZones)
+                    x = rightX + pricesShiftBars
+                    lab = label.new(
+                        x=x,
+                        y=p,
+                        text=str.tostring(p, format.mintick),
+                        xloc=xloc.bar_index,
+                        yloc=yloc.price,
+                        style=label.style_label_left,
+                        textcolor=pricesColor,
+                        color=color.new(pricesColor, 100),
+                        size=size.tiny
+                    )
+                    array.push(priceLabels, lab)

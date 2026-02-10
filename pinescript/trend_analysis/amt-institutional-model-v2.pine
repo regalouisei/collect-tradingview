@@ -1,0 +1,1002 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// FABIO VALENTINI — AUCTION MARKET THEORY INSTITUTIONAL INDICATOR v2
+// Pine Script v6 | Modular Architecture | Non-Predictive | Condition-Based
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MODEL SUMMARY (Extracted from Valentini Transcript & Research):
+// ───────────────────────────────────────────────────────────────────────────────
+// This is a MODEL, not a strategy. A strategy cages a dynamic entity.
+// The market is an auction — it moves from balance to imbalance and back.
+//
+// STEP 1 — LOCATION:  Are we in balance or imbalance? Only trade OUT of balance.
+// STEP 2 — VALIDATION: Use LVN (Low Volume Nodes) as reaction zones.
+//          Use HVN (High Volume Nodes) as acceptance/consolidation zones.
+// STEP 3 — AGGRESSION: Confirm with large EXECUTED orders (bubbles).
+//
+// BALANCE BOX (Value Area):
+// Valentini: "Market is usually in balance. That is why traders take a
+// streak of stop-losses." The Balance Box is the Value Area (VAH-VAL)
+// where 70% of volume was transacted — the NO-TRADE zone. Only trade
+// when price breaks OUT of this box with confirmed aggression.
+//
+// VOLUME PROFILE METHODOLOGY:
+// HVN/LVN detection uses standard bin-based volume distribution —
+// the same methodology used by ATAS, Sierra Chart, Quantower, and
+// TradingView's own Session Volume Profile. Each bar's volume is
+// proportionally distributed across the price bins (rows) it spans.
+// Reference: Dalton, J. "Mind Over Markets" (1990); Steidlmayer, J.P.
+// "Markets & Market Logic" (1986); CME Group Market Profile education.
+//
+// LIMITATIONS (TradingView):
+// - No true tick-by-tick order flow / DOM data available
+// - Volume is distributed proportionally across candle range (approximation)
+// - No executed vs limit order differentiation
+// - Volume delta is APPROXIMATED using candle structure
+// - Aggression bubbles use volume spike + delta proxy, NOT true order flow
+// ═══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("Valentini AMT Institutional Model v2",
+     shorttitle   = "V-AMT v2",
+     overlay      = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 200)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUT SETTINGS — Organized by Module
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Global Settings ──
+string GRP_GLOBAL = "Global Settings"
+
+string labelMode = input.string("Detailed", "Label Mode",
+     options = ["Short", "Detailed"], group = GRP_GLOBAL,
+     tooltip = "SHORT: Compact 2-3 letter labels (e.g. WH, DL, R, S).\nDETAILED: Full descriptive labels (e.g. Weekly High, Prev Day Low, 30m Resistance).\nUse Short for cleaner charts, Detailed when learning the indicator.")
+
+string labelSizeInput = input.string("Small", "Label Size",
+     options = ["Auto", "Tiny", "Small", "Normal", "Large"],
+     group = GRP_GLOBAL,
+     tooltip = "Controls the text size of ALL labels on the chart.\nAUTO: TradingView decides based on zoom.\nTINY: Smallest, best for high-density charts.\nSMALL: Default, good balance of visibility.\nNORMAL: Easier to read on larger screens.\nLARGE: Maximum readability, best for presentations.")
+
+bool isFutures = input.bool(true, "Futures Mode (NQ/ES/YM)",
+     group = GRP_GLOBAL,
+     tooltip = "ON = Futures-optimized volume thresholds and delta proxy.\nOFF = ETF mode (SPY/QQQ) with higher thresholds to filter dark-pool noise.\nFutures have concentrated RTH volume making spikes more reliable.\nETFs include off-exchange prints that inflate volume without directional meaning.")
+
+string sensitivityInput = input.string("Medium", "Sensitivity Level",
+     options = ["Low", "Medium", "High"],
+     group = GRP_GLOBAL,
+     tooltip = "Controls how aggressively the indicator filters noise across ALL modules.\nLOW: Strict filtering. Fewer levels, fewer bubbles, only strongest signals. Best for clean charts and experienced traders.\nMEDIUM: Balanced. Good mix of signal density and quality. Recommended default.\nHIGH: Sensitive. More levels, more bubbles, catches weaker signals. Best for scalping or learning.\nAffects: S/R duplicate threshold, volume spike threshold, body ratio filter, confluence proximity, and HVN/LVN thresholds.")
+
+// ── Module A: 30-Min Trend ──
+string GRP_TREND = "Module A: 30-Min Trend"
+
+bool showTrend = input.bool(true, "Show 30-Min Trend Line",
+     group = GRP_TREND,
+     tooltip = "Displays the 30-minute auction trend as a step-line on your chart.\nBLUE = Uptrend (Higher-Highs + Higher-Lows on 30-min).\nRED = Downtrend (Lower-Lows + Lower-Highs on 30-min).\nGRAY = Neutral / No clear structure.\nThis is auction-based structure, NOT a moving average crossover.\nValentini: Trend is only reliable when market is OUT OF BALANCE.")
+
+int trendLookback = input.int(5, "HH/HL Lookback (30-min bars)", minval = 2, maxval = 20,
+     group = GRP_TREND,
+     tooltip = "Number of 30-minute bars used to detect highest-high and lowest-low.\nLower values (2-3) = faster trend detection, more whipsaws.\nHigher values (8-15) = slower, smoother trend, fewer false signals.\nDefault 5 = ~2.5 hours of 30-min structure. Good for NQ/ES intraday.")
+
+// ── Module B: 30-Min Auction S/R ──
+string GRP_SR = "Module B: 30-Min S/R"
+
+bool showSR = input.bool(true, "Show 30-Min Auction S/R",
+     group = GRP_SR,
+     tooltip = "Draws horizontal support and resistance levels from 30-minute auction structure.\nThese are structural pivot highs/lows — points where the auction found acceptance or rejection.\nValentini: These are NOT retail pivots. They represent where large participants transacted.\nLevels persist across all timeframes.")
+
+int srLeftBars = input.int(3, "Pivot Left Bars (30-min)", minval = 1, maxval = 10,
+     group = GRP_SR,
+     tooltip = "Bars to the LEFT required to confirm a pivot high/low.\nHigher = more confirmed (stronger) levels but fewer of them.\nLower = more levels detected but some may be noise.\nDefault 3 = requires 3 bars of price action before the pivot to confirm it.")
+
+int srRightBars = input.int(3, "Pivot Right Bars (30-min)", minval = 1, maxval = 10,
+     group = GRP_SR,
+     tooltip = "Bars to the RIGHT required to confirm a pivot high/low.\nThis creates a natural delay — the level is only drawn AFTER confirmation.\nHigher = more lag but stronger confirmation.\nLower = faster detection but more false levels.\nDefault 3 = level confirmed after 1.5 hours of post-pivot price action.")
+
+int srMaxLevels = input.int(6, "Max S/R Levels Displayed", minval = 2, maxval = 12,
+     group = GRP_SR,
+     tooltip = "Maximum number of support and resistance levels shown simultaneously.\nOldest levels are removed when new ones appear.\nLower = cleaner chart with only the most recent structure.\nHigher = more historical context but more visual clutter.\nDefault 6 = 3 support + 3 resistance is a good balance.")
+
+// ── Module C: Aggression Detection ──
+string GRP_AGGR = "Module C: Aggression"
+
+bool showAggression = input.bool(true, "Show Aggression Bubbles",
+     group = GRP_AGGR,
+     tooltip = "Plots circles (bubbles) at points of large aggressive volume.\nValentini: 'In order flow platforms you see bubbles. When there is direction, location, and aggression your ability to READ is 100%.'\nBLUE circles below bar = Buyer aggression (bullish volume spike with close near high).\nRED circles above bar = Seller aggression (bearish volume spike with close near low).\nCircle SIZE scales with volume intensity: Small/Normal/Large.\nTradingView LIMITATION: This is a volume-spike proxy, not true order flow.")
+
+float futuresMultiplier = input.float(2.0, "Futures Vol Spike Multiplier", minval = 1.0, maxval = 5.0,
+     step = 0.5, group = GRP_AGGR,
+     tooltip = "For FUTURES (NQ/ES/YM): Volume must exceed this multiple of the average to qualify as aggression.\nLower (1.5-2.0) = more frequent signals, catches smaller spikes.\nHigher (3.0-5.0) = only extreme volume events, very selective.\nDefault 2.0 = volume must be 2x the 20-bar average.")
+
+float etfMultiplier = input.float(2.5, "ETF Vol Spike Multiplier", minval = 1.0, maxval = 5.0,
+     step = 0.5, group = GRP_AGGR,
+     tooltip = "For ETFs (SPY/QQQ): Volume must exceed this multiple of the average.\nSet HIGHER than futures because ETF volume includes dark-pool prints,\nblock trades, and off-exchange activity that inflates bar volume.\nDefault 2.5 = filters out most noise while catching genuine institutional aggression.")
+
+int aggrVolPeriod = input.int(20, "Vol Average Period", minval = 5, maxval = 50,
+     group = GRP_AGGR,
+     tooltip = "Number of bars used to calculate the volume moving average baseline.\nThe volume spike threshold = Average Volume x Multiplier.\nLower (5-10) = adapts faster to recent activity, more reactive.\nHigher (30-50) = smoother baseline, less reactive to short-term changes.\nDefault 20 = standard institutional lookback, roughly one trading session on 5-min.")
+
+// ── Module D: Multi-TF Levels ──
+string GRP_MTF = "Module D: MTF Levels"
+
+bool showWeekly = input.bool(true, "Show Weekly Levels",
+     group = GRP_MTF,
+     tooltip = "Draws previous week's High, Low, and Close as horizontal lines.\nWeekly levels represent major structural boundaries where large institutions position.\nValentini: These are the 'big picture' auction boundaries.\nOrange lines by default.")
+
+bool showDaily = input.bool(true, "Show Daily Levels",
+     group = GRP_MTF,
+     tooltip = "Draws previous day's High, Low, Close, Midpoint, and Fibonacci retracements.\nDaily levels are the most commonly referenced by institutional desks.\nThe Midpoint serves as a POC (Point of Control) proxy.\nAlso draws daily Fibonacci levels (23.6%, 38.2%, 50%, 61.8%, 78.6%).\nPurple lines by default.")
+
+bool show4H = input.bool(true, "Show 4H Levels",
+     group = GRP_MTF,
+     tooltip = "Draws previous 4-hour bar's High, Low, and Midpoint.\nThe 4H range represents the Initial Balance — the first major auction range of the session.\nValentini: The market moves from balance to imbalance.\nThe 4H zone shows where the current session's balance is forming.\nCyan lines by default.")
+
+bool showHourly = input.bool(true, "Show Hourly Levels",
+     group = GRP_MTF,
+     tooltip = "Draws previous hour's High and Low as horizontal lines.\nHourly levels are tactical execution levels for intraday trading.\nGray lines by default.")
+
+bool showMAs = input.bool(true, "Show 20/50 MAs",
+     group = GRP_MTF,
+     tooltip = "Draws the Daily 20-period and 50-period Simple Moving Averages.\nThese are institutional reference levels used by trend-following desks.\n20 SMA = short-term momentum reference.\n50 SMA = medium-term trend reference.\nNon-repainting — uses previous day's confirmed values.")
+
+bool showPsychLevels = input.bool(true, "Show Psych Levels",
+     group = GRP_MTF,
+     tooltip = "Draws psychological round number levels as dotted white lines.\nRound numbers act as natural auction boundaries (e.g. NQ 20000, ES 5500).\nLarge participants and algorithms cluster orders around round numbers.\nNQ = 100, ES = 50, YM = 500, SPY = 5, QQQ = 5.")
+
+float psychInterval = input.float(100.0, "Psych Level Interval",
+     minval = 10.0, maxval = 1000.0, step = 10.0, group = GRP_MTF,
+     tooltip = "Spacing between psychological round number levels in price units.\n  NQ = 100 (e.g. 20000, 20100, 20200)\n  ES = 50 (e.g. 5500, 5550, 5600)\n  YM = 500 (e.g. 40000, 40500, 41000)\n  SPY = 5 | QQQ = 5")
+
+bool showWeeklyFibs = input.bool(true, "Show Weekly Fibonacci Levels",
+     group = GRP_MTF,
+     tooltip = "Draws Fibonacci retracement levels from previous week's High-Low range.\nLevels: 23.6%, 38.2%, 50%, 61.8%, 78.6%.\nLabeled with 'W' prefix to distinguish from daily fibs.\nWeekly fibs are significant for swing setups and multi-day holds.")
+
+bool showDailyFibs = input.bool(true, "Show Daily Fibonacci Levels",
+     group = GRP_MTF,
+     tooltip = "Draws Fibonacci retracement levels from previous day's High-Low range.\nLevels: 23.6%, 38.2%, 50%, 61.8%, 78.6%.\nLabeled with 'D' prefix to show source timeframe.\nDaily fibs are the most used institutional retracement reference.")
+
+// ── Module E: Balance / Imbalance ──
+string GRP_BAL = "Module E: Auction Narrative"
+
+bool showBalance = input.bool(true, "Show Balance/Imbalance State",
+     group = GRP_BAL,
+     tooltip = "Colors the chart background to show the current auction state.\nYELLOW tint = BALANCE — choppy, ranging. DO NOT TRADE.\nBLUE tint = IMBALANCE BULLISH — ok to look for longs.\nRED tint = IMBALANCE BEARISH — ok to look for shorts.\nValentini: 'Market is usually in balance. That is why traders take a streak of stop-losses.'")
+
+int balancePeriod = input.int(20, "Balance Detection Period", minval = 5, maxval = 50,
+     group = GRP_BAL,
+     tooltip = "Number of bars for ATR-based balance/imbalance detection.\nCompares short-term ATR vs long-term ATR to measure range expansion.\nDefault 20 = reliable for most intraday timeframes.")
+
+float balanceThreshold = input.float(0.6, "Balance Threshold (0-1)", minval = 0.1, maxval = 1.0,
+     step = 0.1, group = GRP_BAL,
+     tooltip = "The ratio below which the market is considered IN BALANCE.\nATR short / ATR long < threshold = BALANCE (stay away).\nATR short / ATR long >= threshold = IMBALANCE (ok to trade).\nDefault 0.6 = balanced classification matching Valentini's approach.")
+
+// ── Module F: Volume Profile HVN/LVN & Balance Box ──
+string GRP_VP = "Module F: Volume Profile (HVN/LVN)"
+
+bool showHVN = input.bool(true, "Show High Volume Nodes (HVN)",
+     group = GRP_VP,
+     tooltip = "HVN = price levels where a LARGE amount of volume was transacted.\nThese are areas of ACCEPTANCE — price tends to consolidate here.\nHVNs act as strong support/resistance. Price slows down at HVNs.\nValentini uses HVNs to identify where institutional traders built positions.\nMethodology: Dalton 'Mind Over Markets', CME Market Profile education.")
+
+bool showLVN = input.bool(true, "Show Low Volume Nodes (LVN)",
+     group = GRP_VP,
+     tooltip = "LVN = price levels where VERY LITTLE volume was transacted.\nThese are areas of REJECTION — price moves through them fast.\nValentini: LVNs are key reaction zones for entries.\n'When price comes back into the LVN, check the order flow.'\nLVNs are similar to single prints in Market Profile.\nPrice tends to rip through LVNs on revisit due to low liquidity.")
+
+bool showBalanceBox = input.bool(true, "Show Balance Box (Value Area)",
+     group = GRP_VP,
+     tooltip = "Draws a semi-transparent box showing the VALUE AREA — where 70% of volume was traded.\nThis is the BALANCE ZONE / NO-TRADE BOX per Valentini's model.\nValentini: 'In balance, 70% of the time, the market stays stuck.'\nOnly trade when price breaks OUT of this box with confirmed aggression.\nTop edge = VAH (Value Area High). Bottom edge = VAL (Value Area Low).\nPOC (Point of Control) line drawn at highest volume level inside.\nBased on Steidlmayer's Market Profile theory (CME, 1986).")
+
+bool showPOC = input.bool(true, "Show POC Line (Point of Control)",
+     group = GRP_VP,
+     tooltip = "Draws the Point of Control — the single price level with the HIGHEST traded volume.\nPOC acts as a magnet for price and the strongest S/R from volume profile.\nValentini: Target the previous balance POC — 70% of the time, price reverses from it.\nThe POC is the 'fair value' price where buyers and sellers agreed most.")
+
+int vpLookback = input.int(200, "VP Lookback Bars", minval = 50, maxval = 500,
+     group = GRP_VP,
+     tooltip = "Number of bars used to build the volume profile.\nThis defines the 'session' or range for HVN/LVN detection.\nLower (50-100) = recent micro-structure, good for scalping.\nHigher (200-500) = broader structure, better for swing context.\nDefault 200 = covers a full day on 5-min charts (NQ/ES).\nAdjust based on your chart timeframe.")
+
+int vpRows = input.int(24, "VP Resolution (Rows)", minval = 12, maxval = 48,
+     group = GRP_VP,
+     tooltip = "Number of price bins (rows) in the volume profile histogram.\nHigher = more detail, more precise HVN/LVN detection, but slower.\nLower = smoother, fewer but more significant nodes detected.\nDefault 24 = good balance of precision and performance.\n12 = fast/coarse, 48 = detailed/slow.")
+
+float vaPercent = input.float(70.0, "Value Area %", minval = 50.0, maxval = 90.0,
+     step = 5.0, group = GRP_VP,
+     tooltip = "Percentage of total volume that defines the Value Area (Balance Box).\n70% is the standard from Steidlmayer's Market Profile — one standard\ndeviation of a normal distribution. Used universally by institutional desks.\nHigher (80-90%) = wider box, more conservative 'balance' definition.\nLower (50-60%) = tighter box, more aggressive imbalance detection.")
+
+// ── Alert Settings ──
+string GRP_ALERTS = "Alert Configuration"
+
+bool alertBullConfluence = input.bool(true, "Alert: Bull Confluence",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when ALL 3 Valentini conditions align for a LONG:\n1. Market is in IMBALANCE\n2. Price is near a SUPPORT level\n3. BUYER AGGRESSION detected\nThis is the premium setup from the model.")
+
+bool alertBearConfluence = input.bool(true, "Alert: Bear Confluence",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when ALL 3 Valentini conditions align for a SHORT:\n1. Market is in IMBALANCE\n2. Price is near a RESISTANCE level\n3. SELLER AGGRESSION detected\nThis is the premium setup from the model.")
+
+bool alertFailedBuyAuction = input.bool(true, "Alert: Failed Buy Auction",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when aggressive BUYERS fail — previous bar had a buy aggression spike\nbut the current bar closes BELOW the previous bar low.\nValentini: 'Aggressive buyers created a failed auction — the sellers won.'")
+
+bool alertFailedSellAuction = input.bool(true, "Alert: Failed Sell Auction",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when aggressive SELLERS fail — previous bar had a sell aggression spike\nbut the current bar closes ABOVE the previous bar high.\nKey reversal signal in Valentini's model.")
+
+bool alertHugeBuyVol = input.bool(true, "Alert: Huge Buy Volume (5x+)",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when buyer aggression is EXTREME — volume exceeds 5x the average\nwith a bullish candle close. Rare institutional-size events.")
+
+bool alertHugeSellVol = input.bool(true, "Alert: Huge Sell Volume (5x+)",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when seller aggression is EXTREME — volume exceeds 5x the average\nwith a bearish candle close. Rare institutional-size distribution events.")
+
+bool alertBalanceShift = input.bool(false, "Alert: Balance/Imbalance Shift",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when market state CHANGES between balance and imbalance.\nOFF by default because it fires frequently.")
+
+bool alertTrendChange = input.bool(false, "Alert: 30-Min Trend Change",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when the 30-minute trend direction FLIPS.\nOFF by default to reduce noise.")
+
+bool alertAnyAggression = input.bool(false, "Alert: Any Aggression (All Sizes)",
+     group = GRP_ALERTS,
+     tooltip = "Triggers on ANY volume spike with directional conviction.\nMost frequent alert. OFF by default.")
+
+bool alertAtKeyLevel = input.bool(false, "Alert: Price at Key Level",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when price is within proximity of any 30-min S/R level.\nOFF by default because it fires often near levels.")
+
+bool alertPriceExitVA = input.bool(true, "Alert: Price Exits Value Area",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when price closes OUTSIDE the Balance Box (Value Area).\nValentini: This is when to start watching for setups.\nPrice exiting the Value Area = potential imbalance beginning.\nCombine with aggression confirmation before entering.")
+
+bool alertPriceAtPOC = input.bool(false, "Alert: Price at POC",
+     group = GRP_ALERTS,
+     tooltip = "Triggers when price is near the Point of Control level.\nPOC is the strongest volume-based level.\nUseful for mean-reversion setups.\nOFF by default — enable for POC-based strategies.")
+
+// ── Colors ──
+string GRP_COLORS = "Colors"
+
+color colBullTrend  = input.color(#2196F3, "Bull Trend",       group = GRP_COLORS, tooltip = "Bullish trend line and imbalance background.")
+color colBearTrend  = input.color(#F44336, "Bear Trend",       group = GRP_COLORS, tooltip = "Bearish trend line and imbalance background.")
+color colBuyAggr    = input.color(#2196F3, "Buyer Aggression",  group = GRP_COLORS, tooltip = "Buyer aggression bubbles.")
+color colSellAggr   = input.color(#F44336, "Seller Aggression", group = GRP_COLORS, tooltip = "Seller aggression bubbles.")
+color colWeekly     = input.color(#FF9800, "Weekly Level",      group = GRP_COLORS, tooltip = "Weekly H/L/C lines.")
+color colDaily      = input.color(#9C27B0, "Daily Level",       group = GRP_COLORS, tooltip = "Daily H/L/C/M and Fibonacci lines.")
+color col4H         = input.color(#00BCD4, "4H Level",          group = GRP_COLORS, tooltip = "4H balance zone lines.")
+color colHourly     = input.color(#607D8B, "Hourly Level",      group = GRP_COLORS, tooltip = "Hourly H/L lines.")
+color colSupport    = input.color(#4CAF50, "Support Level",     group = GRP_COLORS, tooltip = "30-min auction support levels.")
+color colResistance = input.color(#FF5722, "Resistance Level",  group = GRP_COLORS, tooltip = "30-min auction resistance levels.")
+color colBalance    = input.color(#FFC107, "Balance Zone BG",   group = GRP_COLORS, tooltip = "Background tint when market is in BALANCE.")
+color colHVN        = input.color(#FFEB3B, "HVN Level",         group = GRP_COLORS, tooltip = "High Volume Node lines — areas of acceptance/consolidation.")
+color colLVN        = input.color(#E040FB, "LVN Level",         group = GRP_COLORS, tooltip = "Low Volume Node lines — areas of rejection/fast movement.")
+color colPOC        = input.color(#FF6D00, "POC Line",          group = GRP_COLORS, tooltip = "Point of Control — highest volume price level.")
+color colVABox      = input.color(#FFC107, "Balance Box Fill",  group = GRP_COLORS, tooltip = "Value Area (Balance Box) background fill color.")
+color colWeeklyFib  = input.color(#FF9800, "Weekly Fib Levels", group = GRP_COLORS, tooltip = "Weekly Fibonacci retracement lines.")
+color colDailyFib   = input.color(#9C27B0, "Daily Fib Levels",  group = GRP_COLORS, tooltip = "Daily Fibonacci retracement lines.")
+
+// ── Line Widths ──
+string GRP_WIDTHS = "Line Widths"
+
+int widWeekly   = input.int(2, "Weekly Level Width",     minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for weekly H/L/C levels.")
+int widDaily    = input.int(2, "Daily Level Width",      minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for daily H/L/C/M levels.")
+int wid4H       = input.int(1, "4H Level Width",         minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for 4-hour levels.")
+int widHourly   = input.int(1, "Hourly Level Width",     minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for hourly levels.")
+int widSR       = input.int(1, "S/R Level Width",        minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for 30-min auction S/R levels.")
+int widMA       = input.int(1, "MA Level Width",         minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for daily 20/50 SMA levels.")
+int widFib      = input.int(1, "Fibonacci Level Width",  minval = 1, maxval = 3, group = GRP_WIDTHS, tooltip = "Line thickness for Fibonacci retracement levels.")
+int widPsych    = input.int(1, "Psych Level Width",      minval = 1, maxval = 3, group = GRP_WIDTHS, tooltip = "Line thickness for psychological round number levels.")
+int widHVN      = input.int(2, "HVN Level Width",        minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for High Volume Node levels.")
+int widLVN      = input.int(1, "LVN Level Width",        minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for Low Volume Node levels.")
+int widPOC      = input.int(3, "POC Level Width",        minval = 1, maxval = 5, group = GRP_WIDTHS, tooltip = "Line thickness for Point of Control level.")
+int widVABorder = input.int(1, "Balance Box Border Width", minval = 1, maxval = 3, group = GRP_WIDTHS, tooltip = "Border thickness for the Value Area (Balance Box).")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GLOBAL COMPUTATIONS — Must execute every bar unconditionally for ta.* consistency
+// ═══════════════════════════════════════════════════════════════════════════════
+float globalATR14     = ta.atr(14)
+float vpRangeHigh     = ta.highest(high, vpLookback)
+float vpRangeLow      = ta.lowest(low, vpLookback)
+int atrShortLen       = int(balancePeriod / 2) < 1 ? 1 : int(balancePeriod / 2)
+float atrShort        = ta.atr(atrShortLen)
+float atrLong         = ta.atr(balancePeriod)
+float volAvg          = ta.sma(volume, aggrVolPeriod)
+
+// ── Sensitivity Mapping ──
+float sensBodyRatio   = sensitivityInput == "Low" ? 0.45 : sensitivityInput == "High" ? 0.20 : 0.30
+float sensDupeATRMult = sensitivityInput == "Low" ? 0.50 : sensitivityInput == "High" ? 0.15 : 0.30
+float sensProxATRMult = sensitivityInput == "Low" ? 0.30 : sensitivityInput == "High" ? 0.70 : 0.50
+float sensVolBoost    = sensitivityInput == "Low" ? 0.5  : sensitivityInput == "High" ? -0.3 : 0.0
+float sensHVNMult     = sensitivityInput == "Low" ? 1.8  : sensitivityInput == "High" ? 1.2 : 1.5
+float sensLVNMult     = sensitivityInput == "Low" ? 0.3  : sensitivityInput == "High" ? 0.6 : 0.5
+
+// ── Label Size Mapping ──
+string labelSz = switch labelSizeInput
+    "Auto"   => size.auto
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+labelText(string shortTxt, string longTxt) =>
+    labelMode == "Short" ? shortTxt : longTxt
+
+deltaProxy(float o, float h, float l, float c, float v) =>
+    float barRange = h - l
+    float deltaRatio = barRange > 0 ? (c - l) / barRange - 0.5 : 0.0
+    float delta = deltaRatio * v * 2.0
+    delta
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE A — 30-MINUTE TREND CONTEXT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[htf30H, htf30L, htf30C, htf30O] = request.security(
+     syminfo.tickerid, "30",
+     [high[1], low[1], close[1], open[1]],
+     lookahead = barmerge.lookahead_on)
+
+float htf30HH = request.security(syminfo.tickerid, "30",
+     ta.highest(high, trendLookback)[1],
+     lookahead = barmerge.lookahead_on)
+float htf30LL = request.security(syminfo.tickerid, "30",
+     ta.lowest(low, trendLookback)[1],
+     lookahead = barmerge.lookahead_on)
+float htf30prevHH = request.security(syminfo.tickerid, "30",
+     ta.highest(high, trendLookback)[trendLookback + 1],
+     lookahead = barmerge.lookahead_on)
+float htf30prevLL = request.security(syminfo.tickerid, "30",
+     ta.lowest(low, trendLookback)[trendLookback + 1],
+     lookahead = barmerge.lookahead_on)
+
+bool higherHigh = not na(htf30HH) and not na(htf30prevHH) and htf30HH > htf30prevHH
+bool higherLow  = not na(htf30LL) and not na(htf30prevLL) and htf30LL > htf30prevLL
+bool lowerLow   = not na(htf30LL) and not na(htf30prevLL) and htf30LL < htf30prevLL
+bool lowerHigh  = not na(htf30HH) and not na(htf30prevHH) and htf30HH < htf30prevHH
+
+var int trendState = 0
+if higherHigh and higherLow
+    trendState := 1
+else if lowerLow and lowerHigh
+    trendState := -1
+
+var int prevTrendState = 0
+bool trendChanged = trendState != prevTrendState and prevTrendState != 0
+prevTrendState := trendState
+
+color trendColor = trendState == 1 ? colBullTrend : trendState == -1 ? colBearTrend : color.gray
+
+plot(showTrend ? htf30C : na, "30-Min Trend Line",
+     color = trendColor, linewidth = 2, style = plot.style_stepline)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE B — 30-MINUTE AUCTION SUPPORT & RESISTANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float htf30PivH = request.security(syminfo.tickerid, "30",
+     ta.pivothigh(high, srLeftBars, srRightBars)[1],
+     lookahead = barmerge.lookahead_on)
+float htf30PivL = request.security(syminfo.tickerid, "30",
+     ta.pivotlow(low, srLeftBars, srRightBars)[1],
+     lookahead = barmerge.lookahead_on)
+
+var array<float> resistanceLevels = array.new_float()
+var array<float> supportLevels    = array.new_float()
+var array<line>  srLines          = array.new_line()
+var array<label> srLabels         = array.new_label()
+
+float dupeThreshold = globalATR14 * sensDupeATRMult
+
+if showSR and not na(htf30PivH)
+    bool duplicate = false
+    if array.size(resistanceLevels) > 0
+        for i = 0 to array.size(resistanceLevels) - 1
+            if math.abs(array.get(resistanceLevels, i) - htf30PivH) < dupeThreshold
+                duplicate := true
+                break
+    if not duplicate
+        array.push(resistanceLevels, htf30PivH)
+        if array.size(resistanceLevels) > srMaxLevels
+            array.shift(resistanceLevels)
+
+if showSR and not na(htf30PivL)
+    bool duplicate = false
+    if array.size(supportLevels) > 0
+        for i = 0 to array.size(supportLevels) - 1
+            if math.abs(array.get(supportLevels, i) - htf30PivL) < dupeThreshold
+                duplicate := true
+                break
+    if not duplicate
+        array.push(supportLevels, htf30PivL)
+        if array.size(supportLevels) > srMaxLevels
+            array.shift(supportLevels)
+
+if showSR and barstate.islast
+    if array.size(srLines) > 0
+        for i = 0 to array.size(srLines) - 1
+            line.delete(array.get(srLines, i))
+    if array.size(srLabels) > 0
+        for i = 0 to array.size(srLabels) - 1
+            label.delete(array.get(srLabels, i))
+    array.clear(srLines)
+    array.clear(srLabels)
+
+    if array.size(resistanceLevels) > 0
+        for i = 0 to array.size(resistanceLevels) - 1
+            float lvl = array.get(resistanceLevels, i)
+            line newLine = line.new(bar_index - 50, lvl, bar_index + 10, lvl,
+                 color = colResistance, style = line.style_dashed, width = widSR,
+                 extend = extend.right)
+            array.push(srLines, newLine)
+            string txt = labelText("R", "30m Resistance")
+            label newLabel = label.new(bar_index + 12, lvl, txt,
+                 color = color.new(colResistance, 80), textcolor = colResistance,
+                 style = label.style_label_left, size = labelSz)
+            array.push(srLabels, newLabel)
+
+    if array.size(supportLevels) > 0
+        for i = 0 to array.size(supportLevels) - 1
+            float lvl = array.get(supportLevels, i)
+            line newLine = line.new(bar_index - 50, lvl, bar_index + 10, lvl,
+                 color = colSupport, style = line.style_dashed, width = widSR,
+                 extend = extend.right)
+            array.push(srLines, newLine)
+            string txt = labelText("S", "30m Support")
+            label newLabel = label.new(bar_index + 12, lvl, txt,
+                 color = color.new(colSupport, 80), textcolor = colSupport,
+                 style = label.style_label_left, size = labelSz)
+            array.push(srLabels, newLabel)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE C — AGGRESSION / LARGE TRADE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float effFutMult = futuresMultiplier + sensVolBoost
+float effEtfMult = etfMultiplier + sensVolBoost
+float volThreshold = isFutures ? volAvg * effFutMult : volAvg * effEtfMult
+
+float currentDelta = deltaProxy(open, high, low, close, volume)
+
+bool volSpike       = volume > volThreshold and not na(volAvg) and volAvg > 0
+float candleRange   = high - low
+float bodyRatio     = candleRange > 0 ? math.abs(close - open) / candleRange : 0.0
+bool meaningfulBody = bodyRatio > sensBodyRatio
+
+bool buyAggression  = volSpike and close > open and meaningfulBody and showAggression
+bool sellAggression = volSpike and close < open and meaningfulBody and showAggression
+
+float volRatio = volAvg > 0 ? volume / volAvg : 0.0
+bool isMediumSpike = volRatio >= 2.0 and volRatio < 3.5
+bool isLargeSpike  = volRatio >= 3.5 and volRatio < 5.0
+bool isHugeSpike   = volRatio >= 5.0
+
+plotshape(buyAggression and isMediumSpike, "Buy Aggr (Med)",
+     style = shape.circle, location = location.belowbar,
+     color = color.new(colBuyAggr, 30), size = size.small)
+plotshape(buyAggression and isLargeSpike, "Buy Aggr (Lrg)",
+     style = shape.circle, location = location.belowbar,
+     color = color.new(colBuyAggr, 10), size = size.normal)
+plotshape(buyAggression and isHugeSpike, "Buy Aggr (Huge)",
+     style = shape.circle, location = location.belowbar,
+     color = color.new(colBuyAggr, 0), size = size.large)
+
+plotshape(sellAggression and isMediumSpike, "Sell Aggr (Med)",
+     style = shape.circle, location = location.abovebar,
+     color = color.new(colSellAggr, 30), size = size.small)
+plotshape(sellAggression and isLargeSpike, "Sell Aggr (Lrg)",
+     style = shape.circle, location = location.abovebar,
+     color = color.new(colSellAggr, 10), size = size.normal)
+plotshape(sellAggression and isHugeSpike, "Sell Aggr (Huge)",
+     style = shape.circle, location = location.abovebar,
+     color = color.new(colSellAggr, 0), size = size.large)
+
+bool failedBuyAuction  = buyAggression[1] and close < low[1]
+bool failedSellAuction = sellAggression[1] and close > high[1]
+
+plotshape(failedBuyAuction and showAggression, "Failed Buy Auction",
+     style = shape.xcross, location = location.abovebar,
+     color = colSellAggr, size = size.small)
+plotshape(failedSellAuction and showAggression, "Failed Sell Auction",
+     style = shape.xcross, location = location.belowbar,
+     color = colBuyAggr, size = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE D — MULTI-TIMEFRAME INSTITUTIONAL LEVELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[wkH, wkL, wkC, wkO] = request.security(syminfo.tickerid, "1W",
+     [high[1], low[1], close[1], open[1]],
+     lookahead = barmerge.lookahead_on)
+
+[dayH, dayL, dayC, dayO] = request.security(syminfo.tickerid, "1D",
+     [high[1], low[1], close[1], open[1]],
+     lookahead = barmerge.lookahead_on)
+
+[h4H, h4L, h4C, h4O] = request.security(syminfo.tickerid, "240",
+     [high[1], low[1], close[1], open[1]],
+     lookahead = barmerge.lookahead_on)
+
+[h1H, h1L, h1C] = request.security(syminfo.tickerid, "60",
+     [high[1], low[1], close[1]],
+     lookahead = barmerge.lookahead_on)
+
+float dailyMA20 = request.security(syminfo.tickerid, "1D",
+     ta.sma(close, 20)[1], lookahead = barmerge.lookahead_on)
+float dailyMA50 = request.security(syminfo.tickerid, "1D",
+     ta.sma(close, 50)[1], lookahead = barmerge.lookahead_on)
+
+var array<line>  mtfLines  = array.new_line()
+var array<label> mtfLabels = array.new_label()
+
+drawLevel(float price, color col, string shortName, string longName, int wid, string lineStyle) =>
+    if not na(price) and barstate.islast
+        string txt = labelText(shortName, longName)
+        string lstyle = lineStyle == "dashed" ? line.style_dashed : lineStyle == "dotted" ? line.style_dotted : line.style_solid
+        line newLine = line.new(bar_index - 30, price, bar_index + 10, price,
+             color = col, style = lstyle, width = wid,
+             extend = extend.right)
+        array.push(mtfLines, newLine)
+        label newLabel = label.new(bar_index + 14, price,
+             txt + " " + str.tostring(price, format.mintick),
+             color = color.new(col, 85), textcolor = col,
+             style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, newLabel)
+
+if barstate.islast
+    if array.size(mtfLines) > 0
+        for i = 0 to array.size(mtfLines) - 1
+            line.delete(array.get(mtfLines, i))
+    if array.size(mtfLabels) > 0
+        for i = 0 to array.size(mtfLabels) - 1
+            label.delete(array.get(mtfLabels, i))
+    array.clear(mtfLines)
+    array.clear(mtfLabels)
+
+if showWeekly
+    drawLevel(wkH, colWeekly, "WH", "Weekly High", widWeekly, "solid")
+    drawLevel(wkL, colWeekly, "WL", "Weekly Low", widWeekly, "solid")
+    drawLevel(wkC, colWeekly, "WC", "Weekly Close", math.max(1, widWeekly - 1), "solid")
+
+if showDaily
+    drawLevel(dayH, colDaily, "DH", "Prev Day High", widDaily, "solid")
+    drawLevel(dayL, colDaily, "DL", "Prev Day Low", widDaily, "solid")
+    drawLevel(dayC, colDaily, "DC", "Prev Day Close", math.max(1, widDaily - 1), "solid")
+    float dayMid = (dayH + dayL) / 2.0
+    drawLevel(dayMid, color.new(colDaily, 40), "DM", "Daily Midpoint (POC Proxy)", math.max(1, widDaily - 1), "solid")
+
+if show4H
+    drawLevel(h4H, col4H, "4H-H", "4H Balance High", wid4H, "solid")
+    drawLevel(h4L, col4H, "4H-L", "4H Balance Low", wid4H, "solid")
+    float h4Mid = (h4H + h4L) / 2.0
+    drawLevel(h4Mid, color.new(col4H, 40), "4H-M", "4H Balance Mid", wid4H, "solid")
+
+if showHourly
+    drawLevel(h1H, colHourly, "1H-H", "Hourly High", widHourly, "solid")
+    drawLevel(h1L, colHourly, "1H-L", "Hourly Low", widHourly, "solid")
+
+if showMAs
+    drawLevel(dailyMA20, #26A69A, "D20", "Daily 20 SMA", widMA, "solid")
+    drawLevel(dailyMA50, #EF5350, "D50", "Daily 50 SMA", widMA, "solid")
+
+if showPsychLevels and barstate.islast and psychInterval > 0
+    float baseLevel = math.floor(low / psychInterval) * psychInterval
+    int maxPsychLevels = 5
+    for i = -1 to maxPsychLevels
+        float psyLvl = baseLevel + psychInterval * i
+        if psyLvl > low - psychInterval * 2 and psyLvl < high + psychInterval * 2
+            string pTxt = labelText("PSY", "Psych " + str.tostring(psyLvl, "#"))
+            line pLine = line.new(bar_index - 30, psyLvl, bar_index + 10, psyLvl,
+                 color = color.new(color.white, 70), style = line.style_dotted, width = widPsych,
+                 extend = extend.right)
+            array.push(mtfLines, pLine)
+            label pLabel = label.new(bar_index + 14, psyLvl, pTxt,
+                 color = color.new(color.white, 90), textcolor = color.new(color.white, 40),
+                 style = label.style_label_left, size = labelSz)
+            array.push(mtfLabels, pLabel)
+
+// ── Daily Fibonacci Levels (labeled with source TF) ──
+if showDailyFibs and barstate.islast and not na(dayH) and not na(dayL)
+    float dFibSpan = dayH - dayL
+    if dFibSpan > 0
+        float dFib236 = dayH - dFibSpan * 0.236
+        float dFib382 = dayH - dFibSpan * 0.382
+        float dFib500 = dayH - dFibSpan * 0.500
+        float dFib618 = dayH - dFibSpan * 0.618
+        float dFib786 = dayH - dFibSpan * 0.786
+
+        color dFibCol = color.new(colDailyFib, 50)
+        for fibVal in array.from(dFib236, dFib382, dFib500, dFib618, dFib786)
+            line fLine = line.new(bar_index - 20, fibVal, bar_index + 5, fibVal,
+                 color = dFibCol, style = line.style_dotted, width = widFib,
+                 extend = extend.right)
+            array.push(mtfLines, fLine)
+
+        label df236 = label.new(bar_index + 6, dFib236, labelText("DF236", "D Fib 23.6%"),
+             color = color.new(dFibCol, 90), textcolor = dFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, df236)
+        label df382 = label.new(bar_index + 6, dFib382, labelText("DF382", "D Fib 38.2%"),
+             color = color.new(dFibCol, 90), textcolor = dFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, df382)
+        label df5 = label.new(bar_index + 6, dFib500, labelText("DF50", "D Fib 50%"),
+             color = color.new(dFibCol, 90), textcolor = dFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, df5)
+        label df6 = label.new(bar_index + 6, dFib618, labelText("DF618", "D Fib 61.8%"),
+             color = color.new(dFibCol, 90), textcolor = dFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, df6)
+        label df786 = label.new(bar_index + 6, dFib786, labelText("DF786", "D Fib 78.6%"),
+             color = color.new(dFibCol, 90), textcolor = dFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, df786)
+
+// ── Weekly Fibonacci Levels (labeled with source TF) ──
+if showWeeklyFibs and barstate.islast and not na(wkH) and not na(wkL)
+    float wFibSpan = wkH - wkL
+    if wFibSpan > 0
+        float wFib236 = wkH - wFibSpan * 0.236
+        float wFib382 = wkH - wFibSpan * 0.382
+        float wFib500 = wkH - wFibSpan * 0.500
+        float wFib618 = wkH - wFibSpan * 0.618
+        float wFib786 = wkH - wFibSpan * 0.786
+
+        color wFibCol = color.new(colWeeklyFib, 50)
+        for fibVal in array.from(wFib236, wFib382, wFib500, wFib618, wFib786)
+            line fLine = line.new(bar_index - 30, fibVal, bar_index + 5, fibVal,
+                 color = wFibCol, style = line.style_dashed, width = widFib,
+                 extend = extend.right)
+            array.push(mtfLines, fLine)
+
+        label wf236 = label.new(bar_index + 8, wFib236, labelText("WF236", "W Fib 23.6%"),
+             color = color.new(wFibCol, 90), textcolor = wFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, wf236)
+        label wf382 = label.new(bar_index + 8, wFib382, labelText("WF382", "W Fib 38.2%"),
+             color = color.new(wFibCol, 90), textcolor = wFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, wf382)
+        label wf5 = label.new(bar_index + 8, wFib500, labelText("WF50", "W Fib 50%"),
+             color = color.new(wFibCol, 90), textcolor = wFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, wf5)
+        label wf6 = label.new(bar_index + 8, wFib618, labelText("WF618", "W Fib 61.8%"),
+             color = color.new(wFibCol, 90), textcolor = wFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, wf6)
+        label wf786 = label.new(bar_index + 8, wFib786, labelText("WF786", "W Fib 78.6%"),
+             color = color.new(wFibCol, 90), textcolor = wFibCol, style = label.style_label_left, size = labelSz)
+        array.push(mtfLabels, wf786)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE E — AUCTION NARRATIVE OVERLAY (Balance vs Imbalance)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float balanceRatio = atrLong > 0 ? atrShort / atrLong : 0.5
+
+bool isInBalance  = balanceRatio < balanceThreshold
+bool isImbalanced = not isInBalance
+
+var bool prevBalanceState = true
+bool balanceShifted = isInBalance != prevBalanceState
+prevBalanceState := isInBalance
+
+bgcolor(showBalance and isInBalance ? color.new(colBalance, 92) : na, title = "Balance Zone BG")
+bgcolor(showBalance and isImbalanced and trendState == 1 ? color.new(colBullTrend, 94) : na, title = "Imbalance Bull BG")
+bgcolor(showBalance and isImbalanced and trendState == -1 ? color.new(colBearTrend, 94) : na, title = "Imbalance Bear BG")
+
+// ── Location Validity ──
+float nearestResist = na
+float nearestSupp   = na
+
+if array.size(resistanceLevels) > 0
+    nearestResist := array.get(resistanceLevels, array.size(resistanceLevels) - 1)
+if array.size(supportLevels) > 0
+    nearestSupp := array.get(supportLevels, array.size(supportLevels) - 1)
+
+bool nearResistance = not na(nearestResist) and math.abs(close - nearestResist) < globalATR14 * sensProxATRMult
+bool nearSupport    = not na(nearestSupp) and math.abs(close - nearestSupp) < globalATR14 * sensProxATRMult
+bool atKeyLevel     = nearResistance or nearSupport
+
+// ── Valentini Confluence Signal ──
+bool bullConfluence = isImbalanced and trendState == 1 and nearSupport and buyAggression
+bool bearConfluence = isImbalanced and trendState == -1 and nearResistance and sellAggression
+
+plotshape(bullConfluence, "Bull Confluence",
+     style = shape.diamond, location = location.belowbar,
+     color = color.new(#00E676, 0), size = size.normal)
+plotshape(bearConfluence, "Bear Confluence",
+     style = shape.diamond, location = location.abovebar,
+     color = color.new(#FF1744, 0), size = size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE F — VOLUME PROFILE: HVN, LVN, POC, & BALANCE BOX (VALUE AREA)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Methodology: Standard bin-based volume distribution.
+// Each bar's volume is proportionally allocated across the price bins
+// (rows) that the bar's high-low range spans. This is the same approach
+// used by professional platforms (ATAS, Sierra Chart, Quantower) and
+// TradingView's own Session Volume Profile indicator.
+//
+// Academic foundation:
+// - Steidlmayer, J.P. "Markets & Market Logic" (1986) — Market Profile
+// - Dalton, J. "Mind Over Markets" (1990) — Value Area, POC concepts
+// - CME Group Market Profile Handbook — standard 70% Value Area
+//
+// Valentini's application:
+// - Balance Box (Value Area) = NO-TRADE ZONE. Skip trades inside.
+// - LVN = reaction zones for entries when price revisits
+// - HVN = acceptance zones, price consolidates here
+// - POC = fair value, strongest S/R, target for mean-reversion
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var array<line>  vpLines  = array.new_line()
+var array<label> vpLabels = array.new_label()
+var array<box>   vpBoxes  = array.new_box()
+
+// Persistent VP output values for alerts (updated on last bar)
+var float vpVAH = na
+var float vpVAL = na
+var float vpPOCprice = na
+
+if barstate.islast and (showHVN or showLVN or showBalanceBox or showPOC)
+    // ── Clean up previous VP drawings ──
+    if array.size(vpLines) > 0
+        for i = 0 to array.size(vpLines) - 1
+            line.delete(array.get(vpLines, i))
+    if array.size(vpLabels) > 0
+        for i = 0 to array.size(vpLabels) - 1
+            label.delete(array.get(vpLabels, i))
+    if array.size(vpBoxes) > 0
+        for i = 0 to array.size(vpBoxes) - 1
+            box.delete(array.get(vpBoxes, i))
+    array.clear(vpLines)
+    array.clear(vpLabels)
+    array.clear(vpBoxes)
+
+    // ── Build Volume Profile ──
+    float rHigh = vpRangeHigh
+    float rLow  = vpRangeLow
+    float binSize = not na(rHigh) and not na(rLow) and rHigh > rLow ? (rHigh - rLow) / vpRows : 0.0
+
+    if binSize > 0
+        // Initialize volume bins
+        array<float> volBins = array.new_float(vpRows, 0.0)
+        float totalVolume = 0.0
+
+        // Distribute volume into bins
+        for i = 0 to vpLookback - 1
+            float barH = high[i]
+            float barL = low[i]
+            float barV = volume[i]
+            if not na(barH) and not na(barL) and not na(barV) and barV > 0
+                int startBin = math.max(0, math.min(vpRows - 1, int(math.floor((barL - rLow) / binSize))))
+                int endBin   = math.max(0, math.min(vpRows - 1, int(math.floor((barH - rLow) / binSize))))
+                if startBin > endBin
+                    int tempBin = startBin
+                    startBin := endBin
+                    endBin   := tempBin
+                int numBins = endBin - startBin + 1
+                float volPerBin = barV / numBins
+                for b = startBin to endBin
+                    array.set(volBins, b, array.get(volBins, b) + volPerBin)
+                totalVolume += barV
+
+        if totalVolume > 0
+            // ── Find POC (bin with highest volume) ──
+            int pocBin = 0
+            float maxBinVol = 0.0
+            for b = 0 to vpRows - 1
+                float bv = array.get(volBins, b)
+                if bv > maxBinVol
+                    maxBinVol := bv
+                    pocBin    := b
+
+            float pocPrice = rLow + (pocBin + 0.5) * binSize
+            vpPOCprice := pocPrice
+
+            // ── Calculate Value Area (expanding from POC) ──
+            float vaTarget = totalVolume * (vaPercent / 100.0)
+            float cumVol   = array.get(volBins, pocBin)
+            int vaLowBin   = pocBin
+            int vaHighBin  = pocBin
+
+            for _iter = 0 to vpRows - 1
+                if cumVol >= vaTarget
+                    break
+                float volAbove = vaHighBin < vpRows - 1 ? array.get(volBins, vaHighBin + 1) : 0.0
+                float volBelow = vaLowBin > 0 ? array.get(volBins, vaLowBin - 1) : 0.0
+                if volAbove == 0.0 and volBelow == 0.0
+                    break
+                if volAbove >= volBelow and vaHighBin < vpRows - 1
+                    vaHighBin += 1
+                    cumVol    += volAbove
+                else if vaLowBin > 0
+                    vaLowBin -= 1
+                    cumVol   += volBelow
+                else if vaHighBin < vpRows - 1
+                    vaHighBin += 1
+                    cumVol    += volAbove
+                else
+                    break
+
+            float vahPrice = rLow + (vaHighBin + 1) * binSize
+            float valPrice = rLow + vaLowBin * binSize
+            vpVAH := vahPrice
+            vpVAL := valPrice
+
+            // ── Draw Balance Box (Value Area) ──
+            if showBalanceBox
+                box vaBox = box.new(bar_index - vpLookback, vahPrice, bar_index + 5, valPrice,
+                     border_color = color.new(colVABox, 50), border_width = widVABorder,
+                     border_style = line.style_dashed,
+                     bgcolor = color.new(colVABox, 93))
+                array.push(vpBoxes, vaBox)
+
+                string vaTopTxt = labelText("VAH", "Value Area High (Skip Above)")
+                label vahLabel = label.new(bar_index + 6, vahPrice, vaTopTxt + " " + str.tostring(vahPrice, format.mintick),
+                     color = color.new(colVABox, 85), textcolor = colVABox,
+                     style = label.style_label_left, size = labelSz)
+                array.push(vpLabels, vahLabel)
+
+                string vaBotTxt = labelText("VAL", "Value Area Low (Skip Below)")
+                label valLabel = label.new(bar_index + 6, valPrice, vaBotTxt + " " + str.tostring(valPrice, format.mintick),
+                     color = color.new(colVABox, 85), textcolor = colVABox,
+                     style = label.style_label_left, size = labelSz)
+                array.push(vpLabels, valLabel)
+
+            // ── Draw POC ──
+            if showPOC
+                line pocLine = line.new(bar_index - vpLookback, pocPrice, bar_index + 10, pocPrice,
+                     color = colPOC, style = line.style_solid, width = widPOC,
+                     extend = extend.right)
+                array.push(vpLines, pocLine)
+
+                string pocTxt = labelText("POC", "POC (Fair Value)")
+                label pocLabel = label.new(bar_index + 12, pocPrice, pocTxt + " " + str.tostring(pocPrice, format.mintick),
+                     color = color.new(colPOC, 80), textcolor = colPOC,
+                     style = label.style_label_left, size = labelSz)
+                array.push(vpLabels, pocLabel)
+
+            // ── Detect and Draw HVN / LVN ──
+            float avgBinVol = totalVolume / vpRows
+            float hvnThresh = avgBinVol * sensHVNMult
+            float lvnThresh = avgBinVol * sensLVNMult
+
+            for b = 0 to vpRows - 1
+                float bv = array.get(volBins, b)
+                float binMid = rLow + (b + 0.5) * binSize
+
+                // Skip the POC bin for HVN (POC is drawn separately)
+                if showHVN and bv > hvnThresh and b != pocBin
+                    line hvnLine = line.new(bar_index - vpLookback, binMid, bar_index + 5, binMid,
+                         color = color.new(colHVN, 30), style = line.style_solid, width = widHVN)
+                    array.push(vpLines, hvnLine)
+                    string hvnTxt = labelText("HVN", "HVN (Acceptance)")
+                    label hvnLabel = label.new(bar_index + 6, binMid, hvnTxt,
+                         color = color.new(colHVN, 85), textcolor = colHVN,
+                         style = label.style_label_left, size = labelSz)
+                    array.push(vpLabels, hvnLabel)
+
+                if showLVN and bv < lvnThresh and bv > 0
+                    line lvnLine = line.new(bar_index - vpLookback, binMid, bar_index + 5, binMid,
+                         color = color.new(colLVN, 30), style = line.style_dashed, width = widLVN)
+                    array.push(vpLines, lvnLine)
+                    string lvnTxt = labelText("LVN", "LVN (Rejection)")
+                    label lvnLabel = label.new(bar_index + 6, binMid, lvnTxt,
+                         color = color.new(colLVN, 85), textcolor = colLVN,
+                         style = label.style_label_left, size = labelSz)
+                    array.push(vpLabels, lvnLabel)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VP-BASED ALERT CONDITIONS (need to run every bar for alertcondition)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool priceAboveVA = not na(vpVAH) and close > vpVAH
+bool priceBelowVA = not na(vpVAL) and close < vpVAL
+bool priceOutsideVA = priceAboveVA or priceBelowVA
+bool priceNearPOC = not na(vpPOCprice) and math.abs(close - vpPOCprice) < globalATR14 * 0.3
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 8,
+     bgcolor = color.new(color.black, 30),
+     border_width = 1, border_color = color.new(color.white, 70))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "V-AMT v2", text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 0,
+         isFutures ? "FUTURES" : "ETF",
+         text_color = isFutures ? color.orange : color.aqua, text_size = size.small)
+
+    table.cell(infoTable, 0, 1, "State:", text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 1,
+         isInBalance ? "BALANCE" : "IMBALANCE",
+         text_color = isInBalance ? colBalance : (trendState == 1 ? colBullTrend : colBearTrend),
+         text_size = size.tiny)
+
+    table.cell(infoTable, 0, 2, "30m Trend:", text_color = color.gray, text_size = size.tiny)
+    string trendTxt = trendState == 1 ? "BULL" : trendState == -1 ? "BEAR" : "NEUTRAL"
+    table.cell(infoTable, 1, 2, trendTxt, text_color = trendColor, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 3, "Volume:", text_color = color.gray, text_size = size.tiny)
+    string volTxt = volRatio >= 3.0 ? "EXTREME" : volRatio >= 2.0 ? "SPIKE" : "Normal"
+    color volTxtCol = volRatio >= 3.0 ? color.red : volRatio >= 2.0 ? color.orange : color.gray
+    table.cell(infoTable, 1, 3, volTxt, text_color = volTxtCol, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 4, "Delta:", text_color = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 4,
+         currentDelta > 0 ? "BUY +" + str.tostring(math.round(currentDelta)) :
+         "SELL " + str.tostring(math.round(currentDelta)),
+         text_color = currentDelta > 0 ? colBuyAggr : colSellAggr, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 5, "Location:", text_color = color.gray, text_size = size.tiny)
+    string locTxt = priceAboveVA ? "ABOVE VA" : priceBelowVA ? "BELOW VA" : "INSIDE VA"
+    color locCol = priceOutsideVA ? color.lime : colBalance
+    table.cell(infoTable, 1, 5, locTxt, text_color = locCol, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 6, "Sensitivity:", text_color = color.gray, text_size = size.tiny)
+    color sensCol = sensitivityInput == "Low" ? color.green : sensitivityInput == "High" ? color.red : color.orange
+    table.cell(infoTable, 1, 6, sensitivityInput, text_color = sensCol, text_size = size.tiny)
+
+    table.cell(infoTable, 0, 7, "Signal:", text_color = color.gray, text_size = size.tiny)
+    string sigTxt = bullConfluence ? "BULL CONFLUENCE" :
+         bearConfluence ? "BEAR CONFLUENCE" :
+         isInBalance ? "Wait - In Balance" :
+         not priceOutsideVA ? "Inside VA - Skip" :
+         atKeyLevel ? "At Key Level" : "Scanning..."
+    color sigCol = bullConfluence ? #00E676 :
+         bearConfluence ? #FF1744 :
+         isInBalance or not priceOutsideVA ? colBalance : color.gray
+    table.cell(infoTable, 1, 7, sigTxt, text_color = sigCol, text_size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS — All configurable via input toggles
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(alertBullConfluence and bullConfluence,
+     "Bull Confluence",
+     "V-AMT: BULL CONFLUENCE — Imbalance + Support + Buy Aggression. Premium long setup.")
+
+alertcondition(alertBearConfluence and bearConfluence,
+     "Bear Confluence",
+     "V-AMT: BEAR CONFLUENCE — Imbalance + Resistance + Sell Aggression. Premium short setup.")
+
+alertcondition(alertFailedBuyAuction and failedBuyAuction,
+     "Failed Buy Auction",
+     "V-AMT: Aggressive BUYERS FAILED — price reversed below aggression bar. Potential short.")
+
+alertcondition(alertFailedSellAuction and failedSellAuction,
+     "Failed Sell Auction",
+     "V-AMT: Aggressive SELLERS FAILED — price reversed above aggression bar. Potential long.")
+
+alertcondition(alertHugeBuyVol and buyAggression and isHugeSpike,
+     "Huge Buy Volume",
+     "V-AMT: EXTREME buyer aggression (5x+ volume). Institutional-size buying.")
+
+alertcondition(alertHugeSellVol and sellAggression and isHugeSpike,
+     "Huge Sell Volume",
+     "V-AMT: EXTREME seller aggression (5x+ volume). Institutional-size selling.")
+
+alertcondition(alertBalanceShift and balanceShifted,
+     "Balance/Imbalance Shift",
+     "V-AMT: Market state changed between BALANCE and IMBALANCE.")
+
+alertcondition(alertTrendChange and trendChanged,
+     "30-Min Trend Change",
+     "V-AMT: 30-minute trend direction has FLIPPED.")
+
+alertcondition(alertAnyAggression and (buyAggression or sellAggression),
+     "Any Aggression Detected",
+     "V-AMT: Volume aggression detected (buyer or seller).")
+
+alertcondition(alertAtKeyLevel and atKeyLevel,
+     "Price at Key Level",
+     "V-AMT: Price near a 30-min support or resistance level.")
+
+alertcondition(alertPriceExitVA and priceOutsideVA,
+     "Price Exits Value Area",
+     "V-AMT: Price closed OUTSIDE the Value Area (Balance Box). Watch for setups.")
+
+alertcondition(alertPriceAtPOC and priceNearPOC,
+     "Price at POC",
+     "V-AMT: Price is near the Point of Control. Mean-reversion zone.")

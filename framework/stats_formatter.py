@@ -20,7 +20,7 @@ def format_stats_header(
         Formatted multi-line string with full stats
     """
     lines = []
-    lines.append(f"OpenClaw Backtest Results: {script_name}")
+    lines.append(f"DS-TV Backtest Results: {script_name}")
     lines.append("=" * 60)
     lines.append("")
 

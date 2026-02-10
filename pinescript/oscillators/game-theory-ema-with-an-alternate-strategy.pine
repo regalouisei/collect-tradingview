@@ -1,0 +1,313 @@
+//@version=6
+strategy("Game Theory EMA Strategy - Profitable Edition", 
+     shorttitle="GT EMA Pro", 
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=95,
+     commission_type=strategy.commission.percent,
+     commission_value=0.1,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     max_lines_count=500,
+     max_labels_count=500)
+
+// ==================== INPUTS ====================
+
+// EMA Settings
+emaFast = input.int(9, "Fast EMA", minval=5, maxval=50, group="EMA Settings")
+emaSlow = input.int(21, "Slow EMA", minval=10, maxval=100, group="EMA Settings")
+emaTrend = input.int(50, "Trend Filter EMA", minval=20, maxval=200, group="EMA Settings")
+
+// Game Theory Settings
+gtPeriod = input.int(14, "Game Theory Period", minval=5, maxval=50, group="Game Theory")
+nashFilter = input.bool(true, "Use Nash Equilibrium Filter", group="Game Theory")
+utilityFilter = input.bool(true, "Use Utility Confirmation", group="Game Theory")
+minUtilityGap = input.float(0.15, "Min Utility Gap for Trade", minval=0.0, maxval=1.0, step=0.05, group="Game Theory")
+
+// Risk Management
+riskRewardRatio = input.float(1.5, "Risk:Reward Ratio", minval=1.0, maxval=3.0, step=0.25, group="Risk Management")
+atrPeriod = input.int(14, "ATR Period", minval=5, maxval=50, group="Risk Management")
+atrMultiplier = input.float(1.2, "ATR Stop Multiplier", minval=0.5, maxval=3.0, step=0.1, group="Risk Management")
+maxDailyLoss = input.float(2.0, "Max Daily Loss %", minval=0.5, maxval=10.0, step=0.5, group="Risk Management")
+
+// Trade Filters
+useADXFilter = input.bool(true, "Use ADX Trend Filter", group="Filters")
+adxThreshold = input.int(20, "ADX Threshold", minval=10, maxval=50, group="Filters")
+useVolumeFilter = input.bool(true, "Volume Filter", group="Filters")
+volumeThreshold = input.float(1.2, "Volume Multiplier", minval=1.0, maxval=3.0, step=0.1, group="Filters")
+useRSIFilter = input.bool(true, "RSI Extremes Filter", group="Filters")
+
+// Trade Management
+maxTradesPerDay = input.int(5, "Max Trades Per Day", minval=1, maxval=20, group="Trade Management")
+useTimeFilter = input.bool(false, "Use Time Filter", group="Trade Management")
+startHour = input.int(9, "Start Hour (UTC)", minval=0, maxval=23, group="Trade Management")
+endHour = input.int(20, "End Hour (UTC)", minval=0, maxval=23, group="Trade Management")
+
+// ==================== CORE INDICATORS ====================
+
+// EMAs
+ema_fast = ta.ema(close, emaFast)
+ema_slow = ta.ema(close, emaSlow)
+ema_trend = ta.ema(close, emaTrend)
+
+// ATR for stops and targets
+atr = ta.atr(atrPeriod)
+
+// ADX for trend strength
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+
+// RSI for overbought/oversold
+rsi = ta.rsi(close, 14)
+
+// Volume
+volMA = ta.sma(volume, 20)
+volumeUp = volume > volMA * volumeThreshold
+
+// ==================== COUNTERS & TRACKING ====================
+
+var int tradesOpenedToday = 0
+var float dailyPnL = 0.0
+var int lastTradeBar = 0
+
+// Reset daily counters
+if (ta.cross(time("D"), time("D")) or barstate.isfirst)
+    tradesOpenedToday := 0
+    dailyPnL := 0.0
+
+// ==================== GAME THEORY FUNCTIONS ====================
+
+// Expected Utility Calculation - FIXED for Pine v6
+f_calcExpectedUtility() =>
+    rsi_gt = ta.rsi(close, gtPeriod)
+    buyer_momentum = rsi_gt > 50 ? math.min((rsi_gt - 50) / 50, 1.0) : 0.0
+    seller_momentum = rsi_gt < 50 ? math.min((50 - rsi_gt) / 50, 1.0) : 0.0
+    
+    vol_weight = math.min(volume / volMA, 2.0)
+    vol_probability = math.max(0.5, math.min(vol_weight, 1.5))
+    
+    bull_trend = close > ema_trend ? 1.0 : 0.5
+    bear_trend = close < ema_trend ? 1.0 : 0.5
+    
+    eu_buyer = buyer_momentum * vol_probability * bull_trend
+    eu_seller = seller_momentum * vol_probability * bear_trend
+    
+    [eu_buyer, eu_seller]
+
+// Simplified Nash Equilibrium - FIXED for Pine v6
+f_calcNashEquilibrium(eu_buy, eu_sell) =>
+    diff = math.abs(eu_buy - eu_sell)
+    is_equilibrium = diff < 0.1
+    is_equilibrium
+
+// Momentum Strength - FIXED for Pine v6
+f_calcMomentumStrength() =>
+    bullBars = 0
+    for i = 0 to math.min(gtPeriod - 1, bar_index)
+        if close[i] > open[i]
+            bullBars += 1
+    
+    bullRatio = bullBars / gtPeriod
+    bullRatio
+
+// ==================== CALCULATE SIGNALS ====================
+
+[eu_buyer, eu_seller] = f_calcExpectedUtility()
+is_nash = f_calcNashEquilibrium(eu_buyer, eu_seller)
+momentum = f_calcMomentumStrength()
+utility_gap = math.abs(eu_buyer - eu_seller)
+
+// EMA Crossover Signals
+emaCrossUp = ta.crossover(ema_fast, ema_slow)
+emaCrossDown = ta.crossunder(ema_fast, ema_slow)
+
+// Trend Confirmation
+uptrend = close > ema_trend
+downtrend = close < ema_trend
+
+// Trend Strength
+strongTrend = adx > adxThreshold
+mediumTrend = adx > (adxThreshold - 5)
+
+// Game Theory Conditions
+buyer_has_edge = eu_buyer > eu_seller
+seller_has_edge = eu_seller > eu_buyer
+sufficient_utility = utility_gap > minUtilityGap
+not_equilibrium = not is_nash
+
+// RSI Filter
+rsiOK = (rsi > 20 and rsi < 80)
+
+// ==================== ENTRY CONDITIONS ====================
+
+longCondition = 
+     emaCrossUp and 
+     uptrend and 
+     (not useADXFilter or mediumTrend) and 
+     (not useVolumeFilter or volumeUp) and 
+     (not useRSIFilter or rsiOK) and
+     (not nashFilter or not_equilibrium) and 
+     (not utilityFilter or (buyer_has_edge and sufficient_utility)) and
+     tradesOpenedToday < maxTradesPerDay and
+     (not useTimeFilter or (hour >= startHour and hour < endHour)) and
+     dailyPnL > (strategy.equity * -maxDailyLoss / 100)
+
+shortCondition = 
+     emaCrossDown and 
+     downtrend and 
+     (not useADXFilter or mediumTrend) and 
+     (not useVolumeFilter or volumeUp) and 
+     (not useRSIFilter or rsiOK) and
+     (not nashFilter or not_equilibrium) and 
+     (not utilityFilter or (seller_has_edge and sufficient_utility)) and
+     tradesOpenedToday < maxTradesPerDay and
+     (not useTimeFilter or (hour >= startHour and hour < endHour)) and
+     dailyPnL > (strategy.equity * -maxDailyLoss / 100)
+
+// ==================== POSITION MANAGEMENT ====================
+
+var float longStop = na
+var float longTarget = na
+var float shortStop = na
+var float shortTarget = na
+
+// LONG ENTRY
+if longCondition and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    longStop := close - (atr * atrMultiplier)
+    longTarget := close + (atr * atrMultiplier * riskRewardRatio)
+    tradesOpenedToday += 1
+    lastTradeBar := bar_index
+
+// SHORT ENTRY
+if shortCondition and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    shortStop := close + (atr * atrMultiplier)
+    shortTarget := close - (atr * atrMultiplier * riskRewardRatio)
+    tradesOpenedToday += 1
+    lastTradeBar := bar_index
+
+// ==================== EXIT CONDITIONS ====================
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=longTarget)
+    
+    if close < ema_slow
+        strategy.close("Long", comment="Trend Break")
+    
+    if nashFilter and is_nash and bar_index > lastTradeBar + 5
+        strategy.close("Long", comment="Equilibrium Exit")
+    
+    if bar_index > lastTradeBar + 50
+        strategy.close("Long", comment="Time Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortTarget)
+    
+    if close > ema_slow
+        strategy.close("Short", comment="Trend Break")
+    
+    if nashFilter and is_nash and bar_index > lastTradeBar + 5
+        strategy.close("Short", comment="Equilibrium Exit")
+    
+    if bar_index > lastTradeBar + 50
+        strategy.close("Short", comment="Time Exit")
+
+// ==================== PLOTTING ====================
+
+plot(ema_fast, "Fast EMA (9)", color=color.new(color.blue, 0), linewidth=2)
+plot(ema_slow, "Slow EMA (21)", color=color.new(color.red, 0), linewidth=2)
+plot(ema_trend, "Trend EMA (50)", color=color.new(color.orange, 0), linewidth=1)
+
+bgcolor(uptrend ? color.new(color.green, 94) : color.new(color.red, 94), 
+     title="Trend Background")
+
+bgcolor(is_nash ? color.new(color.yellow, 85) : na, title="Nash Equilibrium Zone")
+
+plotshape(longCondition, "Long Entry", shape.triangleup, 
+     location.belowbar, color=color.new(color.lime, 0), size=size.normal)
+plotshape(shortCondition, "Short Entry", shape.triangledown, 
+     location.abovebar, color=color.new(color.red, 0), size=size.normal)
+
+plot(strategy.position_size > 0 ? longStop : na, "Long Stop", 
+     color=color.new(color.red, 50), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? longTarget : na, "Long Target", 
+     color=color.new(color.green, 50), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortStop : na, "Short Stop", 
+     color=color.new(color.red, 50), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortTarget : na, "Short Target", 
+     color=color.new(color.green, 50), style=plot.style_linebr, linewidth=2)
+
+// ==================== UTILITY INDICATOR PANEL ====================
+
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dashed)
+plot(eu_buyer - eu_seller, "Utility Advantage", 
+     color=eu_buyer > eu_seller ? color.green : color.red, linewidth=2)
+plot(utility_gap, "Utility Gap", color=color.purple, linewidth=1)
+
+// ==================== INFO TABLE ====================
+
+var table infoTable = table.new(position.top_right, 2, 12, 
+     border_width=2, frame_width=2, border_color=color.gray)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "GAME THEORY METRICS", bgcolor=color.new(color.navy, 20), 
+         text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(infoTable, 1, 0, "", bgcolor=color.new(color.navy, 20))
+    
+    posText = strategy.position_size > 0 ? "LONG ↑" : strategy.position_size < 0 ? "SHORT ↓" : "FLAT"
+    posColor = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(infoTable, 0, 1, "Position", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, posText, text_color=posColor, text_size=size.small, text_halign=text.align_right)
+    
+    trendText = uptrend ? "BULLISH ↑" : "BEARISH ↓"
+    trendColor = uptrend ? color.lime : color.red
+    table.cell(infoTable, 0, 2, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, trendText, text_color=trendColor, text_size=size.small, text_halign=text.align_right)
+    
+    adxColor = adx > adxThreshold ? color.lime : adx > adxThreshold - 10 ? color.yellow : color.orange
+    table.cell(infoTable, 0, 3, "ADX Strength", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(adx, "#.#"), 
+         text_color=adxColor, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 4, "EU (Buy)", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(eu_buyer, "#.##"), 
+         text_color=eu_buyer > eu_seller ? color.lime : color.red, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 5, "EU (Sell)", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(eu_seller, "#.##"), 
+         text_color=eu_seller > eu_buyer ? color.red : color.lime, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 6, "Utility Gap", text_color=color.white, text_size=size.small)
+    gapColor = utility_gap > minUtilityGap ? color.lime : color.orange
+    table.cell(infoTable, 1, 6, str.tostring(utility_gap, "#.##"), 
+         text_color=gapColor, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 7, "Nash Equilibrium", text_color=color.white, text_size=size.small)
+    nashColor = is_nash ? color.yellow : color.gray
+    table.cell(infoTable, 1, 7, is_nash ? "⚠ YES" : "✓ NO", 
+         text_color=nashColor, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 8, "─────────────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 8, "─────────────", text_color=color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 9, "Total Trades", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 9, str.tostring(strategy.closedtrades), 
+         text_color=color.white, text_size=size.small, text_halign=text.align_right)
+    
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades * 100) : 0
+    winColor = winRate >= 60 ? color.lime : winRate >= 50 ? color.yellow : color.red
+    table.cell(infoTable, 0, 10, "Win Rate", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 10, str.tostring(winRate, "#.#") + "%", 
+         text_color=winColor, text_size=size.small, text_halign=text.align_right)
+    
+    table.cell(infoTable, 0, 11, "Trades Today", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 11, str.tostring(tradesOpenedToday) + "/" + str.tostring(maxTradesPerDay), 
+         text_color=tradesOpenedToday >= maxTradesPerDay ? color.orange : color.white, 
+         text_size=size.small, text_halign=text.align_right)
+
+// ==================== ALERTS ====================
+
+alertcondition(longCondition, "GT Strategy: Long Signal", "LONG ENTRY SIGNAL")
+alertcondition(shortCondition, "GT Strategy: Short Signal", "SHORT ENTRY SIGNAL")
+alertcondition(is_nash, "GT Strategy: Nash Equilibrium", "MARKET IN EQUILIBRIUM")

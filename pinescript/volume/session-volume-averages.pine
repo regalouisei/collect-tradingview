@@ -1,0 +1,395 @@
+//@version=6
+indicator("Session Volume Averages", shorttitle = "SVA", format = format.volume, overlay = false, max_bars_back = 5000)
+
+//+-------------------------------------------------------+
+//                        INFORMATION                     |
+//+-------------------------------------------------------+
+// #region Information
+
+// Session Volume Averages
+// Displays current volume as bars with two analytical overlays per enabled session:
+//   1. Session Average (2px) — mean volume-per-bar across the last N completed sessions.
+//   2. Bar-Position Average (1px) — average volume at each bar's ordinal position within the session
+//      across the last N completed sessions.
+//
+// Up to three independent sessions with user-defined timing and colour. Outside any active session,
+// all values drop to zero for a clean display.
+
+// #endregion Information
+
+//+-------------------------------------------------------+
+//                          INPUTS                        |
+//+-------------------------------------------------------+
+// #region Inputs
+
+// #region Input Enums ************************************
+
+enum Timezones
+    utc  = "UTC"
+    exch = "Brokers/Exchange"
+    ny   = "America/New_York"
+    chi  = "America/Chicago"
+    lax  = "America/Los_Angeles"
+    tor  = "America/Toronto"
+    lon  = "Europe/London"
+    ber  = "Europe/Berlin"
+    tyo  = "Asia/Tokyo"
+    hkg  = "Asia/Hong_Kong"
+    sgp  = "Asia/Singapore"
+    syd  = "Australia/Sydney"
+
+// #endregion Input Enums
+
+// #region Tooltips ***************************************
+
+string tt_timezone = "Timezone used for all session window calculations."
+string tt_s1       = "Session 1 — Default: New York (0800-1700). Enable/disable and set custom trading hours. " +
+                     "Colour controls both average lines."
+string tt_s2       = "Session 2 — Default: London (0300-1200). Enable/disable and set custom trading hours. " +
+                     "Colour controls both average lines."
+string tt_s3       = "Session 3 — Default: Tokyo (1900-0400). Enable/disable and set custom trading hours. " +
+                     "Colour controls both average lines."
+string tt_sample   = "Number of completed sessions used to calculate averages. Min 5, Max 100."
+string tt_volColor = "Colours for volume bars when price closes up vs down."
+string tt_debug    = "Show diagnostic table with current average values and bar position within each session."
+
+// #endregion Tooltips
+
+// #region Timezone ***************************************
+
+var string iGroupTZ = "Timezone"
+
+i_timezone = input.enum(Timezones.ny, "Timezone", group = iGroupTZ, tooltip = tt_timezone)
+
+// #endregion Timezone
+
+// #region Sessions ***************************************
+
+var string iGroupS1 = "Session 1"
+var string iGroupS2 = "Session 2"
+var string iGroupS3 = "Session 3"
+
+// ── Session 1 (Default: New York) ──
+i_s1Enable  = input.bool(true, "Enable", group = iGroupS1, tooltip = tt_s1)
+i_s1Session = input.session("0800-1700", "Hours", group = iGroupS1, inline = "S1T", active = i_s1Enable)
+i_s1Color   = input.color(#9C27B0, "", group = iGroupS1, inline = "S1T", active = i_s1Enable)
+
+// ── Session 2 (Default: London) ──
+i_s2Enable  = input.bool(true, "Enable", group = iGroupS2, tooltip = tt_s2)
+i_s2Session = input.session("0300-1200", "Hours", group = iGroupS2, inline = "S2T", active = i_s2Enable)
+i_s2Color   = input.color(#29B6F6, "", group = iGroupS2, inline = "S2T", active = i_s2Enable)
+
+// ── Session 3 (Default: Tokyo) ──
+i_s3Enable  = input.bool(true, "Enable", group = iGroupS3, tooltip = tt_s3)
+i_s3Session = input.session("1900-0400", "Hours", group = iGroupS3, inline = "S3T", active = i_s3Enable)
+i_s3Color   = input.color(#F9A825, "", group = iGroupS3, inline = "S3T", active = i_s3Enable)
+
+// #endregion Sessions
+
+// #region Sample Size ************************************
+
+var string iGroupSample = "Sample Size"
+
+i_sampleSize = input.int(20, "Sessions to Average", minval = 5, maxval = 100, group = iGroupSample, tooltip = tt_sample)
+
+// #endregion Sample Size
+
+// #region Appearance *************************************
+
+var string iGroupApp = "Appearance"
+
+i_volUpColor = input.color(#787B86, "Vol Up / Down", group = iGroupApp, inline = "VC", tooltip = tt_volColor)
+i_volDnColor = input.color(#363A45, "", group = iGroupApp, inline = "VC", display = display.none)
+
+// #endregion Appearance
+
+// #region Debug ******************************************
+
+var string iGroupDebug = "Debug"
+
+i_debug = input.bool(false, "Enable Debug", group = iGroupDebug, tooltip = tt_debug)
+
+// #endregion Debug
+
+// #endregion Inputs
+
+//+-------------------------------------------------------+
+//                           UDT'S                        |
+//+-------------------------------------------------------+
+// #region UDT's
+
+// One completed session's volume profile.
+// Space: O(B) where B = number of bars in that session.
+type SessionRecord
+    array<float> barVolumes
+    float        totalVolume
+    int          barCount
+
+// Live state and historical ring buffer for one session.
+// Space: O(N × B) where N = sample size.
+type SessionTracker
+    bool                    enabled
+    string                  sessionStr
+    color                   sessionColor
+    bool                    wasInSession
+    int                     currentBarIndex
+    float                   currentTotalVol
+    array<float>            currentBarVols
+    array<SessionRecord>    history
+
+// #endregion UDT's
+
+//+-------------------------------------------------------+
+//                          METHODS                       |
+//+-------------------------------------------------------+
+// #region Methods
+
+// @function Converts Timezones enum to IANA timezone string.
+// @returns  (string) The timezone string, or exchange timezone if exch selected.
+method timezoneToString(Timezones _this) =>
+    _this == Timezones.exch ? syminfo.timezone : str.tostring(_this)
+
+// @function Reset live tracking state for a new session.
+method resetLive(SessionTracker _this) =>
+    _this.currentBarIndex := 0
+    _this.currentTotalVol := 0.0
+    _this.currentBarVols  := array.new<float>()
+
+// @function Archive current live data as a completed SessionRecord. Trims history to max size.
+//           Cost: O(B) for array copy + O(1) amortized for ring buffer maintenance.
+// @param    _maxHistory (int) - Ring buffer capacity.
+method archiveSession(SessionTracker _this, int _maxHistory) =>
+    if _this.currentBarIndex > 0
+        SessionRecord rec = SessionRecord.new(
+            array.copy(_this.currentBarVols),
+            _this.currentTotalVol,
+            _this.currentBarIndex
+        )
+        _this.history.push(rec)
+        if _this.history.size() > _maxHistory
+            _this.history.shift()
+
+// @function Mean volume-per-bar across all stored sessions. Cost: O(N).
+// @returns  (float) Session average or 0.0.
+method getSessionAvgPerBar(SessionTracker _this) =>
+    float result = 0.0
+    int count = _this.history.size()
+    if count > 0
+        float sumAvg = 0.0
+        for i = 0 to count - 1
+            SessionRecord rec = _this.history.get(i)
+            sumAvg += (rec.barCount > 0 ? rec.totalVolume / rec.barCount : 0.0)
+        result := sumAvg / count
+    result
+
+// @function Average volume at a specific bar position across history. Cost: O(N).
+//           Sessions shorter than _pos are skipped.
+// @param    _pos (int) - Zero-based bar position.
+// @returns  (float) Positional average or 0.0.
+method getBarPositionAvg(SessionTracker _this, int _pos) =>
+    float result = 0.0
+    int count = _this.history.size()
+    if count > 0
+        float sumVol    = 0.0
+        int   validRecs = 0
+        for i = 0 to count - 1
+            SessionRecord rec = _this.history.get(i)
+            if _pos < rec.barVolumes.size()
+                sumVol    += rec.barVolumes.get(_pos)
+                validRecs += 1
+        result := (validRecs > 0 ? sumVol / validRecs : 0.0)
+    result
+
+// #endregion Methods
+
+//+-------------------------------------------------------+
+//                      GLOBAL VARIABLES                  |
+//+-------------------------------------------------------+
+// #region Global Variables
+
+string tzString = i_timezone.timezoneToString()
+
+// ── Append weekday mask to session strings ──
+string s1Full = i_s1Session + ":23456"
+string s2Full = i_s2Session + ":23456"
+string s3Full = i_s3Session + ":23456"
+
+// ── Initialise session trackers (var persists) ──
+var SessionTracker tracker1 = SessionTracker.new(
+    i_s1Enable, s1Full, i_s1Color, false, 0, 0.0, array.new<float>(), array.new<SessionRecord>()
+)
+
+var SessionTracker tracker2 = SessionTracker.new(
+    i_s2Enable, s2Full, i_s2Color, false, 0, 0.0, array.new<float>(), array.new<SessionRecord>()
+)
+
+var SessionTracker tracker3 = SessionTracker.new(
+    i_s3Enable, s3Full, i_s3Color, false, 0, 0.0, array.new<float>(), array.new<SessionRecord>()
+)
+
+// #endregion Global Variables
+
+//+-------------------------------------------------------+
+//                          LIBRARY                       |
+//+-------------------------------------------------------+
+// #region Library
+
+// #endregion Library
+
+//+-------------------------------------------------------+
+//                         FUNCTIONS                      |
+//+-------------------------------------------------------+
+// #region Functions
+
+// @function Test if the current bar falls inside a session.
+// @param    _sessStr (string) - Full session spec.
+// @param    _tz      (string) - IANA timezone string.
+// @returns  (bool)
+isInSession(string _sessStr, string _tz) =>
+    not na(time(timeframe.period, _sessStr, _tz))
+
+// @function Process one bar for a session tracker. Handles session open, accumulation, and close archival.
+//           Cost: O(1) per bar, O(B) on session close.
+// @param    _tracker    (SessionTracker) - Tracker to update.
+// @param    _tz         (string) - Timezone.
+// @param    _vol        (float)  - Current bar volume.
+// @param    _sampleSize (int)    - Max history depth.
+processBar(SessionTracker _tracker, string _tz, float _vol, int _sampleSize) =>
+    if _tracker.enabled
+        bool inSess = isInSession(_tracker.sessionStr, _tz)
+
+        // Session just ended — archive
+        if _tracker.wasInSession and not inSess
+            _tracker.archiveSession(_sampleSize)
+            _tracker.resetLive()
+
+        // Session just started — clean slate
+        if not _tracker.wasInSession and inSess
+            _tracker.resetLive()
+
+        // In session — accumulate
+        if inSess
+            _tracker.currentBarVols.push(_vol)
+            _tracker.currentTotalVol += _vol
+            _tracker.currentBarIndex += 1
+
+        _tracker.wasInSession := inSess
+
+// @function Compute output values for a tracker. Cost: O(N) for each average lookup.
+// @param    _tracker (SessionTracker) - The tracker.
+// @param    _tz      (string)         - Timezone.
+// @returns  [sessAvg, barPosAvg, isActive]
+getOutputs(SessionTracker _tracker, string _tz) =>
+    bool  active    = false
+    float sessAvg   = 0.0
+    float barPosAvg = 0.0
+
+    if _tracker.enabled
+        active := isInSession(_tracker.sessionStr, _tz)
+        if active and _tracker.currentBarIndex > 0
+            int pos   = _tracker.currentBarIndex - 1
+            sessAvg   := _tracker.getSessionAvgPerBar()
+            barPosAvg := _tracker.getBarPositionAvg(pos)
+
+    [sessAvg, barPosAvg, active]
+
+// #endregion Functions
+
+//+-------------------------------------------------------+
+//                         EXECUTION                      |
+//+-------------------------------------------------------+
+// #region Execution
+
+// ── Process each tracker ──
+processBar(tracker1, tzString, volume, i_sampleSize)
+processBar(tracker2, tzString, volume, i_sampleSize)
+processBar(tracker3, tzString, volume, i_sampleSize)
+
+// ── Compute outputs ──
+[s1SessAvg, s1BarAvg, s1Active] = getOutputs(tracker1, tzString)
+[s2SessAvg, s2BarAvg, s2Active] = getOutputs(tracker2, tzString)
+[s3SessAvg, s3BarAvg, s3Active] = getOutputs(tracker3, tzString)
+
+// ── Any session active? ──
+bool anyActive = (i_s1Enable and s1Active) or (i_s2Enable and s2Active) or (i_s3Enable and s3Active)
+
+// ── Volume bars: show when any session is active ──
+color volColor = (anyActive ? (close >= open ? i_volUpColor : i_volDnColor) : na)
+float volValue = (anyActive ? volume : 0.0)
+
+// ── Session outputs: 0.0 when outside session ──
+float s1SessPlot = (i_s1Enable and s1Active ? s1SessAvg : 0.0)
+float s1BarPlot  = (i_s1Enable and s1Active ? s1BarAvg : 0.0)
+float s2SessPlot = (i_s2Enable and s2Active ? s2SessAvg : 0.0)
+float s2BarPlot  = (i_s2Enable and s2Active ? s2BarAvg : 0.0)
+float s3SessPlot = (i_s3Enable and s3Active ? s3SessAvg : 0.0)
+float s3BarPlot  = (i_s3Enable and s3Active ? s3BarAvg : 0.0)
+
+// ── Disabled sessions must not plot at all ──
+float s1SessFinal = (i_s1Enable ? s1SessPlot : na)
+float s1BarFinal  = (i_s1Enable ? s1BarPlot  : na)
+float s2SessFinal = (i_s2Enable ? s2SessPlot : na)
+float s2BarFinal  = (i_s2Enable ? s2BarPlot  : na)
+float s3SessFinal = (i_s3Enable ? s3SessPlot : na)
+float s3BarFinal  = (i_s3Enable ? s3BarPlot  : na)
+
+// ── Volume histogram ──
+plot(volValue, "Volume", color = volColor, style = plot.style_columns, linewidth = 1)
+
+// ── Session 1 lines ──
+plot(s1SessFinal, "S1 Session Avg", color = color.new(i_s1Color, 30), style = plot.style_line, linewidth = 2)
+plot(s1BarFinal, "S1 Bar Avg", color = i_s1Color, style = plot.style_line, linewidth = 1)
+
+// ── Session 2 lines ──
+plot(s2SessFinal, "S2 Session Avg", color = color.new(i_s2Color, 30), style = plot.style_line, linewidth = 2)
+plot(s2BarFinal, "S2 Bar Avg", color = i_s2Color, style = plot.style_line, linewidth = 1)
+
+// ── Session 3 lines ──
+plot(s3SessFinal, "S3 Session Avg", color = color.new(i_s3Color, 30), style = plot.style_line, linewidth = 2)
+plot(s3BarFinal, "S3 Bar Avg", color = i_s3Color, style = plot.style_line, linewidth = 1)
+
+// ── Zero reference ──
+hline(0, "Zero", color.new(color.gray, 80))
+
+// #endregion Execution
+
+//+-------------------------------------------------------+
+//                           DEBUG                        |
+//+-------------------------------------------------------+
+// #region Debug
+
+var table debugTable = na
+
+if i_debug and barstate.islast
+    debugTable := table.new(position.top_right, 4, 5, bgcolor = color.new(color.black, 20), border_width = 1)
+
+    // ── Header row ──
+    table.cell(debugTable, 0, 0, "Session", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 0, "Sess Avg", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 2, 0, "Bar Avg", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 3, 0, "Bar#", text_color = color.white, text_size = size.small)
+
+    // ── S1 row ──
+    table.cell(debugTable, 0, 1, "S1", text_color = i_s1Color, text_size = size.small)
+    table.cell(debugTable, 1, 1, str.tostring(s1SessAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 2, 1, str.tostring(s1BarAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 3, 1, str.tostring(tracker1.currentBarIndex), text_color = color.white, text_size = size.small)
+
+    // ── S2 row ──
+    table.cell(debugTable, 0, 2, "S2", text_color = i_s2Color, text_size = size.small)
+    table.cell(debugTable, 1, 2, str.tostring(s2SessAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 2, 2, str.tostring(s2BarAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 3, 2, str.tostring(tracker2.currentBarIndex), text_color = color.white, text_size = size.small)
+
+    // ── S3 row ──
+    table.cell(debugTable, 0, 3, "S3", text_color = i_s3Color, text_size = size.small)
+    table.cell(debugTable, 1, 3, str.tostring(s3SessAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 2, 3, str.tostring(s3BarAvg, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 3, 3, str.tostring(tracker3.currentBarIndex), text_color = color.white, text_size = size.small)
+
+    // ── Status row ──
+    string statusStr = (anyActive ? "IN SESSION" : "IDLE")
+    table.cell(debugTable, 0, 4, statusStr, text_color = (anyActive ? color.green : color.gray), text_size = size.small)
+    table.cell(debugTable, 1, 4, "Sample: " + str.tostring(i_sampleSize), text_color = color.gray, text_size = size.small)
+
+// #endregion Debug
