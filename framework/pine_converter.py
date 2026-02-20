@@ -1,15 +1,66 @@
-"""Convert Pine Script to Python backtesting.py Strategy using Claude Haiku."""
+"""Convert Pine Script to Python backtesting.py Strategy using OpenClaw's AI models.
+
+Supports multiple AI providers configured in .env:
+- OPENAI_API_KEY: GPT models (gpt-4, gpt-3.5-turbo)
+- GEMINI_API_KEY: Google Gemini (gemini-pro)
+- ZHIPU_API_KEY: zhipu AI (glm-4-flash)
+- ANTHROPIC_API_KEY: Anthropic Claude (claude-haiku, fallback)
+"""
 
 import os
 import re
 
-from anthropic import Anthropic
+# Load .env file if it exists
+def load_env():
+    """Load environment variables from .env file."""
+    env_file = os.path.join(os.path.dirname(__file__), '..', '.env')
+    if os.path.exists(env_file):
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Set environment variable if not already set
+                    if key not in os.environ:
+                        os.environ[key] = value
 
+load_env()
+
+# Configuration from environment (now loaded from .env)
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# OpenClaw model configuration
+DEFAULT_MODEL = os.environ.get("OPENCLAW_DEFAULT_MODEL", "gpt-4o-mini")
+
+# Model mapping for each provider
+MODELS = {
+    "openai": {
+        "default": "gpt-4o-mini",
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
+    },
+    "anthropic": {
+        "default": "claude-haiku-4-5-20251001",
+        "models": ["claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"]
+    },
+    "gemini": {
+        "default": "gemini-1.5-flash",
+        "models": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    },
+    "zhipu": {
+        "default": "glm-4-flash",
+        "models": ["glm-4-flash", "glm-4-air", "glm-4"]
+    }
+}
 
 CONVERSION_PROMPT = """You are a Pine Script to Python converter for algorithmic trading backtests.
 
-Given the following Pine Script indicator or strategy from TradingView, generate a COMPLETE, RUNNABLE Python backtest file using the `backtesting.py` library.
+Given the following Pine Script indicator or strategy from TradingView, generate a COMPLETE, RUNNABLE Python backtest file using `backtesting.py` library.
 
 REQUIREMENTS:
 1. Import from backtesting: `from backtesting import Backtest, Strategy`
@@ -20,8 +71,8 @@ REQUIREMENTS:
 6. The Strategy class MUST be named `TvStrategy`
 
 TRADING RULES:
-- If the Pine Script IS a strategy (has strategy.entry/exit), replicate its entry/exit logic
-- If the Pine Script is ONLY an indicator, create reasonable trading rules:
+- If Pine Script IS a strategy (has strategy.entry/exit), replicate its entry/exit logic
+- If Pine Script is ONLY an indicator, create reasonable trading rules:
   - For moving averages: buy on fast crossing above slow, sell on fast crossing below slow
   - For oscillators (RSI, Stochastic): buy when oversold and turning up, sell when overbought and turning down
   - For bands (Bollinger, Keltner): buy on lower band touch with reversal, sell on upper band touch
@@ -68,7 +119,7 @@ from backtesting.lib import crossover
 
 
 class TvStrategy(Strategy):
-    # Default parameters from the Pine Script
+    # Default parameters from Pine Script
     param1 = 14  # example
 
     def init(self):
@@ -90,6 +141,105 @@ PINE SCRIPT:
 {pine_code}"""
 
 
+def _get_model_name() -> str:
+    """Get the model name based on provider and configuration."""
+    # Check if user specified a model
+    if DEFAULT_MODEL:
+        return DEFAULT_MODEL
+
+    # Use default for the provider
+    provider_config = MODELS.get(LLM_PROVIDER, MODELS["anthropic"])
+    return provider_config["default"]
+
+
+def _call_openai(prompt: str) -> str:
+    """Call OpenAI API (GPT models)."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("OpenAI package not installed. Run: pip install openai")
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set in .env")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    model = _get_model_name()
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are an expert at converting Pine Script to Python code."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=4096,
+        temperature=0.7,
+    )
+
+    return response.choices[0].message.content
+
+
+def _call_anthropic(prompt: str) -> str:
+    """Call Anthropic API (Claude models)."""
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        raise RuntimeError("Anthropic package not installed. Run: pip install anthropic")
+
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    model = _get_model_name()
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return response.content[0].text
+
+
+def _call_gemini(prompt: str) -> str:
+    """Call Google Gemini API."""
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        raise RuntimeError("Google Generative AI package not installed. Run: pip install google-generativeai")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set in .env")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(_get_model_name())
+
+    response = model.generate_content(prompt)
+    return response.text
+
+
+def _call_zhipu(prompt: str) -> str:
+    """Call zhipu AI API (GLM models)."""
+    try:
+        from zhipuai import ZhipuAI
+    except ImportError:
+        raise RuntimeError("ZhipuAI package not installed. Run: pip install zhipuai")
+
+    if not ZHIPU_API_KEY:
+        raise RuntimeError("ZHIPU_API_KEY not set in .env")
+
+    client = ZhipuAI(api_key=ZHIPU_API_KEY)
+    model = _get_model_name()
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=4096,
+        temperature=0.7,
+    )
+
+    return response.choices[0].message.content
+
+
 def convert_pine_to_python(
     pine_code: str,
     script_name: str = "unknown",
@@ -99,40 +249,43 @@ def convert_pine_to_python(
 
     Args:
         pine_code: Raw Pine Script source code
-        script_name: Name of the TradingView script (for the docstring)
-        previous_error: If retrying, the error from the previous attempt
+        script_name: Name of the TradingView script (for docstring)
+        previous_error: If retrying, error from the previous attempt
 
     Returns:
         Complete Python source code string
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY not set. Export it or add to .env"
-        )
-
     prompt_content = CONVERSION_PROMPT.replace("{pine_code}", pine_code)
     if previous_error:
         prompt_content += f"\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: {previous_error}\nPlease fix the issue and try again."
 
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    # Call the appropriate API based on provider
+    try:
+        if LLM_PROVIDER == "openai":
+            raw_code = _call_openai(prompt_content)
+        elif LLM_PROVIDER == "anthropic":
+            raw_code = _call_anthropic(prompt_content)
+        elif LLM_PROVIDER == "gemini":
+            raw_code = _call_gemini(prompt_content)
+        elif LLM_PROVIDER == "zhipu":
+            raw_code = _call_zhipu(prompt_content)
+        else:
+            raise RuntimeError(f"Unsupported LLM provider: {LLM_PROVIDER}. Choose from: openai, anthropic, gemini, zhipu")
+    except Exception as e:
+        # Fallback to Anthropic if configured
+        if ANTHROPIC_API_KEY and LLM_PROVIDER != "anthropic":
+            print(f"[pine_converter] Primary provider ({LLM_PROVIDER}) failed: {e}")
+            print(f"[pine_converter] Falling back to Anthropic...")
+            raw_code = _call_anthropic(prompt_content)
+        else:
+            raise
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4096,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt_content,
-            }
-        ],
-    )
-
-    raw_code = response.content[0].text.strip()
+    raw_code = raw_code.strip()
 
     # Strip markdown fences if present
     raw_code = _strip_code_fences(raw_code)
 
-    # Validate it at least has the Strategy class
+    # Validate it at least has a Strategy class
     if "class TvStrategy" not in raw_code:
         # Try to find any Strategy subclass and rename it
         match = re.search(r"class (\w+)\(Strategy\)", raw_code)
