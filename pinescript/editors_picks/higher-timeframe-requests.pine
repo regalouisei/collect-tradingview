@@ -1,0 +1,171 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © PineCoders
+
+//@version=5
+indicator("Higher-timeframe requests", "", true)
+
+// Higher-timeframe requests
+// v1, 2024.03.29
+
+// This code was written using the recommendations from the Pine Script™ User Manual's Style Guide:
+//   https://www.tradingview.com/pine-script-docs/en/v5/writing/Style_guide.html
+
+
+
+//#region ———————————————————— Constants and inputs
+
+
+// Constants
+color  GRAY    = color.gray
+color  WHITE   = color.white
+color  ORANGE  = color.orange
+color  FUCHSIA = color.fuchsia
+color  LIME    = color.lime
+string TICKER  = syminfo.tickerid
+string ON      = "On"
+string OFF     = "Off"
+string TF0     = "Fixed TF"
+string TF1     = "Multiple of chart TF"
+
+// Tooltips
+string TT_TFT = "The higher timeframe selection method. Possible options: '" + TF0 + "'' or '" + TF1 + "'."
+string TT_FTF = "A fixed timeframe value. If the 'HTF Selection' value is 'Fixed TF', this input determines the 
+     higher timeframe for the data requests."
+string TT_TFM = "The multiplier applied to the chart's timeframe. For example, the higher timeframe calculated on a 
+     15m chart with a multiple of 4 is 60m (1h). This input only affects the output when using 'Multiple of chart TF' 
+     as the 'HTF Selection' value."
+
+// Inputs
+string GRP1         = "Calculations"
+bool   repaintInput = input.string(OFF,     "Repainting",                group = GRP1, options = [ON, OFF]) == ON
+float  srcInput     = input.source(close,   "Source",                    group = GRP1)
+string tfTypeInput  = input.string(TF1,     "HTF Selection",             group = GRP1, options = [TF0, TF1], tooltip = TT_TFT)
+string fixedTfInput = input.timeframe("1D", "  Fixed Higher Timeframe:", group = GRP1,                       tooltip = TT_FTF)
+int    tfMultInput  = input.int(4,          "  Timeframe Multiple",      group = GRP1, minval = 1,           tooltip = TT_TFM)
+
+string GRP2                 = "Timeframe Display"
+bool   showInfoBoxInput     = input.bool(true,       "Show timeframe",                group = GRP2)
+string infoBoxSizeInput     = input.string("large",  "Size ",          inline = "21", group = GRP2, options = ["tiny", "small", "normal", "large", "huge", "auto"])
+string infoBoxYPosInput     = input.string("bottom", "↕",              inline = "21", group = GRP2, options = ["top", "middle", "bottom"])
+string infoBoxXPosInput     = input.string("right",  "↔",              inline = "21", group = GRP2, options = ["left", "center", "right"])
+color  infoBoxColorInput    = input.color(GRAY,      "",               inline = "21", group = GRP2)
+color  infoBoxTxtColorInput = input.color(WHITE,     "T",              inline = "21", group = GRP2)
+//#endregion
+
+
+
+//#region ———————————————————— Calculations
+
+
+// @variable A multiple of the chart's timeframe or a fixed higher timeframe, depending on the `tfTypeInput` value.
+string requestedTf = switch tfTypeInput
+    TF0 => fixedTfInput
+    TF1 => timeframe.from_seconds(timeframe.in_seconds() * tfMultInput)
+
+
+// ————— Variant 1. Basic non-repainting HTF `request.security()` call (LIME)
+
+// Here, we demonstrate a non-repainting HTF request in its simplest form. The call uses `barmerge.lookahead_on`,
+// meaning the function looks ahead to the final values of historical bars and references the current value on realtime 
+// bars. However, since the `expression` in the call (`srcInput`) is offset by 1 bar, the "future" data the function 
+// accesses is never from the future. It always represents the value from the last confirmed HTF bar. 
+
+
+// @variable The `srcInput` value from the last confirmed bar on the `requestedTf`.
+float c0 = request.security(TICKER, requestedTf, srcInput[1], lookahead = barmerge.lookahead_on)
+
+
+// ————— Variant 2. `htfSecurity()` with repainting control (FUCHSIA)
+
+// Here, the `htfSecurity()` function wraps `request.security()` to allow convenient control of repainting behavior. 
+// When its `repaint` value is `false`, it offsets the input expression by one bar and uses `barmerge.lookahead_on` 
+// as the `lookahead` value in the data request. 
+
+// NOTE: This function cannot accept a tuple as its `expression` argument. However, it can accept an object of a 
+//       user-defined type (UDT) to achieve a similar result. For a demonstration of a non-repainting tuple request, 
+//       see Method 3 below.
+
+
+// @function            A wrapper for `request.security()` with HTF repainting control. 
+// @param symbol        (simple string) Symbol to request the data from.
+// @param timeframe     (simple string) Timeframe of the requested data. Must be greater than the chart's timeframe. 
+// @param expression    (<any type>) An expression to calculate and return from the requested context.
+// @param repaint       (simple bool) Condition to determine whether the requested `expression` can repaint. 
+//                      Optional. Default is false.
+// @returns             (<any type>) The value of the `expression` from the requested `symbol` and `timeframe`.
+htfSecurity(simple string symbol, simple string timeframe, expression, simple bool repaint = false) => 
+    if timeframe.in_seconds(timeframe) <= timeframe.in_seconds() 
+        runtime.error(
+             "The requested timeframe (" + timeframe + ") is too small. Select a higher timeframe." 
+         )
+    int offset = repaint ? 0 : 1
+    lookahead  = repaint ? barmerge.lookahead_off : barmerge.lookahead_on
+    result     = request.security(symbol, timeframe, expression[offset], lookahead = lookahead)
+
+// Return `srcInput` from the requested context using `htfSecurity()`, controlling repainting with `repaintInput`. 
+float c1 = htfSecurity(TICKER, requestedTf, srcInput, repaintInput)
+
+
+// ————— Variant 3. Non-repainting calls returning tuples (WHITE)
+
+// While the `htfSecurity()` function above will allow one to easily request most types of data with repainting 
+// control, scripts cannot use tuples as arguments in user-defined functions. If one needs to request a tuple from a 
+// higher-timeframe context with repainting control, they can apply the above function's logic in the outer scope. 
+
+
+// Set `offset` and `lookahead` variables based on `repaintInput` to control repainting: 
+// 0 and `barmerge.lookahead_off` for repainting, 1 and `barmerge.lookahead_on` for non-repainting.
+int offset = repaintInput ? 0 : 1
+lookahead  = repaintInput ? barmerge.lookahead_off : barmerge.lookahead_on
+
+// Request a tuple of the `open` and `srcInput` using `offset` and `lookahead` to manage repainting.
+// Note that each expression in the tuple applies the `offset`.
+[o2, c2] = request.security(TICKER, requestedTf, [open[offset], srcInput[offset]], lookahead = lookahead)
+
+
+// ————— Variant 4, Control. Default `request.security()` call, which is subject to repainting. (ORANGE)
+
+// Here, we included a `request.security()` call with default settings as a reference point. 
+// Unlike the variants outlined above, this call behaves differently on historical and realtime bars. 
+// When the script restarts its execution pattern, what were once considered realtime bars become historical bars.
+// Consequently, the results across those bars may repaint. 
+
+
+// @variable The `srcInput` value from the `TICKER` on the `requestedTf` timeframe. Its result can repaint.
+float c3 = request.security(TICKER, requestedTf, srcInput)
+//#endregion
+
+
+
+//#region ———————————————————— Errors and outputs
+
+
+// Raise a runtime error when the user-selected TF isn't higher than the chart TF.
+if timeframe.in_seconds(requestedTf) <= timeframe.in_seconds() 
+    runtime.error(
+         "The requested timeframe (" + requestedTf + ") is too small. Select a higher timeframe."
+     )
+
+// ————— Plot values from `request.security()` examples.
+plot(na, "══════════ PLOTS", display = display.data_window)
+plot(c3, "Method 4: 🔨 Basic repainting call", color.new(ORANGE, 30), 8)
+plot(c0, "Method 1: 👍 Non-repaintng call",    LIME,                  6)
+plot(c1, "Method 2: 👍 `htfSecurity()`",       FUCHSIA,               4)
+plot(c2, "Method 3: 👍 Tuple form",            WHITE,                 1)
+
+// Plot squares at the chart's bottom, using contrasting colors for historical bars and orange for realtime bars, to 
+// visually distinguish bars where data will repaint in variants permitting it.
+plotshape(barstate.ishistory,  "`barstate.ishistory`",  shape.square, location.bottom, color.new(chart.fg_color, 70))
+plotshape(barstate.isrealtime, "`barstate.isrealtime`", shape.square, location.bottom, color.new(ORANGE,         50))
+
+// Mark timeframe changes by highlighting the background gray.
+bgcolor(timeframe.change(requestedTf) ? color.new(GRAY, 80) : na, title = "Timeframe change highlight")
+
+// Display the user-selected TF in a single-cell table.
+if showInfoBoxInput and barstate.islastconfirmedhistory
+    var table tfDisplay = table.new(str.format("{0}_{1}", infoBoxYPosInput, infoBoxXPosInput), 1, 1)
+    table.cell(
+         tfDisplay, 0, 0, requestedTf, bgcolor = infoBoxColorInput, text_color = infoBoxTxtColorInput, 
+         text_size = infoBoxSizeInput
+     )
+//#endregion

@@ -1,0 +1,147 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Volume Energy Reservoirs [LuxAlgo]", "LuxAlgo - Volume Energy Reservoirs", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR   = #089981
+color BEAR_COLOR   = #f23645
+color ACCUM_COLOR  = #ffeb3b 
+color NEUTRAL_COLOR = #787b86
+
+// Groups
+G_MAIN = "Main Settings"
+G_VIS  = "Visual Settings"
+
+int   lengthInput      = input.int(20, "Energy Horizon", minval = 5, group = G_MAIN, tooltip = "Lookback for price stability and range midpoint.")
+float sensitivityInput = input.float(1.5, "Energy Sensitivity", minval = 0.5, step = 0.1, group = G_MAIN, tooltip = "Adjusts how quickly energy is released during volume spikes.")
+
+// Signal Settings
+bool  showSqueezeInput   = input.bool(true, "Highlight Squeeze Box", group = G_VIS, tooltip = "Draws a filled box around price consolidation when energy is building.")
+bool  showExtensionInput = input.bool(true, "Show Extension Levels", group = G_VIS, tooltip = "Extends the high/low levels of the squeeze after the box ends until a breakout occurs.")
+
+// Chart Overlay Settings
+bool  showBgInput      = input.bool(true, "Show Conviction Gradient on Chart", group = G_VIS)
+int   bgTransparency   = input.int(75, "Background Transparency", minval = 0, maxval = 100, group = G_VIS)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// 1. Robust Normalized Volume
+float volStdev = ta.stdev(volume, 100)
+float normVol  = nz(volStdev != 0 ? volume / volStdev : 1.0)
+
+// 2. Adaptive Price Displacement
+float hi          = ta.highest(lengthInput)
+float lo          = ta.lowest(lengthInput)
+float midPrice    = math.avg(hi, lo)
+float priceRange  = hi - lo
+float priceRel    = priceRange != 0 ? (hl2 - midPrice) / priceRange : 0
+
+// 3. Energy Reservoir Logic
+var float reservoir = 0.0
+bool isLowVol       = normVol < 1.0
+bool isStable       = math.abs(priceRel) < 0.2
+
+if isLowVol and isStable
+    reservoir += 0.5 
+else if normVol > sensitivityInput
+    reservoir *= 0.7 
+else
+    reservoir := math.max(0, reservoir - 0.1)
+
+reservoir := math.min(10.0, reservoir)
+
+// 4. Kinetic Momentum
+float momentum         = priceRel * normVol * 20
+float smoothedMomentum = ta.ema(momentum, 5)
+float maxMomentum      = math.max(10.0, ta.highest(math.abs(smoothedMomentum), 200))
+
+// 5. Signal Logic
+bool squeezeActive = reservoir > 5.0
+bool squeezeStart  = squeezeActive and not squeezeActive[1]
+bool squeezeEnd    = not squeezeActive and squeezeActive[1]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals: Oscillator
+//---------------------------------------------------------------------------------------------------------------------{
+color coreColor = smoothedMomentum > 0 ? BULL_COLOR : BEAR_COLOR
+color glowColor = color.from_gradient(math.abs(smoothedMomentum), 0, maxMomentum, color.new(coreColor, 98), coreColor)
+
+p_mom  = plot(smoothedMomentum, "Momentum Core", color = coreColor, linewidth = 2)
+p_zero = plot(0, "Zero Line", color = NEUTRAL_COLOR, display = display.none)
+
+fill(p_mom, p_zero, maxMomentum, 0, color.new(glowColor, 40), color.new(glowColor, 90), title = "Kinetic Aura")
+
+p_res = plot(reservoir, "Reservoir Level", display = display.none)
+fill(p_res, p_zero, color = color.new(ACCUM_COLOR, 85), title = "Energy Reservoir Fill")
+
+hline(0, "Baseline", color = NEUTRAL_COLOR, linestyle = hline.style_dotted)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals: On-Chart Squeeze Highlight (force_overlay)
+//---------------------------------------------------------------------------------------------------------------------{
+var box   activeBox   = na
+var line  extHiLine   = na
+var line  extLoLine   = na
+var float currentHi   = na
+var float currentLo   = na
+var bool  isExtending = false
+
+if showSqueezeInput
+    // 1. Reset/Start Squeeze
+    if squeezeStart
+        currentHi   := high
+        currentLo   := low
+        isExtending := false
+        activeBox   := box.new(bar_index, currentHi, bar_index, currentLo, 
+             bgcolor       = color.new(ACCUM_COLOR, 85), 
+             border_color  = color.new(ACCUM_COLOR, 50), 
+             border_style  = line.style_dashed,
+             force_overlay = true)
+             
+        line.delete(extHiLine)
+        line.delete(extLoLine)
+        extHiLine := na
+        extLoLine := na
+
+    // 2. Active Squeeze Tracking
+    if squeezeActive and not na(activeBox)
+        currentHi := math.max(currentHi, high)
+        currentLo := math.min(currentLo, low)
+        box.set_top(activeBox, currentHi)
+        box.set_bottom(activeBox, currentLo)
+        box.set_right(activeBox, bar_index)
+
+    // 3. Post-Squeeze Line Extension
+    if squeezeEnd and showExtensionInput
+        isExtending := true
+        extHiLine   := line.new(bar_index, currentHi, bar_index, currentHi, color = color.new(ACCUM_COLOR, 50), style = line.style_dashed, force_overlay = true)
+        extLoLine   := line.new(bar_index, currentLo, bar_index, currentLo, color = color.new(ACCUM_COLOR, 50), style = line.style_dashed, force_overlay = true)
+
+    if isExtending and not na(extHiLine)
+        line.set_x2(extHiLine, bar_index)
+        line.set_x2(extLoLine, bar_index)
+        
+        // Stop extension on close outside of range
+        if close > currentHi or close < currentLo
+            isExtending := false
+
+// Conviction Background Gradient
+color dynamicBgColor = smoothedMomentum > 0 
+     ? color.from_gradient(smoothedMomentum, 0, maxMomentum, color.new(BULL_COLOR, 100), color.new(BULL_COLOR, bgTransparency))
+     : color.from_gradient(math.abs(smoothedMomentum), 0, maxMomentum, color.new(BEAR_COLOR, 100), color.new(BEAR_COLOR, bgTransparency))
+
+bgcolor(showBgInput ? dynamicBgColor : na, force_overlay = true, title = "Conviction Gradient")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+alertcondition(squeezeStart, "Energy Squeeze Detected", "A new price range is being highlighted for an energy squeeze.")
+alertcondition(ta.crossover(smoothedMomentum, 0), "Momentum Bullish", "Energy momentum turned positive.")
+alertcondition(ta.crossunder(smoothedMomentum, 0), "Momentum Bearish", "Energy momentum turned negative.")
+
+//---------------------------------------------------------------------------------------------------------------------}

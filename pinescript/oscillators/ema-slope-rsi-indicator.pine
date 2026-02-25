@@ -1,0 +1,792 @@
+//@version=6
+// By xvelox_
+// xvelox.com
+// Moving averages Slope with no trade zones where slope is under Threshold.
+// Converted to Indicator: Displays visual alerts when EMA slope signals occur
+// Shows entry signals when EMA slope passes NTZ with sufficient delta
+// Stretch filter to prevent signals when market is overextended.
+// Stretch threshold input to control the maximum % difference between the two MAs.
+// Shows exit signals based on Trailing Stop (Blackflag FTS Swingarm by Jose Azcarate) and slope conditions.
+// Default values were tested in BTCUSDT 15min market.
+// Exit confirmation bars input to control the number of bars to wait before showing exit signal.
+// Sensitivity input to control the number of previous peaks to check for divergences.
+// Max peaks to compare input to control the number of previous peaks to check for divergences.
+// Slope-rsi lookback bars input to control the number of bars to compare RSI direction against slope momentum.
+// Slope-rsi confirmation input to control the number of bars to compare RSI direction against slope momentum.
+// RSI Divergence signal option
+// RSI-Slope Oscillator signal option
+// Visual signals: Green triangles (Long), Red triangles (Short), Orange X (Exit)
+// Alert conditions available for all entry and exit signals.
+
+indicator('EMA Slope - RSI Indicator', precision = 5, overlay = false)
+
+// Moving Average Settings
+// Short MA (used for stretch filter)
+shortMALength = input.int(40, 'Short MA Length', minval = 1, tooltip = 'Period length for the short moving average used in the stretch filter. Compared with the long MA to detect overextended market conditions.')
+shortMAType = input.string('EMA', 'Short MA Type', options = ['SMA', 'EMA', 'DEMA', 'TEMA', 'WMA', 'VWMA', 'SMWMA', 'SWMA', 'HMA'], tooltip = 'Moving average type for the short MA. Should match or complement the long MA type for consistent calculations.')
+
+// Long MA (main MA for slope calculation)
+longMALength = input.int(160, 'Long MA Length', minval = 1, tooltip = 'Period length for the long moving average used for slope calculation and NTZ detection.')
+longMAType = input.string('EMA', 'Long MA Type', options = ['SMA', 'EMA', 'DEMA', 'TEMA', 'WMA', 'VWMA', 'SMWMA', 'SWMA', 'HMA'], tooltip = 'Moving average type for the long MA.')
+
+// Other indicator settings
+smoothBars = input.int(3, 'Smooth Bars', minval = 1)
+noTZone = input(true, 'No Trade Zone Threshold')
+maDL = input.int(8, 'NTZ Threshold', step = 1, minval = 1)
+hLineHeight = maDL
+accTh = input(35, 'Acceleration display greater than')
+src = input(close, 'MA Source')
+
+// Indicator inputs
+indicatorGroup = 'Indicator Settings'
+maxStretchPercent = input.float(0.45, 'Max Stretch Threshold (%)', minval = 0.00, step = 0.01, group = indicatorGroup, tooltip = 'Maximum percentage difference between long MA and short MA to allow signals. Enter as percentage points: 0.3 = 0.3%, 1.0 = 1.0%. Prevents signals when market is overextended: blocks longs when long MA > short MA by this amount, blocks shorts when long MA < short MA by this amount. Higher = more permissive. Set 0 to disable.')
+minDelta = input.float(3.4, 'Minimum Delta Threshold', minval = 0.0, step = 0.1, group = indicatorGroup, tooltip = 'Minimum required change in EMA slope (maDf) to generate a signal. Delta = slope difference between current and previous bar/timeframe. Higher values = stronger momentum required, filters weak signals. Set 0 to disable.')
+useTimeframeDelta = input(true, 'Use Timeframe Delta', group = indicatorGroup, tooltip = 'Enabled: Compare delta from previous confirmed (closed) bar - more reliable, slight delay. Disabled: Compare delta from previous bar - faster but may trigger on unconfirmed data.')
+// Acceleration entry settings
+enableAccelEntry = input.bool(true, 'Enable Acceleration Entry', group = indicatorGroup, tooltip = 'Enable alternative entry condition when EMA slope shows sudden raise (acceleration) indicated by color dots. Works independently of NTZ crossing, respecting all existing filters.')
+minAccelForEntry = input.float(40, 'Min Acceleration for Entry', minval = 0, step = 5, group = indicatorGroup, tooltip = 'Minimum acceleration value required for acceleration-based entries. Higher values = more selective, only strongest momentum moves. Default 50 matches typical acceleration display threshold.')
+// Trend confirmation filter
+useTrendConfirmation = input.bool(false, 'Use MA Trend Confirmation', group = indicatorGroup, tooltip = 'Enable trend confirmation filter based on MA relationship. When enabled: Long signals only when Short MA > Long MA (uptrend), Short signals only when Short MA < Long MA (downtrend). Prevents counter-trend signals.')
+// RSI divergence entry settings
+enableRSIDivergence = input.bool(false, 'Enable RSI Divergence Signals', group = indicatorGroup, tooltip = 'Enable RSI divergence-based entry signals. Bullish divergence: price makes lower lows while RSI makes higher lows. Bearish divergence: price makes higher highs while RSI makes lower highs.')
+showDivergence = input.bool(true, 'Show RSI Divergences', group = indicatorGroup, tooltip = 'Show divergence lines and markers on the chart.')
+rsiLength = input.int(14, 'RSI Length', minval = 1, group = indicatorGroup, tooltip = 'Period length for RSI calculation used in divergence detection.')
+rsiSmooth = input.int(3, 'RSI Smoothing', minval = 1, group = indicatorGroup, tooltip = 'Number of bars to smooth the RSI calculation using SMA.')
+rsiSource = input(close, 'RSI Source', group = indicatorGroup, tooltip = 'Price source for RSI calculation.')
+pivotTT = 'Higher value = More sensitive (more signals, faster detection). Lower value = Less sensitive (fewer but stronger signals, more delay)'
+sensitivityInput = input.int(6, title = 'Divergence Sensitivity', minval = 1, maxval = 12, group = indicatorGroup, tooltip = pivotTT)
+maxPivots = input.int(8, title = 'Max Peaks to Compare', minval = 2, maxval = 15, group = indicatorGroup, tooltip = 'Number of previous peaks to check for divergences')
+// Slope-RSI divergence settings
+showSlopeRsiExhaustion = input.bool(true, 'Show Slope-RSI Exhaustion', group = indicatorGroup, tooltip = 'Display Slope-RSI exhaustion markers when slope momentum and RSI momentum diverge. Orange/Yellow triangles indicate potential trend exhaustion.')
+enableSlopeRsiEntries = input.bool(true, 'Enable Slope-RSI Divergence Signals', group = indicatorGroup, tooltip = 'Enable direct entries on Slope-RSI divergences (counter-trend reversals). When enabled, shows signals when slope and RSI momentum diverge significantly, indicating trend exhaustion and potential reversal.')
+useSlopeRsiConfirmation = input.bool(false, 'Require Slope-RSI Confirmation', group = indicatorGroup, tooltip = 'When enabled, RSI divergence entries require Slope-RSI confirmation for higher quality signals. Filters divergence entries where slope and RSI momentum don\'t align.')
+slopeRsiLookback = input.int(4, 'Slope-RSI Lookback Bars', minval = 2, maxval = 10, group = indicatorGroup, tooltip = 'Number of bars to compare RSI direction against slope momentum. Higher = more conservative detection.')
+minDivergenceGap = input.float(10.0, 'Min Slope-RSI Gap (pts)', minval = 0, maxval = 100, step = 0.5, group = indicatorGroup, tooltip = 'Minimum distance between EMA Slope (maDf) and Centered RSI (RSI-50) to trigger a Slope-RSI divergence. Higher = only strong divergences detected. Lower = more sensitive. Set 0 to disable gap threshold.')
+// Entry type control - Individual checkboxes for each entry type
+enableNTZCross = input.bool(true, 'Enable NTZ Cross Signals', group = indicatorGroup, tooltip = 'Enable signals when EMA slope crosses above/below No Trade Zone (NTZ) boundaries with sufficient delta. This is the primary signal method based on slope momentum crossing the NTZ threshold.')
+enableRSISlopeOscillator = input.bool(true, 'Enable RSI-Slope Oscillator Signals', group = indicatorGroup, tooltip = 'Enable RSI-Slope Oscillator entry signals. Long: RSI crosses above EMA Slope AND both RSI and Slope are heading UP. Short: RSI crosses below EMA Slope AND both RSI and Slope are heading DOWN.')
+
+// Exit Settings
+exitConfirmBars = input.int(4, 'Exit Confirmation Bars', minval = 0, maxval = 10, group = indicatorGroup, tooltip = 'Number of consecutive bars exit conditions must be met before showing exit signal. 0 = immediate exit. 1-3 = filters false signals. Higher = more tolerant of pullbacks.')
+
+// Trailing Stop Settings (Blackflag FTS Swingarm - by Jose Azcarate)
+useTrailingStop = input.bool(true, 'Show Trailing Stop Exits', group = 'Exit Settings', tooltip = 'Display exit signals based on Blackflag FTS Swingarm trailing stop when price crosses the trailing stop line.')
+trailType = input.string('modified', 'Trail Type', options = ['modified', 'unmodified'], group = 'Exit Settings', tooltip = 'Modified: Uses enhanced true range calculation. Unmodified: Uses standard true range.')
+ATRPeriod = input.int(10, 'ATR Period', minval = 1, group = 'Exit Settings', tooltip = 'Period for ATR calculation used in trailing stop.')
+ATRFactor = input.float(4, 'ATR Factor', minval = 0.1, step = 0.1, group = 'Exit Settings', tooltip = 'Multiplier for ATR in trailing stop calculation. Higher values = wider trailing stop.')
+divTrailingStopGrace = input.int(3, 'Divergence Signal Grace Bars', minval = 0, maxval = 10, group = 'Exit Settings', tooltip = 'Number of bars to wait before activating trailing stop for divergence signals. Gives the signal time to develop. 0 = immediate activation.')
+divATRFactor = input.float(4, 'Divergence Signal ATR Factor', minval = 0.1, step = 0.1, group = 'Exit Settings', tooltip = 'ATR multiplier for divergence signal trailing stops. Higher than standard to give reversal signals more room. Recommended: 5-8.')
+oscTrailingStopGrace = input.int(3, 'RSI-Slope Oscillator Signal Grace Bars', minval = 0, maxval = 10, group = 'Exit Settings', tooltip = 'Number of bars to wait before activating trailing stop for RSI-Slope Oscillator signals. Gives the signal time to develop. 0 = immediate activation.')
+oscATRFactor = input.float(4, 'RSI-Slope Oscillator Signal ATR Factor', minval = 0.1, step = 0.1, group = 'Exit Settings', tooltip = 'ATR multiplier for RSI-Slope Oscillator signal trailing stops. Higher than standard to give reversal signals more room. Recommended: 5-8.')
+
+// Moving Average function, for MA Cross, long MA plot and MA Slope no trade zone detection.
+fma(type, src, _len) =>
+    float result = 0
+    if type == 'SMA'
+        result := ta.sma(src, _len)
+        result
+    if type == 'EMA' // Exponential
+        result := ta.ema(src, _len)
+        result
+    if type == 'DEMA'
+        e = ta.ema(src, _len)
+        result := 2 * e - ta.ema(e, _len)
+        result
+    if type == 'TEMA'
+        e = ta.ema(src, _len)
+        result := 3 * (e - ta.ema(e, _len)) + ta.ema(ta.ema(e, _len), _len)
+        result
+    if type == 'WMA'
+        result := ta.wma(src, _len)
+        result
+    if type == 'VWMA'
+        result := ta.vwma(src, _len)
+        result
+    if type == 'SMWMA' // Smoothed
+        w = ta.wma(src, _len)
+        wb = ta.sma(src, _len)
+        result := na(w[1]) ? wb : (w[1] * (_len - 1) + src) / _len
+        result
+    if type == 'SWMA' // Symmetrically weighted
+        result := ta.swma(src)
+        result
+    if type == 'HMA'
+        result := ta.wma(2 * ta.wma(src, _len / 2) - ta.wma(src, _len), math.round(math.sqrt(_len)))
+        result
+    result
+
+shortMA = fma(shortMAType, src, shortMALength)
+longMA = fma(longMAType, src, longMALength)
+
+// Calculate % difference between the two MAs to detect stretched conditions
+// Real percentage points: (longMA - shortMA) / shortMA * 100 gives actual percentage (e.g., 0.3 for 0.3%)
+maPercentDiff = (longMA - shortMA) / shortMA * 100
+
+maDF = longMA - longMA[smoothBars]
+// MA Slope scale
+fmaDf(ma, maDF) =>
+    maMax = ta.highest(maDF, 500)
+    maMin = ta.lowest(maDF, 500)
+    ma_range = maMax - maMin
+    maDf = 100 * maDF / ma_range
+    maDf
+
+maDf = fmaDf(longMA, maDF)
+
+// Calculate delta from previous bar or previous confirmed bar
+var float prevConfirmedSlope = na
+float delta = na
+
+if useTimeframeDelta
+    // For timeframe delta, compare current confirmed slope with previous confirmed slope
+    if barstate.isconfirmed
+        if not na(prevConfirmedSlope)
+            delta := maDf - prevConfirmedSlope
+            delta
+        prevConfirmedSlope := maDf
+        prevConfirmedSlope
+else // Use previous bar delta
+    delta := maDf - maDf[1]
+    delta
+
+maAcce = math.abs(maDf - maDf[1]) * smoothBars * 2
+maAccHt = ta.highest(maAcce, 200)
+maAcc = 50 * maAcce / maAccHt
+
+// RSI Calculation (with smoothing like Double RSI BB)
+rsi = ta.sma(ta.rsi(rsiSource, rsiLength), rsiSmooth)
+// Centered RSI (RSI-50): ranges from +50 to -50 (zero-centered for direct comparison with slope pane)
+cRsi = rsi - 50
+
+// RSI-Slope Oscillator: Detect when RSI crosses EMA Slope, then wait for both to be heading in same direction
+// Track cross events and wait for confirmation
+var bool waitingForLongConfirmation = false
+var bool waitingForShortConfirmation = false
+
+// Detect RSI crossing EMA Slope
+rsiSlopeCrossUp = cRsi > maDf and cRsi[1] <= maDf[1]  // RSI crosses above Slope
+rsiSlopeCrossDown = cRsi < maDf and cRsi[1] >= maDf[1]  // RSI crosses below Slope
+
+// Check both are heading in same direction (values greater/less than previous)
+rsiHeadingUp = cRsi > cRsi[1]
+rsiHeadingDown = cRsi < cRsi[1]
+slopeHeadingUp = maDf > maDf[1]
+slopeHeadingDown = maDf < maDf[1]
+
+// State machine: Track crosses and wait for confirmation
+if enableRSISlopeOscillator
+    // If cross up happens, start waiting for long confirmation
+    if rsiSlopeCrossUp
+        waitingForLongConfirmation := true
+        waitingForShortConfirmation := false
+    
+    // If cross down happens, start waiting for short confirmation
+    if rsiSlopeCrossDown
+        waitingForShortConfirmation := true
+        waitingForLongConfirmation := false
+else
+    // Reset flags if oscillator is disabled
+    waitingForLongConfirmation := false
+    waitingForShortConfirmation := false
+
+// Long: Enter when waiting for confirmation AND both heading UP
+rsiSlopeOscLong = enableRSISlopeOscillator and waitingForLongConfirmation and rsiHeadingUp and slopeHeadingUp and (not useTimeframeDelta or barstate.isconfirmed)
+
+// Short: Enter when waiting for confirmation AND both heading DOWN
+rsiSlopeOscShort = enableRSISlopeOscillator and waitingForShortConfirmation and rsiHeadingDown and slopeHeadingDown and (not useTimeframeDelta or barstate.isconfirmed)
+
+// Slope-RSI Divergence Detection (Trend Exhaustion)
+// Detects when slope momentum and RSI momentum diverge, indicating potential reversal tension
+var int bullSlopeRsiBar = na
+var int bearSlopeRsiBar = na
+var int prevBullSlopeRsiBar = na
+var int prevBearSlopeRsiBar = na
+var float prevBullSlope = na
+var float prevBearSlope = na
+var float prevBullCRsi = na
+var float prevBearCRsi = na
+bullishSlopeRsiDiv = false
+bearishSlopeRsiDiv = false
+
+// Check if acceleration is active (needed for Slope-RSI detection)
+accelerationActive = maAcc >= minAccelForEntry
+
+// Gap = distance between EMA Slope and Centered RSI (same pane scale)
+divergenceGap = math.abs(maDf - cRsi)
+
+// Bearish Slope-RSI: Slope accelerating up with momentum, but RSI declining (trend exhaustion)
+if accelerationActive and not na(delta) and delta > 0 and maDf > hLineHeight
+    // RSI declining over lookback periods (RSI not confirming slope acceleration)
+    if cRsi < cRsi[slopeRsiLookback] and cRsi < cRsi[slopeRsiLookback * 2]
+        // Check divergence gap threshold (if enabled)
+        if minDivergenceGap == 0 or divergenceGap >= minDivergenceGap
+            bearishSlopeRsiDiv := true
+            bearSlopeRsiBar := bar_index
+            // Draw lines connecting divergence points if we have a previous divergence
+            if showSlopeRsiExhaustion and not na(prevBearSlopeRsiBar)
+                // Draw slope line (in green since slope is rising)
+                line.new(prevBearSlopeRsiBar, prevBearSlope, bar_index, maDf, color = color.new(color.green, 60), width = 2, style = line.style_dashed)
+                // Draw RSI line (in red since RSI is falling)
+                line.new(prevBearSlopeRsiBar, prevBearCRsi, bar_index, cRsi, color = color.new(color.red, 60), width = 2, style = line.style_dashed)
+                // Draw label showing gap strength
+                label.new(bar_index, 80, text = 'Gap: ' + str.tostring(divergenceGap, '#.#'), style = label.style_none, color = color.yellow, textcolor = color.yellow, size = size.tiny)
+            // Store current values for next divergence
+            prevBearSlopeRsiBar := bar_index
+            prevBearSlope := maDf
+            prevBearCRsi := cRsi
+
+// Bullish Slope-RSI: Slope accelerating down with momentum, but RSI rising (trend exhaustion)
+if accelerationActive and not na(delta) and delta < 0 and maDf < -hLineHeight
+    // RSI rising over lookback periods (RSI not confirming slope acceleration)
+    if cRsi > cRsi[slopeRsiLookback] and cRsi > cRsi[slopeRsiLookback * 2]
+        // Check divergence gap threshold (if enabled)
+        if minDivergenceGap == 0 or divergenceGap >= minDivergenceGap
+            bullishSlopeRsiDiv := true
+            bullSlopeRsiBar := bar_index
+            // Draw lines connecting divergence points if we have a previous divergence
+            if showSlopeRsiExhaustion and not na(prevBullSlopeRsiBar)
+                // Draw slope line (in red since slope is falling)
+                line.new(prevBullSlopeRsiBar, prevBullSlope, bar_index, maDf, color = color.new(color.red, 60), width = 2, style = line.style_dashed)
+                // Draw RSI line (in green since RSI is rising)
+                line.new(prevBullSlopeRsiBar, prevBullCRsi, bar_index, cRsi, color = color.new(color.green, 60), width = 2, style = line.style_dashed)
+                // Draw label showing gap strength
+                label.new(bar_index, -80, text = 'Gap: ' + str.tostring(divergenceGap, '#.#'), style = label.style_none, color = color.orange, textcolor = color.orange, size = size.tiny)
+            // Store current values for next divergence
+            prevBullSlopeRsiBar := bar_index
+            prevBullSlope := maDf
+            prevBullCRsi := cRsi
+
+// Arrays to store multiple pivot values (declared at top level for persistence)
+var array<float> pivotHighsRSI = array.new<float>(0)
+var array<int> pivotHighsBars = array.new<int>(0)
+var array<float> pivotHighsPrice = array.new<float>(0)
+
+var array<float> pivotLowsRSI = array.new<float>(0)
+var array<int> pivotLowsBars = array.new<int>(0)
+var array<float> pivotLowsPrice = array.new<float>(0)
+
+// RSI Divergence Detection (Multi-Peak Comparison)
+// Bullish divergence: price makes lower low, RSI makes higher low
+// Bearish divergence: price makes higher high, RSI makes lower high
+bullishDivergence = false
+bearishDivergence = false
+var int bullDivBar = na
+var int bearDivBar = na
+
+// Detect divergences if either showDivergence or enableRSIDivergence is true
+if showDivergence or enableRSIDivergence
+    // Calculate pivot lookback from sensitivity
+    pivotLookback = 16 - sensitivityInput // Inverse: higher input = lower lookback = more sensitive
+    
+    // Pivot detection
+    pivotHigh = ta.pivothigh(rsi, pivotLookback, pivotLookback)
+    pivotLow = ta.pivotlow(rsi, pivotLookback, pivotLookback)
+    priceHigh = ta.pivothigh(high, pivotLookback, pivotLookback) // Use actual highs (includes wicks)
+    priceLow = ta.pivotlow(low, pivotLookback, pivotLookback) // Use actual lows (includes wicks)
+    
+    // Bearish Divergence: Price makes higher high, but RSI makes lower high
+    if not na(pivotHigh)
+        // Check against all previous peaks for divergences
+        if array.size(pivotHighsRSI) > 0
+            for i = 0 to math.min(array.size(pivotHighsRSI) - 1, maxPivots - 1) by 1
+                prevRSI = array.get(pivotHighsRSI, i)
+                prevBar = array.get(pivotHighsBars, i)
+                prevPrice = array.get(pivotHighsPrice, i)
+                
+                // Bearish divergence condition
+                if priceHigh > prevPrice and pivotHigh < prevRSI
+                    bearishDivergence := true
+                    bearDivBar := bar_index
+                    // Draw line connecting RSI peaks (centered: RSI 50 = 0) if enabled
+                    if showDivergence
+                        line.new(prevBar, prevRSI - 50, bar_index, pivotHigh - 50, color = color.new(color.purple, 20), width = 2, style = line.style_solid)
+                    break
+        
+        // Store current pivot
+        array.unshift(pivotHighsRSI, pivotHigh)
+        array.unshift(pivotHighsBars, bar_index)
+        array.unshift(pivotHighsPrice, priceHigh)
+        
+        // Keep only recent pivots
+        if array.size(pivotHighsRSI) > maxPivots
+            array.pop(pivotHighsRSI)
+            array.pop(pivotHighsBars)
+            array.pop(pivotHighsPrice)
+    
+    // Bullish Divergence: Price makes lower low, but RSI makes higher low
+    if not na(pivotLow)
+        // Check against all previous troughs for divergences
+        if array.size(pivotLowsRSI) > 0
+            for i = 0 to math.min(array.size(pivotLowsRSI) - 1, maxPivots - 1) by 1
+                prevRSI = array.get(pivotLowsRSI, i)
+                prevBar = array.get(pivotLowsBars, i)
+                prevPrice = array.get(pivotLowsPrice, i)
+                
+                // Bullish divergence condition
+                if priceLow < prevPrice and pivotLow > prevRSI
+                    bullishDivergence := true
+                    bullDivBar := bar_index
+                    // Draw line connecting RSI troughs (centered: RSI 50 = 0) if enabled
+                    if showDivergence
+                        line.new(prevBar, prevRSI - 50, bar_index, pivotLow - 50, color = color.new(color.lime, 20), width = 2, style = line.style_solid)
+                    break
+        
+        // Store current pivot
+        array.unshift(pivotLowsRSI, pivotLow)
+        array.unshift(pivotLowsBars, bar_index)
+        array.unshift(pivotLowsPrice, priceLow)
+        
+        // Keep only recent pivots
+        if array.size(pivotLowsRSI) > maxPivots
+            array.pop(pivotLowsRSI)
+            array.pop(pivotLowsBars)
+            array.pop(pivotLowsPrice)
+
+
+// Determine if EMA is in NTZ Channel
+inChannel = maDf < hLineHeight and maDf > -hLineHeight and (maDf[1] >= hLineHeight or maDf[1] <= -hLineHeight)
+
+// Strategy Entry/Exit Logic
+// Detect when slope crosses NTZ boundaries
+var float prevConfirmedSlopeForCross = na
+crossAboveNTZ = false
+crossBelowNTZ = false
+
+if useTimeframeDelta
+    // For timeframe delta, check cross on confirmed bars only
+    if barstate.isconfirmed
+        if not na(prevConfirmedSlopeForCross)
+            crossAboveNTZ := maDf > hLineHeight and prevConfirmedSlopeForCross <= hLineHeight
+            crossBelowNTZ := maDf < -hLineHeight and prevConfirmedSlopeForCross >= -hLineHeight
+            crossBelowNTZ
+        prevConfirmedSlopeForCross := maDf
+        prevConfirmedSlopeForCross
+else // Use previous bar for cross detection
+    crossAboveNTZ := maDf > hLineHeight and maDf[1] <= hLineHeight
+    crossBelowNTZ := maDf < -hLineHeight and maDf[1] >= -hLineHeight
+    crossBelowNTZ
+
+// Check if delta is sufficient for entry
+deltaSufficient = not na(delta) and math.abs(delta) >= minDelta
+
+// Stretch filter: avoid signals when MAs are too far apart (overextended)
+// For longs: filter only active when shortMA > longMA (negative difference). If too stretched down, block signal.
+//            When longMA > shortMA, filter is inactive (always allow).
+// For shorts: filter only active when longMA > shortMA (positive difference). If too stretched up, block signal.
+//             When shortMA > longMA, filter is inactive (always allow).
+stretchFilterLong = maPercentDiff >= 0 or (maPercentDiff < 0 and maPercentDiff >= -maxStretchPercent)
+stretchFilterShort = maPercentDiff <= 0 or (maPercentDiff > 0 and maPercentDiff <= maxStretchPercent)
+
+// Trend confirmation filter: based on MA relationship
+// For longs: require shortMA > longMA (uptrend) - maPercentDiff < 0 means shortMA > longMA
+// For shorts: require shortMA < longMA (downtrend) - maPercentDiff > 0 means shortMA < longMA
+// When enabled: blocks short signals if shortMA > longMA (no counter-trend short signals in uptrends)
+trendConfirmLong = not useTrendConfirmation or shortMA > longMA
+trendConfirmShort = not useTrendConfirmation or shortMA < longMA
+
+// Wilders MA function (for trailing stop)
+Wild_ma(_src, _malength) =>
+    _wild = 0.0
+    _wild := nz(_wild[1]) + (_src - nz(_wild[1])) / _malength
+    _wild
+
+// Trailing Stop Calculation (Blackflag FTS Swingarm - by Jose Azcarate)
+var float trail = na
+var int trailTrend = 1
+
+if useTrailingStop or enableRSIDivergence or enableRSISlopeOscillator
+    // Normalized OHLC data
+    norm_o = request.security(ticker.new(syminfo.prefix, syminfo.ticker), timeframe.period, open)
+    norm_h = request.security(ticker.new(syminfo.prefix, syminfo.ticker), timeframe.period, high)
+    norm_l = request.security(ticker.new(syminfo.prefix, syminfo.ticker), timeframe.period, low)
+    norm_c = request.security(ticker.new(syminfo.prefix, syminfo.ticker), timeframe.period, close)
+    
+    // True Range Calculations
+    HiLo = math.min(norm_h - norm_l, 1.5 * nz(ta.sma(norm_h - norm_l, ATRPeriod)))
+    HRef = norm_l <= norm_h[1] ? norm_h - norm_c[1] : norm_h - norm_c[1] - 0.5 * (norm_l - norm_h[1])
+    LRef = norm_h >= norm_l[1] ? norm_c[1] - norm_l : norm_c[1] - norm_l - 0.5 * (norm_l[1] - norm_h)
+    trueRange = trailType == 'modified' ? math.max(HiLo, HRef, LRef) : math.max(norm_h - norm_l, math.abs(norm_h - norm_c[1]), math.abs(norm_l - norm_c[1]))
+    
+    // Trade Logic
+    loss = ATRFactor * Wild_ma(trueRange, ATRPeriod)
+    Up = norm_c - loss
+    Dn = norm_c + loss
+    
+    var float TrendUp = na
+    var float TrendDown = na
+    
+    // Initialize on first bar
+    if na(TrendUp)
+        TrendUp := Up
+        TrendDown := Dn
+    else
+        TrendUp := norm_c[1] > TrendUp[1] ? math.max(Up, TrendUp[1]) : Up
+        TrendDown := norm_c[1] < TrendDown[1] ? math.min(Dn, TrendDown[1]) : Dn
+    
+    trailTrend := norm_c > TrendDown[1] ? 1 : norm_c < TrendUp[1] ? -1 : nz(trailTrend[1], 1)
+    trail := trailTrend == 1 ? TrendUp : TrendDown
+
+// Acceleration-based signal conditions: sudden slope raise when color dots appear
+// accelerationActive is now defined earlier for Slope-RSI divergence detection
+// Detect sudden slope increase with acceleration
+suddenSlopeRaiseLong = enableAccelEntry and accelerationActive and deltaSufficient and delta > 0 and maDf > hLineHeight and stretchFilterLong and trendConfirmLong and (not useTimeframeDelta or barstate.isconfirmed)
+suddenSlopeRaiseShort = enableAccelEntry and accelerationActive and deltaSufficient and delta < 0 and maDf < -hLineHeight and stretchFilterShort and trendConfirmShort and (not useTimeframeDelta or barstate.isconfirmed)
+
+// RSI divergence signal conditions with optional Slope-RSI confirmation
+// Optional Slope-RSI confirmation filter (when disabled, allows all RSI divergences)
+slopeRsiConfirmLong = not useSlopeRsiConfirmation or bullishSlopeRsiDiv
+slopeRsiConfirmShort = not useSlopeRsiConfirmation or bearishSlopeRsiDiv
+// Bullish divergence: price lower low but RSI higher low - potential reversal up
+rsiDivergenceLong = enableRSIDivergence and bullishDivergence and slopeRsiConfirmLong and (not useTimeframeDelta or barstate.isconfirmed)
+// Bearish divergence: price higher high but RSI lower high - potential reversal down
+rsiDivergenceShort = enableRSIDivergence and bearishDivergence and slopeRsiConfirmShort and (not useTimeframeDelta or barstate.isconfirmed)
+
+// Slope-RSI divergence signal conditions (counter-trend reversal signals)
+// Bearish Slope-RSI divergence = Short signal (slope up, RSI down = exhaustion, expect reversal down)
+slopeRsiDivergenceLong = enableSlopeRsiEntries and bullishSlopeRsiDiv and (not useTimeframeDelta or barstate.isconfirmed)
+// Bullish Slope-RSI divergence = Long signal (slope down, RSI up = exhaustion, expect reversal up)
+slopeRsiDivergenceShort = enableSlopeRsiEntries and bearishSlopeRsiDiv and (not useTimeframeDelta or barstate.isconfirmed)
+
+// Track simulated position state for exit signal logic
+var bool inLongPosition = false
+var bool inShortPosition = false
+var bool isRSIDivergenceLong = false
+var bool isRSIDivergenceShort = false
+var bool isRSISlopeOscLong = false
+var bool isRSISlopeOscShort = false
+var int entryBarLong = 0
+var int entryBarShort = 0
+
+// Long signal: slope crosses above NTZ with positive delta OR sudden raise with acceleration OR RSI bullish divergence OR Slope-RSI bullish divergence OR RSI-Slope Oscillator
+// For timeframe delta, only check on confirmed bars
+// For RSI-Slope Oscillator: Also allow signal when already showing short position (to reverse)
+ntzCrossLong = enableNTZCross and crossAboveNTZ and deltaSufficient and delta > 0 and stretchFilterLong and trendConfirmLong and (not useTimeframeDelta or barstate.isconfirmed)
+rsiSlopeOscLongEntry = rsiSlopeOscLong and (not inLongPosition or (inShortPosition and enableRSISlopeOscillator and isRSISlopeOscShort))  // Allow signal if flat or reversing from RSI-Slope Osc short
+longCondition = ntzCrossLong or suddenSlopeRaiseLong or rsiDivergenceLong or slopeRsiDivergenceLong or rsiSlopeOscLongEntry
+
+// Short signal: slope crosses below NTZ with negative delta OR sudden raise with acceleration OR RSI bearish divergence OR Slope-RSI bearish divergence OR RSI-Slope Oscillator
+// For timeframe delta, only check on confirmed bars
+// For RSI-Slope Oscillator: Also allow signal when already showing long position (to reverse)
+ntzCrossShort = enableNTZCross and crossBelowNTZ and deltaSufficient and delta < 0 and stretchFilterShort and trendConfirmShort and (not useTimeframeDelta or barstate.isconfirmed)
+rsiSlopeOscShortEntry = rsiSlopeOscShort and (not inShortPosition or (inLongPosition and enableRSISlopeOscillator and isRSISlopeOscLong))  // Allow signal if flat or reversing from RSI-Slope Osc long
+shortCondition = ntzCrossShort or suddenSlopeRaiseShort or rsiDivergenceShort or slopeRsiDivergenceShort or rsiSlopeOscShortEntry
+
+// Track exit confirmation (consecutive bars exit conditions are met)
+var int exitConfirmCountLong = 0
+var int exitConfirmCountShort = 0
+
+// Set signal type flags and position state
+// For RSI-Slope Oscillator reversals, allow signal even when in opposite position
+if longCondition and (not inLongPosition or (inShortPosition and enableRSISlopeOscillator and isRSISlopeOscShort and rsiSlopeOscLongEntry))
+    // Set the signal type flag based on which condition triggered
+    // Slope-RSI divergence signals are also treated as divergence signals (use divergence exit logic)
+    isRSIDivergenceLong := rsiDivergenceLong or slopeRsiDivergenceLong
+    isRSIDivergenceShort := false
+    isRSISlopeOscLong := rsiSlopeOscLongEntry
+    isRSISlopeOscShort := false
+    entryBarLong := bar_index
+    inLongPosition := true
+    inShortPosition := false
+    // Reset exit confirmation counter
+    exitConfirmCountLong := 0
+    exitConfirmCountShort := 0
+    // Reset RSI-Slope Oscillator waiting flags after long signal
+    if rsiSlopeOscLongEntry
+        waitingForLongConfirmation := false
+        waitingForShortConfirmation := false
+
+if shortCondition and (not inShortPosition or (inLongPosition and enableRSISlopeOscillator and isRSISlopeOscLong and rsiSlopeOscShortEntry))
+    // Set the signal type flag based on which condition triggered
+    // Slope-RSI divergence signals are also treated as divergence signals (use divergence exit logic)
+    isRSIDivergenceLong := false
+    isRSIDivergenceShort := rsiDivergenceShort or slopeRsiDivergenceShort
+    isRSISlopeOscLong := false
+    isRSISlopeOscShort := rsiSlopeOscShortEntry
+    entryBarShort := bar_index
+    inLongPosition := false
+    inShortPosition := true
+    // Reset exit confirmation counter
+    exitConfirmCountLong := 0
+    exitConfirmCountShort := 0
+    // Reset RSI-Slope Oscillator waiting flags after short signal
+    if rsiSlopeOscShortEntry
+        waitingForLongConfirmation := false
+        waitingForShortConfirmation := false
+
+// Calculate bars since signal (ensure we only check exits when we have an active position state)
+barsSinceEntryLong = inLongPosition ? (bar_index - entryBarLong) : 0
+barsSinceEntryShort = inShortPosition ? (bar_index - entryBarShort) : 0
+
+// Divergence-specific trailing stop (built fresh from entry point)
+var float divTrailLong = na
+var float divTrailShort = na
+var float divEntryPrice = na
+var int divTrailInitBarLong = -1
+var int divTrailInitBarShort = -1
+
+// RSI-Slope Oscillator-specific trailing stop (built fresh from entry point)
+var float oscTrailLong = na
+var float oscTrailShort = na
+var float oscEntryPrice = na
+var int oscTrailInitBarLong = -1
+var int oscTrailInitBarShort = -1
+
+// Calculate ATR for divergence and oscillator trailing stops
+atrValue = ta.atr(ATRPeriod)
+
+// Update divergence trailing stop when tracking a divergence signal (only if divergence signals are enabled)
+if enableRSIDivergence and inLongPosition and isRSIDivergenceLong
+    // Check if we just signaled on this bar (initialize stop)
+    if divTrailInitBarLong != entryBarLong
+        divEntryPrice := close
+        divTrailLong := close - (divATRFactor * atrValue)
+        divTrailInitBarLong := entryBarLong
+    else
+        // Update trailing stop - only move up, never down
+        newStop = close - (divATRFactor * atrValue)
+        divTrailLong := math.max(nz(divTrailLong[1], newStop), newStop)
+else if not inLongPosition or not enableRSIDivergence
+    // Reset when not tracking long divergence OR divergence signals are disabled
+    divTrailLong := na
+    divTrailInitBarLong := -1
+
+if enableRSIDivergence and inShortPosition and isRSIDivergenceShort
+    // Check if we just signaled on this bar (initialize stop)
+    if divTrailInitBarShort != entryBarShort
+        divEntryPrice := close
+        divTrailShort := close + (divATRFactor * atrValue)
+        divTrailInitBarShort := entryBarShort
+    else
+        // Update trailing stop - only move down, never up
+        newStop = close + (divATRFactor * atrValue)
+        divTrailShort := math.min(nz(divTrailShort[1], newStop), newStop)
+else if not inShortPosition or not enableRSIDivergence
+    // Reset when not tracking short divergence OR divergence signals are disabled
+    divTrailShort := na
+    divTrailInitBarShort := -1
+
+// Update RSI-Slope Oscillator trailing stop when tracking an oscillator signal (only if oscillator signals are enabled)
+if enableRSISlopeOscillator and inLongPosition and isRSISlopeOscLong
+    // Check if we just signaled on this bar (initialize stop)
+    if oscTrailInitBarLong != entryBarLong
+        oscEntryPrice := close
+        oscTrailLong := close - (oscATRFactor * atrValue)
+        oscTrailInitBarLong := entryBarLong
+    else
+        // Update trailing stop - only move up, never down
+        newStop = close - (oscATRFactor * atrValue)
+        oscTrailLong := math.max(nz(oscTrailLong[1], newStop), newStop)
+else if not inLongPosition or not enableRSISlopeOscillator
+    // Reset when not tracking long oscillator OR oscillator signals are disabled
+    oscTrailLong := na
+    oscTrailInitBarLong := -1
+
+if enableRSISlopeOscillator and inShortPosition and isRSISlopeOscShort
+    // Check if we just signaled on this bar (initialize stop)
+    if oscTrailInitBarShort != entryBarShort
+        oscEntryPrice := close
+        oscTrailShort := close + (oscATRFactor * atrValue)
+        oscTrailInitBarShort := entryBarShort
+    else
+        // Update trailing stop - only move down, never up
+        newStop = close + (oscATRFactor * atrValue)
+        oscTrailShort := math.min(nz(oscTrailShort[1], newStop), newStop)
+else if not inShortPosition or not enableRSISlopeOscillator
+    // Reset when not in short oscillator position OR oscillator entries are disabled
+    oscTrailShort := na
+    oscTrailInitBarShort := -1
+
+// Track exit signals
+var bool longExitSignal = false
+var bool shortExitSignal = false
+
+// SEPARATE EXIT LOGIC: RSI-Slope Oscillator Entries
+// For RSI-Slope Oscillator entries: Exit on opposite entry condition (reverse position) OR ATR trailing stop (after grace period)
+if inLongPosition and enableRSISlopeOscillator and isRSISlopeOscLong and barsSinceEntryLong > 0
+    // RSI-Slope Oscillator long signal - exit when opposite short condition triggers (reverse) OR trailing stop hit
+    reverseExit = rsiSlopeOscShort  // Wait for short signal condition instead of simple cross
+    trailStopExit = barsSinceEntryLong > oscTrailingStopGrace and not na(oscTrailLong) and close < oscTrailLong
+    shouldExit = reverseExit or trailStopExit
+    
+    if shouldExit
+        longExitSignal := true
+        inLongPosition := false
+        // Reset flags (entry flags will be set by new entry logic if reversing)
+        if trailStopExit
+            isRSISlopeOscLong := false
+            entryBarLong := 0
+        // If reversing, don't reset flags here - let the entry logic handle it
+
+if inShortPosition and enableRSISlopeOscillator and isRSISlopeOscShort and barsSinceEntryShort > 0
+    // RSI-Slope Oscillator short position - exit when opposite long condition triggers (reverse) OR trailing stop hit
+    reverseExit = rsiSlopeOscLong  // Wait for long entry condition instead of simple cross
+    trailStopExit = barsSinceEntryShort > oscTrailingStopGrace and not na(oscTrailShort) and close > oscTrailShort
+    shouldExit = reverseExit or trailStopExit
+    
+    if shouldExit
+        shortExitSignal := true
+        inShortPosition := false
+        // Reset flags (entry flags will be set by new entry logic if reversing)
+        if trailStopExit
+            isRSISlopeOscShort := false
+            entryBarShort := 0
+        // If reversing, don't reset flags here - let the entry logic handle it
+
+// SEPARATE EXIT LOGIC: Divergence vs Non-Divergence Signals
+// For DIVERGENCE signals: ONLY divergence-specific trailing stop exit (with grace period)
+// Only runs if divergence signals are enabled
+if inLongPosition and enableRSIDivergence and isRSIDivergenceLong and barsSinceEntryLong > divTrailingStopGrace
+    // Divergence long signal - check ONLY divergence trailing stop (after grace period)
+    trailStopExit = not na(divTrailLong) and close < divTrailLong
+    if trailStopExit
+        longExitSignal := true
+        inLongPosition := false
+        // Reset flags
+        isRSIDivergenceLong := false
+        entryBarLong := 0
+
+// For NON-DIVERGENCE and NON-RSI-SLOPE-OSC long signals: slope exits (with confirmation) OR trailing stop (immediate)
+// Also handles divergence signals if enableRSIDivergence is turned off
+// Also handles RSI-Slope Oscillator signals if enableRSISlopeOscillator is turned off
+if inLongPosition and (not isRSIDivergenceLong or not enableRSIDivergence) and (not isRSISlopeOscLong or not enableRSISlopeOscillator) and barsSinceEntryLong > 0
+    // Standard long signal - check slope exits AND trailing stop
+    slopeExitCondition = maDf <= hLineHeight or (maDf < maDf[1] and maDf < 0)
+    trailStopExit = useTrailingStop and not na(trail) and close < trail
+    
+    // Update exit confirmation counter for slope exits
+    if slopeExitCondition
+        exitConfirmCountLong := exitConfirmCountLong + 1
+    else
+        // Slope recovered (back above NTZ or turned positive) - reset counter
+        exitConfirmCountLong := 0
+    
+    // Determine if we should exit
+    slopeExitConfirmed = slopeExitCondition and exitConfirmCountLong > exitConfirmBars
+    shouldExit = slopeExitConfirmed or trailStopExit
+    
+    if shouldExit
+        longExitSignal := true
+        inLongPosition := false
+        // Reset flags
+        isRSIDivergenceLong := false
+        isRSISlopeOscLong := false
+        entryBarLong := 0
+        exitConfirmCountLong := 0
+
+// For DIVERGENCE short signals: ONLY divergence-specific trailing stop exit (with grace period)
+// Only runs if divergence signals are enabled
+if inShortPosition and enableRSIDivergence and isRSIDivergenceShort and barsSinceEntryShort > divTrailingStopGrace
+    // Divergence short signal - check ONLY divergence trailing stop (after grace period)
+    trailStopExit = not na(divTrailShort) and close > divTrailShort
+    if trailStopExit
+        shortExitSignal := true
+        inShortPosition := false
+        // Reset flags
+        isRSIDivergenceShort := false
+        entryBarShort := 0
+
+// For NON-DIVERGENCE and NON-RSI-SLOPE-OSC short signals: slope exits (with confirmation) OR trailing stop (immediate)
+// Also handles divergence signals if enableRSIDivergence is turned off
+// Also handles RSI-Slope Oscillator signals if enableRSISlopeOscillator is turned off
+if inShortPosition and (not isRSIDivergenceShort or not enableRSIDivergence) and (not isRSISlopeOscShort or not enableRSISlopeOscillator) and barsSinceEntryShort > 0
+    // Standard short signal - check slope exits AND trailing stop
+    slopeExitCondition = maDf >= -hLineHeight or (maDf > maDf[1] and maDf > 0)
+    trailStopExit = useTrailingStop and not na(trail) and close > trail
+    
+    // Update exit confirmation counter for slope exits
+    if slopeExitCondition
+        exitConfirmCountShort := exitConfirmCountShort + 1
+    else
+        // Slope recovered (back below NTZ or turned negative) - reset counter
+        exitConfirmCountShort := 0
+    
+    // Determine if we should exit
+    slopeExitConfirmed = slopeExitCondition and exitConfirmCountShort > exitConfirmBars
+    shouldExit = slopeExitConfirmed or trailStopExit
+    
+    if shouldExit
+        shortExitSignal := true
+        inShortPosition := false
+        // Reset flags
+        isRSIDivergenceShort := false
+        isRSISlopeOscShort := false
+        entryBarShort := 0
+        exitConfirmCountShort := 0
+
+// Reset exit signals on each bar (they're only true for one bar)
+longExitSignal := longExitSignal and barstate.isconfirmed ? false : longExitSignal
+shortExitSignal := shortExitSignal and barstate.isconfirmed ? false : shortExitSignal
+
+// Alert Conditions
+alertcondition(longCondition and not inShortPosition, title = 'Long Entry Signal', message = '🟢 LONG ENTRY\nEMA Slope: {{plot_0}}\nRSI: {{plot_1}}\nPrice: {{close}}')
+alertcondition(shortCondition and not inLongPosition, title = 'Short Entry Signal', message = '🔴 SHORT ENTRY\nEMA Slope: {{plot_0}}\nRSI: {{plot_1}}\nPrice: {{close}}')
+alertcondition(longExitSignal, title = 'Long Exit Signal', message = '🟡 LONG EXIT\nEMA Slope: {{plot_0}}\nRSI: {{plot_1}}\nPrice: {{close}}')
+alertcondition(shortExitSignal, title = 'Short Exit Signal', message = '🟡 SHORT EXIT\nEMA Slope: {{plot_0}}\nRSI: {{plot_1}}\nPrice: {{close}}')
+
+// Plotting
+cUP = color.rgb(38, 255, 72, 50)
+cUPb = color.rgb(38, 255, 52, 40)
+cLP = color.rgb(255, 20, 20, 40)
+cLPb = color.rgb(229, 18, 18, 40)
+cNTZ = color.rgb(186, 167, 167, 70)
+colorS = maDf > 0 ? cUP : maDf < 0 ? cLP : cNTZ
+
+//Colors
+f_colorN(maDf, maDL, cUP, cUPb, cLP, cLPb, cNTZ) =>
+    colorN = color.rgb(38, 255, 72, 75)
+    colorN := maDf > 0 and maDf > maDL and maDf > maDf[1] ? cUPb : maDf > 0 and maDf > maDL and maDf <= maDf[1] ? cUP : maDf > 0 and maDf <= maDL ? cNTZ : maDf <= 0 and maDf < -maDL and maDf > maDf[1] ? cLPb : maDf <= 0 and maDf < -maDL and maDf <= maDf[1] ? cLP : maDf > -maDL ? cNTZ : na
+    colorN
+
+c_ntz = noTZone ? f_colorN(maDf, maDL, cUP, cUPb, cLP, cLPb, cNTZ) : colorS
+trspa = maAcc < accTh ? 92 : 100 - maAcc * 1.5
+c_Acc = maAcc > 0.3 * maAcc and close > open ? color.rgb(10, 246, 255, trspa) : maAcc > 0.3 * maAcc and close < open ? color.rgb(239, 2, 77, trspa) : color.rgb(160, 160, 160, trspa)
+
+hUp = hline(hLineHeight, title = 'NTZ Top', color = color.rgb(75, 219, 94, 40), linewidth = 1, linestyle = hline.style_dashed)
+hDn = hline(-hLineHeight, title = 'NTZ Bottom', color = color.rgb(244, 34, 34, 40), linewidth = 1, linestyle = hline.style_dashed)
+ntzFillC = input.color(color.new(#777777, 70), 'NTZ fill color')
+fill(hUp, hDn, color = ntzFillC)
+hline(0, linestyle = hline.style_solid, color = color.rgb(255, 255, 255, 70))
+plot(maDf, 'Diff MA', c_ntz)
+plot(maDf, 'Diff MA fill', c_ntz, style = plot.style_area)
+plot(maAcc, 'MA Accel', color = c_Acc, style = plot.style_circles, linewidth = 4)
+// Plot RSI in bright blue, centered (RSI 50 = 0)
+plot(cRsi, 'Centered RSI (RSI-50)', color = color.new(#87CEEB, 0), linewidth = 1)
+
+// Plot divergence markers without affecting pane scaling
+plotshape(showDivergence and bullishDivergence and bar_index == bullDivBar, 'Bull Div', style = shape.diamond, location = location.bottom, color = color.lime, size = size.tiny)
+plotshape(showDivergence and bearishDivergence and bar_index == bearDivBar, 'Bear Div', style = shape.diamond, location = location.top, color = color.purple, size = size.tiny)
+
+// Plot Slope-RSI exhaustion markers (trend exhaustion warnings)
+plotshape(showSlopeRsiExhaustion and bullishSlopeRsiDiv and bar_index == bullSlopeRsiBar, 'Bull Slope-RSI Exhaustion', style = shape.triangleup, location = location.bottom, color = color.orange, size = size.tiny)
+plotshape(showSlopeRsiExhaustion and bearishSlopeRsiDiv and bar_index == bearSlopeRsiBar, 'Bear Slope-RSI Exhaustion', style = shape.triangledown, location = location.top, color = color.yellow, size = size.tiny)
+
+// Slope-RSI Information Table
+var table slopeRsiTable = table.new(position.top_right, 2, 4, border_width = 1)
+
+if barstate.islast
+    // Header
+    table.cell(slopeRsiTable, 0, 0, 'Metric', text_color = color.white, bgcolor = color.rgb(40, 40, 40), text_size = size.small)
+    table.cell(slopeRsiTable, 1, 0, 'Value', text_color = color.white, bgcolor = color.rgb(40, 40, 40), text_size = size.small)
+    
+    // Slope row
+    slopeColor = maDf > hLineHeight ? color.green : maDf < -hLineHeight ? color.red : color.gray
+    table.cell(slopeRsiTable, 0, 1, 'Slope', text_color = color.white, bgcolor = color.rgb(60, 60, 60), text_size = size.small)
+    table.cell(slopeRsiTable, 1, 1, str.tostring(maDf, '#.##'), text_color = slopeColor, bgcolor = color.rgb(60, 60, 60), text_size = size.small)
+    
+    // Centered RSI row (RSI-50)
+    cRsiColor = cRsi > 20 ? color.red : cRsi < -20 ? color.green : color.white
+    table.cell(slopeRsiTable, 0, 2, 'cRSI', text_color = color.white, bgcolor = color.rgb(60, 60, 60), text_size = size.small)
+    table.cell(slopeRsiTable, 1, 2, str.tostring(cRsi, '#.##'), text_color = cRsiColor, bgcolor = color.rgb(60, 60, 60), text_size = size.small)
+    
+    // Gap row - color changes to yellow when over threshold
+    gapOverThreshold = minDivergenceGap > 0 and divergenceGap >= minDivergenceGap
+    gapTextColor = gapOverThreshold ? color.yellow : color.white
+    gapBgColor = gapOverThreshold ? color.rgb(80, 80, 0) : color.rgb(60, 60, 60)
+    table.cell(slopeRsiTable, 0, 3, 'Gap', text_color = color.white, bgcolor = gapBgColor, text_size = size.small)
+    table.cell(slopeRsiTable, 1, 3, str.tostring(divergenceGap, '#.##'), text_color = gapTextColor, bgcolor = gapBgColor, text_size = size.small)
+
+// Visual Entry/Exit Signals (placed at end to ensure they render on top)
+plotshape(longCondition and not inShortPosition, 'Long Entry', style = shape.triangleup, location = location.bottom, color = color.new(color.green, 0), size = size.small, text = 'LONG')
+plotshape(shortCondition and not inLongPosition, 'Short Entry', style = shape.triangledown, location = location.top, color = color.new(color.red, 0), size = size.small, text = 'SHORT')
+plotshape(longExitSignal, 'Long Exit', style = shape.xcross, location = location.top, color = color.new(color.orange, 0), size = size.tiny, text = 'EXIT')
+plotshape(shortExitSignal, 'Short Exit', style = shape.xcross, location = location.bottom, color = color.new(color.orange, 0), size = size.tiny, text = 'EXIT')

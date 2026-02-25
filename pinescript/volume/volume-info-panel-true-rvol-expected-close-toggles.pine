@@ -1,0 +1,270 @@
+// @file: volume_info_panel_true_rvol_toggles_v6.pine
+//@version=6
+indicator("Volume Info Panel (TRUE RVOL + Expected Close) - Toggles", overlay=true, max_labels_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs
+//──────────────────────────────────────────────────────────────────────────────
+group_place = "Panel / Placement"
+pos_opt = input.string("Bottom Right", "Panel position", options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left","Top Center","Bottom Center","Middle Center"], group=group_place)
+show_header = input.bool(true, "Show header row", group=group_place)
+
+panel_bg_color  = input.color(color.black, "Panel background", group=group_place)
+panel_bg_transp = input.int(85, "Panel bg transparency (0..100)", minval=0, maxval=100, group=group_place)
+border_transp   = input.int(75, "Border transparency (0..100)", minval=0, maxval=100, group=group_place)
+
+group_rows = "Rows"
+auto_hide_outside_rth = input.bool(true, "Auto-hide after close (outside RTH)", group=group_rows)
+show_row_current      = input.bool(true, "Current bar vol", group=group_rows)
+show_row_today        = input.bool(true, "Today vol so far", group=group_rows)
+show_row_true_rvol    = input.bool(true, "TRUE RVOL / RTH", group=group_rows)
+show_row_avg_session  = input.bool(true, "Avg session total (RTH)", group=group_rows)
+show_row_expected     = input.bool(true, "Expected session close", group=group_rows)
+show_row_avg_daily    = input.bool(true, "Avg daily vol", group=group_rows)
+show_row_progress     = input.bool(true, "Progress", group=group_rows)
+
+group_sizes = "Text Sizes"
+label_size_opt = input.string("Small", "Label text size", options=["Tiny","Small","Normal","Large"], group=group_sizes)
+value_size_opt = input.string("Normal", "Value text size", options=["Tiny","Small","Normal","Large","Huge"], group=group_sizes)
+
+group_colors = "Colors"
+col_header   = input.color(color.white,  "Header text",        group=group_colors)
+col_current  = input.color(color.orange, "Current bar vol",    group=group_colors)
+col_today    = input.color(#ffeb3b,      "Today vol so far",   group=group_colors)
+col_session  = input.color(#00b0ff,      "TRUE RVOL / RTH",    group=group_colors)
+col_daily    = input.color(#00e676,      "Avg daily vol",      group=group_colors)
+col_progress = input.color(#e040fb,      "Progress",           group=group_colors)
+
+group_calc = "Averages"
+lookback_daily = input.int(20, "Avg Daily lookback (days)", minval=1, group=group_calc)
+lookback_rvol  = input.int(20, "TRUE RVOL lookback (sessions)", minval=1, group=group_calc)
+max_sessions_store_in = input.int(80, "Max sessions stored (memory cap)", minval=1, group=group_calc)
+
+group_sess = "TRUE RVOL Session"
+sess_input = input.session("0930-1600", "RTH session (exchange time)", group=group_sess)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+//──────────────────────────────────────────────────────────────────────────────
+f_pos(s) =>
+    switch s
+        "Top Right"      => position.top_right
+        "Top Left"       => position.top_left
+        "Bottom Right"   => position.bottom_right
+        "Bottom Left"    => position.bottom_left
+        "Middle Right"   => position.middle_right
+        "Middle Left"    => position.middle_left
+        "Top Center"     => position.top_center
+        "Bottom Center"  => position.bottom_center
+        "Middle Center"  => position.middle_center
+        => position.bottom_right
+
+f_size(s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.normal
+
+f_fmt(x) => str.tostring(x, "#,##0")
+
+f_avg_cum_at_pos(pos, lookback, hist, offsets, lens) =>
+    float sum = 0.0
+    int cnt = 0
+    int sessions = array.size(offsets)
+    if sessions > 0 and pos > 0
+        int startS = math.max(0, sessions - lookback)
+        for s = startS to sessions - 1
+            int off = array.get(offsets, s)
+            int len = array.get(lens, s)
+            if pos <= len
+                sum += array.get(hist, off + (pos - 1))
+                cnt += 1
+    cnt > 0 ? (sum / cnt) : na
+
+f_avg_session_total(lookback, hist, offsets, lens) =>
+    float sum = 0.0
+    int cnt = 0
+    int sessions = array.size(offsets)
+    if sessions > 0
+        int startS = math.max(0, sessions - lookback)
+        for s = startS to sessions - 1
+            int off = array.get(offsets, s)
+            int len = array.get(lens, s)
+            if len > 0
+                sum += array.get(hist, off + len - 1)
+                cnt += 1
+    cnt > 0 ? (sum / cnt) : na
+
+f_prune_oldest_if_needed(max_sessions, hist, offsets, lens) =>
+    int sessions = array.size(offsets)
+    if sessions > max_sessions
+        int drop_len = array.shift(lens)
+        array.shift(offsets)
+        if drop_len > 0
+            for _ = 0 to drop_len - 1
+                array.shift(hist)
+        int n = array.size(offsets)
+        if n > 0
+            for k = 0 to n - 1
+                array.set(offsets, k, array.get(offsets, k) - drop_len)
+
+f_store_curve(curve, max_sessions, hist, offsets, lens) =>
+    int curve_len = array.size(curve)
+    if curve_len > 0
+        int startIdx = array.size(hist)
+        array.push(offsets, startIdx)
+        array.push(lens, curve_len)
+        for i = 0 to curve_len - 1
+            array.push(hist, array.get(curve, i))
+        f_prune_oldest_if_needed(max_sessions, hist, offsets, lens)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Calculations (day totals + avg daily)
+//──────────────────────────────────────────────────────────────────────────────
+float curr_vol = volume
+
+var float today_vol = 0.0
+if timeframe.change("D")
+    today_vol := 0.0
+today_vol += volume
+
+float avg_daily = request.security(syminfo.tickerid, "D", ta.sma(volume[1], lookback_daily))
+float pct = (not na(avg_daily) and avg_daily > 0) ? (today_vol / avg_daily * 100) : na
+
+//──────────────────────────────────────────────────────────────────────────────
+// TRUE RVOL Engine (RTH cumulative vs avg cumulative at same bar-of-session)
+//──────────────────────────────────────────────────────────────────────────────
+int max_sessions_store = math.max(max_sessions_store_in, lookback_rvol)
+
+bool in_sess = not na(time(timeframe.period, sess_input))
+bool prev_in_sess = bar_index > 0 ? in_sess[1] : false
+bool new_day = timeframe.change("D")
+
+bool sess_open  = in_sess and (not prev_in_sess or new_day)
+bool sess_close = (not in_sess) and prev_in_sess
+
+var int   sess_pos = 0
+var float sess_cum = 0.0
+
+var float[] day_curve = array.new_float()
+var float[] hist_vals = array.new_float()
+var int[]   offsets   = array.new_int()
+var int[]   lens      = array.new_int()
+
+var float last_sess_total = na
+
+if sess_open
+    if array.size(day_curve) > 0
+        last_sess_total := array.get(day_curve, array.size(day_curve) - 1)
+        f_store_curve(day_curve, max_sessions_store, hist_vals, offsets, lens)
+    sess_pos := 0
+    sess_cum := 0.0
+    array.clear(day_curve)
+
+if sess_close
+    if array.size(day_curve) > 0
+        last_sess_total := array.get(day_curve, array.size(day_curve) - 1)
+        f_store_curve(day_curve, max_sessions_store, hist_vals, offsets, lens)
+    sess_pos := 0
+    sess_cum := 0.0
+    array.clear(day_curve)
+
+if in_sess
+    sess_pos += 1
+    sess_cum += volume
+    array.push(day_curve, sess_cum)
+
+float avg_by_now     = (timeframe.isintraday and in_sess) ? f_avg_cum_at_pos(sess_pos, lookback_rvol, hist_vals, offsets, lens) : na
+float true_rvol      = (not na(avg_by_now) and avg_by_now > 0) ? (sess_cum / avg_by_now) : na
+float avg_sess_total = timeframe.isintraday ? f_avg_session_total(lookback_rvol, hist_vals, offsets, lens) : na
+float exp_close      = (in_sess and not na(avg_sess_total) and not na(avg_by_now)) ? (sess_cum + (avg_sess_total - avg_by_now)) : na
+float close_rvol     = (not na(last_sess_total) and not na(avg_sess_total) and avg_sess_total > 0) ? (last_sess_total / avg_sess_total) : na
+
+// Effective row toggles (auto-hide outside RTH)
+bool outside = not in_sess
+bool eff_current  = show_row_current  and (not auto_hide_outside_rth or not outside)
+bool eff_expected = show_row_expected and (not auto_hide_outside_rth or not outside)
+
+bool eff_today       = show_row_today
+bool eff_true_rvol   = show_row_true_rvol
+bool eff_avg_session = show_row_avg_session
+bool eff_avg_daily   = show_row_avg_daily
+bool eff_progress    = show_row_progress
+
+//──────────────────────────────────────────────────────────────────────────────
+// Render table (fixed size; table.clear uses 5-arg form)
+//──────────────────────────────────────────────────────────────────────────────
+color panel_bg = color.new(panel_bg_color, panel_bg_transp)
+label_sz = f_size(label_size_opt)
+value_sz = f_size(value_size_opt)
+
+int COLS = 2
+int ROWS = 10
+int END_COL = 1
+int END_ROW = ROWS - 1
+
+var table tbl = table.new(position=position.bottom_right, columns=COLS, rows=ROWS, bgcolor=na, frame_width=1, frame_color=color.new(color.gray, border_transp), border_width=1, border_color=color.new(color.gray, border_transp))
+
+if barstate.islast
+    table.set_position(tbl, f_pos(pos_opt))
+    table.clear(tbl, 0, 0, END_COL, END_ROW)
+
+    int r = 0
+    if show_header
+        table.cell(tbl, 0, r, "Metric", text_color=col_header, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, "Value",  text_color=col_header, text_size=label_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_current
+        table.cell(tbl, 0, r, "Current Bar Vol", text_color=col_current, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, f_fmt(curr_vol),   text_color=col_current, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_today
+        table.cell(tbl, 0, r, "Today's Vol so far", text_color=col_today, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, f_fmt(today_vol),     text_color=col_today, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_true_rvol
+        string left = "TRUE RVOL (" + sess_input + ")"
+        string right = ""
+        if not timeframe.isintraday
+            right := "n/a (use intraday)"
+        else if in_sess
+            string sofar_txt = f_fmt(sess_cum)
+            string avg_txt   = na(avg_by_now) ? "n/a" : f_fmt(avg_by_now)
+            string rvol_txt  = na(true_rvol) ? "n/a" : (str.tostring(true_rvol, "#.##") + "x")
+            right := "RTH so far " + sofar_txt + " | avg by now " + avg_txt + " | " + rvol_txt
+        else
+            string last_txt = na(last_sess_total) ? "n/a" : f_fmt(last_sess_total)
+            string avg_tot  = na(avg_sess_total) ? "n/a" : f_fmt(avg_sess_total)
+            string rvol_c   = na(close_rvol) ? "n/a" : (str.tostring(close_rvol, "#.##") + "x")
+            right := "Last RTH " + last_txt + " | avg total " + avg_tot + " | " + rvol_c
+
+        table.cell(tbl, 0, r, left,  text_color=col_session, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, right, text_color=col_session, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_avg_session
+        table.cell(tbl, 0, r, "Avg Session Total (RTH)", text_color=col_session, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, na(avg_sess_total) ? "n/a" : f_fmt(avg_sess_total), text_color=col_session, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_expected
+        table.cell(tbl, 0, r, "Expected Session Close", text_color=col_session, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, na(exp_close) ? "n/a" : f_fmt(exp_close), text_color=col_session, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_avg_daily
+        table.cell(tbl, 0, r, "Avg Daily Vol", text_color=col_daily, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, na(avg_daily) ? "n/a" : f_fmt(avg_daily), text_color=col_daily, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1
+
+    if eff_progress
+        string prog_val = na(pct) ? "n/a" : (str.tostring(math.round(pct)) + "% of avg day")
+        table.cell(tbl, 0, r, "Today Progress", text_color=col_progress, text_size=label_sz, text_halign=text.align_left, bgcolor=panel_bg)
+        table.cell(tbl, 1, r, prog_val,         text_color=col_progress, text_size=value_sz, text_halign=text.align_right, bgcolor=panel_bg)
+        r += 1

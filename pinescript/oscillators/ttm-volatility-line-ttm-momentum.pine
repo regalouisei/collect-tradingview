@@ -1,0 +1,173 @@
+//@version=5
+indicator("TTM Volatility Line + TTM Momentum (TV-style) — Center @ 50", overlay=false)
+
+//────────────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────────────
+grpCore = "Core (TTM Squeeze)"
+len     = input.int(20, "Length (BB & KC)", minval=5, group=grpCore)
+bbMult  = input.float(2.0, "BB StDev Mult", step=0.1, group=grpCore)
+kcMult  = input.float(1.5, "KC Mult", step=0.1, group=grpCore)
+
+grpScale = "Volatility Line (0–100 mapping)"
+normLookbk = input.int(200, "Width Normalization Lookback", minval=50, group=grpScale)
+smoothLen  = input.int(5, "Volatility Smoothing (EMA)", minval=1, group=grpScale)
+
+grpZones = "Zones (Volatility Line)"
+lowZone    = input.float(20.0, "Low Zone (Squeeze ON max)", step=0.5, group=grpZones)
+highZone   = input.float(80.0, "High Zone (Expansion extreme)", step=0.5, group=grpZones)
+
+grpMom = "TTM Momentum (TV look)"
+showMom       = input.bool(true, "Show TTM Momentum Histogram", group=grpMom)
+showDots      = input.bool(true, "Show Squeeze Dots on center line", group=grpMom)
+momScaleMode  = input.string("Auto", "Momentum scaling", options=["Auto", "Manual"], group=grpMom)
+momScale      = input.float(1.0, "Manual momentum scale", step=0.1, group=grpMom)
+momAutoLookbk = input.int(200, "Auto scale lookback", minval=50, group=grpMom)
+
+grpBg = "Background (pane)"
+showBg     = input.bool(true, "Highlight squeeze on background", group=grpBg)
+showExhBg  = input.bool(true, "Highlight expansion exhaustion (orange bg)", group=grpBg)
+
+grpExh = "Expansion Exhaustion (bg only)"
+exhLookback = input.int(40, "Peak Lookback", minval=10, group=grpExh)
+nearPeakPct = input.float(0.98, "Near-peak threshold", step=0.01, minval=0.90, maxval=1.0, group=grpExh)
+fallBars    = input.int(3, "Bars of falling width", minval=1, group=grpExh)
+
+//────────────────────────────────────────────────────────────
+// NEW: BB/KC Ratio Percentile (optional line)
+//────────────────────────────────────────────────────────────
+grpRatio = "BB/KC Ratio (Optional)"
+showRatioLine  = input.bool(true, "Show BB/KC Ratio Percentile (0–100)", group=grpRatio)
+ratioLookback  = input.int(252, "Ratio percentile lookback", minval=50, group=grpRatio)
+ratioLineWidth = input.int(2, "Ratio line width", minval=1, maxval=4, group=grpRatio)
+ratioColor     = input.color(color.blue, "Ratio line color", group=grpRatio)
+
+//────────────────────────────────────────────────────────────
+// Helpers
+//────────────────────────────────────────────────────────────
+clamp01(x) =>
+    x < 0 ? 0.0 : x > 1 ? 1.0 : x
+
+//────────────────────────────────────────────────────────────
+// BB(20) and KC(1.5)
+//────────────────────────────────────────────────────────────
+src   = close
+basis = ta.sma(src, len)
+dev   = bbMult * ta.stdev(src, len)
+
+bbU = basis + dev
+bbL = basis - dev
+
+atr = ta.atr(len)
+kcU = basis + kcMult * atr
+kcL = basis - kcMult * atr
+
+squeezeOn  = (bbU < kcU) and (bbL > kcL)
+squeezeOff = (bbU > kcU) and (bbL < kcL)
+release    = squeezeOff and squeezeOn[1]
+
+//────────────────────────────────────────────────────────────
+// Volatility measure: BB width % + normalization
+//────────────────────────────────────────────────────────────
+bbWidthPct = basis != 0 ? ((bbU - bbL) / basis) * 100.0 : na
+
+minW    = ta.lowest(bbWidthPct, normLookbk)
+maxW    = ta.highest(bbWidthPct, normLookbk)
+rangeW  = maxW - minW
+w01_raw = rangeW != 0 ? (bbWidthPct - minW) / rangeW : 0.0
+w01     = clamp01(w01_raw)
+
+// HARD ALIGNMENT mapping (0..100)
+oscRaw =
+     squeezeOn
+         ? (w01 * lowZone)
+         : (lowZone + w01 * (100.0 - lowZone))
+
+volOsc = ta.ema(oscRaw, smoothLen)
+
+// Expansion exhaustion (bg)
+wPeak      = ta.highest(bbWidthPct, exhLookback)
+nearPk     = bbWidthPct >= wPeak * nearPeakPct
+fallingWid = ta.falling(bbWidthPct, fallBars)
+expExhaust = squeezeOff and nearPk and fallingWid
+
+//────────────────────────────────────────────────────────────
+// NEW: BB/KC ratio percentile (0–100)
+//────────────────────────────────────────────────────────────
+bbWidth = bbU - bbL
+kcWidth = kcU - kcL
+bbkcRatio = kcWidth != 0 ? (bbWidth / kcWidth) : na
+bbkcPR    = ta.percentrank(bbkcRatio, ratioLookback)  // 0..100
+
+//────────────────────────────────────────────────────────────
+// TTM Momentum Oscillator (TV-style) — anchored to center=50
+// IMPORTANT: We plot 4 separate histograms so Style tab is editable per state.
+//────────────────────────────────────────────────────────────
+hh = ta.highest(high, len)
+ll = ta.lowest(low, len)
+midHL = (hh + ll) / 2.0
+midMA = ta.sma(close, len)
+mid   = (midHL + midMA) / 2.0
+
+mom = ta.linreg(close - mid, len, 0)
+
+// Scaling (visual height)
+absMax    = ta.highest(math.abs(mom), momAutoLookbk)
+scaleAuto = absMax != 0 ? (50.0 / absMax) : 1.0
+scale     = momScaleMode == "Auto" ? scaleAuto : momScale
+
+momDelta = mom * scale            // signed distance from 50
+momPlot  = 50.0 + momDelta        // plotted value (but histogram base is 50)
+
+// 4-state classification (0..3)
+// 0: pos rising, 1: pos falling, 2: neg falling (more negative), 3: neg rising (toward 0)
+momUp     = momDelta >= 0
+momRising = momDelta > momDelta[1]
+
+state0 = momUp and momRising
+state1 = momUp and not momRising
+state2 = (not momUp) and not momRising
+state3 = (not momUp) and momRising
+
+// 4 separate plots (constant colors) => Style tab can override them
+plot(showMom and state0 ? momPlot : na, "TTM Mom 0 (Pos Rising)",  style=plot.style_columns, linewidth=2, color=color.gray,   histbase=50.0, editable=true)
+plot(showMom and state1 ? momPlot : na, "TTM Mom 1 (Pos Falling)", style=plot.style_histogram, linewidth=2, color=color.gray,  histbase=50.0, editable=true)
+plot(showMom and state2 ? momPlot : na, "TTM Mom 2 (Neg Falling)", style=plot.style_histogram, linewidth=2, color=color.gray,    histbase=50.0, editable=true)
+plot(showMom and state3 ? momPlot : na, "TTM Mom 3 (Neg Rising)",  style=plot.style_columns, linewidth=2, color=color.gray, histbase=50.0, editable=true)
+
+// Squeeze dots along the center line (50) (kept editable via Style)
+plot(showDots and squeezeOn  ? 50.0 : na, "Squeeze Dot (ON)",  style=plot.style_circles, linewidth=3, color=color.black, editable=true)
+plot(showDots and squeezeOff ? 50.0 : na, "Squeeze Dot (OFF)", style=plot.style_circles, linewidth=3, color=color.gray,  editable=true)
+
+//────────────────────────────────────────────────────────────
+// Volatility line + zones
+//────────────────────────────────────────────────────────────
+plot(volOsc, "Volatility Oscillator (Line)", linewidth=2, color=color.maroon, editable=true)
+
+// Zone lines (also editable)
+plot(lowZone,  "Low Zone",      color=color.new(color.green, 0), linewidth=1, editable=true)
+plot(50.0,     "Center (50)",   color=color.new(color.gray, 40), linewidth=1, editable=true)
+plot(highZone, "High Zone",     color=color.new(color.red, 0), linewidth=1, editable=true)
+
+//────────────────────────────────────────────────────────────
+// NEW: Ratio percentile line (optional)
+//────────────────────────────────────────────────────────────
+plot(showRatioLine ? bbkcPR : na, "BB/KC Ratio Percentile (0–100)",
+     linewidth=ratioLineWidth, color=ratioColor, editable=true)
+
+//────────────────────────────────────────────────────────────
+// Background
+//────────────────────────────────────────────────────────────
+bg = showBg ?
+     (squeezeOn ? color.new(color.green, 88) :
+      (showExhBg and expExhaust) ? color.new(color.orange, 85) :
+      volOsc > highZone ? color.new(color.red, 90) :
+      na) : na
+bgcolor(bg)
+
+//────────────────────────────────────────────────────────────
+// Alerts
+//────────────────────────────────────────────────────────────
+alertcondition(squeezeOn, "Squeeze ON", "TTM Squeeze ON (BB inside KC).")
+alertcondition(release, "Squeeze Release", "Squeeze released (BB moved outside KC).")
+alertcondition(expExhaust, "Expansion Exhaustion", "Expansion appears exhausted: width near peak and falling.")

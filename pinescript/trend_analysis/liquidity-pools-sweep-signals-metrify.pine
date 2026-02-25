@@ -1,0 +1,740 @@
+//@version=6
+indicator('Liquidity Pools + Sweep Signals [Metrify]', shorttitle = 'Metrify - Liquidity Canvas', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+coregroup = 'Core',displaygroup = 'Display',sweepgroup = 'Sweep Confirmation'
+
+swinglen = input.int(9, 'Swing Length', minval = 3, maxval = 40, group = coregroup)
+mergeatr = input.float(0.35, 'Merge Distance', minval = 0.05, maxval = 2.00, step = 0.01, group = coregroup, tooltip = 'How close two nearby liquidity levels must be (in ATR) to be merged into one zone. Lower = more separate zones, higher = more merged zones.')
+activatescoring = input.bool(false, 'Activate Scoring', group = coregroup, tooltip = 'If ON, sweep signals must pass Min Score To Trigger.')
+scoremintrigger = input.float(65.0, 'Minimum Score', minval = 0.0, maxval = 100.0, step = 1.0, group = coregroup)
+wickratioscale = input.float(1.50, 'Wick Ratio Scale', minval = 0.2, maxval = 10.0, step = 0.1, group = sweepgroup, tooltip = 'Controls how much wick size helps the score. Lower = even small wicks score well. Higher = only strong rejection wicks score well.')
+usedisplacementconfirm = input.bool(false, 'Require Displacement Confirm', group = sweepgroup, tooltip = 'If ON, a sweep is only confirmed after a follow-through break (displacement). If OFF, signals can trigger immediately from the sweep candle score.')
+volumemalen = input.int(20, 'Volume MA Length', minval = 5, maxval = 100, group = sweepgroup)
+volumespikemult = input.float(1.2, 'Min Volume / MA', minval = 0.5, maxval = 5.0, step = 0.1, group = sweepgroup)
+showdash = input.bool(true, 'Show Dashboard', group = displaygroup)
+showpools = input.bool(true, 'Show Pool Bodies', group = displaygroup)
+showtraces = input.bool(true, 'Show Historical Traces', group = displaygroup)
+showsweepflags = input.bool(true, 'Show Sweep Markers', group = displaygroup)
+showcompasslines = input.bool(false, 'Show Nearest Pool', group = displaygroup)
+maxvisibleactiveboxes = input.int(4, 'Max Active Boxes / Side', minval = 1, maxval = 15, group = displaygroup)
+maxboxdistanceatr = input.float(6.0, 'Show Box Within Distance (ATR)', minval = 0.5, maxval = 20.0, step = 0.1, group = displaygroup)
+ndunit = input.string('Percent', 'Nearest Unit', options = ['Percent', 'Pips'], group = displaygroup)
+
+//Scoring
+scorewpen = 16.0, scorewreclaim = 18.0, scorewwick = 14.0, scorewbody = 8.0
+scorewema = 10.0, scorewlen = 12.0, scorewmss = 16.0, scoreweffort = 12.0, scorewdisp = 8.0
+atrfast = ta.atr(14), volmanow = ta.sma(volume, volumemalen), ema200 = ta.ema(close, 200)
+
+var array<float> h_mid = array.new_float()
+var array<float> h_top = array.new_float()
+var array<float> h_bot = array.new_float()
+var array<int> h_start = array.new_int()
+var array<int> h_hits = array.new_int()
+var array<int> h_last_touch = array.new_int()
+var array<int> h_state = array.new_int()
+var array<int> h_pend = array.new_int()
+var array<int> h_pend_bar = array.new_int()
+var array<float> h_pend_hi = array.new_float()
+var array<float> h_pend_lo = array.new_float()
+var array<float> h_pend_mss = array.new_float()
+var array<float> h_pend_base = array.new_float()
+var array<box> h_core = array.new_box()
+var array<box> h_halo = array.new_box()
+var array<line> h_line = array.new_line()
+
+var array<float> l_mid = array.new_float()
+var array<float> l_top = array.new_float()
+var array<float> l_bot = array.new_float()
+var array<int> l_start = array.new_int()
+var array<int> l_hits = array.new_int()
+var array<int> l_last_touch = array.new_int()
+var array<int> l_state = array.new_int()
+var array<int> l_pend = array.new_int() 
+var array<int> l_pend_bar = array.new_int()
+var array<float> l_pend_hi = array.new_float()
+var array<float> l_pend_lo = array.new_float()
+var array<float> l_pend_mss = array.new_float()
+var array<float> l_pend_base = array.new_float()
+var array<box> l_core = array.new_box()
+var array<box> l_halo = array.new_box()
+var array<line> l_line = array.new_line()
+
+var array<line> tracelines = array.new_line()
+var array<int> traceborn = array.new_int()
+var array<box> pulseboxes = array.new_box()
+var array<int> pulseborn = array.new_int()
+var array<int> pulsedir = array.new_int() // +1 bull pulse, -1 bear pulse
+var array<label> sweepflags = array.new_label()
+
+var int bswc = 0,var int sswc = 0,var string levt = 'None'
+bool bswn = false,bool sswn = false
+
+//hardcoded
+plotextendbars = 10,poolatr = 0.45,poollife = 1700
+presentwindow = 3200,effortrangeatrmin = 0.80,linelengthrefbars = 25
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_norm01(float x, float lo, float hi) =>
+    float span = math.max(hi - lo, 1e-6)
+    f_clamp((x - lo) / span, 0.0, 1.0)
+
+penatrmin = 0.05,penatrmax = 1.20
+f_scorepenetration(float penatr) =>
+    float lo = penatrmin,float hi = penatrmax
+    float target = lo + (hi - lo) * 0.35
+    float halfspan = math.max((hi - lo) * 0.65, 0.20)
+    float tri = 1.0 - math.abs(penatr - target) / halfspan
+    f_clamp(tri, 0.0, 1.0)
+
+reclaimmin = 50.0
+f_scorereclaim(float reclaimpct) =>
+    float lo = reclaimmin * 0.60
+    f_norm01(reclaimpct, lo, 100.0)
+
+f_scorewick(float wickratio) =>
+    float scale = math.max(wickratioscale, 0.20)
+    f_clamp(wickratio / scale, 0.0, 1.0)
+
+f_scorebodybias(bool bodyok) =>
+    bodyok ? 1.0 : 0.30
+
+f_scoreema(int dir, float closepx, float emapx, float atrref) =>
+    if na(emapx) or atrref <= 0
+        0.5
+    else
+        float favoratr = dir == 1 ? (emapx - closepx) / atrref : (closepx - emapx) / atrref
+        f_clamp(favoratr / 1.8, 0.0, 1.0)
+
+f_scorelinelength(int agebars) =>
+    f_clamp(float(agebars) / (linelengthrefbars * 2.0), 0.0, 1.0)
+
+f_linelengthpenalty(int agebars) =>
+    float ratio = f_clamp(float(agebars) / linelengthrefbars, 0.0, 1.0)
+    float shaped = math.pow(ratio, 1.6)
+    f_clamp(0.20 + shaped * 0.80, 0.20, 1.0)
+
+f_scoremss(int dir, float reflevel, float closepx, float atrref) =>
+    if na(reflevel) or atrref <= 0
+        0.0
+    else
+        float distatr = dir == -1 ? (reflevel - closepx) / atrref : (closepx - reflevel) / atrref
+        f_clamp(distatr / 1.20, 0.0, 1.0)
+
+f_scoreeffort(float rangeatr, float volratio) =>
+    float volscore = na(volratio) ? 0.5 : f_norm01(volratio, 0.7, math.max(volumespikemult, 0.8))
+    float rangescore = f_norm01(rangeatr, 0.0, math.max(effortrangeatrmin, 0.1))
+    f_clamp(volscore * 0.60 + rangescore * 0.40, 0.0, 1.0)
+
+displacementwindow = 3,displacementbodyatrmin = 0.35
+f_scoredisplacement(int dir, float refbreak, float closepx, float bodyatr, float atrref) =>
+    if atrref <= 0 or na(refbreak)
+        0.0
+    else
+        float breakatr = dir == -1 ? (refbreak - closepx) / atrref : (closepx - refbreak) / atrref
+        float breakscore = f_clamp(breakatr / 1.2, 0.0, 1.0)
+        float bodyscore = f_norm01(bodyatr, displacementbodyatrmin * 0.6, displacementbodyatrmin * 1.8)
+        f_clamp(breakscore * 0.55 + bodyscore * 0.45, 0.0, 1.0)
+
+f_totalscore(float basepart, float mssscore, float effortscore, float dispscore, bool includedisp) =>
+    float baseweight = scorewpen + scorewreclaim + scorewwick + scorewbody + scorewema + scorewlen
+    float wdisp = includedisp ? scorewdisp : 0.0
+    float totalweight = baseweight + scorewmss + scoreweffort + wdisp
+    float totalpart = basepart + scorewmss * mssscore + scoreweffort * effortscore + wdisp * dispscore
+    totalweight > 0 ? totalpart / totalweight * 100.0 : 0.0
+
+f_chnote(float pct) =>
+    na(pct) ? 'Outside channel: no action until price re-enters.' : pct < 30 ? 'Lower channel (discount): look for long setup.' : pct > 70 ? 'Upper channel (premium): look for short setup.' : 'Middle channel: no action (uncertain).'
+
+f_pipsize() =>
+    float tick = syminfo.mintick
+    int decimals = tick > 0 ? int(math.round(math.log(1.0 / tick) / math.log(10.0))) : 0
+    decimals == 3 or decimals == 5 ? tick * 10.0 : tick
+
+f_poolalpha(int hits, int state) =>
+    state == 1 ? 80 : state == 2 ? 95 : int(math.round(f_clamp(88 - hits * 5, 58, 90)))
+
+f_pushflag(label lb) =>
+    array.push(sweepflags, lb)
+    if array.size(sweepflags) > 120
+        label.delete(array.shift(sweepflags))
+
+tracehistorymax = 380,tracehistorybars = 3500
+f_addtrace(float y, int x1, int x2, color css, bool dashed, bool strong) =>
+    if showtraces and x2 > x1
+        st = dashed ? line.style_dashed : strong ? line.style_solid : line.style_dotted
+        int w = strong ? 2 : 1
+        line tr = line.new(x1, y, x2, y, color = css, style = st, width = w)
+        array.push(tracelines, tr),array.push(traceborn, bar_index)
+        if array.size(tracelines) > tracehistorymax
+            line oldtrace = array.shift(tracelines)
+            line.delete(oldtrace)
+            array.shift(traceborn)
+
+f_cleanuptraces() =>
+    if showtraces
+        if array.size(tracelines) > 0
+            for i = array.size(tracelines) - 1 to 0 by 1
+                int born = array.get(traceborn, i)
+                if bar_index - born > tracehistorybars
+                    line.delete(array.get(tracelines, i))
+                    array.remove(tracelines, i),array.remove(traceborn, i)
+    else
+        if array.size(tracelines) > 0
+            for i = array.size(tracelines) - 1 to 0 by 1
+                line.delete(array.get(tracelines, i))
+                array.remove(tracelines, i),array.remove(traceborn, i)
+
+f_addpulse(int dir, float top, float bot) =>
+    if top > bot
+        color base = dir == 1 ? #14b8a6 : #ff5a5f
+        box pb = box.new(bar_index, top, bar_index + 1, bot, bgcolor = color.new(base, 84), border_color = color.new(#f59e0b, 45), border_width = 1)
+        array.push(pulseboxes, pb), array.push(pulseborn, bar_index), array.push(pulsedir, dir)
+        if array.size(pulseboxes) > 100
+            box oldpulse = array.shift(pulseboxes)
+            box.delete(oldpulse)
+            array.shift(pulseborn),array.shift(pulsedir)
+
+f_cleanuppulses() =>
+    if array.size(pulseboxes) > 0
+        for i = array.size(pulseboxes) - 1 to 0 by 1
+            box pb = array.get(pulseboxes, i)
+            int born = array.get(pulseborn, i)
+            int dir = array.get(pulsedir, i)
+            int age = bar_index - born
+            if age > 18
+                box.delete(pb)
+                array.remove(pulseboxes, i),array.remove(pulseborn, i),array.remove(pulsedir, i)
+            if age <= 18
+                int alphabody = int(math.round(f_clamp(80 + age * 6, 80, 98)))
+                int alphaborder = int(math.round(f_clamp(40 + age * 7, 40, 97)))
+                color base = dir == 1 ? #14b8a6 : #ff5a5f
+                box.set_right(pb, bar_index + 1)
+                box.set_bgcolor(pb, color.new(base, alphabody))
+                box.set_border_color(pb, color.new(#f59e0b, alphaborder))
+
+f_deletepool(int idx, array<float> mid, array<float> top, array<float> bot, array<int> start, array<int> hits, array<int> lasttouch, array<int> state, array<int> pend, array<int> pendbar, array<float> pendhi, array<float> pendlo, array<float> pendmss, array<float> pendbase, array<box> core, array<box> halo, array<line> lvl) =>
+    box.delete(array.get(core, idx)), box.delete(array.get(halo, idx))
+    line.delete(array.get(lvl, idx))
+
+    array.remove(mid, idx),array.remove(top, idx),array.remove(bot, idx),array.remove(pendmss, idx)
+    array.remove(start, idx),array.remove(hits, idx),array.remove(lasttouch, idx),array.remove(pendlo, idx)
+    array.remove(state, idx),array.remove(pend, idx),array.remove(pendbar, idx),array.remove(pendhi, idx)
+    array.remove(pendbase, idx),array.remove(core, idx),array.remove(halo, idx),array.remove(lvl, idx)
+
+f_deletehigh(int idx) =>
+    f_deletepool(idx, h_mid, h_top, h_bot, h_start, h_hits, h_last_touch, h_state, h_pend, h_pend_bar, h_pend_hi, h_pend_lo, h_pend_mss, h_pend_base, h_core, h_halo, h_line)
+
+f_deletelow(int idx) =>
+    f_deletepool(idx, l_mid, l_top, l_bot, l_start, l_hits, l_last_touch, l_state, l_pend, l_pend_bar, l_pend_hi, l_pend_lo, l_pend_mss, l_pend_base, l_core, l_halo, l_line)
+
+f_resethpend(int i) =>
+    array.set(h_pend, i, 0), array.set(h_pend_bar, i, -1)
+    array.set(h_pend_hi, i, na), array.set(h_pend_lo, i, na)
+    array.set(h_pend_mss, i, na), array.set(h_pend_base, i, 0.0)
+
+f_resetlpend(int i) =>
+    array.set(l_pend, i, 0), array.set(l_pend_bar, i, -1)
+    array.set(l_pend_hi, i, na), array.set(l_pend_lo, i, na)
+    array.set(l_pend_mss, i, na), array.set(l_pend_base, i, 0.0)
+
+f_addpool(float price, int x, float atrref, color pcol, bool ishigh, array<float> mid, array<float> top, array<float> bot, array<int> start, array<int> hits, array<int> lasttouch, array<int> state, array<int> pend, array<int> pendbar, array<float> pendhi, array<float> pendlo, array<float> pendmss, array<float> pendbase, array<box> corearr, array<box> haloarr, array<line> linearr) =>
+    float half = math.max(atrref * poolatr, syminfo.mintick * 5.0)
+    float t = price + half, float b = price - half
+    box core = box.new(x, t, bar_index + plotextendbars, b, bgcolor = color.new(pcol, 88), border_color = color.new(pcol, 62), border_width = 1)
+    box halo = box.new(x, t + half * 0.60, bar_index + plotextendbars, b - half * 0.60, bgcolor = color.new(pcol, 95), border_color = color.new(pcol, 90), border_width = 1)
+    line lvl = line.new(x, price, bar_index + plotextendbars, price, color = color.new(pcol, 0), width = 1, style = line.style_dotted)
+    box.set_text_size(core, size.tiny)
+    box.set_text_halign(core, text.align_left)
+    box.set_text_valign(core, ishigh ? text.align_top : text.align_bottom)
+    array.push(mid, price), array.push(top, t), array.push(bot, b), array.push(start, x)
+    array.push(hits, 1), array.push(lasttouch, x), array.push(state, 0), array.push(pend, 0)
+    array.push(pendbar, -1), array.push(pendhi, na), array.push(pendlo, na), array.push(pendmss, na)
+    array.push(pendbase, 0.0), array.push(corearr, core), array.push(haloarr, halo), array.push(linearr, lvl)
+    while array.size(mid) > 12
+        f_deletepool(0, mid, top, bot, start, hits, lasttouch, state, pend, pendbar, pendhi, pendlo, pendmss, pendbase, corearr, haloarr, linearr)
+
+f_addhigh(float price, int x, float atrref) =>
+    f_addpool(price, x, atrref, #ff5a5f, true, h_mid, h_top, h_bot, h_start, h_hits, h_last_touch, h_state, h_pend, h_pend_bar, h_pend_hi, h_pend_lo, h_pend_mss, h_pend_base, h_core, h_halo, h_line)
+
+f_addlow(float price, int x, float atrref) =>
+    f_addpool(price, x, atrref, #14b8a6, false, l_mid, l_top, l_bot, l_start, l_hits, l_last_touch, l_state, l_pend, l_pend_bar, l_pend_hi, l_pend_lo, l_pend_mss, l_pend_base, l_core, l_halo, l_line)
+
+f_registerpool(float price, int x, float atrref, bool ishigh, color pcol, array<float> mid, array<float> top, array<float> bot, array<int> start, array<int> hits, array<int> lasttouch, array<int> state, array<int> pend, array<int> pendbar, array<float> pendhi, array<float> pendlo, array<float> pendmss, array<float> pendbase, array<box> corearr, array<box> haloarr, array<line> linearr) =>
+    float mergeband = math.max(atrref * mergeatr, syminfo.mintick * 8.0)
+    int nearest = -1
+    float bestdist = 10e10
+    if array.size(mid) > 0
+        for i = 0 to array.size(mid) - 1 by 1
+            if array.get(state, i) < 2
+                float d = math.abs(price - array.get(mid, i))
+                if d <= mergeband and d < bestdist
+                    bestdist := d
+                    nearest := i
+                    nearest
+    if nearest == -1
+        f_addpool(price, x, atrref, pcol, ishigh, mid, top, bot, start, hits, lasttouch, state, pend, pendbar, pendhi, pendlo, pendmss, pendbase, corearr, haloarr, linearr)
+        array.get(linearr, array.size(linearr) - 1)
+    else
+        float oldmid = array.get(mid, nearest)
+        int oldhits = array.get(hits, nearest)
+        int newhits = oldhits + 1
+        float newmid = (oldmid * oldhits + price) / newhits
+        float half = math.max(atrref * poolatr * (1 + math.min(newhits, 8) * 0.05), syminfo.mintick * 5.0)
+        array.set(mid, nearest, newmid), array.set(top, nearest, newmid + half)
+        array.set(bot, nearest, newmid - half), array.set(hits, nearest, newhits)
+        array.set(lasttouch, nearest, x), array.get(linearr, nearest)
+
+f_registerhigh(float price, int x, float atrref) =>
+    f_registerpool(price, x, atrref, true, #ff5a5f, h_mid, h_top, h_bot, h_start, h_hits, h_last_touch, h_state, h_pend, h_pend_bar, h_pend_hi, h_pend_lo, h_pend_mss, h_pend_base, h_core, h_halo, h_line)
+
+f_registerlow(float price, int x, float atrref) =>
+    f_registerpool(price, x, atrref, false, #14b8a6, l_mid, l_top, l_bot, l_start, l_hits, l_last_touch, l_state, l_pend, l_pend_bar, l_pend_hi, l_pend_lo, l_pend_mss, l_pend_base, l_core, l_halo, l_line)
+
+f_drawpool(int start, float mid, float top, float bot, int hits, int state, box core, box halo, line lvl, color sidecol, string tagprefix, array<float> showntop, array<float> shownbot, int boxesshown, float decluttergapabs) =>
+    int outn = boxesshown
+    if state < 2
+        int rightx = bar_index + plotextendbars
+        float halfbase = math.max((top - bot) * 0.5, syminfo.mintick * 5.0)
+        float inflate = 1 + math.min(hits, 7) * 0.05
+        float vistop = mid + halfbase * inflate
+        float visbot = mid - halfbase * inflate
+        color poolcolor = state == 1 ? #f59e0b : sidecol
+        float distatr = atrfast > 0 ? math.abs(mid - close) / atrfast : 0.0
+        bool nearenough = distatr <= maxboxdistanceatr
+        bool keepbyhits = hits >= 5
+        bool overlap = false
+        if array.size(showntop) > 0
+            for k = 0 to array.size(showntop) - 1 by 1
+                float prevtop = array.get(showntop, k)
+                float prevbot = array.get(shownbot, k)
+                float inter = math.min(vistop, prevtop) - math.max(visbot, prevbot)
+                if inter > -decluttergapabs
+                    overlap := true
+                    overlap
+        bool allowbox = showpools and outn < maxvisibleactiveboxes and (nearenough or keepbyhits) and not overlap
+        if allowbox
+            box.set_lefttop(core, start, vistop)
+            box.set_rightbottom(core, rightx, visbot)
+            box.set_bgcolor(core, color.new(poolcolor, f_poolalpha(hits, state)))
+            box.set_border_color(core, color.new(poolcolor, state == 1 ? 24 : 62))
+            box.set_border_width(core, state == 1 ? 2 : 1)
+            line.set_xy1(lvl, start, mid),line.set_xy2(lvl, rightx, mid)
+            line.set_color(lvl, state == 1 ? na : color.new(poolcolor, 0))
+            line.set_style(lvl, state == 1 ? line.style_solid : line.style_dotted)
+            box.set_lefttop(halo, start, vistop + halfbase * 0.60)
+            box.set_rightbottom(halo, rightx, visbot - halfbase * 0.60)
+            box.set_bgcolor(halo, color.new(poolcolor, 95))
+            box.set_border_color(halo, color.new(poolcolor, 90))
+            string tag = tagprefix + str.tostring(hits)
+            tag := tag + (state == 1 ? '  swept' : '')
+            box.set_text(core, tag)
+            box.set_text_color(core, color.new(sidecol, 12))
+            array.push(showntop, vistop),array.push(shownbot, visbot)
+            outn := outn + 1
+            outn
+        else
+            box.set_bgcolor(core, na)
+            box.set_border_color(core, na)
+            box.set_bgcolor(halo, na)
+            box.set_border_color(halo, na)
+            box.set_text(core, '')
+            line.set_xy1(lvl, start, mid)
+            line.set_xy2(lvl, rightx, mid)
+            line.set_style(lvl, line.style_dotted)
+            line.set_color(lvl, showpools and state != 1 ? color.new(poolcolor, 40) : na)
+    else
+        box.set_bgcolor(core, na)
+        box.set_border_color(core, na)
+        box.set_bgcolor(halo, na)
+        box.set_border_color(halo, na)
+        line.set_color(lvl, na)
+        box.set_text(core, '')
+    outn
+
+f_scanside(bool ishigh, array<float> mid, array<int> state) =>
+    int act = 0, int swp = 0
+    float near = na, float neard = na
+    if array.size(mid) > 0
+        for i = 0 to array.size(mid) - 1 by 1
+            int st = array.get(state, i)
+            if st < 2
+                act := act + 1
+                if st == 1
+                    swp := swp + 1
+                float m = array.get(mid, i)
+                float d = ishigh ? m - close : close - m
+                if d > 0 and (na(neard) or d < neard)
+                    neard := d
+                    near := m
+    [act, swp, near, neard]
+
+f_scanchannel(array<float> selltop, array<float> sellbot, array<int> sellstate, array<float> buytop, array<float> buybot, array<int> buystate) =>
+    float selledge = na, float buyedge = na
+    bool insidesell = false, bool insidebuy = false
+    if array.size(selltop) > 0
+        for i = 0 to array.size(selltop) - 1 by 1
+            if array.get(sellstate, i) < 2
+                float st = array.get(selltop, i)
+                float sb = array.get(sellbot, i)
+                if close >= sb and close <= st
+                    insidesell := true
+                if sb > close and (na(selledge) or sb < selledge)
+                    selledge := sb
+    if array.size(buytop) > 0
+        for i = 0 to array.size(buytop) - 1 by 1
+            if array.get(buystate, i) < 2
+                float bt = array.get(buytop, i)
+                float bb = array.get(buybot, i)
+                if close >= bb and close <= bt
+                    insidebuy := true
+                if bt < close and (na(buyedge) or bt > buyedge)
+                    buyedge := bt
+    [selledge, buyedge, insidesell, insidebuy]
+
+ph = ta.pivothigh(swinglen, swinglen)
+pl = ta.pivotlow(swinglen, swinglen)
+
+if not na(ph)
+    int sx = bar_index - swinglen
+    float seed = high[swinglen]
+    float atrref = nz(atrfast[swinglen], atrfast)
+    f_registerhigh(seed, sx, atrref)
+
+if not na(pl)
+    int sx = bar_index - swinglen
+    float seed = low[swinglen]
+    float atrref = nz(atrfast[swinglen], atrfast)
+    f_registerlow(seed, sx, atrref)
+
+mssboslookback = 8
+float decluttergapabs = atrfast * 0.30
+int highboxesshown = 0
+array<float> highshowntop = array.new_float()
+array<float> highshownbot = array.new_float()
+if array.size(h_mid) > 0
+    for i = array.size(h_mid) - 1 to 0 by 1
+        float mid = array.get(h_mid, i)
+        float top = array.get(h_top, i)
+        float bot = array.get(h_bot, i)
+        int start = array.get(h_start, i)
+        int hits = array.get(h_hits, i)
+        int lasttouch = array.get(h_last_touch, i)
+        int state = array.get(h_state, i)
+        box core = array.get(h_core, i)
+        box halo = array.get(h_halo, i)
+        line lvl = array.get(h_line, i)
+        int age = bar_index - start
+        bool outwindow = age > presentwindow
+        
+        if outwindow
+            if hits >= 2 or state > 0
+                f_addtrace(mid, start, bar_index, color.new(#ff5a5f, 60), state == 2, false)
+            f_deletehigh(i)
+        else
+            bool wasswept = state == 1
+            bool active = state < 2
+            if active
+                bool touched = high >= bot and high <= top and close < mid
+                if touched and lasttouch != bar_index
+                    hits := hits + 1
+                    lasttouch := bar_index
+                    array.set(h_hits, i, hits)
+                    array.set(h_last_touch, i, lasttouch)
+                    if hits == 2
+                        f_addtrace(mid, start, bar_index, color.new(#ff5a5f, 62), false, false)
+                float penatr = atrfast > 0 ? math.max(high - top, 0.0) / atrfast : 0.0
+                float reclaimpct = high > low ? (high - close) / (high - low) * 100.0 : 0.0
+                bool bodyok = close < open
+                float bodyabs = math.abs(close - open)
+                float upperwick = high - math.max(open, close)
+                float wickratio = upperwick / math.max(bodyabs, syminfo.mintick)
+                float mssrefcandidate = ta.lowest(low, mssboslookback)[1]
+                float penscore = f_scorepenetration(penatr)
+                float reclaimscore = f_scorereclaim(reclaimpct)
+                float wickscore = f_scorewick(wickratio)
+                float bodyscore = f_scorebodybias(bodyok)
+                float emascore = f_scoreema(-1, close, ema200, atrfast)
+                float lenscore = f_scorelinelength(age)
+                float basepart = scorewpen * penscore + scorewreclaim * reclaimscore + scorewwick * wickscore + scorewbody * bodyscore + scorewema * emascore + scorewlen * lenscore
+                bool sweepraw = high > top and close < mid and penatr > 0 and reclaimpct > 0
+                bool canstartsweep = state == 0 and (not usedisplacementconfirm or array.get(h_pend, i) == 0)
+                
+                if sweepraw and canstartsweep
+                    if usedisplacementconfirm
+                        array.set(h_pend, i, 1),array.set(h_pend_bar, i, bar_index)
+                        array.set(h_pend_hi, i, high),array.set(h_pend_lo, i, low)
+                        array.set(h_pend_mss, i, mssrefcandidate),array.set(h_pend_base, i, basepart)
+                    else
+                        float rangeatrnow = atrfast > 0 ? (high - low) / atrfast : 0.0
+                        float volrationow = not na(volmanow) and volmanow > 0 ? volume / volmanow : na
+                        float mssscorenow = f_scoremss(-1, mssrefcandidate, close, atrfast)
+                        float effortscorenow = f_scoreeffort(rangeatrnow, volrationow)
+                        float finalscore = f_totalscore(basepart, mssscorenow, effortscorenow, 0.0, false)
+                        finalscore := finalscore * f_linelengthpenalty(age)
+                        if not activatescoring or finalscore >= scoremintrigger
+                            state := 1
+                            array.set(h_state, i, state)
+                            sswn := true
+                            sswc := sswc + 1
+                            levt := 'Bear sweep ' + str.tostring(finalscore, '#.0') + ' @ ' + str.tostring(mid, format.mintick)
+                            f_addtrace(mid, start, bar_index, color.new(#f59e0b, 22), false, true)
+                            f_addpulse(-1, high, mid)
+                            if showsweepflags
+                                string tagscore = str.tostring(finalscore, '#.0')
+                                label lb = label.new(bar_index, high, tagscore, style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.small, tooltip = 'Bear Sweep | Final ' + str.tostring(finalscore, '#.1') + '/100 | Trigger ' + str.tostring(scoremintrigger, '#.0') + ' | Core Pen ' + str.tostring(scorewpen, '#.0') + 'x' + str.tostring(penscore, '#.2') + ', Rec ' + str.tostring(scorewreclaim, '#.0') + 'x' + str.tostring(reclaimscore, '#.2') + ', Wick ' + str.tostring(scorewwick, '#.0') + 'x' + str.tostring(wickscore, '#.2') + ', Body ' + str.tostring(scorewbody, '#.0') + 'x' + str.tostring(bodyscore, '#.2') + ', EMA ' + str.tostring(scorewema, '#.0') + 'x' + str.tostring(emascore, '#.2') + ', Len ' + str.tostring(scorewlen, '#.0') + 'x' + str.tostring(lenscore, '#.2') + ' | Context MSS ' + str.tostring(scorewmss, '#.0') + 'x' + str.tostring(mssscorenow, '#.2') + ', Eff ' + str.tostring(scoreweffort, '#.0') + 'x' + str.tostring(effortscorenow, '#.2') + ' | Line age ' + str.tostring(age) + ' bars, penalty x' + str.tostring(f_linelengthpenalty(age), '#.2'))
+                                f_pushflag(lb)
+                
+                if usedisplacementconfirm and state == 0 and array.get(h_pend, i) == 1
+                    int pbar = array.get(h_pend_bar, i)
+                    float phi = array.get(h_pend_hi, i)
+                    float plo = array.get(h_pend_lo, i)
+                    float pmss = array.get(h_pend_mss, i)
+                    float pbase = array.get(h_pend_base, i)
+                    int page = bar_index - pbar
+                    float bodyatrnow = atrfast > 0 ? math.abs(close - open) / atrfast : 0.0
+                    float rangeatrnow = atrfast > 0 ? (high - low) / atrfast : 0.0
+                    float volrationow = not na(volmanow) and volmanow > 0 ? volume / volmanow : na
+                    float mssscorenow = f_scoremss(-1, pmss, close, atrfast)
+                    float effortscorenow = f_scoreeffort(rangeatrnow, volrationow)
+                    float dispscorenow = f_scoredisplacement(-1, plo, close, bodyatrnow, atrfast)
+                    bool invalidpend = close > phi
+                    bool confirmdisp = page >= 1 and page <= displacementwindow and close < plo and bodyatrnow >= displacementbodyatrmin
+                    bool expirepend = page > displacementwindow
+                    
+                    if confirmdisp
+                        float finalscore = f_totalscore(pbase, mssscorenow, effortscorenow, dispscorenow, true)
+                        int sweepage = math.max(pbar - start, 0)
+                        finalscore := finalscore * f_linelengthpenalty(sweepage)
+                        if not activatescoring or finalscore >= scoremintrigger
+                            state := 1
+                            array.set(h_state, i, state)
+                            sswn := true
+                            sswc := sswc + 1
+                            levt := 'Bear confirm ' + str.tostring(finalscore, '#.0') + ' @ ' + str.tostring(mid, format.mintick)
+                            f_addtrace(mid, start, bar_index, color.new(#f59e0b, 22), false, true)
+                            f_addpulse(-1, phi, mid)
+                            if showsweepflags
+                                string tagscore = 'SS ' + str.tostring(finalscore, '#.0')
+                                label lb = label.new(bar_index, high, tagscore, style = label.style_label_down, color = color.new(#f59e0b, 20), textcolor = color.white, size = size.tiny, tooltip = 'Bear Confirm | Final ' + str.tostring(finalscore, '#.1') + '/100 | Trigger ' + str.tostring(scoremintrigger, '#.0') + ' | Base bundle (Pen+Rec+Wick+Body+EMA+Len) ' + str.tostring(pbase, '#.1') + ' | Context MSS ' + str.tostring(scorewmss, '#.0') + 'x' + str.tostring(mssscorenow, '#.2') + ', Eff ' + str.tostring(scoreweffort, '#.0') + 'x' + str.tostring(effortscorenow, '#.2') + ', Disp ' + str.tostring(scorewdisp, '#.0') + 'x' + str.tostring(dispscorenow, '#.2') + ' | Sweep age ' + str.tostring(sweepage) + ' bars, penalty x' + str.tostring(f_linelengthpenalty(sweepage), '#.2'))
+                                f_pushflag(lb)
+                        f_resethpend(i)
+                    else if invalidpend or expirepend
+                        f_resethpend(i)
+
+                bool broken = close > top and close[1] > top
+                bool expired = age > poollife
+                if broken or expired
+                    state := 2
+                    array.set(h_state, i, state)
+                    f_resethpend(i)
+                    box.set_right(core, bar_index)
+                    box.set_right(halo, bar_index)
+                    line.set_x2(lvl, bar_index)
+                    if hits >= 2 or wasswept or broken
+                        color trcol = broken ? color.new(#ff5a5f, 36) : color.new(#ff5a5f, 62)
+                        f_addtrace(mid, start, bar_index, trcol, broken, false)
+                    
+            state := array.get(h_state, i)
+            hits := array.get(h_hits, i)
+            mid := array.get(h_mid, i)
+            top := array.get(h_top, i)
+            bot := array.get(h_bot, i)
+            highboxesshown := f_drawpool(start, mid, top, bot, hits, state, core, halo, lvl, #ff5a5f, 'SELL LP x', highshowntop, highshownbot, highboxesshown, decluttergapabs)
+
+int lowboxesshown = 0
+array<float> lowshowntop = array.new_float()
+array<float> lowshownbot = array.new_float()
+
+if array.size(l_mid) > 0
+    for i = array.size(l_mid) - 1 to 0 by 1
+        float mid = array.get(l_mid, i)
+        float top = array.get(l_top, i)
+        float bot = array.get(l_bot, i)
+        int start = array.get(l_start, i)
+        int hits = array.get(l_hits, i)
+        int lasttouch = array.get(l_last_touch, i)
+        int state = array.get(l_state, i)
+        box core = array.get(l_core, i)
+        box halo = array.get(l_halo, i)
+        line lvl = array.get(l_line, i)
+        int age = bar_index - start
+        bool outwindow = age > presentwindow
+        if outwindow
+            if hits >= 2 or state > 0
+                f_addtrace(mid, start, bar_index, color.new(#14b8a6, 60), state == 2, false)
+            f_deletelow(i)
+        else
+            bool wasswept = state == 1
+            bool active = state < 2
+            if active
+                bool touched = low <= top and low >= bot and close > mid
+                if touched and lasttouch != bar_index
+                    hits := hits + 1
+                    lasttouch := bar_index
+                    array.set(l_hits, i, hits)
+                    array.set(l_last_touch, i, lasttouch)
+                    if hits == 2
+                        f_addtrace(mid, start, bar_index, color.new(#14b8a6, 62), false, false)
+                float penatr = atrfast > 0 ? math.max(bot - low, 0.0) / atrfast : 0.0
+                float reclaimpct = high > low ? (close - low) / (high - low) * 100.0 : 0.0
+                bool bodyok = close > open
+                float bodyabs = math.abs(close - open)
+                float lowerwick = math.min(open, close) - low
+                float wickratio = lowerwick / math.max(bodyabs, syminfo.mintick)
+                float mssrefcandidate = ta.highest(high, mssboslookback)[1]
+                float penscore = f_scorepenetration(penatr)
+                float reclaimscore = f_scorereclaim(reclaimpct)
+                float wickscore = f_scorewick(wickratio)
+                float bodyscore = f_scorebodybias(bodyok)
+                float emascore = f_scoreema(1, close, ema200, atrfast)
+                float lenscore = f_scorelinelength(age)
+                float basepart = scorewpen * penscore + scorewreclaim * reclaimscore + scorewwick * wickscore + scorewbody * bodyscore + scorewema * emascore + scorewlen * lenscore
+                bool sweepraw = low < bot and close > mid and penatr > 0 and reclaimpct > 0
+                bool canstartsweep = state == 0 and (not usedisplacementconfirm or array.get(l_pend, i) == 0)
+                if sweepraw and canstartsweep
+                    if usedisplacementconfirm
+                        array.set(l_pend, i, 1),array.set(l_pend_bar, i, bar_index)
+                        array.set(l_pend_hi, i, high),array.set(l_pend_lo, i, low)
+                        array.set(l_pend_mss, i, mssrefcandidate),array.set(l_pend_base, i, basepart)
+                    else
+                        float rangeatrnow = atrfast > 0 ? (high - low) / atrfast : 0.0
+                        float volrationow = not na(volmanow) and volmanow > 0 ? volume / volmanow : na
+                        float mssscorenow = f_scoremss(1, mssrefcandidate, close, atrfast)
+                        float effortscorenow = f_scoreeffort(rangeatrnow, volrationow)
+                        float finalscore = f_totalscore(basepart, mssscorenow, effortscorenow, 0.0, false)
+                        finalscore := finalscore * f_linelengthpenalty(age)
+                        if not activatescoring or finalscore >= scoremintrigger
+                            state := 1
+                            array.set(l_state, i, state)
+                            bswn := true
+                            bswc := bswc + 1
+                            levt := 'Bull sweep ' + str.tostring(finalscore, '#.0') + ' @ ' + str.tostring(mid, format.mintick)
+                            f_addtrace(mid, start, bar_index, color.new(#f59e0b, 22), false, true)
+                            f_addpulse(1, mid, low)
+                            if showsweepflags
+                                string tagscore = str.tostring(finalscore, '#.0')
+                                label lb = label.new(bar_index, low, tagscore, style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.small, tooltip = 'Bull Sweep | Final ' + str.tostring(finalscore, '#.1') + '/100 | Trigger ' + str.tostring(scoremintrigger, '#.0') + ' | Core Pen ' + str.tostring(scorewpen, '#.0') + 'x' + str.tostring(penscore, '#.2') + ', Rec ' + str.tostring(scorewreclaim, '#.0') + 'x' + str.tostring(reclaimscore, '#.2') + ', Wick ' + str.tostring(scorewwick, '#.0') + 'x' + str.tostring(wickscore, '#.2') + ', Body ' + str.tostring(scorewbody, '#.0') + 'x' + str.tostring(bodyscore, '#.2') + ', EMA ' + str.tostring(scorewema, '#.0') + 'x' + str.tostring(emascore, '#.2') + ', Len ' + str.tostring(scorewlen, '#.0') + 'x' + str.tostring(lenscore, '#.2') + ' | Context MSS ' + str.tostring(scorewmss, '#.0') + 'x' + str.tostring(mssscorenow, '#.2') + ', Eff ' + str.tostring(scoreweffort, '#.0') + 'x' + str.tostring(effortscorenow, '#.2') + ' | Line age ' + str.tostring(age) + ' bars, penalty x' + str.tostring(f_linelengthpenalty(age), '#.2'))
+                                f_pushflag(lb)
+                if usedisplacementconfirm and state == 0 and array.get(l_pend, i) == 1
+                    int pbar = array.get(l_pend_bar, i)
+                    float phi = array.get(l_pend_hi, i)
+                    float plo = array.get(l_pend_lo, i)
+                    float pmss = array.get(l_pend_mss, i)
+                    float pbase = array.get(l_pend_base, i)
+                    int page = bar_index - pbar
+                    float bodyatrnow = atrfast > 0 ? math.abs(close - open) / atrfast : 0.0
+                    float rangeatrnow = atrfast > 0 ? (high - low) / atrfast : 0.0
+                    float volrationow = not na(volmanow) and volmanow > 0 ? volume / volmanow : na
+                    float mssscorenow = f_scoremss(1, pmss, close, atrfast)
+                    float effortscorenow = f_scoreeffort(rangeatrnow, volrationow)
+                    float dispscorenow = f_scoredisplacement(1, phi, close, bodyatrnow, atrfast)
+                    bool invalidpend = close < plo
+                    bool confirmdisp = page >= 1 and page <= displacementwindow and close > phi and bodyatrnow >= displacementbodyatrmin
+                    bool expirepend = page > displacementwindow
+                    if confirmdisp
+                        float finalscore = f_totalscore(pbase, mssscorenow, effortscorenow, dispscorenow, true)
+                        int sweepage = math.max(pbar - start, 0)
+                        finalscore := finalscore * f_linelengthpenalty(sweepage)
+                        if not activatescoring or finalscore >= scoremintrigger
+                            state := 1
+                            array.set(l_state, i, state)
+                            bswn := true
+                            bswc := bswc + 1
+                            levt := 'Bull confirm ' + str.tostring(finalscore, '#.0') + ' @ ' + str.tostring(mid, format.mintick)
+                            f_addtrace(mid, start, bar_index, color.new(#f59e0b, 22), false, true)
+                            f_addpulse(1, mid, plo)
+                            if showsweepflags
+                                string tagscore = 'BS ' + str.tostring(finalscore, '#.0')
+                                label lb = label.new(bar_index, low, tagscore, style = label.style_label_up, color = color.new(#f59e0b, 20), textcolor = color.white, size = size.tiny, tooltip = 'Bull Confirm | Final ' + str.tostring(finalscore, '#.1') + '/100 | Trigger ' + str.tostring(scoremintrigger, '#.0') + ' | Base bundle (Pen+Rec+Wick+Body+EMA+Len) ' + str.tostring(pbase, '#.1') + ' | Context MSS ' + str.tostring(scorewmss, '#.0') + 'x' + str.tostring(mssscorenow, '#.2') + ', Eff ' + str.tostring(scoreweffort, '#.0') + 'x' + str.tostring(effortscorenow, '#.2') + ', Disp ' + str.tostring(scorewdisp, '#.0') + 'x' + str.tostring(dispscorenow, '#.2') + ' | Sweep age ' + str.tostring(sweepage) + ' bars, penalty x' + str.tostring(f_linelengthpenalty(sweepage), '#.2'))
+                                f_pushflag(lb)
+                        f_resetlpend(i)
+                    else if invalidpend or expirepend
+                        f_resetlpend(i)
+                bool broken = close < bot and close[1] < bot
+                bool expired = age > poollife
+                if broken or expired
+                    state := 2
+                    array.set(l_state, i, state)
+                    f_resetlpend(i)
+                    box.set_right(core, bar_index)
+                    box.set_right(halo, bar_index)
+                    line.set_x2(lvl, bar_index)
+                    if hits >= 2 or wasswept or broken
+                        color trcol = broken ? color.new(#14b8a6, 36) : color.new(#14b8a6, 62)
+                        f_addtrace(mid, start, bar_index, trcol, broken, false)
+            state := array.get(l_state, i)
+            hits := array.get(l_hits, i)
+            mid := array.get(l_mid, i)
+            top := array.get(l_top, i)
+            bot := array.get(l_bot, i)
+            lowboxesshown := f_drawpool(start, mid, top, bot, hits, state, core, halo, lvl, #14b8a6, 'BUY LP x', lowshowntop, lowshownbot, lowboxesshown, decluttergapabs)
+
+f_cleanuptraces()
+f_cleanuppulses()
+
+[actsp, swpsp, nearestsell, nselld] = f_scanside(true, h_mid, h_state)
+[actbp, swpbp, nearestbuy, nbuyd] = f_scanside(false, l_mid, l_state)
+[selledge, buyedge, insidesell, insidebuy] = f_scanchannel(h_top, h_bot, h_state, l_top, l_bot, l_state)
+
+sellcompass = plot(showcompasslines ? selledge : na, 'Nearest Sell Pool', color = color.new(#ff5a5f, 30), linewidth = 1, style = plot.style_linebr)
+buycompass = plot(showcompasslines ? buyedge : na, 'Nearest Buy Pool', color = color.new(#14b8a6, 30), linewidth = 1, style = plot.style_linebr)
+fill(sellcompass, buycompass, color = color.new(color.gray, 96), title = 'Liquidity Channel')
+
+float chpct = na
+bool insidezone = insidesell or insidebuy
+if not insidezone and not na(selledge) and not na(buyedge) and selledge > buyedge
+    chpct := f_clamp((close - buyedge) / (selledge - buyedge) * 100.0, 0.0, 100.0)
+    chpct
+
+float pip_size = f_pipsize()
+float nspct = not na(nselld) and close != 0 ? nselld / close * 100.0 : na
+float nbpct = not na(nbuyd) and close != 0 ? nbuyd / close * 100.0 : na
+float nspip = not na(nselld) and pip_size > 0 ? nselld / pip_size : na
+float nbpip = not na(nbuyd) and pip_size > 0 ? nbuyd / pip_size : na
+
+string nsd = ndunit == 'Pips' ? (na(nspip) ? '+n/a' : '+' + str.tostring(nspip, '#.1') + 'pip') : (na(nspct) ? '+n/a' : '+' + str.tostring(nspct, '#.2') + '%')
+string nbd = ndunit == 'Pips' ? (na(nbpip) ? '-n/a' : '-' + str.tostring(nbpip, '#.1') + 'pip') : (na(nbpct) ? '-n/a' : '-' + str.tostring(nbpct, '#.2') + '%')
+string nsinfo = nsd + ' @' + (na(nearestsell) ? 'n/a' : str.tostring(nearestsell, format.mintick))
+string nbinfo = nbd + ' @' + (na(nearestbuy) ? 'n/a' : str.tostring(nearestbuy, format.mintick))
+string chv = insidesell and insidebuy ? 'Inside overlap zone' : insidesell ? 'Inside SELL zone' : insidebuy ? 'Inside BUY zone' : na(chpct) ? 'Outside channel' : str.tostring(chpct, '#.1') + '% inside'
+string chnote = insidesell and insidebuy ? 'Overlapping liquidity: structure compressed.' : insidesell ? 'Premium zone touched: short-side liquidity active.' : insidebuy ? 'Discount zone touched: long-side liquidity active.' : f_chnote(chpct)
+color chvclr = insidesell ? color.new(#ff5a5f, 0) : insidebuy ? color.new(#14b8a6, 0) : na(chpct) ? color.new(color.white, 35) : chpct >= 80 ? color.new(#ff5a5f, 0) : chpct >= 60 ? color.new(#ff5a5f, 20) : chpct <= 20 ? color.new(#14b8a6, 0) : chpct <= 40 ? color.new(#14b8a6, 20) : color.new(#f59e0b, 0)
+
+string spstat = str.tostring(actsp)
+string bpstat = str.tostring(actbp)
+string ssstat = str.tostring(sswc)
+string bsstat = str.tostring(bswc)
+
+lsz = size.small
+var table dash = table.new(position.top_right, 3, 6, bgcolor = color.new(#0f172a, 8), frame_color = color.new(#334155, 20), border_color = color.new(#334155, 20), frame_width = 1, border_width = 1)
+var bool dashmrg = false
+
+if showdash and barstate.islast
+    if not dashmrg
+        table.merge_cells(dash, 0, 4, 0, 5)
+        table.merge_cells(dash, 1, 4, 2, 4)
+        table.merge_cells(dash, 1, 5, 2, 5)
+        dashmrg := true
+    table.cell(dash, 0, 0, 'METRIC', text_color = color.new(color.white, 55), text_size = lsz, bgcolor = color.new(#0b1220, 0), text_halign = text.align_center)
+    table.cell(dash, 1, 0, 'SELL', text_color = color.new(#ff5a5f, 0), text_size = lsz, bgcolor = color.new(#ff5a5f, 90), text_halign = text.align_center)
+    table.cell(dash, 2, 0, 'BUY', text_color = color.new(#14b8a6, 0), text_size = lsz, bgcolor = color.new(#14b8a6, 90), text_halign = text.align_center)
+    table.cell(dash, 0, 1, 'Pools Active', text_color = color.new(color.white, 35), text_size = lsz, bgcolor = color.new(#0b1220, 0))
+    table.cell(dash, 1, 1, spstat, text_color = color.new(#ff5a5f, 0), text_size = lsz, bgcolor = color.new(#ff5a5f, 92), text_halign = text.align_center)
+    table.cell(dash, 2, 1, bpstat, text_color = color.new(#14b8a6, 0), text_size = lsz, bgcolor = color.new(#14b8a6, 92), text_halign = text.align_center)
+    table.cell(dash, 0, 2, 'Nearest', text_color = color.new(color.white, 35), text_size = lsz, bgcolor = color.new(#0b1220, 0))
+    table.cell(dash, 1, 2, nsinfo, text_color = color.new(#ff5a5f, 0), text_size = lsz, bgcolor = color.new(#ff5a5f, 92), text_halign = text.align_center)
+    table.cell(dash, 2, 2, nbinfo, text_color = color.new(#14b8a6, 0), text_size = lsz, bgcolor = color.new(#14b8a6, 92), text_halign = text.align_center)
+    table.cell(dash, 0, 3, 'Sweeps', text_color = color.new(color.white, 35), text_size = lsz, bgcolor = color.new(#0b1220, 0))
+    table.cell(dash, 1, 3, ssstat, text_color = color.new(#ff5a5f, 0), text_size = lsz, bgcolor = color.new(#ff5a5f, 92), text_halign = text.align_center)
+    table.cell(dash, 2, 3, bsstat, text_color = color.new(#14b8a6, 0), text_size = lsz, bgcolor = color.new(#14b8a6, 92), text_halign = text.align_center)
+    table.cell(dash, 0, 4, 'Channel', text_color = color.new(color.white, 35), text_size = lsz, bgcolor = color.new(#0b1220, 0))
+    table.cell(dash, 1, 4, chv, text_color = chvclr, text_size = lsz, bgcolor = color.new(#0b1220, 0), text_halign = text.align_center)
+    table.cell(dash, 1, 5, chnote, text_color = color.new(color.white, 35), text_size = size.tiny, bgcolor = color.new(#0b1220, 0), text_halign = text.align_center)
+else if barstate.islast
+    table.clear(dash, 0, 0, 2, 5)
+
+alertcondition(bswn, 'Bull Sweep', 'Bull sweep detected on {{ticker}} ({{interval}}).')
+alertcondition(sswn, 'Bear Sweep', 'Bear sweep detected on {{ticker}} ({{interval}}).')
+alertcondition(bswn or sswn, 'Any Sweep', 'Sweep detected on {{ticker}} ({{interval}}).')

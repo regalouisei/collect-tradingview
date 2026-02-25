@@ -1,0 +1,103 @@
+//@version=6
+indicator("Relative Volume (Multi-TF, Candle-Matched Colors) + Scaled ATR", overlay=false, precision=4, dynamic_requests=false)
+
+// ——— Inputs
+tf  = input.timeframe("D", "Source timeframe", options=["D","W","M"])
+len = input.int(30, "Lookback bars", minval=1)
+
+// Color behavior
+colorMode  = input.string("Source timeframe", "Color by", options=["Source timeframe","Chart timeframe"])
+
+// Candle colors
+bullCol    = input.color(#26A69A, "Bull candle color")
+bearCol    = input.color(#EF5350, "Bear candle color")
+neutralCol = input.color(color.gray, "Doji/neutral color")
+
+// ——— Data for RVOL (from selected timeframe)
+vol_tf  = request.security(syminfo.tickerid, tf, volume, barmerge.gaps_off, barmerge.lookahead_off)
+avg_tf  = request.security(syminfo.tickerid, tf, ta.sma(volume, len), barmerge.gaps_off, barmerge.lookahead_off)
+rvol_tf = avg_tf > 0 ? vol_tf / avg_tf : na
+
+// ——— Decide which candles to “match” for RVOL colors
+useChart = colorMode == "Chart timeframe"
+
+// ALWAYS request these (no conditional request calls)
+o_tf = request.security(syminfo.tickerid, tf, open,  barmerge.gaps_off, barmerge.lookahead_off)
+c_tf = request.security(syminfo.tickerid, tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Then select series (safe)
+o_col = useChart ? open  : o_tf
+c_col = useChart ? close : c_tf
+
+// ——— Column color = candle direction
+isUp   = c_col > o_col
+isDown = c_col < o_col
+col    = isUp ? bullCol : isDown ? bearCol : neutralCol
+
+// ——— Plot RVOL
+plot(rvol_tf, style=plot.style_columns, color=col, title="RVOL (columns)")
+hline(1.0, "Baseline 1.0")
+hline(1.2, "Early 1.2", color=color.new(color.green, 0))
+hline(1.5, "Valid 1.5", color=color.new(color.green, 0))
+hline(2.0, "Strong 2",  color=color.new(color.yellow, 0))
+hline(3.0, "Power 3",   color=color.new(color.orange, 0))
+hline(5.0, "Climax 5",  color=color.new(color.red, 0))
+
+//==================================================================================================
+// ATR (Scaled so it doesn't crush RVOL visibility)
+//==================================================================================================
+groupATR = "ATR"
+
+// Timeframe for ATR
+atrTfMode = input.string("Same as RVOL", "ATR timeframe",
+     options=["Same as RVOL","Chart timeframe"], group=groupATR)
+atrTf = atrTfMode == "Same as RVOL" ? tf : timeframe.period
+
+atrLen = input.int(14, "ATR Length", minval=1, group=groupATR)
+atrSmoothing = input.string("RMA", "ATR Smoothing", options=["RMA", "SMA", "EMA", "WMA"], group=groupATR)
+
+atrPlotMode = input.string("Relative (ATR / SMA(ATR))", "ATR plot mode",
+     options=["Relative (ATR / SMA(ATR))", "Percent of close (ATR/Close*100)", "Raw (will squash RVOL)"], group=groupATR)
+
+atrNormLen = input.int(50, "Relative ATR baseline length", minval=1, group=groupATR,
+     tooltip="Used only for Relative mode: ATR / SMA(ATR, baseline length).")
+
+atrClampMax = input.float(10.0, "Clamp scaled ATR max", minval=0.0, group=groupATR,
+     tooltip="Caps the *scaled* ATR line so rare spikes don't dominate the pane. Set to 0 to disable clamping.")
+
+atrColor = input.color(color.new(#B71C1C, 0), "ATR Color", group=groupATR)
+atrWidth = input.int(2, "ATR Line Width", minval=1, maxval=5, group=groupATR)
+
+showRawAtrInData = input.bool(true, "Show raw ATR value (Data Window/Status only)", group=groupATR)
+
+// Smoothing helper
+ma_function(source, length) =>
+    switch atrSmoothing
+        "RMA" => ta.rma(source, length)
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        => ta.wma(source, length)
+
+// ATR computed on chosen ATR timeframe
+atrRaw = request.security(syminfo.tickerid, atrTf, ma_function(ta.tr(true), atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+clsTf  = request.security(syminfo.tickerid, atrTf, close,                      barmerge.gaps_off, barmerge.lookahead_off)
+
+// Scaled ATR modes
+atrRelBase = request.security(syminfo.tickerid, atrTf, ta.sma(ma_function(ta.tr(true), atrLen), atrNormLen), barmerge.gaps_off, barmerge.lookahead_off)
+atrRel     = (atrRelBase > 0) ? (atrRaw / atrRelBase) : na
+atrPct     = (clsTf != 0) ? (atrRaw / clsTf) * 100.0 : na
+
+atrScaled =
+     atrPlotMode == "Relative (ATR / SMA(ATR))" ? atrRel :
+     atrPlotMode == "Percent of close (ATR/Close*100)" ? atrPct :
+     atrRaw
+
+// Optional clamp (only for scaled line)
+atrScaledClamped = atrClampMax > 0 ? math.min(atrScaled, atrClampMax) : atrScaled
+
+// Plot scaled ATR line in the pane (won't squash RVOL in Relative/Pct modes)
+plot(atrScaledClamped, title="ATR (scaled for this pane)", color=atrColor, linewidth=atrWidth)
+
+// Plot raw ATR value WITHOUT plotting in the pane (so it shouldn't affect y-scale)
+plot(showRawAtrInData ? atrRaw : na, title="ATR (raw, data only)", color=atrColor,
+     display = showRawAtrInData ? (display.status_line + display.data_window) : display.none)

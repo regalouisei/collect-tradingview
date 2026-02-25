@@ -1,0 +1,176 @@
+//@version=6
+indicator(title="Log Return Price Change Tanh Oscillator", shorttitle="PAO Norm", overlay=false, precision=2)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+velocityLen = input.int(8, "Velocity EMA Length", minval=1, group="Core Settings")
+accelSmoothLen = input.int(5, "Acceleration Smooth Length", minval=1, group="Core Settings")
+finalSmoothLen = input.int(3, "Final Smooth Length", minval=1, group="Core Settings")
+returnBars = input.int(14, "Return Bars", minval=1, group="Core Settings")
+
+normLookback = input.int(80, "Normalization Lookback", minval=20, group="Normalization")
+tanhScale = input.float(2.2, "Tanh Scale", minval=0.1, step=0.1, group="Normalization", tooltip="Lower = more aggressive saturation, Higher = smoother response")
+velocityWeight = input.float(0.65, "Velocity Weight", minval=0.0, maxval=1.0, step=0.05, group="Normalization")
+accelWeight = input.float(0.35, "Acceleration Weight", minval=0.0, maxval=1.0, step=0.05, group="Normalization")
+deadZone = input.float(7.0, "Dead Zone (0-30)", minval=0.0, maxval=30.0, step=0.5, group="Normalization", tooltip="Suppress tiny values around zero for cleaner visual behavior")
+
+showBackground = input.bool(true, "Show Background Color", group="Display")
+showSignalLine = input.bool(true, "Show Signal Line", group="Display")
+showHistogram = input.bool(true, "Show Histogram", group="Display")
+signalLen = input.int(9, "Signal EMA Length", minval=1, group="Display")
+showStatsTable = input.bool(true, "Show Stats Table", group="Display")
+tablePositionInput = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Display")
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+tanh_custom(x) =>
+    // Clamp to avoid overflow in exp() for extreme values.
+    xSafe = clamp(x, -20.0, 20.0)
+    expPos = math.exp(xSafe)
+    expNeg = math.exp(-xSafe)
+    (expPos - expNeg) / (expPos + expNeg)
+
+// ============================================================================
+// CORE CALCULATION: PRICE CHANGE SPEED-UP / SLOW-DOWN
+// ============================================================================
+// 1) N-bar log return in percent (scale-invariant for price level changes).
+ret = close[returnBars] > 0 ? 100.0 * math.log(close / close[returnBars]) : 0.0
+
+// 2) Velocity: smoothed return.
+velocity = ta.ema(ret, velocityLen)
+
+// 3) Acceleration: change in velocity, then smoothed.
+accRaw = velocity - velocity[1]
+acc = ta.ema(accRaw, accelSmoothLen)
+
+// ============================================================================
+// NORMALIZATION
+// ============================================================================
+sigmaVel = ta.stdev(velocity, normLookback)
+sigmaAcc = ta.stdev(acc, normLookback)
+zVel = sigmaVel > 0 ? velocity / sigmaVel : 0.0
+zAcc = sigmaAcc > 0 ? acc / sigmaAcc : 0.0
+
+weightSum = math.max(velocityWeight + accelWeight, 0.0001)
+blend = (zVel * velocityWeight + zAcc * accelWeight) / weightSum
+oscRaw = 100.0 * tanh_custom(blend / tanhScale)
+oscSmoothed = ta.ema(oscRaw, finalSmoothLen)
+osc = math.abs(oscSmoothed) < deadZone ? 0.0 : oscSmoothed
+
+// Optional signal line for crossings.
+signal = ta.ema(osc, signalLen)
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+oscColor = osc >= 0 ? color.new(color.lime, 0) : color.new(color.red, 0)
+histColor = osc >= signal ? color.new(color.lime, 60) : color.new(color.red, 60)
+plot(showHistogram ? (osc - signal) : na, "Histogram", style=plot.style_columns, color=histColor)
+plot(osc, "Acceleration Oscillator", color=oscColor, linewidth=2)
+plot(showSignalLine ? signal : na, "Signal", color=color.new(color.orange, 0), linewidth=1)
+
+hline(0, "Zero", color=color.gray, linestyle=hline.style_solid, linewidth=2)
+hline(25, "Early Acceleration", color=color.new(color.green, 80), linestyle=hline.style_dotted)
+hline(-25, "Early Deceleration", color=color.new(color.red, 80), linestyle=hline.style_dotted)
+hline(50, "Strong Up Acceleration", color=color.new(color.green, 70), linestyle=hline.style_dashed)
+hline(-50, "Strong Down Acceleration", color=color.new(color.red, 70), linestyle=hline.style_dashed)
+hline(80, "Extreme Up", color=color.new(color.green, 60), linestyle=hline.style_dotted)
+hline(-80, "Extreme Down", color=color.new(color.red, 60), linestyle=hline.style_dotted)
+
+bg = showBackground ? (osc > 50 ? color.new(color.green, 94) : osc > 0 ? color.new(color.green, 97) : osc > -50 ? color.new(color.red, 97) : color.new(color.red, 94)) : na
+bgcolor(bg, title="Background")
+
+// ============================================================================
+// STATS TABLE
+// ============================================================================
+tablePosition = switch tablePositionInput
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+
+var table statsTable = table.new(
+     tablePosition, 3, 8,
+     bgcolor=color.new(color.black, 88),
+     frame_color=color.new(color.silver, 70),
+     frame_width=1,
+     border_color=color.new(color.silver, 82),
+     border_width=1)
+
+stateText = osc >= 0 ? "Bullish" : "Bearish"
+strengthText = math.abs(osc) >= 80 ? "Extreme" : math.abs(osc) >= 50 ? "Strong" : math.abs(osc) >= 25 ? "Moderate" : "Weak"
+spread = osc - signal
+
+dirColor = osc >= 0 ? color.lime : color.red
+spreadColor = spread >= 0 ? color.lime : color.red
+absOsc = math.abs(osc)
+
+headerBg = osc >= signal ? color.new(color.green, 70) : color.new(color.red, 70)
+subHeaderBg = color.new(color.rgb(30, 35, 45), 20)
+cellLabelBg = color.new(color.rgb(42, 49, 64), 18)
+baseValueBg = color.new(color.rgb(16, 20, 27), 8)
+oscValueBg = absOsc >= 80 ? color.new(dirColor, 65) : absOsc >= 50 ? color.new(dirColor, 74) : absOsc >= 25 ? color.new(dirColor, 82) : color.new(dirColor, 90)
+spreadValueBg = color.new(spreadColor, 78)
+stateValueBg = color.new(dirColor, 76)
+textCol = color.white
+mutedCol = color.new(color.white, 15)
+
+spreadText = spread >= 0 ? "+" + str.tostring(spread, "#.00") : str.tostring(spread, "#.00")
+signalState = osc >= signal ? "Momentum Up" : "Momentum Down"
+intensityText = absOsc >= 80 ? "Very High" : absOsc >= 50 ? "High" : absOsc >= 25 ? "Medium" : "Low"
+meterText = absOsc >= 80 ? "#####"
+     : absOsc >= 60 ? "####-"
+     : absOsc >= 40 ? "###--"
+     : absOsc >= 20 ? "##---"
+     : "#----"
+
+if barstate.isfirst
+    table.merge_cells(statsTable, 0, 0, 2, 0)
+    table.merge_cells(statsTable, 0, 1, 2, 1)
+
+if barstate.islast and showStatsTable
+    table.clear(statsTable, 0, 0, 2, 7)
+    table.cell(statsTable, 0, 0, "PAO Live Dashboard", text_color=textCol, bgcolor=headerBg, text_size=size.small, text_halign=text.align_center)
+    table.cell(statsTable, 0, 1, stateText + "  |  " + signalState, text_color=textCol, bgcolor=subHeaderBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 2, "Metric", text_color=mutedCol, bgcolor=cellLabelBg, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(statsTable, 1, 2, "Value", text_color=mutedCol, bgcolor=cellLabelBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 2, "Level", text_color=mutedCol, bgcolor=cellLabelBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 3, "Strength", text_color=textCol, bgcolor=cellLabelBg, text_size=size.tiny)
+    table.cell(statsTable, 1, 3, strengthText, text_color=textCol, bgcolor=oscValueBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 3, intensityText, text_color=textCol, bgcolor=oscValueBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 4, "Osc", text_color=textCol, bgcolor=cellLabelBg, text_size=size.tiny)
+    table.cell(statsTable, 1, 4, str.tostring(osc, "#.00"), text_color=textCol, bgcolor=oscValueBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 4, meterText, text_color=textCol, bgcolor=oscValueBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 5, "Signal", text_color=textCol, bgcolor=cellLabelBg, text_size=size.tiny)
+    table.cell(statsTable, 1, 5, str.tostring(signal, "#.00"), text_color=textCol, bgcolor=baseValueBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 5, "EMA(" + str.tostring(signalLen) + ")", text_color=mutedCol, bgcolor=baseValueBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 6, "Spread", text_color=textCol, bgcolor=cellLabelBg, text_size=size.tiny)
+    table.cell(statsTable, 1, 6, spreadText, text_color=textCol, bgcolor=spreadValueBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 6, spread >= 0 ? "Positive" : "Negative", text_color=textCol, bgcolor=spreadValueBg, text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(statsTable, 0, 7, "Ret Bars", text_color=textCol, bgcolor=cellLabelBg, text_size=size.tiny)
+    table.cell(statsTable, 1, 7, str.tostring(returnBars), text_color=textCol, bgcolor=baseValueBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(statsTable, 2, 7, "Log Return", text_color=mutedCol, bgcolor=baseValueBg, text_size=size.tiny, text_halign=text.align_center)
+
+if barstate.islast and not showStatsTable
+    table.clear(statsTable, 0, 0, 2, 7)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(ta.crossover(osc, 0), "Bullish Acceleration", "PAO crossed above 0: acceleration turning bullish")
+alertcondition(ta.crossunder(osc, 0), "Bearish Acceleration", "PAO crossed below 0: acceleration turning bearish")
+alertcondition(ta.crossover(osc, 50), "Strong Up Acceleration", "PAO crossed above 50")
+alertcondition(ta.crossunder(osc, -50), "Strong Down Acceleration", "PAO crossed below -50")
+alertcondition(ta.crossover(osc, signal), "Osc Crossed Above Signal", "PAO crossed above Signal line")
+alertcondition(ta.crossunder(osc, signal), "Osc Crossed Below Signal", "PAO crossed below Signal line")

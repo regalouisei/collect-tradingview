@@ -1,0 +1,1694 @@
+//© BK Gann — Monster Flow v4.0 SPRING (Enhanced Edition)
+// All original logic preserved + 7 major enhancement modules
+// v4.0.1 FIX: Signal frequency restored to match v3.4 baseline
+// v4.1.0: Institutional Real-Time Hover Tooltips on ALL labels
+// Enhancements: Conviction Scoring, Decorrelated Components, MTF Confluence,
+//               Exit Signals, Adaptive Weighting, CVD Integration, ML Backtesting Engine
+//@version=6
+indicator("BK AK-REAPER-Drone", shorttitle="🕹️", overlay=false, explicit_plot_zorder=true, max_labels_count=500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ CORE SETTINGS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+mode       = input.string("Net", "Display Mode", options=["Compare","Net"], group="Core")
+showHist   = input.bool(true, "Show Histogram", group="Core")
+showLine   = input.bool(true, "Show Net Line", group="Core")
+
+sumLen     = input.int(25, "Summation Period", minval=1, group="Core")
+rsiLen     = input.int(14, "RSI Period (NVI/PVI core)", minval=1, group="Core")
+longLen    = input.int(255, "Long EMA (NVI/PVI detrend)", minval=10, group="Core")
+
+normLen    = input.int(200, "Normalization Length (z-score)", minval=20, group="Normalization")
+zSoftCap   = input.float(2.5, "Z Soft-Cap (tanh squash)", minval=0.5, step=0.1, group="Normalization")
+ratioCap   = input.float(10.0, "Ratio Hard-Cap", minval=1.0, step=0.5, group="Normalization")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ 1M INTRABAR ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+useLTF     = input.bool(true, "Use 1m Intrabar Volume Engine", group="1m Intrabar Engine")
+ltf        = input.timeframe("1", "Lower Timeframe", group="1m Intrabar Engine")
+ltMethod   = input.string("CLV", "1m Direction Method", options=["Tick","Candle","CLV"], group="1m Intrabar Engine")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ COMPONENT WEIGHTS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+wCore      = input.float(1.50, "Weight: NVI/PVI Core", minval=0, step=0.1, group="Weights")
+wLTF       = input.float(1.25, "Weight: 1m Intrabar Flow", minval=0, step=0.1, group="Weights")
+wCMF       = input.float(0.75, "Weight: CMF", minval=0, step=0.1, group="Weights")
+wOBV       = input.float(0.75, "Weight: OBV Impulse", minval=0, step=0.1, group="Weights")
+wVWAP      = input.float(0.75, "Weight: VWAP Deviation", minval=0, step=0.1, group="Weights")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 1: CONVICTION SCORING ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableConviction  = input.bool(true, "Enable Conviction Scoring", group="Conviction Scoring", tooltip="Grades every signal 0–100 based on component agreement, penetration depth, reversal speed, and divergence presence. Arrow color/size reflects grade. Does NOT suppress signals by default — set minimum score > 0 to filter.")
+convMinScore      = input.int(0, "Minimum Score to Display Signal", minval=0, maxval=100, step=5, group="Conviction Scoring", tooltip="Signals below this threshold are suppressed entirely. Default 0 = show ALL signals (just grade them). Set to 30-50 to filter weak ones.")
+convCompWeight    = input.float(30.0, "Score Weight: Component Agreement (%)", minval=0, maxval=100, step=5, group="Conviction Scoring")
+convDepthWeight   = input.float(30.0, "Score Weight: Penetration Depth (%)", minval=0, maxval=100, step=5, group="Conviction Scoring")
+convSpeedWeight   = input.float(25.0, "Score Weight: Reversal Speed (%)", minval=0, maxval=100, step=5, group="Conviction Scoring")
+convDivWeight     = input.float(15.0, "Score Weight: Divergence Presence (%)", minval=0, maxval=100, step=5, group="Conviction Scoring")
+convColorMode     = input.string("Threshold Tiers", "Arrow Color Mode", options=["Gradient","Threshold Tiers","Original"], group="Conviction Scoring", tooltip="Gradient = smooth color by score. Threshold Tiers = A/B/C/D grading with distinct colors. Original = use base signal colors.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 3: DECORRELATED COMPONENTS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableDecorr      = input.bool(true, "Enable Decorrelated Components", group="Decorrelated Components", tooltip="Adds genuinely independent data sources to reduce correlation between flow components. OFF by default — enable when you want to add breadth/IV/spread data.")
+
+enableBreadth     = input.bool(true, "Use Breadth Component", group="Decorrelated Components", tooltip="Advancing vs declining volume on an index — truly independent of single-ticker price×volume.")
+breadthAdvSym     = input.symbol("USI:UVOLQ", "Advancing Volume Symbol", group="Decorrelated Components")
+breadthDecSym     = input.symbol("USI:DVOLQ", "Declining Volume Symbol", group="Decorrelated Components")
+wBreadth          = input.float(0.80, "Weight: Breadth", minval=0, step=0.1, group="Decorrelated Components")
+
+enableIVProxy     = input.bool(true, "Use IV Skew Proxy", group="Decorrelated Components", tooltip="Uses VIX or equivalent as a fear/greed proxy — inversely related to flow for confirmation.")
+ivProxySym        = input.symbol("CBOE:VIX", "Volatility Index Symbol", group="Decorrelated Components")
+ivProxyLen        = input.int(20, "IV Proxy SMA Length", minval=5, group="Decorrelated Components")
+wIVProxy          = input.float(0.60, "Weight: IV Proxy", minval=0, step=0.1, group="Decorrelated Components")
+
+enableSpreadProxy = input.bool(true, "Use Spread Proxy (HL Range)", group="Decorrelated Components", tooltip="High-Low range relative to ATR as a microstructure liquidity proxy.")
+spreadProxyLen    = input.int(14, "Spread Proxy ATR Length", minval=5, group="Decorrelated Components")
+wSpreadProxy      = input.float(0.50, "Weight: Spread Proxy", minval=0, step=0.1, group="Decorrelated Components")
+
+enableAutodecorr  = input.bool(true, "Auto-Reduce Weight When Correlated", group="Decorrelated Components", tooltip="When rolling correlation between CMF/OBV/LTF is high, automatically reduces their combined weight. OFF by default — only needed when you suspect echo-chamber effects.")
+corrLookback      = input.int(50, "Correlation Lookback", minval=10, group="Decorrelated Components")
+corrThresh        = input.float(0.7, "High-Correlation Threshold", minval=0.3, maxval=0.95, step=0.05, group="Decorrelated Components")
+corrPenalty        = input.float(0.5, "Weight Multiplier When Correlated", minval=0.1, maxval=1.0, step=0.1, group="Decorrelated Components")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 4: MULTI-TIMEFRAME CONFLUENCE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableMTF         = input.bool(true, "Enable MTF Confluence", group="MTF Confluence", tooltip="Computes Monster Flow net signal on higher timeframes for confluence.")
+mtfTF1            = input.timeframe("60", "HTF 1", group="MTF Confluence")
+mtfTF2            = input.timeframe("240", "HTF 2", group="MTF Confluence")
+mtfTF3            = input.timeframe("D", "HTF 3", group="MTF Confluence")
+mtfUseTF1         = input.bool(true, "Use HTF 1", group="MTF Confluence")
+mtfUseTF2         = input.bool(true, "Use HTF 2", group="MTF Confluence")
+mtfUseTF3         = input.bool(false, "Use HTF 3", group="MTF Confluence")
+mtfMode           = input.string("Grade", "MTF Mode", options=["Gate","Grade","Dashboard Only"], group="MTF Confluence", tooltip="Gate = block counter-trend signals. Grade = allow but label. Dashboard Only = display only.")
+mtfGateThresh     = input.float(0.0, "MTF Gate Threshold", minval=-1.0, maxval=1.0, step=0.1, group="MTF Confluence")
+showMTFDash       = input.bool(true, "Show MTF Dashboard Panel", group="MTF Confluence")
+mtfDashPos        = input.string("Top Right", "Dashboard Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group="MTF Confluence")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 5: EXIT SIGNAL ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableExits       = input.bool(true, "Enable Exit Signals", group="Exit Signals", tooltip="Generates explicit sell/cover signals — completes the trading system.")
+exitMode          = input.string("Zero Cross", "Primary Exit Method", options=["Flow Reversal","Zero Cross","Opposite Extreme","Trailing Stop","Composite"], group="Exit Signals", tooltip="Composite = any enabled sub-method triggers exit. Individual modes only use that one method.")
+exitFlowReverse   = input.bool(false, "Exit on Flow Reversal", group="Exit Signals", tooltip="Exit long when net signal turns negative, short when positive. Can be aggressive — OFF by default.")
+exitZeroCross     = input.bool(false, "Exit on Zero Cross", group="Exit Signals", tooltip="Exit when net signal crosses zero line. Moderate aggressiveness.")
+exitOpposite      = input.bool(false, "Exit at Opposite Extreme", group="Exit Signals", tooltip="Exit when signal reaches the opposite threshold boundary. This is a profit-target style exit.")
+exitTrailingATR   = input.bool(false, "Use ATR Trailing Stop", group="Exit Signals")
+exitATRMult       = input.float(2.5, "ATR Trailing Multiplier", minval=0.5, step=0.5, group="Exit Signals")
+exitATRLen        = input.int(14, "ATR Period for Exits", minval=5, group="Exit Signals")
+exitTimeBars      = input.int(0, "Time Stop (bars, 0=off)", minval=0, group="Exit Signals", tooltip="Force exit after N bars. 0 = disabled.")
+exitIcon          = input.string("✕", "Exit Icon", options=["✕","◼","●","⊘","X"], group="Exit Signals")
+exitLongCol       = input.color(#ff0014, "Exit Long Color", group="Exit Signals")
+exitShortCol      = input.color(#37ff0c, "Exit Short Color", group="Exit Signals")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 6: ADAPTIVE COMPONENT WEIGHTING ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableAdaptive    = input.bool(true, "Enable Adaptive Weighting", group="Adaptive Weights", tooltip="Tracks which components predicted price direction correctly and adjusts weights dynamically. OFF by default — enable after observing baseline behavior.")
+adaptDecay        = input.float(0.95, "Accuracy Decay Factor", minval=0.80, maxval=0.99, step=0.01, group="Adaptive Weights")
+adaptLookback     = input.int(100, "Adaptive Lookback (bars)", minval=20, group="Adaptive Weights")
+adaptMinWeight    = input.float(0.20, "Minimum Component Weight", minval=0.0, maxval=1.0, step=0.1, group="Adaptive Weights")
+adaptMaxWeight    = input.float(3.0, "Maximum Component Weight", minval=1.0, maxval=5.0, step=0.5, group="Adaptive Weights")
+showAdaptWeights  = input.bool(true, "Show Adaptive Weights in Dashboard", group="Adaptive Weights")
+
+enableDynVolWt    = input.bool(true, "Dynamic Volume Weighting", group="Adaptive Weights", tooltip="When relative volume is high, boost intrabar weight and reduce lagging components. OFF by default — can dampen signal amplitude if left on.")
+dynVolLen         = input.int(50, "Relative Volume Lookback", minval=10, group="Adaptive Weights")
+dynVolMult        = input.float(2.0, "RelVol Threshold for Boost", minval=1.0, step=0.25, group="Adaptive Weights", tooltip="Default 2.0x = only activates on genuinely anomalous volume.")
+dynVolBoost       = input.float(1.5, "Intrabar Boost Multiplier", minval=1.0, step=0.25, group="Adaptive Weights")
+dynVolReduce      = input.float(0.75, "Lagging Component Reduction", minval=0.1, maxval=1.0, step=0.1, group="Adaptive Weights", tooltip="How much to reduce NVI/PVI and OBV during high-vol events. 0.75 = mild, 0.5 = aggressive.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 7: CVD INTEGRATION ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableCVD         = input.bool(true, "Enable CVD Component", group="CVD Integration", tooltip="Cumulative Volume Delta as a 6th component. Uses a conservative weight so it enhances without overwhelming the original 5-component signal.")
+wCVD              = input.float(0.50, "Weight: CVD", minval=0, step=0.1, group="CVD Integration", tooltip="Default 0.50 — half the weight of NVI/PVI Core. Enough to contribute without diluting the original signal.")
+cvdEmaLen         = input.int(20, "CVD EMA Smoothing", minval=5, group="CVD Integration")
+cvdDivergence     = input.bool(true, "Show CVD Divergence", group="CVD Integration", tooltip="Price makes new high but CVD doesn't — extremely powerful reversal signal.")
+cvdDivIcon        = input.string("Δ", "CVD Div Icon", options=["Δ","⚡","◆","★"], group="CVD Integration")
+cvdDivCol         = input.color(#FF6600, "CVD Divergence Color", group="CVD Integration")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ML BACKTESTING ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableML          = input.bool(true, "Enable ML Backtesting Engine", group="ML Engine", tooltip="Tracks signal outcomes and dynamically adjusts threshold based on recent performance. OFF by default.")
+mlLookback        = input.int(200, "ML Lookback Window", minval=50, group="ML Engine")
+mlOutcomeBars     = input.int(20, "Outcome Measurement (bars ahead)", minval=5, group="ML Engine")
+mlTargetR         = input.float(1.5, "Target R-Multiple", minval=0.5, step=0.5, group="ML Engine")
+mlAdaptThreshold  = input.bool(false, "Auto-Adapt Threshold", group="ML Engine")
+mlAdaptWeights    = input.bool(true, "Auto-Adapt Weights", group="ML Engine")
+mlMinSamples      = input.int(10, "Min Samples Before Adapting", minval=5, group="ML Engine")
+showMLStats       = input.bool(false, "Show ML Stats Panel", group="ML Engine")
+mlStatsPos        = input.string("Bottom Right", "ML Panel Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group="ML Engine")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ THRESHOLD SETTINGS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+netSmoothL = input.int(5, "Net Smoothing EMA", minval=1, group="Threshold")
+useAutoThr = input.bool(true, "Auto Threshold", group="Threshold")
+thrManual  = input.float(0.70, "Manual Threshold", minval=0.10, maxval=0.99, step=0.05, group="Threshold")
+autoLen    = input.int(300, "AutoThr Lookback", minval=50, group="Threshold")
+autoK      = input.float(1.2, "AutoThr Mult", minval=0.1, step=0.1, group="Threshold")
+thrMin     = input.float(0.30, "AutoThr Min", minval=0.05, maxval=0.95, step=0.05, group="Threshold")
+thrMax     = input.float(0.95, "AutoThr Max", minval=0.10, maxval=0.99, step=0.01, group="Threshold")
+
+thrDisplay = input.string("Bands", "Threshold Display", options=["Off","Lines","Bands"], group="Threshold")
+thrCol     = input.color(color.gray, "Threshold Color", group="Threshold")
+thrTransp  = input.int(29, "Threshold Transparency", minval=0, maxval=90, group="Threshold")
+thrFillTr  = input.int(92, "Band Fill Transparency", minval=0, maxval=95, group="Threshold")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ SPRING SIGNAL SETTINGS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+showSignals   = input.bool(true, "Show Signals", group="Spring Signals")
+maxLinger     = input.int(3, "Max Linger Bars (Spring Window)", minval=1, maxval=10, group="Spring Signals", tooltip="If flow stays in extreme zone longer than this, it's NOT a spring — it's real pressure.")
+minCompAgree  = input.int(2, "Min Components Confirming", minval=1, maxval=5, group="Spring Signals", tooltip="How many of the ORIGINAL 5 components must confirm. CVD is counted separately as a bonus, not a requirement.")
+cooldown      = input.int(8, "Min Bars Between Signals", minval=0, group="Spring Signals")
+confirmBar    = input.bool(true, "Confirm On Bar Close", group="Spring Signals")
+
+zoneTrackMode   = input.string("Realtime (Legacy)", "Zone Count Mode", options=["Confirmed Bars (Recommended)","Realtime (Legacy)"], group="Spring Signals")
+freezeBoundary  = input.bool(false, "Freeze Threshold On Zone Entry", group="Spring Signals")
+reclaimFilter   = input.string("Off", "Price Reclaim Filter", options=["Off","EMA Fast","VWAP","EMA Fast or VWAP","EMA Fast and VWAP"], group="Spring Signals")
+compConfirmMode = input.string("Velocity", "Component Confirm Mode", options=["Velocity","Velocity+Polarity","Impulse","Impulse+Polarity"], group="Spring Signals")
+impulseLen      = input.int(50, "Impulse StDev Len", minval=5, group="Spring Signals")
+impulseK        = input.float(1.0, "Impulse Mult", minval=0.1, step=0.1, group="Spring Signals")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ TRAPS (Prolonged Extremes) ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableTraps   = input.bool(true, "Enable Trap Logic", group="Traps")
+trapDisplay   = input.string("Markers+Shade", "Trap Display", options=["Off","Markers","Shade Only","Markers+Shade"], group="Traps")
+trapShadeMode = input.string("During Trap Zone", "Shade Mode", options=["During Trap Zone","Post Trap Cooldown","Both"], group="Traps")
+trapBlockMode = input.string("Off", "Trap Blocking", options=["Off","Block Entries"], group="Traps")
+trapBlockBars = input.int(12, "Block Bars After Trap", minval=1, group="Traps")
+
+trapBearIcon  = input.string("☠", "Bear Trap Icon", options=["⛔","☠","▼","✖","T"], group="Trap Visuals")
+trapBullIcon  = input.string("⚡", "Bull Trap Icon", options=["⛔","⚡","⚠","▲","✖","T"], group="Trap Visuals")
+trapBearCol   = input.color(#FF00E5, "Bear Trap Color", group="Trap Visuals")
+trapBullCol   = input.color(#00F5FF, "Bull Trap Color", group="Trap Visuals")
+trapTransp    = input.int(0, "Trap Icon Transparency", minval=0, maxval=90, group="Trap Visuals")
+trapShadeTr   = input.int(90, "Trap Shade Transparency", minval=0, maxval=100, group="Trap Visuals")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ SIGNAL VISUALS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+sigColLong   = input.color(#00FF00, "Long Signal Color", group="Signal Visuals")
+sigColShort  = input.color(#FF0000, "Short Signal Color", group="Signal Visuals")
+sigTr        = input.int(0, "Signal Transparency", minval=0, maxval=90, group="Signal Visuals")
+sigSizeOpt   = input.string("Small", "Signal Size", options=["Tiny","Small","Normal","Large"], group="Signal Visuals")
+sigIconLong  = input.string("▲", "Long Icon", options=["▲","⚡","◆","★","✦","△","⬆","L"], group="Signal Visuals")
+sigIconShort = input.string("▼", "Short Icon", options=["▼","☠","◆","★","✦","▽","⬇","S"], group="Signal Visuals")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ TREND SETTINGS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+trendMode  = input.string("Off", "Trend Mode", options=["Off","Gate","Extremes"], group="Trend")
+emaFastL   = input.int(21, "EMA Fast", minval=1, group="Trend")
+emaSlowL   = input.int(55, "EMA Slow", minval=2, group="Trend")
+extremeDeepMult = input.float(1.2, "Extremes Deep Mult", minval=1.0, step=0.05, group="Trend")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ NEON LINE (4-Quadrant) ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+lineWidth  = input.int(2, "Net Line Width", minval=1, maxval=4, group="Neon Line")
+lineMinTr  = input.int(0, "Line Min Transparency", minval=0, maxval=90, group="Neon Line")
+lineMaxTr  = input.int(25, "Line Max Transparency", minval=0, maxval=90, group="Neon Line")
+
+c_pos_rise = input.color(#00F5FF, "Pos + Rising (Cyan)", group="Neon Line")
+c_pos_fall = input.color(#FFF700, "Pos + Falling (Yellow)", group="Neon Line")
+c_neg_fall = input.color(#FF00E5, "Neg + Falling (Magenta)", group="Neon Line")
+c_neg_rise = input.color(#FF5A00, "Neg + Rising (Orange)", group="Neon Line")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ CANDLE COLORING ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+colorCandles   = input.bool(false, "Color Candles", group="Candle Colors")
+minBodyTransp  = input.int(0, "Min Transparency", minval=0, maxval=90, group="Candle Colors")
+maxBodyTransp  = input.int(55, "Max Transparency", minval=0, maxval=90, group="Candle Colors")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ HISTOGRAM ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+upCol      = input.color(#00ffbb, "Histogram Up", group="Histogram")
+dnCol      = input.color(#ff1100, "Histogram Down", group="Histogram")
+histTransp = input.int(65, "Histogram Transparency", minval=0, maxval=90, group="Histogram")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ DIVERGENCES ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+showDiv       = input.bool(true, "Show Divergence Icons", group="Divergences")
+divFilter     = input.string("Off", "Divergence Filter", options=["Off","Extremes Only"], group="Divergences")
+divPivLen     = input.int(5, "Divergence Pivot Len", minval=2, group="Divergences")
+bullIcon      = input.string("⚡", "Bull Div Icon", options=["⚡","▲","⤴","◆","★","✦"], group="Divergences")
+bearIcon      = input.string("☠", "Bear Div Icon", options=["☠","▼","⤵","◆","★","✦"], group="Divergences")
+iconSizeOpt   = input.string("Normal", "Div Icon Size", options=["Tiny","Small","Normal"], group="Divergences")
+showBullDiv   = input.bool(true, "Show Bull Div", group="Divergences")
+showBearDiv   = input.bool(true, "Show Bear Div", group="Divergences")
+bullDivCol    = input.color(#00F5FF, "Bull Div Color", group="Divergences")
+bearDivCol    = input.color(#FF00E5, "Bear Div Color", group="Divergences")
+divTransp     = input.int(0, "Divergence Transparency", minval=0, maxval=90, group="Divergences")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ GANN WINDOWS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+showGann       = input.bool(true, "Show Gann Time Windows", group="Gann")
+gannPiv        = input.int(8, "Gann Pivot Length", minval=2, group="Gann")
+gannAnchorMode = input.string("Last Pivot High/Low", "Gann Anchor Mode", options=["Last Entry Signal","Last Pivot High/Low","Last Swing High Only","Last Swing Low Only"], group="Gann")
+showGannZero   = input.bool(true, "Show 0-Start Marker", group="Gann")
+gannZeroIcon   = input.string("✦", "0-Start Icon", options=["⌖","•","⦿","◉","✦","★"], group="Gann")
+gannTextCol    = input.color(#00F5FF, "Gann Text Color", group="Gann Label")
+gannTextTransp = input.int(55, "Gann Text Transparency", minval=0, maxval=95, group="Gann Label")
+gannBgTransp   = input.int(100, "Gann Background Transparency", minval=0, maxval=100, group="Gann Label")
+gannYOffset    = input.float(0.00, "Gann Y Offset", step=0.01, group="Gann Label")
+gannSizeOpt    = input.string("Normal", "Gann Label Size", options=["Tiny","Small","Normal"], group="Gann Label")
+
+g7   = input.bool(false, "7", inline="g1", group="Gann Windows")
+g14  = input.bool(true,  "14", inline="g1", group="Gann Windows")
+g21  = input.bool(true,  "21", inline="g1", group="Gann Windows")
+g28  = input.bool(false, "28", inline="g1", group="Gann Windows")
+g30  = input.bool(false, "30", inline="g2", group="Gann Windows")
+g45  = input.bool(false, "45", inline="g2", group="Gann Windows")
+g60  = input.bool(false, "60", inline="g2", group="Gann Windows")
+g72  = input.bool(false, "72", inline="g2", group="Gann Windows")
+g90  = input.bool(false, "90", inline="g3", group="Gann Windows")
+g120 = input.bool(false, "120", inline="g3", group="Gann Windows")
+g144 = input.bool(false, "144", inline="g3", group="Gann Windows")
+g180 = input.bool(false, "180", inline="g3", group="Gann Windows")
+g252 = input.bool(false, "252", inline="g4", group="Gann Windows")
+g360 = input.bool(false, "360", inline="g4", group="Gann Windows")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ DASHBOARD CONTROL ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+showCompDash   = input.bool(true, "Show Component Dashboard", group="Dashboard", tooltip="Real-time table showing all component values, weights, and directions.")
+compDashPos    = input.string("Top Left", "Dashboard Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group="Dashboard")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ TOOLTIP CONTROL ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+enableTooltips    = input.bool(true, "Enable Institutional Tooltips", group="Tooltips", tooltip="Hover over any label for real-time institutional intelligence: component breakdown, strategy notes, risk context, and trade management guidance.")
+ttShowComponents  = input.bool(true, "Show Component Breakdown", group="Tooltips")
+ttShowStrategy    = input.bool(true, "Show Strategy Notes", group="Tooltips")
+ttShowRisk        = input.bool(true, "Show Risk Context", group="Tooltips")
+ttShowEducation   = input.bool(true, "Show Educational Notes", group="Tooltips")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ LABEL CONTROL ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+useLabelLimiter = input.bool(true, "Use Label Limiter", group="Label Control")
+maxKeepLabels   = input.int(250, "Max Labels Kept", minval=50, maxval=500, group="Label Control")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ HELPERS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+eps = 1e-6
+
+f_safe_div(float n, float d) => math.abs(d) < eps ? 0.0 : n / d
+f_cap(float x, float cap) => math.min(math.max(x, -cap), cap)
+
+f_z(float src, int len) =>
+    m = ta.sma(src, len)
+    s = ta.stdev(src, len)
+    s == 0.0 ? 0.0 : (src - m) / s
+
+f_tanh(float x) =>
+    xx = f_cap(x, 10.0)
+    e2 = math.exp(2.0 * xx)
+    (e2 - 1.0) / (e2 + 1.0)
+
+f_unit(float z, float softCap) => f_tanh(z / softCap)
+
+f_hit_gann(int b) =>
+    result = (g7 and b == 7) or (g14 and b == 14) or (g21 and b == 21) or (g28 and b == 28)
+    result := result or (g30 and b == 30) or (g45 and b == 45) or (g60 and b == 60) or (g72 and b == 72)
+    result := result or (g90 and b == 90) or (g120 and b == 120) or (g144 and b == 144) or (g180 and b == 180)
+    result := result or (g252 and b == 252) or (g360 and b == 360)
+    result
+
+f_size(string s) => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
+
+iconSize = f_size(iconSizeOpt)
+gannSize = f_size(gannSizeOpt)
+sigSize  = f_size(sigSizeOpt)
+
+// Label limiter
+var label[] _lbls = array.new_label()
+f_keep_label(label l) =>
+    if useLabelLimiter and not na(l)
+        array.push(_lbls, l)
+        if array.size(_lbls) > maxKeepLabels
+            label.delete(array.shift(_lbls))
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ TOOLTIP HELPER FUNCTIONS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+f_r2(float v) => str.tostring(math.round(v * 100) / 100)
+f_r1(float v) => str.tostring(math.round(v * 10) / 10)
+f_r0(float v) => str.tostring(math.round(v))
+f_pct(float v) => str.tostring(math.round(v)) + "%"
+f_dir(float v) => v > 0 ? "▲" : v < 0 ? "▼" : "—"
+f_bias(float v) => v > 0.3 ? "STRONG BULL" : v > 0.1 ? "BULL" : v > -0.1 ? "NEUTRAL" : v > -0.3 ? "BEAR" : "STRONG BEAR"
+
+f_grade(float score) =>
+    score >= 80 ? "A" : score >= 60 ? "B" : score >= 40 ? "C" : "D"
+
+f_grade_desc(float score) =>
+    score >= 80 ? "HIGH CONVICTION — Institutional quality setup" :
+     score >= 60 ? "GOOD — Solid setup with minor gaps" :
+     score >= 40 ? "MODERATE — Proceed with reduced size" :
+     "WEAK — Consider passing or using minimum size"
+
+f_spring_quality(int bars, int maxB) =>
+    bars == 1 ? "SNAP (1-bar) — Fastest reversal = strongest spring" :
+     bars == 2 ? "QUICK (2-bar) — Very fast, high quality" :
+     bars <= maxB ? "NORMAL (" + str.tostring(bars) + "-bar) — Within spring window" :
+     "EXTENDED — Past spring window = TRAP territory"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ COMPONENT CALCULATIONS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 1) Core: NVI vs PVI (Institutional)
+dumbDev  = ta.pvi - ta.ema(ta.pvi, longLen)
+smartDev = ta.nvi - ta.ema(ta.nvi, longLen)
+drsi = ta.rsi(dumbDev, rsiLen)
+srsi = ta.rsi(smartDev, rsiLen)
+r_buy  = f_cap(f_safe_div(srsi, drsi), ratioCap)
+r_sell = f_cap(f_safe_div(100.0 - srsi, 100.0 - drsi), ratioCap)
+buySum  = math.sum(r_buy, sumLen)
+sellSum = math.sum(r_sell, sumLen)
+coreU   = f_unit(f_z(buySum - sellSum, normLen), zSoftCap)
+
+// 2) LTF Intrabar Flow
+ltfIsLower = timeframe.in_seconds(ltf) < timeframe.in_seconds(timeframe.period)
+float ltfFlow = na
+if useLTF and ltfIsLower
+    signedExpr = ltMethod == "Tick" ? math.sign(ta.change(close)) * volume : ltMethod == "Candle" ? (close > open ? volume : close < open ? -volume : 0.0) : ((high != low ? ((2.0 * close - high - low) / (high - low)) : 0.0) * volume)
+    [arrSigned, arrVol] = request.security_lower_tf(syminfo.tickerid, ltf, [signedExpr, volume])
+    totVol = array.sum(arrVol)
+    ltfFlow := totVol > 0.0 ? array.sum(arrSigned) / totVol : na
+
+upV = close > open ? volume : 0.0
+dnV = close < open ? volume : 0.0
+flowFallback = (upV - dnV) / math.max(ta.sma(volume, sumLen), eps)
+flowUsed = (useLTF and ltfIsLower and not na(ltfFlow)) ? ltfFlow : flowFallback
+ltfU = f_unit(f_z(flowUsed, normLen), zSoftCap)
+
+// 3) CMF
+mfm  = high != low ? ((2.0 * close - high - low) / (high - low)) : 0.0
+mfv  = mfm * volume
+cmfRaw = math.sum(mfv, sumLen) / math.max(math.sum(volume, sumLen), eps)
+cmfU = f_unit(f_z(cmfRaw, normLen), zSoftCap)
+
+// 4) OBV Impulse
+obvImp = ta.ema(math.sign(ta.change(close)) * volume, sumLen)
+obvU   = f_unit(f_z(obvImp, normLen), zSoftCap)
+
+// 5) VWAP Deviation
+vwapVal = ta.vwap(hlc3)
+vwapRef = not na(vwapVal) ? vwapVal : ta.sma(hlc3, sumLen)
+atr     = ta.atr(14)
+vwapDev = (close - vwapRef) / math.max(atr, eps)
+vwapU   = f_unit(f_z(vwapDev, normLen), zSoftCap)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 7: CVD COMPONENT ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float cvdCumulative = 0.0
+float cvdBar = na
+
+if enableCVD
+    float deltaTick = na
+    if useLTF and ltfIsLower
+        signedExpr2 = ltMethod == "Tick" ? math.sign(ta.change(close)) * volume : ltMethod == "Candle" ? (close > open ? volume : close < open ? -volume : 0.0) : ((high != low ? ((2.0 * close - high - low) / (high - low)) : 0.0) * volume)
+        [arrSigned2, _arrVol2] = request.security_lower_tf(syminfo.tickerid, ltf, [signedExpr2, volume])
+        deltaTick := array.sum(arrSigned2)
+    
+    if na(deltaTick)
+        deltaTick := (close > open ? 1.0 : close < open ? -1.0 : 0.0) * volume
+    
+    cvdCumulative += deltaTick
+    cvdBar := deltaTick
+
+float cvdEma = enableCVD ? ta.ema(cvdCumulative, cvdEmaLen) : na
+float cvdDetrended = enableCVD ? cvdCumulative - cvdEma : na
+float cvdU = enableCVD ? f_unit(f_z(nz(cvdDetrended), normLen), zSoftCap) : 0.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 3: DECORRELATED COMPONENTS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float breadthU = 0.0
+float ivProxyU = 0.0
+float spreadProxyU = 0.0
+
+if enableDecorr
+    if enableBreadth
+        advVol = request.security(breadthAdvSym, timeframe.period, close)
+        decVol = request.security(breadthDecSym, timeframe.period, close)
+        breadthRatio = f_safe_div(nz(advVol) - nz(decVol), nz(advVol) + nz(decVol))
+        breadthU := f_unit(f_z(breadthRatio, normLen), zSoftCap)
+
+    if enableIVProxy
+        ivRaw = request.security(ivProxySym, timeframe.period, close)
+        ivSma = ta.sma(nz(ivRaw), ivProxyLen)
+        ivDev = nz(ivRaw) - ivSma
+        ivProxyU := -f_unit(f_z(ivDev, normLen), zSoftCap)
+
+    if enableSpreadProxy
+        hlRange = high - low
+        atrRef = ta.atr(spreadProxyLen)
+        spreadRatio = f_safe_div(hlRange, math.max(atrRef, eps))
+        spreadProxyU := f_unit(f_z(1.0 - spreadRatio, normLen), zSoftCap)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 3B: AUTO-DECORRELATION ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float corrPenaltyMult = 1.0
+
+if enableDecorr and enableAutodecorr
+    corrCmfObv = ta.correlation(cmfU, obvU, corrLookback)
+    corrCmfLtf = ta.correlation(cmfU, ltfU, corrLookback)
+    corrObvLtf = ta.correlation(obvU, ltfU, corrLookback)
+    
+    avgCorr = (math.abs(nz(corrCmfObv)) + math.abs(nz(corrCmfLtf)) + math.abs(nz(corrObvLtf))) / 3.0
+    corrPenaltyMult := avgCorr > corrThresh ? corrPenalty : 1.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 6: ADAPTIVE + DYNAMIC VOLUME WEIGHTING ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float accCore = 0.5
+var float accLTF  = 0.5
+var float accCMF  = 0.5
+var float accOBV  = 0.5
+var float accVWAP = 0.5
+var float accCVD  = 0.5
+
+float futureReturn = ta.change(close, 5)
+bool evalBar = bar_index > adaptLookback
+
+if enableAdaptive and evalBar
+    float correctCore = (coreU[5] > 0 and futureReturn > 0) or (coreU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0
+    float correctLTF  = (ltfU[5] > 0 and futureReturn > 0) or (ltfU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0
+    float correctCMF  = (cmfU[5] > 0 and futureReturn > 0) or (cmfU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0
+    float correctOBV  = (obvU[5] > 0 and futureReturn > 0) or (obvU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0
+    float correctVWAP = (vwapU[5] > 0 and futureReturn > 0) or (vwapU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0
+    float correctCVD  = enableCVD ? ((cvdU[5] > 0 and futureReturn > 0) or (cvdU[5] < 0 and futureReturn < 0) ? 1.0 : 0.0) : 0.5
+
+    accCore := accCore * adaptDecay + correctCore * (1.0 - adaptDecay)
+    accLTF  := accLTF  * adaptDecay + correctLTF  * (1.0 - adaptDecay)
+    accCMF  := accCMF  * adaptDecay + correctCMF  * (1.0 - adaptDecay)
+    accOBV  := accOBV  * adaptDecay + correctOBV  * (1.0 - adaptDecay)
+    accVWAP := accVWAP * adaptDecay + correctVWAP * (1.0 - adaptDecay)
+    accCVD  := accCVD  * adaptDecay + correctCVD  * (1.0 - adaptDecay)
+
+float awCore = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wCore * (accCore / 0.5))) : wCore
+float awLTF  = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wLTF  * (accLTF  / 0.5))) : wLTF
+float awCMF  = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wCMF  * (accCMF  / 0.5))) : wCMF
+float awOBV  = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wOBV  * (accOBV  / 0.5))) : wOBV
+float awVWAP = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wVWAP * (accVWAP / 0.5))) : wVWAP
+float awCVD  = enableAdaptive ? math.max(adaptMinWeight, math.min(adaptMaxWeight, wCVD  * (accCVD  / 0.5))) : wCVD
+
+float relVol = volume / math.max(ta.sma(volume, dynVolLen), eps)
+bool isHighVol = enableDynVolWt and relVol > dynVolMult
+
+if isHighVol
+    awLTF  := awLTF * dynVolBoost
+    awCore := awCore * dynVolReduce
+    awOBV  := awOBV * dynVolReduce
+
+if enableDecorr and enableAutodecorr
+    awCMF := awCMF * corrPenaltyMult
+    awOBV := awOBV * corrPenaltyMult
+    awLTF := awLTF * corrPenaltyMult
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ COMPOSITE NET ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float baseW = awCore + awLTF + awCMF + awOBV + awVWAP
+float baseComp = awCore*coreU + awLTF*ltfU + awCMF*cmfU + awOBV*obvU + awVWAP*vwapU
+float baseNet = baseComp / math.max(baseW, eps)
+
+float totalW = baseW
+float netRaw = baseNet
+
+if enableCVD
+    float cvdFraction = awCVD / math.max(baseW + awCVD, eps)
+    netRaw := baseNet * (1.0 - cvdFraction) + cvdU * cvdFraction
+    totalW := baseW + awCVD
+
+if enableDecorr
+    float decorW = 0.0
+    float decorComp = 0.0
+    if enableBreadth
+        decorW += wBreadth
+        decorComp += wBreadth * breadthU
+    if enableIVProxy
+        decorW += wIVProxy
+        decorComp += wIVProxy * ivProxyU
+    if enableSpreadProxy
+        decorW += wSpreadProxy
+        decorComp += wSpreadProxy * spreadProxyU
+    
+    if decorW > 0
+        float decorFraction = decorW / math.max(totalW + decorW, eps)
+        netRaw := netRaw * (1.0 - decorFraction) + (decorComp / decorW) * decorFraction
+        totalW += decorW
+
+wSum   = math.max(totalW, eps)
+netSig = ta.ema(netRaw, netSmoothL)
+
+// Dynamic threshold
+absN   = math.abs(netSig)
+mAbs   = ta.sma(absN, autoLen)
+sAbs   = ta.stdev(absN, autoLen)
+thrDyn = math.min(thrMax, math.max(thrMin, mAbs + autoK * sAbs))
+float thrUse = useAutoThr ? thrDyn : thrManual
+
+// Trend
+emaFast  = ta.ema(close, emaFastL)
+emaSlow  = ta.ema(close, emaSlowL)
+bullBias = emaFast > emaSlow
+bearBias = emaFast < emaSlow
+
+// Slope
+slope = netSig - nz(netSig[1])
+ok = confirmBar ? barstate.isconfirmed : true
+
+// Component velocities
+coreVel = ta.change(coreU)
+ltfVel  = ta.change(ltfU)
+cmfVel  = ta.change(cmfU)
+obvVel  = ta.change(obvU)
+vwapVel = ta.change(vwapU)
+cvdVel  = enableCVD ? ta.change(cvdU) : 0.0
+
+// Component confirmation logic
+f_impThr(float u) => ta.stdev(ta.change(u), impulseLen) * impulseK
+
+coreBullOk = compConfirmMode == "Velocity" ? (coreVel > 0) : compConfirmMode == "Velocity+Polarity" ? (coreVel > 0 and coreU < 0) : compConfirmMode == "Impulse" ? (coreVel > f_impThr(coreU)) : (coreVel > f_impThr(coreU) and coreU < 0)
+ltfBullOk  = compConfirmMode == "Velocity" ? (ltfVel > 0)  : compConfirmMode == "Velocity+Polarity" ? (ltfVel > 0 and ltfU < 0)   : compConfirmMode == "Impulse" ? (ltfVel > f_impThr(ltfU))   : (ltfVel > f_impThr(ltfU) and ltfU < 0)
+cmfBullOk  = compConfirmMode == "Velocity" ? (cmfVel > 0)  : compConfirmMode == "Velocity+Polarity" ? (cmfVel > 0 and cmfU < 0)   : compConfirmMode == "Impulse" ? (cmfVel > f_impThr(cmfU))   : (cmfVel > f_impThr(cmfU) and cmfU < 0)
+obvBullOk  = compConfirmMode == "Velocity" ? (obvVel > 0)  : compConfirmMode == "Velocity+Polarity" ? (obvVel > 0 and obvU < 0)   : compConfirmMode == "Impulse" ? (obvVel > f_impThr(obvU))   : (obvVel > f_impThr(obvU) and obvU < 0)
+vwapBullOk = compConfirmMode == "Velocity" ? (vwapVel > 0) : compConfirmMode == "Velocity+Polarity" ? (vwapVel > 0 and vwapU < 0) : compConfirmMode == "Impulse" ? (vwapVel > f_impThr(vwapU)) : (vwapVel > f_impThr(vwapU) and vwapU < 0)
+
+coreBearOk = compConfirmMode == "Velocity" ? (coreVel < 0) : compConfirmMode == "Velocity+Polarity" ? (coreVel < 0 and coreU > 0) : compConfirmMode == "Impulse" ? (coreVel < -f_impThr(coreU)) : (coreVel < -f_impThr(coreU) and coreU > 0)
+ltfBearOk  = compConfirmMode == "Velocity" ? (ltfVel < 0)  : compConfirmMode == "Velocity+Polarity" ? (ltfVel < 0 and ltfU > 0)   : compConfirmMode == "Impulse" ? (ltfVel < -f_impThr(ltfU))   : (ltfVel < -f_impThr(ltfU) and ltfU > 0)
+cmfBearOk  = compConfirmMode == "Velocity" ? (cmfVel < 0)  : compConfirmMode == "Velocity+Polarity" ? (cmfVel < 0 and cmfU > 0)   : compConfirmMode == "Impulse" ? (cmfVel < -f_impThr(cmfU))   : (cmfVel < -f_impThr(cmfU) and cmfU > 0)
+obvBearOk  = compConfirmMode == "Velocity" ? (obvVel < 0)  : compConfirmMode == "Velocity+Polarity" ? (obvVel < 0 and obvU > 0)   : compConfirmMode == "Impulse" ? (obvVel < -f_impThr(obvU))   : (obvVel < -f_impThr(obvU) and obvU > 0)
+vwapBearOk = compConfirmMode == "Velocity" ? (vwapVel < 0) : compConfirmMode == "Velocity+Polarity" ? (vwapVel < 0 and vwapU > 0) : compConfirmMode == "Impulse" ? (vwapVel < -f_impThr(vwapU)) : (vwapVel < -f_impThr(vwapU) and vwapU > 0)
+
+bullCompCount = (coreBullOk ? 1 : 0) + (ltfBullOk ? 1 : 0) + (cmfBullOk ? 1 : 0) + (obvBullOk ? 1 : 0) + (vwapBullOk ? 1 : 0)
+bearCompCount = (coreBearOk ? 1 : 0) + (ltfBearOk ? 1 : 0) + (cmfBearOk ? 1 : 0) + (obvBearOk ? 1 : 0) + (vwapBearOk ? 1 : 0)
+
+cvdBullOk = enableCVD ? (cvdVel > 0) : false
+cvdBearOk = enableCVD ? (cvdVel < 0) : false
+
+int totalCompCount = enableCVD ? 6 : 5
+int bullCompTotal = bullCompCount + (cvdBullOk ? 1 : 0)
+int bearCompTotal = bearCompCount + (cvdBearOk ? 1 : 0)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ SPRING SIGNAL ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int barsInBearZone = 0
+var int barsInBullZone = 0
+var int lastBearZoneBars = 0
+var int lastBullZoneBars = 0
+
+var bool wasInBearZone = false
+var bool wasInBullZone = false
+
+var float bearBoundary = na
+var float bullBoundary = na
+var float bearMinNet = na
+var float bullMaxNet = na
+
+var float lastBearBoundary = na
+var float lastBullBoundary = na
+var float lastBearMinNet = na
+var float lastBullMaxNet = na
+
+bool inBearZone = false
+bool inBullZone = false
+bool justExitedBear = false
+bool justExitedBull = false
+
+zoneUpdateOK = zoneTrackMode == "Confirmed Bars (Recommended)" ? barstate.isconfirmed : true
+
+if zoneUpdateOK
+    float thrBearUse = (freezeBoundary and wasInBearZone and not na(bearBoundary)) ? bearBoundary : thrUse
+    float thrBullUse = (freezeBoundary and wasInBullZone and not na(bullBoundary)) ? bullBoundary : thrUse
+
+    inBearZone := netSig < -thrBearUse
+    inBullZone := netSig >  thrBullUse
+
+    justExitedBear := (not inBearZone) and wasInBearZone
+    justExitedBull := (not inBullZone) and wasInBullZone
+
+    if inBearZone and not wasInBearZone
+        bearBoundary := thrUse
+        bearMinNet := netSig
+        barsInBearZone := 0
+
+    if inBullZone and not wasInBullZone
+        bullBoundary := thrUse
+        bullMaxNet := netSig
+        barsInBullZone := 0
+
+    if inBearZone
+        barsInBearZone += 1
+        bearMinNet := na(bearMinNet) ? netSig : math.min(bearMinNet, netSig)
+    else
+        if justExitedBear
+            lastBearZoneBars := barsInBearZone
+            lastBearBoundary := bearBoundary
+            lastBearMinNet := bearMinNet
+        barsInBearZone := 0
+        bearBoundary := na
+        bearMinNet := na
+
+    if inBullZone
+        barsInBullZone += 1
+        bullMaxNet := na(bullMaxNet) ? netSig : math.max(bullMaxNet, netSig)
+    else
+        if justExitedBull
+            lastBullZoneBars := barsInBullZone
+            lastBullBoundary := bullBoundary
+            lastBullMaxNet := bullMaxNet
+        barsInBullZone := 0
+        bullBoundary := na
+        bullMaxNet := na
+
+    wasInBearZone := inBearZone
+    wasInBullZone := inBullZone
+else
+    inBearZone := wasInBearZone
+    inBullZone := wasInBullZone
+    justExitedBear := false
+    justExitedBull := false
+
+wasSpringValley = justExitedBear and lastBearZoneBars <= maxLinger and lastBearZoneBars > 0
+wasSpringPeak   = justExitedBull and lastBullZoneBars <= maxLinger and lastBullZoneBars > 0
+
+wasTrapValley = justExitedBear and lastBearZoneBars > maxLinger
+wasTrapPeak   = justExitedBull and lastBullZoneBars > maxLinger
+
+// Cooldown
+var int lastSigBar = na
+canSig = cooldown == 0 ? true : (na(lastSigBar) or (bar_index - lastSigBar >= cooldown))
+
+// Trap blocking windows
+var int blockLongUntil = na
+var int blockShortUntil = na
+
+if enableTraps and zoneUpdateOK
+    if wasTrapValley
+        blockLongUntil := bar_index + trapBlockBars
+    if wasTrapPeak
+        blockShortUntil := bar_index + trapBlockBars
+
+trapBlockLong = enableTraps and trapBlockMode == "Block Entries" and not na(blockLongUntil) and bar_index < blockLongUntil
+trapBlockShort = enableTraps and trapBlockMode == "Block Entries" and not na(blockShortUntil) and bar_index < blockShortUntil
+
+compOkLong = bullCompCount >= minCompAgree
+compOkShort = bearCompCount >= minCompAgree
+
+deepValley = not na(lastBearBoundary) and not na(lastBearMinNet) ? (lastBearMinNet < -lastBearBoundary * extremeDeepMult) : false
+deepPeak   = not na(lastBullBoundary) and not na(lastBullMaxNet) ? (lastBullMaxNet >  lastBullBoundary * extremeDeepMult) : false
+
+allowLong  = trendMode == "Off" ? true : trendMode == "Gate" ? bullBias : trendMode == "Extremes" ? (bullBias or deepValley) : true
+allowShort = trendMode == "Off" ? true : trendMode == "Gate" ? bearBias : trendMode == "Extremes" ? (bearBias or deepPeak) : true
+
+reclaimLong = true
+reclaimShort = true
+
+if reclaimFilter != "Off"
+    emaL = close > emaFast
+    emaS = close < emaFast
+    vwpL = close > vwapRef
+    vwpS = close < vwapRef
+    reclaimLong  := reclaimFilter == "EMA Fast" ? emaL : reclaimFilter == "VWAP" ? vwpL : reclaimFilter == "EMA Fast or VWAP" ? (emaL or vwpL) : reclaimFilter == "EMA Fast and VWAP" ? (emaL and vwpL) : true
+    reclaimShort := reclaimFilter == "EMA Fast" ? emaS : reclaimFilter == "VWAP" ? vwpS : reclaimFilter == "EMA Fast or VWAP" ? (emaS or vwpS) : reclaimFilter == "EMA Fast and VWAP" ? (emaS and vwpS) : true
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 4: MTF CONFLUENCE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_htf_net() =>
+    _dumbDev  = ta.pvi - ta.ema(ta.pvi, longLen)
+    _smartDev = ta.nvi - ta.ema(ta.nvi, longLen)
+    _drsi = ta.rsi(_dumbDev, rsiLen)
+    _srsi = ta.rsi(_smartDev, rsiLen)
+    _r_buy  = f_cap(f_safe_div(_srsi, _drsi), ratioCap)
+    _r_sell = f_cap(f_safe_div(100.0 - _srsi, 100.0 - _drsi), ratioCap)
+    _buySum  = math.sum(_r_buy, sumLen)
+    _sellSum = math.sum(_r_sell, sumLen)
+    _coreU   = f_unit(f_z(_buySum - _sellSum, normLen), zSoftCap)
+    
+    _mfm  = high != low ? ((2.0 * close - high - low) / (high - low)) : 0.0
+    _mfv  = _mfm * volume
+    _cmfRaw = math.sum(_mfv, sumLen) / math.max(math.sum(volume, sumLen), eps)
+    _cmfU = f_unit(f_z(_cmfRaw, normLen), zSoftCap)
+    
+    _net = (_coreU + _cmfU) / 2.0
+    ta.ema(_net, netSmoothL)
+
+float htf1Net = na
+float htf2Net = na
+float htf3Net = na
+
+if enableMTF
+    if mtfUseTF1
+        htf1Net := request.security(syminfo.tickerid, mtfTF1, f_htf_net(), barmerge.gaps_off, barmerge.lookahead_off)
+    if mtfUseTF2
+        htf2Net := request.security(syminfo.tickerid, mtfTF2, f_htf_net(), barmerge.gaps_off, barmerge.lookahead_off)
+    if mtfUseTF3
+        htf3Net := request.security(syminfo.tickerid, mtfTF3, f_htf_net(), barmerge.gaps_off, barmerge.lookahead_off)
+
+float htfAvg = na
+int htfCount = 0
+float htfSum = 0.0
+
+if enableMTF
+    if mtfUseTF1 and not na(htf1Net)
+        htfSum += htf1Net
+        htfCount += 1
+    if mtfUseTF2 and not na(htf2Net)
+        htfSum += htf2Net
+        htfCount += 1
+    if mtfUseTF3 and not na(htf3Net)
+        htfSum += htf3Net
+        htfCount += 1
+    htfAvg := htfCount > 0 ? htfSum / htfCount : na
+
+bool mtfAllowLong = true
+bool mtfAllowShort = true
+bool mtfWithTrend = true
+
+if enableMTF and mtfMode != "Dashboard Only" and not na(htfAvg)
+    if mtfMode == "Gate"
+        mtfAllowLong  := htfAvg > mtfGateThresh
+        mtfAllowShort := htfAvg < -mtfGateThresh
+    if mtfMode == "Grade"
+        mtfWithTrend := (wasSpringValley and htfAvg > 0) or (wasSpringPeak and htfAvg < 0)
+        mtfAllowLong  := true
+        mtfAllowShort := true
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENTRY SIGNALS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+enterLong  = showSignals and ok and canSig and wasSpringValley and slope > 0 and compOkLong and allowLong and reclaimLong and not trapBlockLong and mtfAllowLong
+enterShort = showSignals and ok and canSig and wasSpringPeak   and slope < 0 and compOkShort and allowShort and reclaimShort and not trapBlockShort and mtfAllowShort
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 1: CONVICTION SCORING ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int lastBullDivBar = na
+var int lastBearDivBar = na
+
+float convictionLong  = 50.0
+float convictionShort = 50.0
+
+// Store sub-scores for tooltips
+float convCompScoreL = 0.0
+float convDepthScoreL = 0.0
+float convSpeedScoreL = 0.0
+float convDivScoreL = 0.0
+float convCompScoreS = 0.0
+float convDepthScoreS = 0.0
+float convSpeedScoreS = 0.0
+float convDivScoreS = 0.0
+
+if enableConviction
+    float compScoreLong  = (bullCompTotal / math.max(totalCompCount, 1)) * 100.0
+    float compScoreShort = (bearCompTotal / math.max(totalCompCount, 1)) * 100.0
+    
+    float depthLong  = 0.0
+    float depthShort = 0.0
+    if wasSpringValley and not na(lastBearMinNet) and not na(lastBearBoundary) and lastBearBoundary > 0
+        float penetration = math.abs(lastBearMinNet) - lastBearBoundary
+        depthLong := math.max(0.0, math.min(100.0, penetration / lastBearBoundary * 200.0))
+    if wasSpringPeak and not na(lastBullMaxNet) and not na(lastBullBoundary) and lastBullBoundary > 0
+        float penetration = lastBullMaxNet - lastBullBoundary
+        depthShort := math.max(0.0, math.min(100.0, penetration / lastBullBoundary * 200.0))
+    
+    float speedLong  = wasSpringValley ? math.max(0.0, (1.0 - (lastBearZoneBars - 1.0) / math.max(maxLinger - 1.0, 1.0)) * 100.0) : 50.0
+    float speedShort = wasSpringPeak   ? math.max(0.0, (1.0 - (lastBullZoneBars - 1.0) / math.max(maxLinger - 1.0, 1.0)) * 100.0) : 50.0
+    
+    float divScoreLong  = (not na(lastBullDivBar) and bar_index - lastBullDivBar <= 10) ? 100.0 : 0.0
+    float divScoreShort = (not na(lastBearDivBar) and bar_index - lastBearDivBar <= 10) ? 100.0 : 0.0
+    
+    // Store sub-scores for tooltip access
+    convCompScoreL := compScoreLong
+    convDepthScoreL := depthLong
+    convSpeedScoreL := speedLong
+    convDivScoreL := divScoreLong
+    convCompScoreS := compScoreShort
+    convDepthScoreS := depthShort
+    convSpeedScoreS := speedShort
+    convDivScoreS := divScoreShort
+    
+    float wTotal = convCompWeight + convDepthWeight + convSpeedWeight + convDivWeight
+    convictionLong  := wTotal > 0 ? (convCompWeight * compScoreLong + convDepthWeight * depthLong + convSpeedWeight * speedLong + convDivWeight * divScoreLong) / wTotal : 50.0
+    convictionShort := wTotal > 0 ? (convCompWeight * compScoreShort + convDepthWeight * depthShort + convSpeedWeight * speedShort + convDivWeight * divScoreShort) / wTotal : 50.0
+
+if enableConviction and convMinScore > 0
+    if enterLong and convictionLong < convMinScore
+        enterLong := false
+    if enterShort and convictionShort < convMinScore
+        enterShort := false
+
+if enterLong or enterShort
+    lastSigBar := bar_index
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ENHANCEMENT 5: EXIT SIGNAL ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int posDir = 0
+var int posEntryBar = na
+var float posEntryPrice = na
+
+if enterLong
+    posDir := 1
+    posEntryBar := bar_index
+    posEntryPrice := close
+if enterShort
+    posDir := -1
+    posEntryBar := bar_index
+    posEntryPrice := close
+
+bool exitLong  = false
+bool exitShort = false
+
+// Track exit reasons for tooltips
+var string exitReason = ""
+
+if enableExits and posDir != 0
+    bool useComposite = exitMode == "Composite"
+    
+    bool flowRevExit = (exitFlowReverse or exitMode == "Flow Reversal") and ((posDir == 1 and netSig < 0) or (posDir == -1 and netSig > 0))
+    bool zeroCrossExit = (exitZeroCross or exitMode == "Zero Cross") and ((posDir == 1 and ta.crossunder(netSig, 0.0)) or (posDir == -1 and ta.crossover(netSig, 0.0)))
+    bool oppExtremeExit = (exitOpposite or exitMode == "Opposite Extreme") and ((posDir == 1 and netSig > thrUse) or (posDir == -1 and netSig < -thrUse))
+    
+    bool trailExit = false
+    if exitTrailingATR or exitMode == "Trailing Stop"
+        exitATR = ta.atr(exitATRLen)
+        if posDir == 1
+            trailExit := close < nz(posEntryPrice) - exitATRMult * exitATR
+        if posDir == -1
+            trailExit := close > nz(posEntryPrice) + exitATRMult * exitATR
+    
+    bool timeExit = false
+    if exitTimeBars > 0 and not na(posEntryBar)
+        timeExit := (bar_index - posEntryBar) >= exitTimeBars
+    
+    // Build exit reason string
+    string reasons = ""
+    if flowRevExit
+        reasons := reasons + "Flow Reversal, "
+    if zeroCrossExit
+        reasons := reasons + "Zero Cross, "
+    if oppExtremeExit
+        reasons := reasons + "Opposite Extreme, "
+    if trailExit
+        reasons := reasons + "ATR Trail Stop, "
+    if timeExit
+        reasons := reasons + "Time Stop, "
+    
+    if useComposite
+        exitLong  := posDir == 1  and ok and (flowRevExit or zeroCrossExit or oppExtremeExit or trailExit or timeExit)
+        exitShort := posDir == -1 and ok and (flowRevExit or zeroCrossExit or oppExtremeExit or trailExit or timeExit)
+    else
+        bool primaryFired = exitMode == "Flow Reversal" ? flowRevExit : exitMode == "Zero Cross" ? zeroCrossExit : exitMode == "Opposite Extreme" ? oppExtremeExit : exitMode == "Trailing Stop" ? trailExit : false
+        exitLong  := posDir == 1  and ok and primaryFired
+        exitShort := posDir == -1 and ok and primaryFired
+    
+    if exitLong or exitShort
+        exitReason := str.length(reasons) > 2 ? str.substring(reasons, 0, str.length(reasons) - 2) : exitMode
+        posDir := 0
+        posEntryBar := na
+        posEntryPrice := na
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ML BACKTESTING ENGINE ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int mlTotalSignals = 0
+var int mlWins = 0
+var int mlLosses = 0
+var float mlSumR = 0.0
+
+var float[] mlOutcomes = array.new_float(0)
+var int[] mlSignalTypes = array.new_int(0)
+
+if enableML
+    bool wasLongSignal = enterLong[mlOutcomeBars]
+    bool wasShortSignal = enterShort[mlOutcomeBars]
+    
+    if wasLongSignal
+        float entryP = close[mlOutcomeBars]
+        float exitP = close
+        float atrAtEntry = ta.atr(14)[mlOutcomeBars]
+        float rMult = atrAtEntry > 0 ? (exitP - entryP) / atrAtEntry : 0.0
+        
+        mlTotalSignals += 1
+        if rMult >= mlTargetR
+            mlWins += 1
+        else
+            mlLosses += 1
+        mlSumR += rMult
+        
+        array.push(mlOutcomes, rMult)
+        array.push(mlSignalTypes, 1)
+        if array.size(mlOutcomes) > mlLookback
+            array.shift(mlOutcomes)
+            array.shift(mlSignalTypes)
+    
+    if wasShortSignal
+        float entryP = close[mlOutcomeBars]
+        float exitP = close
+        float atrAtEntry = ta.atr(14)[mlOutcomeBars]
+        float rMult = atrAtEntry > 0 ? (entryP - exitP) / atrAtEntry : 0.0
+        
+        mlTotalSignals += 1
+        if rMult >= mlTargetR
+            mlWins += 1
+        else
+            mlLosses += 1
+        mlSumR += rMult
+        
+        array.push(mlOutcomes, rMult)
+        array.push(mlSignalTypes, -1)
+        if array.size(mlOutcomes) > mlLookback
+            array.shift(mlOutcomes)
+            array.shift(mlSignalTypes)
+
+if enableML and mlAdaptThreshold and mlTotalSignals >= mlMinSamples
+    float winRate = mlTotalSignals > 0 ? mlWins / mlTotalSignals : 0.5
+    float thrAdj = winRate > 0.6 ? 0.95 : winRate > 0.5 ? 1.0 : winRate > 0.4 ? 1.05 : 1.15
+    thrUse := math.min(thrMax, math.max(thrMin, thrUse * thrAdj))
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ PLOTS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(0, "Zero", color=color.new(color.gray, 70))
+
+thrShow = thrDisplay != "Off"
+thrUpPlot = plot(thrShow ? thrUse : na, "Thr+", color=color.new(thrCol, thrTransp))
+thrDnPlot = plot(thrShow ? -thrUse : na, "Thr-", color=color.new(thrCol, thrTransp))
+fill(thrUpPlot, thrDnPlot, color = thrDisplay == "Bands" ? color.new(thrCol, thrFillTr) : na)
+
+inBearTrap = enableTraps and inBearZone and barsInBearZone > maxLinger
+inBullTrap = enableTraps and inBullZone and barsInBullZone > maxLinger
+
+postBearTrap = enableTraps and trapShadeMode != "During Trap Zone" and not na(blockLongUntil) and bar_index < blockLongUntil
+postBullTrap = enableTraps and trapShadeMode != "During Trap Zone" and not na(blockShortUntil) and bar_index < blockShortUntil
+
+doShade = enableTraps and (trapDisplay == "Shade Only" or trapDisplay == "Markers+Shade")
+
+shadeBear = doShade and (trapShadeMode == "During Trap Zone" ? inBearTrap : trapShadeMode == "Post Trap Cooldown" ? postBearTrap : (inBearTrap or postBearTrap))
+shadeBull = doShade and (trapShadeMode == "During Trap Zone" ? inBullTrap : trapShadeMode == "Post Trap Cooldown" ? postBullTrap : (inBullTrap or postBullTrap))
+
+bgcolor(shadeBear ? color.new(trapBearCol, trapShadeTr) : shadeBull ? color.new(trapBullCol, trapShadeTr) : na)
+
+histUpPlot = (showHist and mode == "Net" and netSig >= 0) ? netSig : na
+histDnPlot = (showHist and mode == "Net" and netSig < 0) ? netSig : na
+plot(histUpPlot, "Net Buy", color=color.new(upCol, histTransp), style=plot.style_columns, linewidth=4)
+plot(histDnPlot, "Net Sell", color=color.new(dnCol, histTransp), style=plot.style_columns, linewidth=4)
+
+absNet = math.min(math.abs(netSig), 1.0)
+tLine = math.round(lineMaxTr - absNet * (lineMaxTr - lineMinTr))
+quadCol = netSig >= 0 ? (slope >= 0 ? c_pos_rise : c_pos_fall) : (slope <= 0 ? c_neg_fall : c_neg_rise)
+lineCol = color.new(quadCol, tLine)
+plot(showLine ? netSig : na, "Net Line", color=lineCol, linewidth=lineWidth)
+
+absNet2 = math.min(math.abs(netSig), 1.0)
+tBody = math.round(maxBodyTransp - absNet2 * (maxBodyTransp - minBodyTransp))
+cCol = netSig >= 0 ? color.new(c_pos_fall, tBody) : color.new(c_neg_rise, tBody)
+barcolor(colorCandles ? cCol : na)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ CONVICTION COLOR/SIZE HELPERS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_convColor(float score, color baseCol) =>
+    if convColorMode == "Original" or not enableConviction
+        color.new(baseCol, sigTr)
+    else if convColorMode == "Gradient"
+        t = math.round(90 - score * 0.9)
+        color.new(baseCol, t)
+    else
+        score >= 80 ? color.new(#00FF00, 0) :
+         score >= 60 ? color.new(#00CCFF, 10) :
+         score >= 40 ? color.new(#FFD700, 20) :
+         color.new(#FF4444, 40)
+
+f_convSize(float score) =>
+    if not enableConviction
+        sigSize
+    else
+        score >= 80 ? size.large :
+         score >= 60 ? size.normal :
+         score >= 40 ? size.small :
+         size.tiny
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ INSTITUTIONAL TOOLTIP BUILDERS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── ENTRY SIGNAL TOOLTIP ──
+f_entry_tooltip(bool isLong, float conviction, float compScore, float depthScore, float speedScore, float divScore, int zoneBars, float zoneMinMax, float zoneBoundary) =>
+    string side = isLong ? "LONG" : "SHORT"
+    string springType = isLong ? "Valley Spring" : "Peak Spring"
+    string tt = ""
+    
+    // ═══ HEADER ═══
+    tt := "═══ REAPER " + side + " ENTRY ═══\n"
+    tt += springType + " | Grade: " + f_grade(conviction) + " (" + f_r0(conviction) + "/100)\n"
+    tt += f_grade_desc(conviction) + "\n"
+    
+    // ═══ COMPONENT BREAKDOWN ═══
+    if ttShowComponents and enableTooltips
+        tt += "\n── Component Breakdown ──\n"
+        tt += "NVI/PVI:  " + f_r2(coreU) + " " + f_dir(coreVel) + " (w:" + f_r2(awCore) + ") " + (isLong ? (coreBullOk ? "✓" : "✗") : (coreBearOk ? "✓" : "✗")) + "\n"
+        tt += "Intrabar: " + f_r2(ltfU) + " " + f_dir(ltfVel) + " (w:" + f_r2(awLTF) + ") " + (isLong ? (ltfBullOk ? "✓" : "✗") : (ltfBearOk ? "✓" : "✗"))
+        tt += isHighVol ? " [VOL BOOST]\n" : "\n"
+        tt += "CMF:      " + f_r2(cmfU) + " " + f_dir(cmfVel) + " (w:" + f_r2(awCMF) + ") " + (isLong ? (cmfBullOk ? "✓" : "✗") : (cmfBearOk ? "✓" : "✗")) + "\n"
+        tt += "OBV:      " + f_r2(obvU) + " " + f_dir(obvVel) + " (w:" + f_r2(awOBV) + ") " + (isLong ? (obvBullOk ? "✓" : "✗") : (obvBearOk ? "✓" : "✗")) + "\n"
+        tt += "VWAP:     " + f_r2(vwapU) + " " + f_dir(vwapVel) + " (w:" + f_r2(awVWAP) + ") " + (isLong ? (vwapBullOk ? "✓" : "✗") : (vwapBearOk ? "✓" : "✗")) + "\n"
+        if enableCVD
+            tt += "CVD:      " + f_r2(cvdU) + " " + f_dir(cvdVel) + " (w:" + f_r2(awCVD) + ") " + (isLong ? (cvdBullOk ? "✓" : "✗") : (cvdBearOk ? "✓" : "✗")) + "\n"
+        tt += "Confirming: " + str.tostring(isLong ? bullCompTotal : bearCompTotal) + "/" + str.tostring(totalCompCount) + "\n"
+    
+    // ═══ SPRING MECHANICS ═══
+    if enableTooltips
+        tt += "\n── Spring Mechanics ──\n"
+        tt += "Zone Duration: " + f_spring_quality(zoneBars, maxLinger) + "\n"
+        if not na(zoneMinMax) and not na(zoneBoundary)
+            float penPct = zoneBoundary > 0 ? math.abs(math.abs(zoneMinMax) - zoneBoundary) / zoneBoundary * 100.0 : 0.0
+            tt += "Max Penetration: " + f_r2(zoneMinMax) + " (" + f_r0(penPct) + "% past boundary)\n"
+        tt += "Threshold: " + f_r2(thrUse) + (useAutoThr ? " (Auto)" : " (Manual)") + "\n"
+        tt += "Net Signal: " + f_r2(netSig) + " | Slope: " + f_r2(slope) + "\n"
+    
+    // ═══ CONVICTION BREAKDOWN ═══
+    if enableConviction and enableTooltips
+        tt += "\n── Conviction Scores ──\n"
+        tt += "Agreement:  " + f_r0(compScore) + "/100 (wt:" + f_r0(convCompWeight) + "%)\n"
+        tt += "Depth:      " + f_r0(depthScore) + "/100 (wt:" + f_r0(convDepthWeight) + "%)\n"
+        tt += "Speed:      " + f_r0(speedScore) + "/100 (wt:" + f_r0(convSpeedWeight) + "%)\n"
+        tt += "Divergence: " + f_r0(divScore) + "/100 (wt:" + f_r0(convDivWeight) + "%)\n"
+    
+    // ═══ MTF CONFLUENCE ═══
+    if enableMTF and enableTooltips
+        tt += "\n── MTF Confluence ──\n"
+        if mtfUseTF1
+            tt += mtfTF1 + ": " + (not na(htf1Net) ? f_r2(htf1Net) + " " + f_bias(htf1Net) : "N/A") + "\n"
+        if mtfUseTF2
+            tt += mtfTF2 + ": " + (not na(htf2Net) ? f_r2(htf2Net) + " " + f_bias(htf2Net) : "N/A") + "\n"
+        if mtfUseTF3
+            tt += mtfTF3 + ": " + (not na(htf3Net) ? f_r2(htf3Net) + " " + f_bias(htf3Net) : "N/A") + "\n"
+        string mtfVerdict = mtfWithTrend ? "✓ WITH TREND — Higher conviction" : "⚠ COUNTER-TREND — Reduce size"
+        tt += "Verdict: " + mtfVerdict + "\n"
+    
+    // ═══ MARKET CONTEXT ═══
+    if enableTooltips
+        tt += "\n── Market Context ──\n"
+        tt += "Price: " + f_r2(close) + " | ATR: " + f_r2(atr) + "\n"
+        tt += "VWAP: " + f_r2(vwapRef) + " (" + (close > vwapRef ? "ABOVE" : "BELOW") + ")\n"
+        tt += "EMA Trend: " + (bullBias ? "BULLISH" : bearBias ? "BEARISH" : "FLAT") + "\n"
+        tt += "RelVol: " + f_r2(relVol) + "x" + (isHighVol ? " ⚡ HIGH — Institutional activity" : "") + "\n"
+        if enableDecorr
+            if enableBreadth
+                tt += "Breadth: " + f_r2(breadthU) + " " + f_dir(breadthU) + "\n"
+            if enableIVProxy
+                tt += "IV Proxy: " + f_r2(ivProxyU) + " " + (ivProxyU > 0 ? "(Fear declining)" : "(Fear rising)") + "\n"
+        if corrPenaltyMult < 1.0
+            tt += "⚠ Corr Penalty Active: " + f_r2(corrPenaltyMult) + "x\n"
+    
+    // ═══ STRATEGY NOTES ═══
+    if ttShowStrategy and enableTooltips
+        tt += "\n── Strategy ──\n"
+        if conviction >= 80
+            tt += "• A-Grade: Full position, tight stop below spring low\n"
+            tt += "• Target: Next major level or opposite extreme zone\n"
+        else if conviction >= 60
+            tt += "• B-Grade: Standard position, normal stop\n"
+            tt += "• Consider scaling in on confirmation\n"
+        else if conviction >= 40
+            tt += "• C-Grade: Half size, wider stop, quick partials\n"
+            tt += "• Weak setup — need more confirmation\n"
+        else
+            tt += "• D-Grade: Minimum size or pass entirely\n"
+            tt += "• Missing key confirmations — high risk\n"
+        
+        if not mtfWithTrend and enableMTF
+            tt += "• ⚠ Counter-trend: Reduce size 50%, take quick profits\n"
+        if isHighVol
+            tt += "• ⚡ High volume: Institutions moving — respect the signal\n"
+        if compScore >= 80
+            tt += "• Strong agreement across components — high reliability\n"
+        if depthScore >= 70
+            tt += "• Deep penetration spring — maximum rubber-band energy\n"
+    
+    // ═══ RISK CONTEXT ═══
+    if ttShowRisk and enableTooltips
+        tt += "\n── Risk ──\n"
+        tt += "1 ATR Stop: " + (isLong ? f_r2(close - atr) : f_r2(close + atr)) + "\n"
+        tt += "2 ATR Stop: " + (isLong ? f_r2(close - 2*atr) : f_r2(close + 2*atr)) + "\n"
+        if enableML and mlTotalSignals >= mlMinSamples
+            float wr = mlTotalSignals > 0 ? mlWins * 100.0 / mlTotalSignals : 0.0
+            float ar = mlTotalSignals > 0 ? mlSumR / mlTotalSignals : 0.0
+            tt += "ML Win Rate: " + f_r1(wr) + "% | Avg R: " + f_r2(ar) + "\n"
+    
+    // ═══ EDUCATIONAL ═══
+    if ttShowEducation and enableTooltips
+        tt += "\n── What Is This Signal? ──\n"
+        if isLong
+            tt += "Valley Spring: Flow hit extreme bearish zone then\n"
+            tt += "snapped back within " + str.tostring(maxLinger) + " bars. This suggests\n"
+            tt += "sellers exhausted & smart money absorbed supply.\n"
+            tt += "Think: stop hunt below support that failed to hold.\n"
+        else
+            tt += "Peak Spring: Flow hit extreme bullish zone then\n"
+            tt += "reversed within " + str.tostring(maxLinger) + " bars. This suggests\n"
+            tt += "buyers exhausted & smart money distributed.\n"
+            tt += "Think: breakout above resistance that got faded.\n"
+    
+    tt
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ SIGNAL LABELS (Conviction-Enhanced + Tooltips) ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if enterLong
+    scoreLabel = enableConviction ? " [" + str.tostring(math.round(convictionLong)) + "]" : ""
+    mtfLabel = enableMTF and mtfMode == "Grade" ? (mtfWithTrend ? " ✓" : " ⚠") : ""
+    labelText = sigIconLong + scoreLabel + mtfLabel
+    string tt = enableTooltips ? f_entry_tooltip(true, convictionLong, convCompScoreL, convDepthScoreL, convSpeedScoreL, convDivScoreL, lastBearZoneBars, lastBearMinNet, lastBearBoundary) : ""
+    lb = label.new(bar_index, netSig, labelText, style=label.style_label_up, color=color.new(color.black, 100), textcolor=f_convColor(convictionLong, sigColLong), size=f_convSize(convictionLong), tooltip=tt)
+    f_keep_label(lb)
+
+if enterShort
+    scoreLabel = enableConviction ? " [" + str.tostring(math.round(convictionShort)) + "]" : ""
+    mtfLabel = enableMTF and mtfMode == "Grade" ? (mtfWithTrend ? " ✓" : " ⚠") : ""
+    labelText = sigIconShort + scoreLabel + mtfLabel
+    string tt = enableTooltips ? f_entry_tooltip(false, convictionShort, convCompScoreS, convDepthScoreS, convSpeedScoreS, convDivScoreS, lastBullZoneBars, lastBullMaxNet, lastBullBoundary) : ""
+    lb = label.new(bar_index, netSig, labelText, style=label.style_label_down, color=color.new(color.black, 100), textcolor=f_convColor(convictionShort, sigColShort), size=f_convSize(convictionShort), tooltip=tt)
+    f_keep_label(lb)
+
+// ── EXIT SIGNAL LABELS + TOOLTIPS ──
+if enableExits
+    if exitLong
+        string tt = ""
+        if enableTooltips
+            tt := "═══ EXIT LONG ═══\n"
+            tt += "Trigger: " + exitReason + "\n"
+            tt += "Net Signal: " + f_r2(netSig) + "\n"
+            tt += "Threshold: ±" + f_r2(thrUse) + "\n"
+            tt += "\n── Component State at Exit ──\n"
+            tt += "NVI/PVI: " + f_r2(coreU) + " " + f_dir(coreVel) + "\n"
+            tt += "Intrabar: " + f_r2(ltfU) + " " + f_dir(ltfVel) + "\n"
+            tt += "CMF: " + f_r2(cmfU) + " " + f_dir(cmfVel) + "\n"
+            tt += "OBV: " + f_r2(obvU) + " " + f_dir(obvVel) + "\n"
+            tt += "VWAP: " + f_r2(vwapU) + " " + f_dir(vwapVel) + "\n"
+            if enableCVD
+                tt += "CVD: " + f_r2(cvdU) + " " + f_dir(cvdVel) + "\n"
+            if ttShowStrategy
+                tt += "\n── Post-Exit Strategy ──\n"
+                if netSig > 0
+                    tt += "• Flow still positive — watch for re-entry on pullback\n"
+                    tt += "• This exit may be premature if trend is strong\n"
+                else
+                    tt += "• Flow turned negative — exit timing confirmed\n"
+                    tt += "• Watch for short setup if flow accelerates down\n"
+                tt += "• Wait for cooldown (" + str.tostring(cooldown) + " bars) before next entry\n"
+            if ttShowEducation
+                tt += "\n── Why Exit Here? ──\n"
+                if str.contains(exitReason, "Zero Cross")
+                    tt += "Zero Cross: Net flow crossed the zero line, meaning\n"
+                    tt += "the balance of buying vs selling pressure has shifted.\n"
+                    tt += "Momentum that drove the entry is now exhausted.\n"
+                else if str.contains(exitReason, "Opposite Extreme")
+                    tt += "Opposite Extreme: Flow reached the bullish extreme\n"
+                    tt += "zone — the mirror image of where we entered.\n"
+                    tt += "This is a profit-target exit: take the gift.\n"
+                else if str.contains(exitReason, "Flow Reversal")
+                    tt += "Flow Reversal: Net signal flipped direction before\n"
+                    tt += "reaching zero. Aggressive exit — may leave $ on table\n"
+                    tt += "but protects against momentum collapse.\n"
+                else if str.contains(exitReason, "Trail")
+                    tt += "ATR Trail: Price violated the trailing stop.\n"
+                    tt += "This protects gains while allowing runners.\n"
+        lb = label.new(bar_index, netSig, exitIcon, style=label.style_label_down, color=color.new(color.black, 100), textcolor=color.new(exitLongCol, 0), size=size.small, tooltip=tt)
+        f_keep_label(lb)
+    if exitShort
+        string tt = ""
+        if enableTooltips
+            tt := "═══ EXIT SHORT ═══\n"
+            tt += "Trigger: " + exitReason + "\n"
+            tt += "Net Signal: " + f_r2(netSig) + "\n"
+            tt += "Threshold: ±" + f_r2(thrUse) + "\n"
+            tt += "\n── Component State at Exit ──\n"
+            tt += "NVI/PVI: " + f_r2(coreU) + " " + f_dir(coreVel) + "\n"
+            tt += "Intrabar: " + f_r2(ltfU) + " " + f_dir(ltfVel) + "\n"
+            tt += "CMF: " + f_r2(cmfU) + " " + f_dir(cmfVel) + "\n"
+            tt += "OBV: " + f_r2(obvU) + " " + f_dir(obvVel) + "\n"
+            tt += "VWAP: " + f_r2(vwapU) + " " + f_dir(vwapVel) + "\n"
+            if enableCVD
+                tt += "CVD: " + f_r2(cvdU) + " " + f_dir(cvdVel) + "\n"
+            if ttShowStrategy
+                tt += "\n── Post-Exit Strategy ──\n"
+                if netSig < 0
+                    tt += "• Flow still negative — watch for re-entry on bounce\n"
+                    tt += "• This exit may be premature if trend is strong\n"
+                else
+                    tt += "• Flow turned positive — exit timing confirmed\n"
+                    tt += "• Watch for long setup if flow accelerates up\n"
+                tt += "• Wait for cooldown (" + str.tostring(cooldown) + " bars) before next entry\n"
+            if ttShowEducation
+                tt += "\n── Why Exit Here? ──\n"
+                if str.contains(exitReason, "Zero Cross")
+                    tt += "Zero Cross: Net flow crossed above zero, meaning\n"
+                    tt += "selling pressure has been absorbed by buyers.\n"
+                else if str.contains(exitReason, "Opposite Extreme")
+                    tt += "Opposite Extreme: Flow reached the bearish extreme\n"
+                    tt += "— profit target reached. Take the gift.\n"
+                else if str.contains(exitReason, "Flow Reversal")
+                    tt += "Flow Reversal: Aggressive exit on momentum shift.\n"
+                else if str.contains(exitReason, "Trail")
+                    tt += "ATR Trail: Price violated the trailing stop upward.\n"
+        lb = label.new(bar_index, netSig, exitIcon, style=label.style_label_up, color=color.new(color.black, 100), textcolor=color.new(exitShortCol, 0), size=size.small, tooltip=tt)
+        f_keep_label(lb)
+
+// ── TRAP LABELS + TOOLTIPS ──
+if enableTraps and (trapDisplay == "Markers" or trapDisplay == "Markers+Shade")
+    if wasTrapValley and ok
+        string tt = ""
+        if enableTooltips
+            tt := "═══ BEAR TRAP DETECTED ═══\n"
+            tt += "Flow stayed in bearish extreme for " + str.tostring(lastBearZoneBars) + " bars\n"
+            tt += "(Spring window: " + str.tostring(maxLinger) + " bars max)\n"
+            tt += "\n── What Happened ──\n"
+            tt += "Sustained selling pressure held below -" + f_r2(nz(lastBearBoundary)) + "\n"
+            tt += "Max depth: " + f_r2(nz(lastBearMinNet)) + "\n"
+            tt += "This was NOT a quick spring — it was real distribution.\n"
+            if ttShowStrategy
+                tt += "\n── Strategy ──\n"
+                tt += "• DO NOT buy the bounce here — this is a trap\n"
+                tt += "• Institutions were distributing, not accumulating\n"
+                tt += "• Any bounce is likely a dead cat / bull trap\n"
+                if trapBlockMode == "Block Entries"
+                    tt += "• Long entries BLOCKED for " + str.tostring(trapBlockBars) + " bars\n"
+                else
+                    tt += "• ⚠ Blocking is OFF — consider enabling it\n"
+                tt += "• Look for short entries on failed bounces\n"
+            if ttShowEducation
+                tt += "\n── Trap vs Spring ──\n"
+                tt += "Spring: Quick dip into extreme (≤" + str.tostring(maxLinger) + " bars),\n"
+                tt += "then snaps back. Like a rubber band — stored energy.\n"
+                tt += "Trap: Prolonged time in extreme (>" + str.tostring(maxLinger) + " bars).\n"
+                tt += "Not a rubber band — more like a waterfall.\n"
+                tt += "The longer flow stays extreme, the more real it is.\n"
+        lb = label.new(bar_index, netSig, trapBearIcon, style=label.style_label_down, color=color.new(color.black, 100), textcolor=color.new(trapBearCol, trapTransp), size=sigSize, tooltip=tt)
+        f_keep_label(lb)
+    if wasTrapPeak and ok
+        string tt = ""
+        if enableTooltips
+            tt := "═══ BULL TRAP DETECTED ═══\n"
+            tt += "Flow stayed in bullish extreme for " + str.tostring(lastBullZoneBars) + " bars\n"
+            tt += "(Spring window: " + str.tostring(maxLinger) + " bars max)\n"
+            tt += "\n── What Happened ──\n"
+            tt += "Sustained buying pressure held above +" + f_r2(nz(lastBullBoundary)) + "\n"
+            tt += "Max peak: " + f_r2(nz(lastBullMaxNet)) + "\n"
+            tt += "This was NOT a quick spring — it was real accumulation.\n"
+            if ttShowStrategy
+                tt += "\n── Strategy ──\n"
+                tt += "• DO NOT short the pullback here — this is a trap\n"
+                tt += "• Institutions were accumulating, not distributing\n"
+                tt += "• Any pullback is likely a buying opportunity\n"
+                if trapBlockMode == "Block Entries"
+                    tt += "• Short entries BLOCKED for " + str.tostring(trapBlockBars) + " bars\n"
+                else
+                    tt += "• ⚠ Blocking is OFF — consider enabling it\n"
+                tt += "• Look for long entries on pullbacks\n"
+            if ttShowEducation
+                tt += "\n── Trap vs Spring ──\n"
+                tt += "Spring: Quick spike into extreme (≤" + str.tostring(maxLinger) + " bars),\n"
+                tt += "then fades. Exhaustion move — reversal incoming.\n"
+                tt += "Trap: Prolonged time in extreme (>" + str.tostring(maxLinger) + " bars).\n"
+                tt += "NOT exhaustion — genuine institutional commitment.\n"
+                tt += "The pullback after a bull trap = buy the dip.\n"
+        lb = label.new(bar_index, netSig, trapBullIcon, style=label.style_label_up, color=color.new(color.black, 100), textcolor=color.new(trapBullCol, trapTransp), size=sigSize, tooltip=tt)
+        f_keep_label(lb)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ DIVERGENCES (with tooltips) ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if showDiv
+    phP = ta.pivothigh(high, divPivLen, divPivLen)
+    plP = ta.pivotlow(low, divPivLen, divPivLen)
+
+    var float lastPH = na
+    var float lastPHnet = na
+    var float lastPL = na
+    var float lastPLnet = na
+
+    if showBearDiv and not na(phP)
+        pNet = netSig[divPivLen]
+        okExtreme = divFilter == "Off" ? true : (pNet > thrUse[divPivLen])
+        if okExtreme and not na(lastPH) and phP > lastPH and pNet < lastPHnet
+            string tt = ""
+            if enableTooltips
+                tt := "═══ BEARISH DIVERGENCE ═══\n"
+                tt += "Price: Higher High (" + f_r2(lastPH) + " → " + f_r2(phP) + ")\n"
+                tt += "Flow:  Lower High (" + f_r2(lastPHnet) + " → " + f_r2(pNet) + ")\n"
+                tt += "\n── Interpretation ──\n"
+                tt += "Price pushed higher but flow didn't confirm.\n"
+                tt += "Buyers are weakening — fewer participants driving\n"
+                tt += "the move up. Classic distribution signature.\n"
+                if ttShowStrategy
+                    tt += "\n── Strategy ──\n"
+                    tt += "• Tighten stops on existing longs\n"
+                    tt += "• Watch for peak spring setup to go short\n"
+                    tt += "• If in extreme zone: high-probability reversal\n"
+                    tt += "• Divergence + spring signal = A+ setup\n"
+                if ttShowEducation
+                    tt += "\n── Why It Works ──\n"
+                    tt += "Smart money sells INTO strength. Retail sees the\n"
+                    tt += "higher high and buys. But institutional flow is\n"
+                    tt += "already declining — the move is running on fumes.\n"
+                    tt += "When the last buyer is in, price drops fast.\n"
+            lb = label.new(bar_index - divPivLen, netSig[divPivLen], bearIcon, style=label.style_label_down, color=color.new(color.black, 100), textcolor=color.new(bearDivCol, divTransp), size=iconSize, tooltip=tt)
+            f_keep_label(lb)
+            lastBearDivBar := bar_index
+        lastPH := phP
+        lastPHnet := pNet
+
+    if showBullDiv and not na(plP)
+        pNet = netSig[divPivLen]
+        okExtreme = divFilter == "Off" ? true : (pNet < -thrUse[divPivLen])
+        if okExtreme and not na(lastPL) and plP < lastPL and pNet > lastPLnet
+            string tt = ""
+            if enableTooltips
+                tt := "═══ BULLISH DIVERGENCE ═══\n"
+                tt += "Price: Lower Low (" + f_r2(lastPL) + " → " + f_r2(plP) + ")\n"
+                tt += "Flow:  Higher Low (" + f_r2(lastPLnet) + " → " + f_r2(pNet) + ")\n"
+                tt += "\n── Interpretation ──\n"
+                tt += "Price made new low but flow is less bearish.\n"
+                tt += "Sellers are weakening — smart money is absorbing\n"
+                tt += "supply at lower prices. Classic accumulation.\n"
+                if ttShowStrategy
+                    tt += "\n── Strategy ──\n"
+                    tt += "• Tighten stops on existing shorts\n"
+                    tt += "• Watch for valley spring setup to go long\n"
+                    tt += "• If in extreme zone: high-probability reversal\n"
+                    tt += "• Divergence + spring signal = A+ setup\n"
+                if ttShowEducation
+                    tt += "\n── Why It Works ──\n"
+                    tt += "Smart money buys INTO weakness. Retail sees the\n"
+                    tt += "lower low and panics out. But institutional flow\n"
+                    tt += "is actually improving — absorption in progress.\n"
+                    tt += "When the last seller capitulates, price rips up.\n"
+            lb = label.new(bar_index - divPivLen, netSig[divPivLen], bullIcon, style=label.style_label_up, color=color.new(color.black, 100), textcolor=color.new(bullDivCol, divTransp), size=iconSize, tooltip=tt)
+            f_keep_label(lb)
+            lastBullDivBar := bar_index
+        lastPL := plP
+        lastPLnet := pNet
+
+// ── CVD DIVERGENCE + TOOLTIPS ──
+if enableCVD and cvdDivergence
+    cvdPH = ta.pivothigh(high, divPivLen, divPivLen)
+    cvdPL = ta.pivotlow(low, divPivLen, divPivLen)
+    
+    var float lastCvdPH = na
+    var float lastCvdPHval = na
+    var float lastCvdPL = na
+    var float lastCvdPLval = na
+    
+    if not na(cvdPH)
+        cvdAtPiv = cvdCumulative[divPivLen]
+        if not na(lastCvdPH) and cvdPH > lastCvdPH and cvdAtPiv < nz(lastCvdPHval)
+            string tt = ""
+            if enableTooltips
+                tt := "═══ CVD BEARISH DIVERGENCE ═══\n"
+                tt += "Price: Higher High (" + f_r2(lastCvdPH) + " → " + f_r2(cvdPH) + ")\n"
+                tt += "CVD: Declining (buy-side volume fading)\n"
+                tt += "\n── Why CVD Div Is Special ──\n"
+                tt += "This is RAW order flow divergence — not indicator-\n"
+                tt += "derived. Actual buy volume is declining even as\n"
+                tt += "price rises. Market makers are pulling bids.\n"
+                if ttShowStrategy
+                    tt += "\n── Strategy ──\n"
+                    tt += "• Strongest reversal signal in the toolkit\n"
+                    tt += "• When combined with flow divergence = ⚡ setup\n"
+                    tt += "• Ideal: CVD div + bear flow div + peak spring\n"
+                    tt += "• Consider aggressive short on spring trigger\n"
+            lb = label.new(bar_index - divPivLen, netSig[divPivLen], cvdDivIcon, style=label.style_label_down, color=color.new(color.black, 100), textcolor=color.new(cvdDivCol, 0), size=iconSize, tooltip=tt)
+            f_keep_label(lb)
+        lastCvdPH := cvdPH
+        lastCvdPHval := cvdAtPiv
+    
+    if not na(cvdPL)
+        cvdAtPiv = cvdCumulative[divPivLen]
+        if not na(lastCvdPL) and cvdPL < lastCvdPL and cvdAtPiv > nz(lastCvdPLval)
+            string tt = ""
+            if enableTooltips
+                tt := "═══ CVD BULLISH DIVERGENCE ═══\n"
+                tt += "Price: Lower Low (" + f_r2(lastCvdPL) + " → " + f_r2(cvdPL) + ")\n"
+                tt += "CVD: Rising (sell-side volume fading)\n"
+                tt += "\n── Why CVD Div Is Special ──\n"
+                tt += "RAW order flow divergence. Actual sell volume is\n"
+                tt += "declining even as price drops. Smart money\n"
+                tt += "is absorbing the supply — accumulation in progress.\n"
+                if ttShowStrategy
+                    tt += "\n── Strategy ──\n"
+                    tt += "• Strongest reversal signal in the toolkit\n"
+                    tt += "• When combined with flow divergence = ⚡ setup\n"
+                    tt += "• Ideal: CVD div + bull flow div + valley spring\n"
+                    tt += "• Consider aggressive long on spring trigger\n"
+            lb = label.new(bar_index - divPivLen, netSig[divPivLen], cvdDivIcon, style=label.style_label_up, color=color.new(color.black, 100), textcolor=color.new(cvdDivCol, 0), size=iconSize, tooltip=tt)
+            f_keep_label(lb)
+        lastCvdPL := cvdPL
+        lastCvdPLval := cvdAtPiv
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ GANN WINDOWS + TOOLTIPS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if showGann
+    gph = ta.pivothigh(high, gannPiv, gannPiv)
+    gpl = ta.pivotlow(low, gannPiv, gannPiv)
+
+    var int anchorBar = na
+    var int lastAnchor = na
+
+    if gannAnchorMode == "Last Pivot High/Low"
+        if not na(gph) or not na(gpl)
+            anchorBar := bar_index - gannPiv
+
+    if gannAnchorMode == "Last Swing High Only"
+        if not na(gph)
+            anchorBar := bar_index - gannPiv
+
+    if gannAnchorMode == "Last Swing Low Only"
+        if not na(gpl)
+            anchorBar := bar_index - gannPiv
+
+    if gannAnchorMode == "Last Entry Signal"
+        if enterLong or enterShort
+            anchorBar := bar_index
+
+    if showGannZero and not na(anchorBar) and (na(lastAnchor) or anchorBar != lastAnchor)
+        barsBack0 = bar_index - anchorBar
+        y0 = barsBack0 >= 0 ? netSig[barsBack0] : netSig
+        string tt = ""
+        if enableTooltips
+            tt := "═══ GANN ANCHOR (0) ═══\n"
+            tt += "New time cycle anchor point.\n"
+            tt += "Anchor Mode: " + gannAnchorMode + "\n"
+            tt += "All Gann windows now count from here.\n"
+            if ttShowEducation
+                tt += "\n── Gann Time Theory ──\n"
+                tt += "W.D. Gann believed time is the most\n"
+                tt += "important factor in market analysis.\n"
+                tt += "Markets tend to change direction at\n"
+                tt += "specific time intervals from pivots.\n"
+                tt += "Key numbers: 7, 14, 21, 30, 45, 60,\n"
+                tt += "72, 90, 120, 144, 180, 252, 360 bars.\n"
+        lb = label.new(anchorBar, y0, gannZeroIcon, style=label.style_none, textcolor=color.new(gannTextCol, gannTextTransp), color=color.new(color.black, 100), size=gannSize, tooltip=tt)
+        f_keep_label(lb)
+        lastAnchor := anchorBar
+
+    if not na(anchorBar)
+        barsSince = bar_index - anchorBar
+        if f_hit_gann(barsSince) and ok
+            string tt = ""
+            if enableTooltips
+                tt := "═══ GANN WINDOW: " + str.tostring(barsSince) + " ═══\n"
+                tt += str.tostring(barsSince) + " bars since anchor point\n"
+                tt += "Net Signal: " + f_r2(netSig) + " " + f_bias(netSig) + "\n"
+                if ttShowStrategy
+                    tt += "\n── Strategy ──\n"
+                    tt += "• Gann windows = heightened reversal probability\n"
+                    tt += "• Look for spring signals near Gann numbers\n"
+                    tt += "• If flow is at extreme + Gann window = ⚡\n"
+                    tt += "• More powerful when multiple cycles converge\n"
+                if ttShowEducation
+                    string gannMeaning = barsSince <= 14 ? "Short cycle — minor swing change" : barsSince <= 30 ? "Medium cycle — intermediate reversal" : barsSince <= 90 ? "Major cycle — significant trend change" : "Grand cycle — structural market shift"
+                    tt += "\n── Cycle Significance ──\n"
+                    tt += gannMeaning + "\n"
+                    if barsSince == 7
+                        tt += "7: Minor weekly rhythm — quick corrections\n"
+                    else if barsSince == 14
+                        tt += "14: Bi-weekly — common options expiry cycle\n"
+                    else if barsSince == 21
+                        tt += "21: Monthly rhythm — institutional rebalancing\n"
+                    else if barsSince == 30
+                        tt += "30: Calendar month — end-of-month flows\n"
+                    else if barsSince == 45
+                        tt += "45: 1/8 of 360 — key Gann geometric angle\n"
+                    else if barsSince == 60
+                        tt += "60: Quarterly — major institutional cycle\n"
+                    else if barsSince == 90
+                        tt += "90: 1/4 of 360 — cardinal Gann square\n"
+                    else if barsSince == 144
+                        tt += "144: Fibonacci + Gann convergence — very powerful\n"
+                    else if barsSince == 180
+                        tt += "180: Half circle — major structural change point\n"
+                    else if barsSince == 252
+                        tt += "252: Trading year — annual cycle anniversary\n"
+                    else if barsSince == 360
+                        tt += "360: Full circle — complete Gann cycle\n"
+            lb = label.new(bar_index, netSig + gannYOffset, str.tostring(barsSince), style=label.style_none, textcolor=color.new(gannTextCol, gannTextTransp), color=color.new(gannTextCol, gannBgTransp), size=gannSize, tooltip=tt)
+            f_keep_label(lb)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ MTF DASHBOARD ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if enableMTF and showMTFDash and barstate.islast
+    tPos = mtfDashPos == "Top Left" ? position.top_left : mtfDashPos == "Top Right" ? position.top_right : mtfDashPos == "Bottom Left" ? position.bottom_left : position.bottom_right
+    var table mtfTable = table.new(tPos, 3, 5, bgcolor=color.new(color.black, 80), border_color=color.new(color.gray, 70), border_width=1)
+    
+    table.cell(mtfTable, 0, 0, "MTF Flow", text_color=color.white, text_size=size.small)
+    table.cell(mtfTable, 1, 0, "Signal", text_color=color.white, text_size=size.small)
+    table.cell(mtfTable, 2, 0, "Bias", text_color=color.white, text_size=size.small)
+    
+    table.cell(mtfTable, 0, 1, "Current TF", text_color=color.gray, text_size=size.tiny)
+    table.cell(mtfTable, 1, 1, str.tostring(math.round(netSig * 100) / 100), text_color=netSig > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(mtfTable, 2, 1, netSig > 0 ? "BULL" : "BEAR", text_color=netSig > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    if mtfUseTF1
+        table.cell(mtfTable, 0, 2, mtfTF1, text_color=color.gray, text_size=size.tiny)
+        table.cell(mtfTable, 1, 2, not na(htf1Net) ? str.tostring(math.round(htf1Net * 100) / 100) : "N/A", text_color=nz(htf1Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+        table.cell(mtfTable, 2, 2, nz(htf1Net) > 0 ? "BULL" : "BEAR", text_color=nz(htf1Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    if mtfUseTF2
+        table.cell(mtfTable, 0, 3, mtfTF2, text_color=color.gray, text_size=size.tiny)
+        table.cell(mtfTable, 1, 3, not na(htf2Net) ? str.tostring(math.round(htf2Net * 100) / 100) : "N/A", text_color=nz(htf2Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+        table.cell(mtfTable, 2, 3, nz(htf2Net) > 0 ? "BULL" : "BEAR", text_color=nz(htf2Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    if mtfUseTF3
+        table.cell(mtfTable, 0, 4, mtfTF3, text_color=color.gray, text_size=size.tiny)
+        table.cell(mtfTable, 1, 4, not na(htf3Net) ? str.tostring(math.round(htf3Net * 100) / 100) : "N/A", text_color=nz(htf3Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+        table.cell(mtfTable, 2, 4, nz(htf3Net) > 0 ? "BULL" : "BEAR", text_color=nz(htf3Net) > 0 ? color.lime : color.red, text_size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ML STATS DASHBOARD ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if enableML and showMLStats and barstate.islast
+    mlPos = mlStatsPos == "Top Left" ? position.top_left : mlStatsPos == "Top Right" ? position.top_right : mlStatsPos == "Bottom Left" ? position.bottom_left : position.bottom_right
+    var table mlTable = table.new(mlPos, 2, 6, bgcolor=color.new(#1a0033, 80), border_color=color.new(#8833ff, 50), border_width=1)
+    
+    winRate = mlTotalSignals > 0 ? (mlWins * 100.0) / mlTotalSignals : 0.0
+    avgR = mlTotalSignals > 0 ? mlSumR / mlTotalSignals : 0.0
+    
+    table.cell(mlTable, 0, 0, "ML Engine", text_color=#8833ff, text_size=size.small)
+    table.cell(mlTable, 1, 0, "Stats", text_color=#8833ff, text_size=size.small)
+    
+    table.cell(mlTable, 0, 1, "Signals", text_color=color.gray, text_size=size.tiny)
+    table.cell(mlTable, 1, 1, str.tostring(mlTotalSignals), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(mlTable, 0, 2, "Win Rate", text_color=color.gray, text_size=size.tiny)
+    table.cell(mlTable, 1, 2, str.tostring(math.round(winRate * 10) / 10) + "%", text_color=winRate > 55 ? color.lime : winRate > 45 ? color.yellow : color.red, text_size=size.tiny)
+    
+    table.cell(mlTable, 0, 3, "Avg R", text_color=color.gray, text_size=size.tiny)
+    table.cell(mlTable, 1, 3, str.tostring(math.round(avgR * 100) / 100), text_color=avgR > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(mlTable, 0, 4, "Wins/Losses", text_color=color.gray, text_size=size.tiny)
+    table.cell(mlTable, 1, 4, str.tostring(mlWins) + "/" + str.tostring(mlLosses), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(mlTable, 0, 5, "Adapting", text_color=color.gray, text_size=size.tiny)
+    table.cell(mlTable, 1, 5, mlTotalSignals >= mlMinSamples ? "ACTIVE" : "COLLECTING", text_color=mlTotalSignals >= mlMinSamples ? color.lime : color.yellow, text_size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ COMPONENT STATUS DASHBOARD ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if showCompDash and barstate.islast
+    cdPos = compDashPos == "Top Left" ? position.top_left : compDashPos == "Top Right" ? position.top_right : compDashPos == "Bottom Left" ? position.bottom_left : position.bottom_right
+    var table compTable = table.new(cdPos, 4, 10, bgcolor=color.new(color.black, 85), border_color=color.new(color.gray, 75), border_width=1)
+    
+    table.cell(compTable, 0, 0, "Component", text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 1, 0, "Value", text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 2, 0, "Weight", text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 0, "Dir", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(compTable, 0, 1, "NVI/PVI", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, 1, str.tostring(math.round(coreU * 100) / 100), text_color=coreU > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(compTable, 2, 1, str.tostring(math.round(awCore * 100) / 100), text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 1, coreVel > 0 ? "▲" : "▼", text_color=coreVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(compTable, 0, 2, "Intrabar", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, 2, str.tostring(math.round(ltfU * 100) / 100), text_color=ltfU > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(compTable, 2, 2, str.tostring(math.round(awLTF * 100) / 100), text_color=isHighVol ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 2, ltfVel > 0 ? "▲" : "▼", text_color=ltfVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(compTable, 0, 3, "CMF", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, 3, str.tostring(math.round(cmfU * 100) / 100), text_color=cmfU > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(compTable, 2, 3, str.tostring(math.round(awCMF * 100) / 100), text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 3, cmfVel > 0 ? "▲" : "▼", text_color=cmfVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(compTable, 0, 4, "OBV", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, 4, str.tostring(math.round(obvU * 100) / 100), text_color=obvU > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(compTable, 2, 4, str.tostring(math.round(awOBV * 100) / 100), text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 4, obvVel > 0 ? "▲" : "▼", text_color=obvVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(compTable, 0, 5, "VWAP", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, 5, str.tostring(math.round(vwapU * 100) / 100), text_color=vwapU > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(compTable, 2, 5, str.tostring(math.round(awVWAP * 100) / 100), text_color=color.white, text_size=size.tiny)
+    table.cell(compTable, 3, 5, vwapVel > 0 ? "▲" : "▼", text_color=vwapVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    if enableCVD
+        table.cell(compTable, 0, 6, "CVD", text_color=color.gray, text_size=size.tiny)
+        table.cell(compTable, 1, 6, str.tostring(math.round(cvdU * 100) / 100), text_color=cvdU > 0 ? color.lime : color.red, text_size=size.tiny)
+        table.cell(compTable, 2, 6, str.tostring(math.round(awCVD * 100) / 100), text_color=color.white, text_size=size.tiny)
+        table.cell(compTable, 3, 6, cvdVel > 0 ? "▲" : "▼", text_color=cvdVel > 0 ? color.lime : color.red, text_size=size.tiny)
+    
+    int statusRow = enableCVD ? 7 : 6
+    zoneText = inBearZone ? "BEAR ZONE (" + str.tostring(barsInBearZone) + ")" : inBullZone ? "BULL ZONE (" + str.tostring(barsInBullZone) + ")" : "NEUTRAL"
+    zoneCol = inBearZone ? (barsInBearZone > maxLinger ? color.fuchsia : color.red) : inBullZone ? (barsInBullZone > maxLinger ? color.aqua : color.lime) : color.gray
+    table.cell(compTable, 0, statusRow, "Zone", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, statusRow, zoneText, text_color=zoneCol, text_size=size.tiny)
+    
+    table.cell(compTable, 0, statusRow + 1, "RelVol", text_color=color.gray, text_size=size.tiny)
+    table.cell(compTable, 1, statusRow + 1, str.tostring(math.round(relVol * 100) / 100) + "x", text_color=isHighVol ? color.yellow : color.white, text_size=size.tiny)
+    
+    table.cell(compTable, 0, statusRow + 2, "Position", text_color=color.gray, text_size=size.tiny)
+    posText = posDir == 1 ? "LONG" : posDir == -1 ? "SHORT" : "FLAT"
+    posCol = posDir == 1 ? color.lime : posDir == -1 ? color.red : color.gray
+    table.cell(compTable, 1, statusRow + 2, posText, text_color=posCol, text_size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ████ ALERTS ████
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(enterLong, "Spring Long", "Monster Flow v4: LONG (Valley Spring)")
+alertcondition(enterShort, "Spring Short", "Monster Flow v4: SHORT (Peak Spring)")
+alertcondition(enterLong or enterShort, "Spring Any", "Monster Flow v4: Spring Signal")
+alertcondition(exitLong, "Exit Long", "Monster Flow v4: EXIT LONG")
+alertcondition(exitShort, "Exit Short", "Monster Flow v4: EXIT SHORT")
+alertcondition(exitLong or exitShort, "Exit Any", "Monster Flow v4: Exit Signal")

@@ -1,0 +1,215 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © rcaminero
+
+//@version=6
+//@version=6
+indicator("CPT Session Levels (PM 4am • OR Fill Zone • Stop 4pm)", overlay=true, max_lines_count=500)
+
+//────────────────────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────────────────────
+useExchange = input.bool(true, "Use Exchange Timezone?")
+customTz    = input.string("America/New_York", "Custom Timezone (if not exchange)")
+tz          = useExchange ? syminfo.timezone : customTz
+
+pmSess  = input.session("0400-0929", "Premarket (PM) 04:00–09:29")
+rthSess = input.session("0930-1600", "RTH 09:30–16:00")
+orSess  = input.session("0800-0815", "Opening Range (OR) 08:00–08:15")
+
+pdMode  = input.string("RTH Session", "Previous Day High/Low Mode", options=["RTH Session", "Daily Candle"])
+
+showPM     = input.bool(true, "Show Premarket High/Low")
+showPD     = input.bool(true, "Show Previous Day High/Low")
+showOR     = input.bool(true, "Show OR High/Low/Mid")
+showORFill = input.bool(true, "Show OR Fill Zone")
+
+keepDays = input.int(30, "Keep last N days of PM/PD lines", minval=1, maxval=200)
+
+// Styling
+orFillTrans = input.int(85, "OR Fill Transparency", minval=0, maxval=100)
+orLineW     = input.int(2,  "OR Line Width", minval=1, maxval=5)
+lvlLineW    = input.int(2,  "PM/PD Line Width", minval=1, maxval=5)
+
+// Colors
+cPMH = input.color(color.fuchsia, "PM High")
+cPML = input.color(color.purple,  "PM Low")
+cPDH = input.color(color.aqua,    "PD High")
+cPDL = input.color(color.orange,  "PD Low")
+cORH = input.color(color.lime,    "OR High")
+cORL = input.color(color.red,     "OR Low")
+cORM = input.color(color.yellow,  "OR Mid")
+cORF = input.color(color.aqua,    "OR Fill Color")
+
+//────────────────────────────────────────────────────────────────────
+// Session detection
+//────────────────────────────────────────────────────────────────────
+inPM  = not na(time(timeframe.period, pmSess, tz))
+inRTH = not na(time(timeframe.period, rthSess, tz))
+inOR  = not na(time(timeframe.period, orSess, tz))
+
+pmStart  = inPM and not inPM[1]
+pmEnded  = (not inPM) and inPM[1]
+orStart  = inOR and not inOR[1]
+orEnded  = (not inOR) and inOR[1]
+rthEnded = (not inRTH) and inRTH[1]
+
+// Only show/extend levels during PM or RTH (stops after 4pm)
+inActive = inPM or inRTH
+
+// New day (timezone-aware)  ✅ MUST BE ABOVE ANY "if newDay"
+newDay = ta.change(time("D", "", tz)) != 0
+
+//────────────────────────────────────────────────────────────────────
+// Helper: trim line arrays
+//────────────────────────────────────────────────────────────────────
+f_trim_lines(_arr) =>
+    while array.size(_arr) > keepDays
+        l = array.shift(_arr)
+        if not na(l)
+            line.delete(l)
+
+//────────────────────────────────────────────────────────────────────
+// PREMARKET HIGH/LOW (Historical lines starting at 4:00)
+//────────────────────────────────────────────────────────────────────
+var float pmHigh = na
+var float pmLow  = na
+var int   pmStartBar = na
+
+var line pmHighLive = na
+var line pmLowLive  = na
+var array<line> pmHighLines = array.new_line()
+var array<line> pmLowLines  = array.new_line()
+
+if newDay
+    pmHigh := na
+    pmLow  := na
+    pmStartBar := na
+    pmHighLive := na
+    pmLowLive  := na
+
+if pmStart
+    pmStartBar := bar_index
+
+if inPM
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow  := na(pmLow)  ? low  : math.min(pmLow, low)
+
+// Create PM lines when PM ends, anchored at 4:00am bar
+if pmEnded and showPM and not na(pmHigh) and not na(pmLow) and not na(pmStartBar)
+    pmHighLive := line.new(pmStartBar, pmHigh, bar_index, pmHigh, extend=extend.none, color=cPMH, width=lvlLineW)
+    pmLowLive  := line.new(pmStartBar, pmLow,  bar_index, pmLow,  extend=extend.none, color=cPML, width=lvlLineW)
+
+    array.push(pmHighLines, pmHighLive)
+    array.push(pmLowLines,  pmLowLive)
+    f_trim_lines(pmHighLines)
+    f_trim_lines(pmLowLines)
+
+// Extend only during PM/RTH
+if not na(pmHighLive) and inActive
+    line.set_x2(pmHighLive, bar_index)
+if not na(pmLowLive) and inActive
+    line.set_x2(pmLowLive, bar_index)
+
+// Freeze at 4pm
+if rthEnded
+    if not na(pmHighLive)
+        line.set_x2(pmHighLive, bar_index - 1)
+    if not na(pmLowLive)
+        line.set_x2(pmLowLive, bar_index - 1)
+
+//────────────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH/LOW (Historical lines, created at 4:00)
+//────────────────────────────────────────────────────────────────────
+var float rthHigh = na
+var float rthLow  = na
+var float lastRthHigh = na
+var float lastRthLow  = na
+
+if newDay
+    rthHigh := na
+    rthLow  := na
+
+if inRTH
+    rthHigh := na(rthHigh) ? high : math.max(rthHigh, high)
+    rthLow  := na(rthLow)  ? low  : math.min(rthLow, low)
+
+if rthEnded and not na(rthHigh) and not na(rthLow)
+    lastRthHigh := rthHigh
+    lastRthLow  := rthLow
+
+prevDayHigh_D = request.security(syminfo.tickerid, "D", high[1])
+prevDayLow_D  = request.security(syminfo.tickerid, "D", low[1])
+
+pdHigh = pdMode == "RTH Session" ? lastRthHigh : prevDayHigh_D
+pdLow  = pdMode == "RTH Session" ? lastRthLow  : prevDayLow_D
+
+var line pdHighLive = na
+var line pdLowLive  = na
+var array<line> pdHighLines = array.new_line()
+var array<line> pdLowLines  = array.new_line()
+
+// Create PD lines at 4:00am
+if pmStart and showPD and not na(pdHigh) and not na(pdLow)
+    pdHighLive := line.new(bar_index, pdHigh, bar_index, pdHigh, extend=extend.none, color=cPDH, width=lvlLineW)
+    pdLowLive  := line.new(bar_index, pdLow,  bar_index, pdLow,  extend=extend.none, color=cPDL, width=lvlLineW)
+
+    array.push(pdHighLines, pdHighLive)
+    array.push(pdLowLines,  pdLowLive)
+    f_trim_lines(pdHighLines)
+    f_trim_lines(pdLowLines)
+
+// Extend only during PM/RTH
+if not na(pdHighLive) and inActive
+    line.set_x2(pdHighLive, bar_index)
+if not na(pdLowLive) and inActive
+    line.set_x2(pdLowLive, bar_index)
+
+// Freeze at 4pm
+if rthEnded
+    if not na(pdHighLive)
+        line.set_x2(pdHighLive, bar_index - 1)
+    if not na(pdLowLive)
+        line.set_x2(pdLowLive, bar_index - 1)
+
+//────────────────────────────────────────────────────────────────────
+// OPENING RANGE (08:00–08:15) FILL ZONE that EXTENDS until 4pm
+// - During OR: zone updates live
+// - After OR ends: zone stays fixed (flat) until 4pm
+// - Uses plot+fill (no box objects)
+//────────────────────────────────────────────────────────────────────
+var float orHighLiveVal  = na
+var float orLowLiveVal   = na
+var float orHighFinal    = na
+var float orLowFinal     = na
+
+if newDay
+    orHighLiveVal := na
+    orLowLiveVal  := na
+    orHighFinal   := na
+    orLowFinal    := na
+
+// Track OR range during 08:00–08:15
+if inOR
+    orHighLiveVal := na(orHighLiveVal) ? high : math.max(orHighLiveVal, high)
+    orLowLiveVal  := na(orLowLiveVal)  ? low  : math.min(orLowLiveVal, low)
+
+// Lock final OR exactly when OR ends
+if orEnded and not na(orHighLiveVal) and not na(orLowLiveVal)
+    orHighFinal := orHighLiveVal
+    orLowFinal  := orLowLiveVal
+
+// Build zone values:
+// While OR is forming -> live values
+// After OR ends -> final locked values
+orTopZone = (showOR and inActive) ? (inOR ? orHighLiveVal : orHighFinal) : na
+orBotZone = (showOR and inActive) ? (inOR ? orLowLiveVal  : orLowFinal)  : na
+orMidZone = (showOR and inActive) ? (inOR ? (orHighLiveVal + orLowLiveVal)/2.0 : (orHighFinal + orLowFinal)/2.0) : na
+
+// Plots (no stepline = no stair stepping)
+pORH = plot(orTopZone, "OR High", color=cORH, linewidth=orLineW)
+pORL = plot(orBotZone, "OR Low",  color=cORL, linewidth=orLineW)
+plot(orMidZone,        "OR Mid",  color=cORM, linewidth=orLineW)
+
+// Fill: shows from OR start, then continues flat until 4pm (because plots continue inActive)
+orFillColor = (showOR and showORFill and (inOR or not na(orHighFinal))) ? color.new(cORF, orFillTrans) : na
+fill(pORH, pORL, color=orFillColor)

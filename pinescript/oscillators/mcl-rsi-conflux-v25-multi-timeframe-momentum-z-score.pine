@@ -1,0 +1,255 @@
+//@version=6
+indicator("MCL RSI Conflux v25", "MCL_RSI_Conflux_v25", overlay=false)
+
+// =================== INPUTS ===================
+len   = input.int(14, "RSI Length")
+tfD   = input.timeframe("D", "Daily")
+tfW   = input.timeframe("W", "Weekly")
+tfM   = input.timeframe("M", "Monthly")
+
+useAdaptive = input.bool(true, "Adaptive OB/OS")
+kBand       = input.float(0.85, "k (stdev)", step=0.05)
+obFixed     = input.float(70, "OB (fixed)", minval=50, maxval=100)
+osFixed     = input.float(30, "OS (fixed)", minval=0,  maxval=50)
+lookback    = input.int(200, "Lookback (OB/OS & Z)", minval=50)
+
+smoothOn   = input.bool(true, "Smooth Lines")
+smoothLen  = input.int(5, "Smooth Len", minval=1)
+
+zThresh    = input.float(0.5, "Z Consensus Threshold", step=0.1)
+
+wD = input.float(1.0, "Wt Daily",   step=0.1, minval=0)
+wW = input.float(1.0, "Wt Weekly",  step=0.1, minval=0)
+wM = input.float(1.0, "Wt Monthly", step=0.1, minval=0)
+
+showDiv      = input.bool(true,  "Show Divergences")
+divCooldown  = input.int(30, "Div Cooldown Bars", minval=1)
+showPanel    = input.bool(true,  "Show Panel")
+panelSelect  = input.string("Top Center", "Panel Position",
+               options=["Top Left","Top Center","Top Right","Bottom Left","Bottom Center","Bottom Right"])
+
+// =================== COLORS / HELPERS ===================
+colD    = color.rgb( 90,185,255)   // Daily: sky blue
+colW    = color.rgb(165,110,255)   // Weekly: violet
+colM    = color.rgb(250,210, 60)   // Monthly: yellow
+colComp = color.new(color.white, 15)
+
+f_s(x) => smoothOn ? ta.ema(x, smoothLen) : x
+f_clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+
+f_blend(c1, c2, t) =>
+    r = math.round(color.r(c1) + t * (color.r(c2) - color.r(c1)))
+    g = math.round(color.g(c1) + t * (color.g(c2) - color.g(c1)))
+    b = math.round(color.b(c1) + t * (color.b(c2) - color.b(c1)))
+    color.rgb(r, g, b, 88)
+
+// Return a table position enum (no type annotation!)
+f_pos(sel) =>
+    p = position.top_center
+    if sel == "Top Left"
+        p := position.top_left
+    else if sel == "Top Right"
+        p := position.top_right
+    else if sel == "Bottom Left"
+        p := position.bottom_left
+    else if sel == "Bottom Center"
+        p := position.bottom_center
+    else if sel == "Bottom Right"
+        p := position.bottom_right
+    p
+
+// =================== CORE (repaint-safe MTF) ===================
+rsi_tf(tf) =>
+    request.security(syminfo.tickerid, tf, ta.rsi(close, len), barmerge.gaps_off, barmerge.lookahead_off)
+
+rD_raw = rsi_tf(tfD)
+rW_raw = rsi_tf(tfW)
+rM_raw = rsi_tf(tfM)
+
+rD = f_s(rD_raw)
+rW = f_s(rW_raw)
+rM = f_s(rM_raw)
+
+// Adaptive OB/OS from daily stats
+ma  = ta.sma(rD_raw, lookback)
+sd  = ta.stdev(rD_raw, lookback)
+obA = f_clamp(ma + kBand * sd, 55, 90)
+osA = f_clamp(ma - kBand * sd, 10, 45)
+ob  = useAdaptive ? obA : obFixed
+os  = useAdaptive ? osA : osFixed
+
+// Composite (0–100)
+sumW = math.max(wD + wW + wM, 1.0)
+comp = f_s((rD*wD + rW*wW + rM*wM) / sumW)
+
+// =================== Z-SCORES & CONFORM ===================
+f_z(x) =>
+    mu  = ta.sma(x, lookback)
+    sdv = ta.stdev(x, lookback)
+    (not na(sdv) and sdv != 0) ? (x - mu) / sdv : 0.0
+
+zD = f_z(rD_raw)
+zW = f_z(rW_raw)
+zM = f_z(rM_raw)
+
+dirZ(x) =>
+    d = 0
+    if x > zThresh
+        d := 1
+    else if x < -zThresh
+        d := -1
+    d
+
+dD = dirZ(zD)
+dW = dirZ(zW)
+dM = dirZ(zM)
+
+conformBull = dD==1 and dW==1 and dM==1
+conformBear = dD==-1 and dW==-1 and dM==-1
+
+// Z-composite for histogram
+zComp = (zD + zW + zM) / 3.0
+
+// =================== STATES / SIGNALS ===================
+alignBull = rD>50 and rW>50 and rM>50
+alignBear = rD<50 and rW<50 and rM<50
+
+dUp     = ta.crossover(rD, rW)
+dDn     = ta.crossunder(rD, rW)
+riskOn  = ta.crossover(comp, 60)
+riskOff = ta.crossunder(comp, 45)
+obHit   = ta.crossover(rD, ob) or ta.crossover(rW, ob) or ta.crossover(rM, ob)
+osHit   = ta.crossunder(rD, os) or ta.crossunder(rW, os) or ta.crossunder(rM, os)
+
+// Divergences (confirmed pivots)
+left = 5, right = 5
+ph = ta.pivothigh(high, left, right)
+pl = ta.pivotlow(low,  left, right)
+prevPh = ta.valuewhen(not na(ph), ph, 1)
+prevPl = ta.valuewhen(not na(pl), pl, 1)
+rAtPh  = ta.valuewhen(not na(ph), rD[right], 0)
+rAtPh1 = ta.valuewhen(not na(ph), rD[right], 1)
+rAtPl  = ta.valuewhen(not na(pl), rD[right], 0)
+rAtPl1 = ta.valuewhen(not na(pl), rD[right], 1)
+bearDiv = showDiv and not na(ph) and not na(prevPh) and ph > prevPh and rAtPh < rAtPh1
+bullDiv = showDiv and not na(pl) and not na(prevPl) and pl < prevPl and rAtPl > rAtPl1
+var int lastDivBar = na
+canTag() => na(lastDivBar) or bar_index - lastDivBar > divCooldown
+
+// =================== RENDER ===================
+// Lines
+plot(rD, "Daily",   colD, 2)
+plot(rW, "Weekly",  colW, 2)
+plot(rM, "Monthly", colM, 2)
+plot(comp, "Comp", colComp, 1)
+
+// Dynamic OB/OS + fill
+pOB = plot(ob, "OB", color.rgb(255,80,80), 1)
+pOS = plot(os, "OS", color.rgb( 80,200,120), 1)
+fill(pOB, pOS, color.new(color.gray, 92))
+
+// Composite gradient background (40→65 → red→green)
+tNorm  = f_clamp((comp - 40.0) / (65.0 - 40.0), 0.0, 1.0)
+gradBg = f_blend(color.rgb(210,60,60), color.rgb(60,210,150), tNorm)
+bgcolor(gradBg)
+
+// Z-Confluence heat ribbon (near top)
+zRibbon = conformBull ? 88 : conformBear ? 88 : na
+zColor  = conformBull ? color.new(color.lime, 65) :
+          conformBear ? color.new(color.red,  65) : na
+plot(zRibbon, title="Z Heatband", style=plot.style_columns, color=zColor)
+
+// Z-Composite histogram around midline (~50)
+zHist = zComp*10 + 50
+plot(zHist, title="Z-Composite", style=plot.style_columns,
+     color = zComp>0 ? color.new(color.lime,60) : color.new(color.red,60))
+
+// Alignment dots
+plotshape(alignBull, title="Aligned Bull 50+", style=shape.circle, size=size.tiny,
+          color=color.rgb(60,200,130), location=location.top, text="▲")
+plotshape(alignBear, title="Aligned Bear 50−", style=shape.circle, size=size.tiny,
+          color=color.rgb(230,70,90), location=location.bottom, text="▼")
+
+// Divergence labels (throttled)
+if bearDiv and canTag()
+    label.new(bar_index - right, rAtPh, "Bear Div",
+              color=color.rgb(220,70,90), style=label.style_label_down, textcolor=color.white)
+    lastDivBar := bar_index
+if bullDiv and canTag()
+    label.new(bar_index - right, rAtPl, "Bull Div",
+              color=color.rgb(70,200,120), style=label.style_label_up, textcolor=color.white)
+    lastDivBar := bar_index
+
+// =================== ALERTS ===================
+alertcondition(dUp,          "D>W",           "Conflux: Daily RSI crossed ABOVE Weekly on {{ticker}}.")
+alertcondition(dDn,          "D<W",           "Conflux: Daily RSI crossed BELOW Weekly on {{ticker}}.")
+alertcondition(riskOn,       "RiskON",        "Conflux: Composite >60 (Risk ON) {{ticker}}.")
+alertcondition(riskOff,      "RiskOFF",       "Conflux: Composite <45 (Risk OFF) {{ticker}}.")
+alertcondition(obHit,        "OB Hit",        "Conflux: Overbought tag on {{ticker}}.")
+alertcondition(osHit,        "OS Hit",        "Conflux: Oversold tag on {{ticker}}.")
+alertcondition(alignBull,    "AlignBull50",   "Conflux: All TFs >50 (Bull) {{ticker}}.")
+alertcondition(alignBear,    "AlignBear50",   "Conflux: All TFs <50 (Bear) {{ticker}}.")
+alertcondition(conformBull,  "Z Conform Bull","Conflux: Z-scores bullish across D/W/M {{ticker}}.")
+alertcondition(conformBear,  "Z Conform Bear","Conflux: Z-scores bearish across D/W/M {{ticker}}.")
+
+// =================== PANEL (High Contrast, Moveable) ===================
+f_state(v, _ob, _os) =>
+    s = "Bear"
+    if v > 50
+        s := "Bull"
+    if v < _os
+        s := "OS"
+    if v > _ob
+        s := "OB"
+    s
+
+f_bg(v, _ob, _os) =>
+    c = color.rgb(250,170,60)   // <50
+    if v > 50
+        c := color.rgb( 60,160,230)   // >50
+    if v < _os
+        c := color.rgb( 70,200,120)   // OS
+    if v > _ob
+        c := color.rgb(220, 70, 90)   // OB
+    c
+
+var table t = na
+if showPanel
+    if na(t)
+        t := table.new(f_pos(panelSelect), 5, 5, border_width=1,
+                       frame_color=color.new(color.gray,80), frame_width=1, bgcolor=color.new(color.black, 0))
+    if barstate.islast
+        // header
+        table.cell(t, 0,0, "TF",   text_color=color.white, bgcolor=color.new(color.gray,15))
+        table.cell(t, 1,0, "RSI",  text_color=color.white, bgcolor=color.new(color.gray,15))
+        table.cell(t, 2,0, "State",text_color=color.white, bgcolor=color.new(color.gray,15))
+        table.cell(t, 3,0, "Z",    text_color=color.white, bgcolor=color.new(color.gray,15))
+        table.cell(t, 4,0, "Band", text_color=color.white, bgcolor=color.new(color.gray,15))
+        // rows
+        table.cell(t, 0,1, "D", text_color=colD)
+        table.cell(t, 1,1, str.tostring(rD, format.mintick), text_color=color.white, bgcolor=f_bg(rD,ob,os))
+        table.cell(t, 2,1, f_state(rD,ob,os), text_color=color.white, bgcolor=f_bg(rD,ob,os))
+        table.cell(t, 3,1, str.tostring(zD, "#.00"), text_color=color.white)
+        table.cell(t, 4,1, str.tostring(os, "#.0") + "–" + str.tostring(ob, "#.0"), text_color=color.white)
+
+        table.cell(t, 0,2, "W", text_color=colW)
+        table.cell(t, 1,2, str.tostring(rW, format.mintick), text_color=color.white, bgcolor=f_bg(rW,ob,os))
+        table.cell(t, 2,2, f_state(rW,ob,os), text_color=color.white, bgcolor=f_bg(rW,ob,os))
+        table.cell(t, 3,2, str.tostring(zW, "#.00"), text_color=color.white)
+        table.cell(t, 4,2, str.tostring(os, "#.0") + "–" + str.tostring(ob, "#.0"), text_color=color.white)
+
+        table.cell(t, 0,3, "M", text_color=colM)
+        table.cell(t, 1,3, str.tostring(rM, format.mintick), text_color=color.white, bgcolor=f_bg(rM,ob,os))
+        table.cell(t, 2,3, f_state(rM,ob,os), text_color=color.white, bgcolor=f_bg(rM,ob,os))
+        table.cell(t, 3,3, str.tostring(zM, "#.00"), text_color=color.white)
+        table.cell(t, 4,3, str.tostring(os, "#.0") + "–" + str.tostring(ob, "#.0"), text_color=color.white)
+
+        table.cell(t, 0,4, "Comp", text_color=color.white)
+        table.cell(t, 1,4, str.tostring(comp, "#.0"), text_color=color.white, bgcolor=f_bg(comp,ob,os))
+        table.cell(t, 2,4, alignBull? "Aligned↑" : alignBear? "Aligned↓" : "Mixed",
+                   text_color=color.white,
+                   bgcolor=alignBull? color.new(color.rgb(60,200,130),10) : alignBear? color.new(color.rgb(230,70,90),10) : color.new(color.gray,80))
+        table.cell(t, 3,4, conformBull? "+Z" : conformBear? "−Z" : "Z~",
+                   text_color=color.white,
+                   bgcolor=conformBull? color.rgb(60,200,130) : conformBear? color.rgb(230,70,90) : color.new(color.gray,80))
+        table.cell(t, 4,4, useAdaptive? "Adaptive" : "Fixed", text_color=color.white)

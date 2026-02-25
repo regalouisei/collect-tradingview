@@ -1,0 +1,196 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Tonzlnxz
+
+//@version=6
+indicator("Ultra Pulse KAMA", shorttitle="TXU-Pulse-KAMA", overlay=true, max_labels_count=200, max_lines_count=200)
+
+//=============================================================================
+// 1. SYSTEM CONFIGURATION (PREMIUM UI)
+//=============================================================================
+var string GRP_STRAT  = "⚡ STRATEGY MODE"
+var string GRP_TREND  = "🌊 TREND FILTER (CLOUD)"
+var string GRP_VISUAL = "🎨 VISUALS & ALERTS"
+var string GRP_ADV    = "⚙️ ADVANCED CALIBRATION (PRO ONLY)"
+
+// --- Strategy Mode ---
+// Simple dropdown for everyone. Explains exactly what each mode does.
+mode = input.string("Normal (Balanced)", "Trading Mode", options = ["Aggressive (Scalp)", "Normal (Balanced)", "Swing (Safe)"], group=GRP_STRAT, tooltip="Controls signal sensitivity:\n• Aggressive: Faster, for 1m-5m charts.\n• Normal: Best for 15m-1H charts.\n• Swing: Slower, best for 4H-Daily charts.")
+
+// --- Trend Filter ---
+// Clear on/off switch.
+useTrend = input.bool(true, "Filter Signals by Trend?", group=GRP_TREND, tooltip="HIGHLY RECOMMENDED for 15m+ Timeframes.\nIf ON, the script only gives BUY signals in Uptrends and SELL signals in Downtrends.")
+emaFastL = input.int(50, "Trend Fast Line", minval=1, group=GRP_TREND, tooltip="Baseline for short-term trend.")
+emaSlowL = input.int(200,"Trend Slow Line", minval=1, group=GRP_TREND, tooltip="Baseline for long-term trend (Cloud bottom).")
+
+// --- Visuals ---
+// Focus on what the user sees.
+showOnlyConfirmed = input.bool(true, "Hide Unconfirmed Signals?", group=GRP_VISUAL, tooltip="If ON, the signal label only appears after the candle closes. Prevents 'repainting'.")
+showAMA           = input.bool(false, "Show Dynamic Support Lines", group=GRP_VISUAL, tooltip="Shows the invisible KAMA lines used to calculate the signals.")
+
+// --- Advanced (Hidden Math) ---
+// Moved complex math here so beginners don't touch it by accident.
+useHA    = input.bool(false, "Use Heikin Ashi Calculation", group=GRP_ADV, tooltip="Smoothes out price noise internally. Good for volatile Crypto assets.")
+devLen   = input.int(20, "Volatility Lookback", minval=2, group=GRP_ADV)
+fastPer  = input.int(2, "Fastest Reaction Speed", minval=1, group=GRP_ADV)
+slowPer  = input.int(30,"Slowest Reaction Speed", minval=2, group=GRP_ADV)
+
+// --- Manual Override (For Developers) ---
+useManual = input.bool(false, "⚠ Enable Manual Override", group=GRP_ADV, tooltip="Ignore the 'Trading Mode' and use custom values below.")
+bs_in     = input.int(3,    "• Buy: Length", minval=2, group=GRP_ADV)
+bf_in     = input.float(2.0,"• Buy: Deviation", minval=0.1, step=0.1, group=GRP_ADV)
+ss_in     = input.int(3,    "• Sell: Length", minval=2, group=GRP_ADV)
+sf_in     = input.float(1.3,"• Sell: Deviation", minval=0.1, step=0.1, group=GRP_ADV)
+
+//=============================================================================
+// 2. DATA ACQUISITION & PROCESSING
+//=============================================================================
+// Internal HA Fetch (Non-Repaint Security)
+ha_open  = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, open,  barmerge.gaps_off, barmerge.lookahead_off)
+ha_high  = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, high,  barmerge.gaps_off, barmerge.lookahead_off)
+ha_low   = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, low,   barmerge.gaps_off, barmerge.lookahead_off)
+ha_close = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Dynamic Source Selection
+src_open  = useHA ? ha_open  : open
+src_high  = useHA ? ha_high  : high
+src_low   = useHA ? ha_low   : low
+src_close = useHA ? ha_close : close
+
+//=============================================================================
+// 3. PARAMETER LOGIC (Dynamic Presets)
+//=============================================================================
+// Mapping the readable Dropdown options to Math values
+isAggressive = mode == "Aggressive (Scalp)"
+isSwing      = mode == "Swing (Safe)"
+
+// Presets
+bs_p = isAggressive ? 2 : isSwing ? 5 : 3
+bf_p = isAggressive ? 1.2 : isSwing ? 3.0 : 2.0
+ss_p = isAggressive ? 2 : isSwing ? 5 : 3
+sf_p = isAggressive ? 0.9 : isSwing ? 2.0 : 1.3
+
+// Final Selection (Preset vs Manual)
+bs = useManual ? bs_in : bs_p
+bf = useManual ? bf_in : bf_p
+ss = useManual ? ss_in : ss_p
+sf = useManual ? sf_in : sf_p
+
+//=============================================================================
+// 4. CORE MATHEMATICS (AMA/KAMA Engine)
+//=============================================================================
+fast = 2.0 / (fastPer + 1.0)
+slow = 2.0 / (slowPer + 1.0)
+
+// --- BUY CALCULATION ---
+dirb    = math.abs(src_close - nz(src_close[bs], src_close))
+vstep_b = math.abs(src_close - nz(src_close[1],  src_close))
+volb    = nz(ta.sma(vstep_b, bs) * bs, 0.0)
+ERb     = volb > 0 ? dirb / volb : 0.0
+scb     = math.pow(ERb * (fast - slow) + slow, 2.0)
+
+var float xb = na
+xb := na(xb[1]) ? src_close : xb[1] + scb * (src_close - xb[1])
+
+// --- SELL CALCULATION ---
+dirs    = math.abs(src_close - nz(src_close[ss], src_close))
+vstep_s = math.abs(src_close - nz(src_close[1],  src_close))
+vols    = nz(ta.sma(vstep_s, ss) * ss, 0.0)
+ERs     = vols > 0 ? dirs / vols : 0.0
+scs     = math.pow(ERs * (fast - slow) + slow, 2.0)
+
+var float xs = na
+xs := na(xs[1]) ? src_close : xs[1] + scs * (src_close - xs[1])
+
+// Delta & Thresholds
+dxb = xb - xb[1]
+dxs = xs - xs[1]
+
+flb = bf * ta.stdev(dxb, devLen)
+fls = sf * ta.stdev(dxs, devLen)
+
+// Momentum 3-bar Delta (The Trigger)
+j = xb - xb[3]
+k = xs[3] - xs
+
+// Raw Triggers
+buyRaw  = ta.crossover(j, flb)
+sellRaw = ta.crossover(k, fls)
+
+//=============================================================================
+// 5. FILTERING & GATING
+//=============================================================================
+// Trend Context
+emaF = ta.ema(src_close, emaFastL)
+emaS = ta.ema(src_close, emaSlowL)
+
+// Strict Trend Definitions
+uptrend   = src_close > emaS and emaF > emaS
+downtrend = src_close < emaS and emaF < emaS
+
+// Signal Gating (ExRem Logic to remove duplicates)
+var int lastSig = 0 // 1=BUY, -1=SELL, 0=none
+buyGate  = buyRaw  and lastSig != 1
+sellGate = sellRaw and lastSig != -1
+
+// Apply Trend Filter
+buyCond_raw  = buyGate  and (not useTrend or uptrend)
+sellCond_raw = sellGate and (not useTrend or downtrend)
+
+// Confirmation Check (Bar Close)
+buyCond_confirmed  = buyCond_raw  and barstate.isconfirmed
+sellCond_confirmed = sellCond_raw and barstate.isconfirmed
+
+// State Update
+if barstate.isconfirmed
+    if buyCond_confirmed
+        lastSig := 1
+    else
+        if sellCond_confirmed
+            lastSig := -1
+
+//=============================================================================
+// 6. VISUALIZATION (PREMIUM PALETTE)
+//=============================================================================
+// Palette Definitions
+col_bull  = color.aqua
+col_bear  = color.yellow
+col_noise = color.gray
+
+// Trend Plots (Cloud Effect)
+p1 = plot(emaF, "Trend Fast", color=color.new(col_bull, 50), linewidth=1)
+p2 = plot(emaS, "Trend Slow", color=color.new(col_bear, 50), linewidth=1)
+fill(p1, p2, color = emaF > emaS ? color.new(col_bull, 90) : color.new(col_bear, 90), title="Trend Cloud")
+
+// Signal Plots (Labels)
+plotshape(showOnlyConfirmed ? buyCond_confirmed  : buyCond_raw,
+     title="Buy Signal", style=shape.labelup, location=location.belowbar,
+     color=col_bull, textcolor=color.black, size=size.tiny, text="BUY")
+
+plotshape(showOnlyConfirmed ? sellCond_confirmed : sellCond_raw,
+     title="Sell Signal", style=shape.labeldown, location=location.abovebar,
+     color=col_bear, textcolor=color.black, size=size.tiny, text="SELL")
+
+// AMA Diagnostic Plots (Optional)
+plot(showAMA ? xb : na, "AMA-Buy Line",  color=color.new(col_bull, 50))
+plot(showAMA ? xs : na, "AMA-Sell Line", color=color.new(col_bear, 50))
+
+// Candle Coloring Logic
+color bar_col = na
+if useTrend
+    if uptrend
+        bar_col := col_bull
+    else if downtrend
+        bar_col := col_bear
+    else
+        bar_col := col_noise
+else
+    // Fallback if trend filter is off
+    bar_col := emaF > emaS ? col_bull : col_bear
+
+barcolor(bar_col, title="Regime Color")
+
+//=============================================================================
+// 7. ALERTS
+//=============================================================================
+alertcondition(buyCond_confirmed,  "BUY Signal (Confirmed)",  "BUY {{ticker}} @ {{close}} | Mode: {{interval}}")
+alertcondition(sellCond_confirmed, "SELL Signal (Confirmed)", "SELL {{ticker}} @ {{close}} | Mode: {{interval}}")

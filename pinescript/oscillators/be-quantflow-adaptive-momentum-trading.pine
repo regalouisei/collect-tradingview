@@ -1,0 +1,408 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TradeWiseWithEase
+
+//@version=6
+strategy("BE-QuantFlow: Adaptive Momentum Trading", shorttitle="BE-Q_MT_1", overlay=false, initial_capital=9900000, default_qty_type=strategy.fixed, default_qty_value=2, max_labels_count=500, calc_on_every_tick=true)
+
+// --- INPUTS ---
+// Group 1: Momentum Settings
+grp_mom = "Momentum Settings"
+len = input.int(50, "Momentum Lookback", group=grp_mom)
+use_weighted = input.bool(true, "Linear Weighting", tooltip="Give more weight to recent candles", group=grp_mom)
+confirm_bars = input.int(5, "Sustain Lookforward Bars", group=grp_mom) 
+history_depth = input.int(30, "Cross History Depth", group=grp_mom)
+stdev_mult = input.float(1.75, "Momentum StDev Mult", group=grp_mom)
+
+// Group 2: Risk Management & Filters
+grp_risk = "Risk Management & Filters"
+atr_period = input.int(14, "ATR Period", group=grp_risk)
+stop_mult_long = input.float(3.0, "Long Stop Mult (ATR)", group=grp_risk)
+stop_mult_short = input.float(2.0, "Short Stop Mult (ATR)", group=grp_risk)
+warn_window = input.int(5, "Reversal Window (Bars)", group=grp_risk)
+use_partial = input.bool(true, "Enable Partial Exit", group=grp_risk)
+
+// Trend Filters
+enable_shorts = input.bool(false, "Enable Short Trades", group=grp_risk)
+use_ma_filter = input.bool(false, "Filter Trades with Trend", tooltip="Only Long if Price > MA, Only Short if Price < MA", group=grp_risk)
+ma_type = input.string("SMA", "Trend Filter", options=["SMA", "EMA", "DEMA"], group=grp_risk)
+ma_len = input.int(20, "Trend Filter Length", group=grp_risk)
+
+// Group 3: Intraday & Ghost Mode
+grp_intra = "Intraday & Ghost Mode"
+use_intraday = input.bool(false, "Enable Intraday Square-off", group=grp_intra)
+sq_off_hr = input.int(15, "Square-off Hour", minval=0, maxval=23, group=grp_intra)
+sq_off_min = input.int(10, "Square-off Minute", minval=0, maxval=59, group=grp_intra)
+
+// --- 1. HISTORICAL DATA ---
+varip bull_weight_array = array.new<float>(0)
+varip bear_weight_array = array.new<float>(0)
+varip total_tr_array = array.new<float>(0)
+varip int stoppedThisBar = 0
+varip float sl_level = na
+varip float sl_level_ = na
+varip bool sl_active = false
+varip int sl_dir = 0
+varip bool ghost_active = false
+varip bool ghost_new_day_started = false
+varip float ghost_qty = 0.0
+
+// --- 2. LIVE CALCULATION ---
+float cur_bull_w = 0.0
+float cur_bear_w = 0.0
+float cur_tr = ta.tr
+float cur_range = high - low
+
+if cur_range > 0
+    if close > close[1]
+        cur_bull_w := cur_tr * ((close - low) / cur_range)
+    else if close < close[1]
+        cur_bear_w := cur_tr * ((high - close) / cur_range)
+
+// CALCULATE WEIGHTED SUMS
+varip float hist_bull = 0.0
+varip float hist_bear = 0.0
+varip float hist_tr = 0.0
+varip float current_weight = 1.0
+
+if use_weighted and array.size(total_tr_array) > 0
+    if barstate.isnew
+        int size = array.size(total_tr_array)
+        hist_bull := 0.0
+        hist_bear := 0.0
+        hist_tr   := 0.0
+        for i = 0 to size - 1
+            float w = i + 1
+            hist_bull += array.get(bull_weight_array, i) * w
+            hist_bear += array.get(bear_weight_array, i) * w
+            hist_tr   += array.get(total_tr_array, i) * w
+        current_weight := size + 1
+else
+    hist_bull := array.sum(bull_weight_array)
+    hist_bear := array.sum(bear_weight_array)
+    hist_tr   := array.sum(total_tr_array)
+    current_weight := 1.0
+
+float final_bull_sum = hist_bull + (cur_bull_w * current_weight)
+float final_bear_sum = hist_bear + (cur_bear_w * current_weight)
+float final_tr_sum   = hist_tr   + (cur_tr   * current_weight)
+
+float bull_score = (final_tr_sum > 0) ? (final_bull_sum / final_tr_sum) * 100 : 0
+float bear_score = (final_tr_sum > 0) ? (final_bear_sum / final_tr_sum) * 100 : 0
+
+// --- 3. DYNAMIC STATISTICS & FILTERS ---
+var cross_levels = array.new<float>(0)
+bool xo = ta.crossover(bull_score, bear_score)
+bool xu = ta.crossunder(bull_score, bear_score)
+
+if (xo or xu) and barstate.isconfirmed
+    float level = (bull_score + bear_score) / 2
+    array.push(cross_levels, level)
+    if array.size(cross_levels) > history_depth
+        array.shift(cross_levels)
+
+bool system_ready = array.size(cross_levels) >= history_depth
+
+float stat_mean = array.size(cross_levels) >= 2 ? array.avg(cross_levels) : 50.0
+float stat_dev  = array.size(cross_levels) >= 2 ? array.stdev(cross_levels) * stdev_mult : 10.0
+float upper_zone = stat_mean + stat_dev
+float lower_zone = stat_mean - stat_dev
+
+bu_blwU = ta.barssince(bull_score > upper_zone)
+br_abvL = ta.barssince(bear_score > upper_zone)
+
+// Trend Filter Logic
+float trend_ma = switch ma_type
+    "SMA" => ta.sma(close, ma_len)
+    "EMA" => ta.ema(close, ma_len)
+    "DEMA" => 
+        float e1 = ta.ema(close, ma_len)
+        2 * e1 - ta.ema(e1, ma_len)
+
+bool long_allowed_by_filter = not use_ma_filter or close > trend_ma
+bool short_allowed_by_filter = enable_shorts and (not use_ma_filter or close < trend_ma)
+
+// --- 4. SIGNALS & LOGIC ---
+varip int state = 0
+var int pending_dir = 0 
+var int bars_held = 0
+
+bool trigger_buy = false
+bool trigger_sell = false
+
+if barstate.isconfirmed
+    // A. Standard Bull Crossover
+    if xo
+        float cross_val = (bull_score + bear_score) / 2
+        bool is_inside = cross_val <= upper_zone and cross_val >= lower_zone
+        if is_inside
+            pending_dir := 1
+            bars_held := 0
+        else
+            if state != 1 and system_ready and long_allowed_by_filter
+                trigger_buy := true
+
+    // B. Bull Breakout / Re-Entry
+    else if system_ready and long_allowed_by_filter and ((bu_blwU[1] >= 5 and bu_blwU == 0 and state != 1) or (state == 0 and bull_score > upper_zone))
+        trigger_buy := true
+
+    // C. Standard Bear Crossover
+    else if xu
+        float cross_val = (bull_score + bear_score) / 2
+        bool is_inside = cross_val <= upper_zone and cross_val >= lower_zone
+        if is_inside
+            pending_dir := -1
+            bars_held := 0
+        else
+            if state != -1 and system_ready and short_allowed_by_filter
+                trigger_sell := true
+
+    // D. Bear Breakout / Re-Entry
+    else if system_ready and short_allowed_by_filter and ((br_abvL[1] >= 5 and br_abvL == 0 and state != -1) or (state == 0 and bear_score > upper_zone))
+        trigger_sell := true
+
+    // Pending Logic
+    if pending_dir == 1
+        if bull_score > bear_score
+            bars_held += 1
+            if bars_held >= confirm_bars and state != 1
+                if close > open
+                    if system_ready and long_allowed_by_filter
+                        trigger_buy := true
+                        pending_dir := 0
+                else
+                    bars_held := 0
+        else
+            pending_dir := 0
+            bars_held := 0
+
+    if pending_dir == -1
+        if bear_score > bull_score
+            bars_held += 1
+            if bars_held >= confirm_bars and state != -1
+                if close < open
+                    if system_ready and short_allowed_by_filter
+                        trigger_sell := true
+                        pending_dir := 0
+                else
+                    bars_held := 0
+        else
+            pending_dir := 0
+            bars_held := 0
+
+// --- 5. TRAILING STOP, VETO & WINDOW REVERSE ---
+float atr_val = ta.atr(atr_period)
+float latr_val = ta.atr(300)
+var int last_warn_bar = -999 
+bool new_warning = false
+bool auto_reverse_triggered = false
+bool stop_out_triggered = false
+
+// A. APPLY VETO & FILTER CHECK
+if sl_active
+    if sl_dir == 1 and trigger_sell
+        if not short_allowed_by_filter
+            trigger_sell := false
+        else
+            trigger_sell := false
+            new_warning := true
+            last_warn_bar := bar_index 
+
+    if sl_dir == -1 and trigger_buy
+        if not long_allowed_by_filter
+            trigger_buy := false
+        else
+            trigger_buy := false
+            new_warning := true
+            last_warn_bar := bar_index 
+
+// B. CHECK STOP & REVERSE
+float current_mult = (sl_dir == 1) ? stop_mult_long : stop_mult_short
+
+if sl_active
+    if sl_dir == 1 // LONG
+
+        bool tradeExited = false
+        if (low < sl_level_) or (close < sl_level and barstate.isconfirmed) 
+            sl_active := false
+            sl_level := na
+            sl_level_ := na
+            state := 0 
+            tradeExited := true
+            stop_out_triggered := true     
+            
+        if tradeExited
+            // Auto-Reverse check
+            int bars_since_warn = bar_index - last_warn_bar
+            if bars_since_warn <= warn_window and short_allowed_by_filter
+                trigger_sell := true
+                auto_reverse_triggered := true
+                stoppedThisBar := (low < sl_level_) ? -2 : 0
+
+        if barstate.isconfirmed and not tradeExited
+            float potential_stop = close - (atr_val * current_mult)
+            if not trigger_buy
+                sl_level := math.max(sl_level, potential_stop)
+                sl_level_ := sl_level - latr_val
+
+    else if sl_dir == -1 // SHORT
+
+        bool tradeExited = false
+        if (high > sl_level_) or (close > sl_level and barstate.isconfirmed)
+            sl_active := false
+            sl_level := na
+            sl_level_ := na
+            state := 0
+            tradeExited := true
+            stop_out_triggered := true
+        
+        if tradeExited
+            // Auto-Reverse check
+            int bars_since_warn = bar_index - last_warn_bar
+            if bars_since_warn <= warn_window and long_allowed_by_filter
+                trigger_buy := true
+                auto_reverse_triggered := true
+                stoppedThisBar := (high > sl_level_) ? -2 : 0        
+
+        if barstate.isconfirmed and not tradeExited
+            float potential_stop = close + (atr_val * current_mult)
+            if not trigger_sell
+                sl_level := math.min(sl_level, potential_stop)
+                sl_level_ := sl_level + latr_val
+                
+
+// --- GHOST TRADE & INTRADAY LOGIC ---
+if use_intraday
+    int next_min = sq_off_min + 1
+    int next_hr = sq_off_hr
+    if next_min == 60
+        next_min := 0
+        next_hr += 1
+        if next_hr == 24
+            next_hr := 0
+
+    string sq_session = str.format("{0,number,00}{1,number,00}-{2,number,00}{3,number,00}:1234567", sq_off_hr, sq_off_min, next_hr, next_min)
+    bool[] sq_flag_array = request.security_lower_tf(syminfo.tickerid, "1", not na(time("", sq_session)))
+
+    bool is_sq_off_time = false
+    if array.size(sq_flag_array) > 0
+        for i = 0 to array.size(sq_flag_array) - 1
+            if array.get(sq_flag_array, i)
+                is_sq_off_time := true
+
+    if is_sq_off_time and sl_active
+        if not ghost_active
+            ghost_qty := strategy.position_size
+            
+        ghost_active := true
+        ghost_new_day_started := false
+        strategy.close_all(comment="Intraday SqOff", immediately = true, alert_message = "Intraday Square-off Triggered")
+
+    bool is_new_day = ta.change(time('1D')) != 0
+    if ghost_active and is_new_day
+        ghost_new_day_started := true
+
+    if ghost_active and ghost_new_day_started
+        if sl_active and barstate.isconfirmed
+            bool resumed = false
+            if sl_dir == 1 and open < close and long_allowed_by_filter
+                strategy.entry("Long", strategy.long, qty=math.abs(ghost_qty), comment="Ghost Resume", alert_message = "Ghost Trade Resumed (Long)")
+                resumed := true
+            else if sl_dir == -1 and open > close and short_allowed_by_filter
+                strategy.entry("Short", strategy.short, qty=math.abs(ghost_qty), comment="Ghost Resume", alert_message = "Ghost Trade Resumed (Short)")
+                resumed := true
+            
+            if resumed
+                ghost_active := false
+
+if not sl_active
+    ghost_active := false
+
+
+// --- STRATEGY EXECUTION ---
+if (trigger_buy or stoppedThisBar == 2) and barstate.isconfirmed
+    stoppedThisBar := 0
+    state := 1
+    sl_active := true
+    sl_dir := 1
+    sl_level := low - (atr_val * stop_mult_long)
+    sl_level_ := sl_level - latr_val    
+    string msg_buy = auto_reverse_triggered ? "Auto-Reverse: Buy Signal" : "Buy Signal"
+    strategy.entry("Long", strategy.long, comment = auto_reverse_triggered ? "Rev Buy" : "Buy", alert_message = msg_buy)
+    
+    if use_partial
+        float entry_price = close
+        float risk_dist = math.abs(entry_price - sl_level)
+        float target_price = entry_price + risk_dist
+        strategy.exit("Partial Long", "Long", qty_percent=50, limit=target_price, comment="Partial Exit", alert_message = "Partial Profit Target Hit (Long)")
+
+    ghost_active := false
+    strategy.exit("Hard Stop Long", "Long", qty_percent=100, stop = sl_level_, comment = "Hard Stop", alert_message = "L-Hard Stop Hit")
+
+if (trigger_sell or stoppedThisBar == -2) and barstate.isconfirmed
+    stoppedThisBar := 0
+    state := -1
+    sl_active := true
+    sl_dir := -1
+    sl_level := high + (atr_val * stop_mult_short)
+    sl_level_ := sl_level + latr_val    
+    string msg_sell = auto_reverse_triggered ? "Auto-Reverse: Sell Signal" : "Sell Signal"
+    strategy.entry("Short", strategy.short, comment = auto_reverse_triggered ? "Rev Sell" : "Sell", alert_message = msg_sell)
+    
+    if use_partial
+        float entry_price = close
+        float risk_dist = math.abs(entry_price - sl_level)
+        float target_price = entry_price - risk_dist
+        strategy.exit("Partial Short", "Short", qty_percent=50, limit=target_price, comment="Partial Exit", alert_message = "Partial Profit Target Hit (Short)")
+
+    ghost_active := false
+    strategy.exit("Hard Stop Short", "Short", qty_percent=100, stop = sl_level_, comment = "Hard Stop", alert_message = "S-Hard Stop Hit")
+
+if stop_out_triggered
+    strategy.close_all(comment="Stop Hit", immediately = true, alert_message = "Trailing Stop Hit | Position Closed")
+
+// --- VISUALS ---
+plot(bull_score, "Bull Score", color=color.green, linewidth=1)
+plot(bear_score, "Bear Score", color=color.red, linewidth=1)
+p1 = plot(upper_zone, "Upper Dev", color=color.new(color.gray, 60), style=plot.style_stepline, linewidth=1)
+p2 = plot(lower_zone, "Lower Dev", color=color.new(color.gray, 60), style=plot.style_stepline, linewidth=1)
+fill(p1, p2, color=color.new(color.gray, 90))
+
+bg_color = bull_score > upper_zone ? color.new(color.green, 85) : bear_score > upper_zone ? color.new(color.red, 85) : na
+bgcolor(bg_color, title="Momentum Regime")
+
+color sl_color = sl_dir == 1 ? color.green : color.red
+plot(sl_active ? sl_level : na, "Trailing Stop", color=sl_color, style=plot.style_linebr, linewidth=1, force_overlay=true)
+plot(sl_active ? sl_level_ : na, "Trailing Stop", color=sl_color, style=plot.style_linebr, linewidth=1, force_overlay=true, linestyle = plot.linestyle_dashed)
+
+// Plot Trend Filter if active
+plot(use_ma_filter ? trend_ma : na, "Trend Filter MA", color=color.blue, linewidth=1, force_overlay=true)
+
+if new_warning and not auto_reverse_triggered
+    if sl_dir == 1 
+        label.new(bar_index, high, text="W", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.tiny, force_overlay=true)
+    else 
+        label.new(bar_index, low, text="W", style=label.style_label_up, color=color.orange, textcolor=color.white, size=size.tiny, force_overlay=true)
+
+// --- HISTORICAL DATA UPDATE ---
+if barstate.isconfirmed
+    float bull_w_update = 0.0
+    float bear_w_update = 0.0
+    float range_size_update = high - low
+    float tr_val_update = ta.tr
+    
+    if range_size_update > 0
+        if close > close[1]
+            float sust = (close - low) / range_size_update
+            bull_w_update := tr_val_update * sust
+        else if close < close[1]
+            float sust = (high - close) / range_size_update
+            bear_w_update := tr_val_update * sust
+    
+    array.push(bull_weight_array, bull_w_update)
+    array.push(bear_weight_array, bear_w_update)
+    array.push(total_tr_array, tr_val_update)
+
+    if array.size(total_tr_array) > len
+        array.shift(bull_weight_array)
+        array.shift(bear_weight_array)
+        array.shift(total_tr_array)

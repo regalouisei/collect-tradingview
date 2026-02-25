@@ -1,0 +1,131 @@
+// This Pine Script™ code is subject to the terms of the Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Synthetic IV Rank [UAlgo]", shorttitle="S-IVR [UAlgo]", format=format.price, precision=2)
+
+// =============================================================================
+// 1. DATA STRUCTURES (TYPES)
+// =============================================================================
+
+type VolatilityEngine
+    int   hv_length         // Length for Historical Volatility
+    int   lookback_length   // Length for Rank Lookback
+    float annual_factor     // Sqrt(Bars per Year)
+
+// =============================================================================
+// 2. METHODS (LOGIC)
+// =============================================================================
+
+method init(VolatilityEngine id, int hv_len, int lookback_len, bool is_crypto) =>
+    id.hv_length := hv_len
+    id.lookback_length := lookback_len
+    // Annualization: Crypto (365), Stocks (252)
+    float days_per_year = is_crypto ? 365.0 : 252.0
+    id.annual_factor := math.sqrt(days_per_year)
+
+// YANG-ZHANG VOLATILITY ESTIMATOR
+// The "Gold Standard" for historical volatility when Option Data is missing.
+// Accounts for Overnight Gaps (Open-Close) and Intraday Drift (Rogers-Satchell).
+method calculate_yang_zhang(VolatilityEngine id) =>
+    // 1. Overnight Volatility (Close[1] to Open)
+    // Measures the gap risk at market open.
+    float log_ho = math.log(close / close[1])
+    float var_ho = ta.variance(log_ho, id.hv_length)
+    
+    // 2. Open-to-Close Volatility
+    // Measures intraday volatility relative to open.
+    float log_oc = math.log(close / open)
+    float var_oc = ta.variance(log_oc, id.hv_length)
+    
+    // 3. Rogers-Satchell Volatility (Trend Independent)
+    // Uses High/Low to capture intraday variance better than Close-to-Close.
+    float rs_log_hc = math.log(high / close)
+    float rs_log_ho = math.log(high / open)
+    float rs_log_lc = math.log(low / close)
+    float rs_log_lo = math.log(low / open)
+    
+    float rs_daily = rs_log_hc * rs_log_ho + rs_log_lc * rs_log_lo
+    float var_rs   = ta.sma(rs_daily, id.hv_length) // Rolling average of RS variance
+    
+    // 4. Combine (Yang-Zhang Formula weights)
+    // k is a weighting factor minimizing variance variance (approx 0.34 for N=20)
+    // Standard k = 0.34 / (1.34 + (n+1)/(n-1))
+    float k = 0.34 / (1.34 + (id.hv_length + 1) / (id.hv_length - 1))
+    
+    float yz_variance = var_ho + k * var_oc + (1 - k) * var_rs
+    float yz_vol      = math.sqrt(yz_variance)
+    
+    // 5. Annualize
+    float annualized_vol = yz_vol * id.annual_factor * 100
+    annualized_vol
+
+// =============================================================================
+// 3. MAIN EXECUTION
+// =============================================================================
+
+// --- Inputs ---
+group_calc = "Calculation Settings"
+int   i_hv_len   = input.int(20, "Yang-Zhang Length", minval=5, group=group_calc)
+int   i_iv_look  = input.int(252, "IV Rank Lookback", minval=50, group=group_calc)
+bool  i_crypto   = input.bool(false, "Crypto Mode (365 Days)", group=group_calc)
+
+group_vis = "Visual Settings (UAlgo Style)"
+color c_high_vol = input.color(#FF3B30, "High Volatility (Fear)", group=group_vis) // Neon Red
+color c_low_vol  = input.color(#007AFF, "Low Volatility (Calm)", group=group_vis)  // Electric Blue
+color c_mid      = input.color(color.gray, "Mid Line", group=group_vis)
+
+// --- Engine Init ---
+var VolatilityEngine engine = VolatilityEngine.new()
+if barstate.isfirst
+    engine.init(i_hv_len, i_iv_look, i_crypto)
+
+// --- Calculations ---
+float yz_iv = engine.calculate_yang_zhang()
+
+// IV Rank Calculation
+float iv_min = ta.lowest(yz_iv, i_iv_look)
+float iv_max = ta.highest(yz_iv, i_iv_look)
+float iv_rank = 0.0
+if (iv_max - iv_min) != 0
+    iv_rank := ((yz_iv - iv_min) / (iv_max - iv_min)) * 100
+else
+    iv_rank := 50.0
+
+// --- Visualization ---
+
+// 1. Plot the Rank Line
+p_rank = plot(iv_rank, "IV Rank", color=color.purple, linewidth=2)
+
+// 2. Reference Lines (Invisible for Fills)
+p_top    = plot(100, display=display.none)
+p_bot    = plot(0, display=display.none)
+p_high_t = plot(80, "High Threshold", color=color.new(c_high_vol, 50), style=plot.style_circles)
+p_low_t  = plot(20, "Low Threshold", color=color.new(c_low_vol, 50), style=plot.style_circles)
+hline(50, "Mid", color=color.new(color.gray, 80))
+
+// 3. Gradient Fills
+// High Vol Zone (80-100): Transparent -> Bright Red
+fill(p_rank, p_top, 100, 80, color.new(c_high_vol, 20), color.new(c_high_vol, 100))
+
+// Low Vol Zone (0-20): Transparent -> Bright Blue
+fill(p_rank, p_bot, 20, 0, color.new(c_low_vol, 100), color.new(c_low_vol, 20))
+
+// 4. Dynamic Labels & Status
+if barstate.islast
+    string state_txt = iv_rank > 80 ? "EXTREME FEAR" : iv_rank < 20 ? "COMPLACENCY" : "NEUTRAL"
+    color state_col  = iv_rank > 80 ? c_high_vol : iv_rank < 20 ? c_low_vol : c_mid
+    
+    // Main IV Rank Label
+    label.new(bar_index, iv_rank, text="IVR: " + str.tostring(iv_rank, "#.0") + "\n" + state_txt, 
+              color=color.new(state_col, 90), 
+              textcolor=state_col, 
+              style=label.style_label_left, 
+              size=size.normal)
+              
+    // Raw Yang-Zhang Volatility Value (Info Label)
+    label.new(bar_index, 0, text="YZ Vol: " + str.tostring(yz_iv, "#.1") + "%",
+              color=color.new(color.black, 100),
+              textcolor=color.gray,
+              style=label.style_label_upper_left,
+              size=size.small)

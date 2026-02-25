@@ -1,0 +1,519 @@
+//@version=6
+// TETRIS (AUTO-PLAY)
+// Short Introduction: 
+// This script implements a Tetris game in Pine Script™ v6 that automatically plays itself.
+// It demonstrates advanced usage of tables, user-defined types, pathfinding logic, and scoring all inside TradingView.
+// a not playable Tetris grid on your chart. This code is purely for fun and educational illustration.
+
+// -----------------------------------------------------------------------------
+//Blockmarker GLOBAL_VARIABLES
+// -----------------------------------------------------------------------------
+
+indicator("Tetris with Auto-Play", overlay=true)
+rows = 18
+cols = 10
+maxBarsBack = 500
+
+// -----------------------------------------------------------------------------
+//Blockmarker TYPE_DEFINITIONS
+// -----------------------------------------------------------------------------
+
+type aGrid
+    int rowsCount
+    int colsCount
+    int[] data
+
+type PieceState
+    int pieceIndex
+    int rotation
+    int x
+    int y
+
+
+// Persistent variables for game state
+varip aGrid g = na
+varip PieceState currentPiece = na
+varip bool pieceActive = false
+varip bool gameOver = false
+varip int[] pieceQueue = array.new_int()
+varip int score = 0
+varip float lastDropTime = na
+varip int previewPieceStored = na
+varip bool spawnPending = false
+
+// Table definitions for game board and preview
+borderCols = cols + 2
+borderRows = rows + 2
+var table gameTable = table.new(position.top_right, borderCols, borderRows, border_width=1, frame_color=color.black, border_color=color.black)
+var int pCols = 9
+var int pRows = 6
+var table previewTable = table.new(position.bottom_right, pCols, pRows, border_width=1, frame_color=color.black, border_color=color.black)
+
+// -----------------------------------------------------------------------------
+//Blockmarker FUNCTIONS
+// -----------------------------------------------------------------------------
+
+// @function     f_getStoneColor
+// @description  Returns a color for the provided stone index.
+// @param        idx int   Stone index (0-based).
+// @returns      color     Color object.
+f_getStoneColor(idx) =>
+    if idx == 0
+        color.fuchsia
+    else if idx == 1
+        color.yellow
+    else if idx == 2
+        color.purple
+    else if idx == 3
+        color.green
+    else if idx == 4
+        color.red
+    else if idx == 5
+        color.blue
+    else
+        color.orange
+
+// @function     f_newGrid
+// @description  Creates a new grid with specified dimensions, filled with 0.
+// @param        rCount int   Number of rows.
+// @param        cCount int   Number of columns.
+// @returns      aGrid        New grid object.
+f_newGrid(rCount, cCount) =>
+    aGrid.new(rCount, cCount, array.new_int(rCount * cCount, 0))
+
+// @function     f_gridGet
+// @description  Gets the value at specified row/column in the grid.
+// @param        grid aGrid   The grid to access.
+// @param        row  int     Row index.
+// @param        col  int     Column index.
+// @returns      int          Value stored at [row,col].
+f_gridGet(grid, row, col) =>
+    idx = row * grid.colsCount + col
+    array.get(grid.data, idx)
+
+// @function     f_gridSet
+// @description  Sets the value at specified row/column in the grid.
+// @param        grid aGrid  The grid to modify.
+// @param        row  int    Row index.
+// @param        col  int    Column index.
+// @param        val  int    Value to set.
+f_gridSet(grid, row, col, val) =>
+    idx = row * grid.colsCount + col
+    array.set(grid.data, idx, val)
+
+// @function     f_gridRowIsFull
+// @description  Checks if a given row in the grid is entirely filled (non-zero).
+// @param        grid aGrid  The grid to check.
+// @param        row  int    Row index.
+// @returns      bool        True if full, false otherwise.
+f_gridRowIsFull(grid, row) =>
+    isFull = true
+    for c = 0 to grid.colsCount - 1
+        if f_gridGet(grid, row, c) == 0
+            isFull := false
+    isFull
+
+// @function     f_gridRemoveRow
+// @description  Removes the specified row from the grid and shifts above rows down.
+// @param        grid aGrid   The grid to modify.
+// @param        rowIndex int The row to remove.
+f_gridRemoveRow(grid, rowIndex) =>
+    for i = 0 to rowIndex - 1
+        r = rowIndex - i
+        for c = 0 to grid.colsCount - 1
+            valAbove = f_gridGet(grid, r - 1, c)
+            f_gridSet(grid, r, c, valAbove)
+    for c = 0 to grid.colsCount - 1
+        f_gridSet(grid, 0, c, 0)
+
+// @function     f_newPieceState
+// @description  Creates a new PieceState record.
+// @param        pieceIndex int  Tetromino type index (0-6).
+// @param        rotation   int  Rotation state.
+// @param        xPos       int  X position.
+// @param        yPos       int  Y position.
+// @returns      PieceState      A new piece state record.
+f_newPieceState(pieceIndex, rotation, xPos, yPos) =>
+    PieceState.new(pieceIndex, rotation, xPos, yPos)
+
+// @function     f_getTetrominoOffsets
+// @description  Returns the offsets for each block of a given tetromino piece and rotation.
+// @param        pieceIndex int  Tetromino index (0-6).
+// @param        rotation   int  Rotation index (0-3).
+// @returns      int[]           Array of [x,y] offsets.
+f_getTetrominoOffsets(pieceIndex, rotation) =>
+    rot = rotation % 4
+    if pieceIndex == 0
+        if rot == 0 or rot == 2
+            array.from(0,0, 1,0, 2,0, 3,0)
+        else
+            array.from(0,0, 0,1, 0,2, 0,3)
+    else if pieceIndex == 1
+        array.from(0,0, 1,0, 0,1, 1,1)
+    else if pieceIndex == 2
+        if rot == 0
+            array.from(1,0, 0,1, 1,1, 2,1)
+        else if rot == 1
+            array.from(1,0, 1,1, 1,2, 0,1)
+        else if rot == 2
+            array.from(0,0, 1,0, 2,0, 1,1)
+        else
+            array.from(0,1, 1,1, 1,0, 1,2)
+    else if pieceIndex == 3
+        if rot == 0
+            array.from(1,0, 2,0, 0,1, 1,1)
+        else if rot == 1
+            array.from(0,0, 0,1, 1,1, 1,2)
+        else if rot == 2
+            array.from(1,1, 2,1, 0,2, 1,2)
+        else
+            array.from(1,0, 1,1, 2,1, 2,2)
+    else if pieceIndex == 4
+        if rot == 0
+            array.from(0,0, 1,0, 1,1, 2,1)
+        else if rot == 1
+            array.from(1,0, 0,1, 1,1, 0,2)
+        else if rot == 2
+            array.from(0,1, 1,1, 1,2, 2,2)
+        else
+            array.from(2,0, 1,1, 2,1, 1,2)
+    else if pieceIndex == 5
+        if rot == 0
+            array.from(0,0, 0,1, 1,1, 2,1)
+        else if rot == 1
+            array.from(0,0, 1,0, 0,1, 0,2)
+        else if rot == 2
+            array.from(0,0, 1,0, 2,0, 2,1)
+        else
+            array.from(1,0, 1,1, 1,2, 0,2)
+    else
+        if rot == 0
+            array.from(2,0, 0,1, 1,1, 2,1)
+        else if rot == 1
+            array.from(0,0, 0,1, 0,2, 1,2)
+        else if rot == 2
+            array.from(0,0, 1,0, 2,0, 0,1)
+        else
+            array.from(0,0, 1,0, 1,1, 1,2)
+
+// @function     f_getOffsets
+// @description  Helper function returning the [x,y] offsets for a given piece state.
+// @param        ps PieceState
+// @returns      int[] Array of [x,y] offsets.
+f_getOffsets(ps) =>
+    f_getTetrominoOffsets(ps.pieceIndex, ps.rotation)
+
+// @function     f_checkCollision
+// @description  Checks if a given piece state collides with the grid or existing blocks.
+// @param        gLocal aGrid      The grid to check against.
+// @param        ps     PieceState The piece state to evaluate.
+// @returns      bool              True if colliding, false otherwise.
+f_checkCollision(gLocal, ps) =>
+    offs = f_getOffsets(ps)
+    collided = false
+    for i = 0 to array.size(offs) - 1 by 2
+        ox = array.get(offs, i)
+        oy = array.get(offs, i+1)
+        px = ps.x + ox
+        py = ps.y + oy
+        if px < 0 or px >= gLocal.colsCount or py < 0 or py >= gLocal.rowsCount
+            collided := true
+        else if f_gridGet(gLocal, py, px) != 0
+            collided := true
+    collided
+
+// @function     f_lockPiece
+// @description  Locks the piece into the grid, writing its blocks as fixed stones.
+// @param        gLocal aGrid      The grid to modify.
+// @param        ps     PieceState The piece state to lock.
+f_lockPiece(gLocal, ps) =>
+    offs = f_getOffsets(ps)
+    for i = 0 to array.size(offs) - 1 by 2
+        ox = array.get(offs, i)
+        oy = array.get(offs, i+1)
+        px = ps.x + ox
+        py = ps.y + oy
+        if px >= 0 and px < gLocal.colsCount and py >= 0 and py < gLocal.rowsCount
+            f_gridSet(gLocal, py, px, ps.pieceIndex + 1)
+
+// @function     f_clearLines
+// @description  Checks all rows in the grid, removes any that are full, and returns the count of cleared lines.
+// @param        gLocal aGrid  The grid to modify.
+// @returns      int           Number of lines cleared.
+f_clearLines(gLocal) =>
+    cleared = 0
+    for r = 0 to gLocal.rowsCount - 1
+        if f_gridRowIsFull(gLocal, r)
+            f_gridRemoveRow(gLocal, r)
+            cleared += 1
+    cleared
+
+// @function     f_stackHeight
+// @description  Finds the overall stack height in the grid. Used in AI scoring.
+// @param        gLocal aGrid   The grid to inspect.
+// @returns      int            Calculated stack height.
+f_stackHeight(gLocal) =>
+    top = gLocal.rowsCount
+    for r = 0 to gLocal.rowsCount - 1
+        for c = 0 to gLocal.colsCount - 1
+            if f_gridGet(gLocal, r, c) != 0
+                top := math.min(top, r)
+    result = 0
+    if top < gLocal.rowsCount
+        result := gLocal.rowsCount - top
+    result
+
+// @function     f_cloneGrid
+// @description  Creates a copy of a given grid object.
+// @param        orig aGrid  The grid to clone.
+// @returns      aGrid       A new grid with the same data.
+f_cloneGrid(orig) =>
+    nc = f_newGrid(orig.rowsCount, orig.colsCount)
+    for rr = 0 to orig.rowsCount - 1
+        for cc = 0 to orig.colsCount - 1
+            valOrig = f_gridGet(orig, rr, cc)
+            f_gridSet(nc, rr, cc, valOrig)
+    nc
+
+// @function     f_fillQueue
+// @description  Ensures the pieceQueue has at least 7 upcoming pieces (randomly filled).
+f_fillQueue() =>
+    while array.size(pieceQueue) < 7
+        newPiece = math.floor(math.random(0, 7))
+        array.push(pieceQueue, newPiece)
+
+// @function     f_aggregateHeight
+// @description  Computes the sum of heights of each column in the grid.
+// @param        gLocal aGrid
+// @returns      float  The aggregated column heights.
+f_aggregateHeight(gLocal) =>
+    sum = 0.0
+    for c = 0 to gLocal.colsCount - 1
+        colHeight = 0.0
+        for r = 0 to gLocal.rowsCount - 1
+            if f_gridGet(gLocal, r, c) != 0
+                colHeight := gLocal.rowsCount - r
+                break
+        sum += colHeight
+    sum
+
+// @function     f_countHoles
+// @description  Counts the number of "holes" in the grid (spaces below blocks).
+// @param        gLocal aGrid
+// @returns      int    The number of holes.
+f_countHoles(gLocal) =>
+    holes = 0
+    for c = 0 to gLocal.colsCount - 1
+        columnHasBlock = false
+        for r = 0 to gLocal.rowsCount - 1
+            if f_gridGet(gLocal, r, c) != 0
+                columnHasBlock := true
+            else if columnHasBlock and f_gridGet(gLocal, r, c) == 0
+                holes += 1
+    holes
+
+// @function     f_bumpiness
+// @description  Computes the total difference between adjacent column heights.
+// @param        gLocal aGrid
+// @returns      float  Bumpiness value used in AI scoring.
+f_bumpiness(gLocal) =>
+    bumpiness = 0.0
+    float[] heights = array.new_float()
+    for c = 0 to gLocal.colsCount - 1
+        colHeight = 0.0
+        for r = 0 to gLocal.rowsCount - 1
+            if f_gridGet(gLocal, r, c) != 0
+                colHeight := gLocal.rowsCount - r
+                break
+        array.push(heights, colHeight)
+    for i = 0 to array.size(heights) - 2
+        h1 = array.get(heights, i)
+        h2 = array.get(heights, i+1)
+        bumpiness += math.abs(h1 - h2)
+    bumpiness
+
+// @function     f_findBestPlacement
+// @description  Uses a basic AI heuristic to test each rotation and column, 
+//               returning the best rotation and column for the piece.
+// @param        gLocal aGrid  Current grid.
+// @param        pieceIndex int Tetromino index.
+// @returns      int[]         [bestRotation, bestX] for piece placement.
+f_findBestPlacement(gLocal, pieceIndex) =>
+    bestRot = 0
+    bestX = 0
+    bestScore = -1e6
+    for rot = 0 to 3
+        for col = 0 to gLocal.colsCount - 1
+            testPs = f_newPieceState(pieceIndex, rot, col, 0)
+            if f_checkCollision(gLocal, testPs)
+                continue
+            while true
+                downPs = f_newPieceState(pieceIndex, rot, col, testPs.y + 1)
+                if f_checkCollision(gLocal, downPs)
+                    break
+                testPs := downPs
+            localClone = f_cloneGrid(gLocal)
+            f_lockPiece(localClone, testPs)
+            linesClearedCandidate = f_clearLines(localClone)
+            aggHeight = f_aggregateHeight(localClone)
+            holes = f_countHoles(localClone)
+            bump = f_bumpiness(localClone)
+            scoreCandidate = (-0.510066 * aggHeight) + (0.760666 * linesClearedCandidate) - (0.35663 * holes) - (0.184483 * bump)
+            if scoreCandidate > bestScore
+                bestScore := scoreCandidate
+                bestRot := rot
+                bestX := col
+    [bestRot, bestX]
+
+// @function     f_spawnPiece
+// @description  Spawns a new piece from the queue using best AI placement. If collision at spawn, gameOver = true.
+// @returns      [PieceState, bool] The piece state and a bool indicating game over.
+f_spawnPiece() =>
+    if array.size(pieceQueue) == 0
+        f_fillQueue()
+    pieceIndex = array.shift(pieceQueue)
+    [bestRot, bestX] = f_findBestPlacement(g, pieceIndex)
+    spawnPs = f_newPieceState(pieceIndex, bestRot, bestX, 0)
+    if f_checkCollision(g, spawnPs)
+        [spawnPs, true]
+    else
+        [spawnPs, false]
+
+// -----------------------------------------------------------------------------
+//Blockmarker EXECUTION (Main Game Logic)
+// -----------------------------------------------------------------------------
+
+if barstate.isrealtime and na(g)
+    g := f_newGrid(rows, cols)
+    pieceActive := false
+    gameOver := false
+    lastDropTime := timenow
+
+if barstate.isrealtime
+    f_fillQueue()
+
+    // Spawn piece if needed
+    if not pieceActive and not gameOver and not spawnPending
+        [newPiece, newOver] = f_spawnPiece()
+        currentPiece := newPiece
+        pieceActive := not newOver
+        gameOver := newOver
+        spawnPending := true
+        if array.size(pieceQueue) > 0
+            previewPieceStored := array.get(pieceQueue, 0)
+
+    // Drop piece automatically
+    if pieceActive and timenow - lastDropTime >= 250
+        lastDropTime := timenow
+        nextPs = f_newPieceState(currentPiece.pieceIndex, currentPiece.rotation, currentPiece.x, currentPiece.y + 1)
+        if f_checkCollision(g, nextPs)
+            f_lockPiece(g, currentPiece)
+            linesCleared = f_clearLines(g)
+            score := score + (linesCleared * 100)
+            pieceActive := false
+        else
+            currentPiece := nextPs
+
+    if not pieceActive
+        spawnPending := false
+
+    activeXs = array.new_int()
+    activeYs = array.new_int()
+    if pieceActive
+        offs = f_getOffsets(currentPiece)
+        for i = 0 to array.size(offs) - 1 by 2
+            xPos = currentPiece.x + array.get(offs, i)
+            yPos = currentPiece.y + array.get(offs, i+1)
+            array.push(activeXs, xPos)
+            array.push(activeYs, yPos)
+
+// -----------------------------------------------------------------------------
+//Blockmarker PLOTTING (Render Tetris Board and Preview)
+// -----------------------------------------------------------------------------
+
+    // Draw main Tetris table
+    for tr = 0 to borderRows - 1
+        for tc = 0 to borderCols - 1
+            if tr == 0 or tr == borderRows - 1 or tc == 0 or tc == borderCols - 1
+                table.cell(gameTable, tc, tr, "■", text_color=color.black, bgcolor=color.lime, text_size=size.tiny, text_valign=text.align_center)
+            else
+                gridRow = tr - 1
+                gridCol = tc - 1
+                inActivePiece = false
+                if pieceActive
+                    offs = f_getOffsets(currentPiece)
+                    for i = 0 to array.size(offs) - 1 by 2
+                        apX = currentPiece.x + array.get(offs, i)
+                        apY = currentPiece.y + array.get(offs, i+1)
+                        if apX == gridCol and apY == gridRow
+                            inActivePiece := true
+                            break
+                if inActivePiece
+                    table.cell(gameTable, tc, tr, "■", text_color=color.white, bgcolor=f_getStoneColor(currentPiece.pieceIndex), text_size=size.tiny, text_valign=text.align_center)
+                else if f_gridGet(g, gridRow, gridCol) != 0
+                    stoneType = f_gridGet(g, gridRow, gridCol)
+                    table.cell(gameTable, tc, tr, "■", text_color=color.white, bgcolor=f_getStoneColor(stoneType - 1), text_size=size.tiny, text_valign=text.align_center)
+                else
+                    table.cell(gameTable, tc, tr, " ", text_color=color.white, bgcolor=color.black, text_size=size.tiny, text_valign=text.align_center)
+
+    // Draw preview & score panel
+    for pr = 0 to pRows - 1
+        for pc = 0 to pCols - 1
+            if pc < 6
+                if pr == 0 or pr == pRows - 1 or pc == 0 or pc == 5
+                    table.cell(previewTable, pc, pr, "■", text_color=color.black, bgcolor=color.lime, text_size=size.tiny, text_valign=text.align_center)
+                else
+                    previewX = pc - 1
+                    previewY = pr - 1
+                    isBlock = false
+                    int previewPiece = previewPieceStored
+                    int previewRot = 0
+                    int[] previewOffsets = na
+                    if not na(previewPiece)
+                        previewOffsets := f_getTetrominoOffsets(previewPiece, previewRot)
+                    centeredOffsets = array.new_int()
+                    if not na(previewOffsets)
+                        minX = 100
+                        maxX = -100
+                        minY = 100
+                        maxY = -100
+                        for i = 0 to array.size(previewOffsets) - 1 by 2
+                            xVal = array.get(previewOffsets, i)
+                            yVal = array.get(previewOffsets, i+1)
+                            minX := math.min(minX, xVal)
+                            maxX := math.max(maxX, xVal)
+                            minY := math.min(minY, yVal)
+                            maxY := math.max(maxY, yVal)
+                        pieceWidth = maxX - minX + 1
+                        pieceHeight = maxY - minY + 1
+                        offsetX = math.floor((4 - pieceWidth) / 2) - minX
+                        offsetY = math.floor((4 - pieceHeight) / 2) - minY
+                        for i = 0 to array.size(previewOffsets) - 1 by 2
+                            origX = array.get(previewOffsets, i)
+                            origY = array.get(previewOffsets, i+1)
+                            newX = origX + offsetX
+                            newY = origY + offsetY
+                            array.push(centeredOffsets, newX)
+                            array.push(centeredOffsets, newY)
+                    if not na(centeredOffsets)
+                        for j = 0 to array.size(centeredOffsets) - 1 by 2
+                            if array.get(centeredOffsets, j) == previewX and array.get(centeredOffsets, j+1) == previewY
+                                isBlock := true
+                    if isBlock
+                        table.cell(previewTable, pc, pr, "■", text_color=color.white, bgcolor=color.orange, text_size=size.tiny, text_valign=text.align_center)
+                    else
+                        table.cell(previewTable, pc, pr, " ", text_color=color.white, bgcolor=color.black, text_size=size.tiny, text_valign=text.align_center)
+            else
+                if pr == 0 or pr == pRows - 1 or pc == 6 or pc == 8
+                    table.cell(previewTable, pc, pr, "■", text_color=color.black, bgcolor=color.lime, text_size=size.tiny, text_valign=text.align_center)
+                else
+                    if pr == 2
+                        table.cell(previewTable, pc, pr, "Score:", text_color=color.white, bgcolor=color.black, text_size=size.tiny, text_valign=text.align_center)
+                    else if pr == 3
+                        table.cell(previewTable, pc, pr, str.tostring(score), text_color=color.white, bgcolor=color.black, text_size=size.tiny, text_valign=text.align_center)
+                    else
+                        table.cell(previewTable, pc, pr, " ", text_color=color.white, bgcolor=color.black, text_size=size.tiny, text_valign=text.align_center)
+
+    // If game is over, show label
+    if gameOver
+        label.new(bar_index, high, style=label.style_label_down, text="GAME OVER", color=color.black, textcolor=color.red, size=size.normal)

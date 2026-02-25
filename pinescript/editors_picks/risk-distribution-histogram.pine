@@ -1,0 +1,395 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════════
+// Risk Distribution Histogram - Advanced Risk Analytics
+// By Henrique Centieiro
+// Version: 1.0
+// Description: Multi-method risk visualization with quartile color analysis
+// ═══════════════════════════════════════════════════════════════════════════════════
+indicator("Risk Distribution Histogram", overlay=false, max_bars_back=1000)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+color CLR_TRANSP = color.rgb(0, 0, 0, 100)
+int X_AXIS_LABEL_ROWS = 5
+int Y_AXIS_LABEL_COLUMNS = 1
+float COLUMN_WIDTH = 0
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// INPUTS WITH RISK VALUE UNIT EXPLANATIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Risk method selection with detailed tooltips
+string risk_method = input.string("Standard Deviation", "Risk Method", 
+     options=["Standard Deviation", "ATR", "Downside Deviation", "Drawdown", "Entropy-Based Risk (EVaR)", "VIX"], 
+     tooltip="• Standard Deviation: Raw daily volatility (0.02 = 2% daily price movement)\n• ATR: Average True Range as % of price (0.02 = 2% daily price range)\n• Downside Deviation: Raw daily downside volatility (0.015 = 1.5% daily downside risk)\n• Drawdown: Peak-to-trough decline for current timeframe period (0.10 = 10% drawdown)\n• Entropy-Based Risk (EVaR): Risk-adjusted entropy measure (higher = more uncertain)\n• VIX: Market fear index as decimal (0.20 = VIX level of 20)\n\nTIP: 50+ samples recommended for reliable statistics",
+     group="Risk Settings")
+
+// Drawdown calculation method
+string dd_method = input.string("Period High", "Drawdown Calculation", 
+     options=["Period High", "Rolling High"], 
+     tooltip="Only needed for drawdown method.\n• Period High: Drawdown from the high of current timeframe period (month/week/day)\n• Rolling High: Drawdown from rolling high over specified bars",
+     group="Risk Settings")
+
+// Rolling high lookback (only used if Rolling High is selected)
+int dd_lookback = input.int(21, "Drawdown Lookback Bars", minval=1, maxval=252, 
+     tooltip="Only needed for drawdown method. Number of bars to look back for rolling high (only used with Rolling High method)", 
+     group="Risk Settings")
+
+// Data collection settings
+int lookback = input.int(0, "Lookback Period (0 = All Data)", minval=0, maxval=1000, 
+     tooltip="Limit data collection for performance. 0 = use all available data (up to 1000 bars)", 
+     group="Data Range")
+bool use_date_range = input.bool(false, "Use Start/End Dates Instead", group="Data Range")
+int start_date = input.time(timestamp("2023-01-01"), "Start Date", group="Data Range")
+int end_date = input.time(timestamp("2024-12-31"), "End Date", group="Data Range")
+
+// Histogram settings
+int num_bins = input.int(30, "Number of Bins", minval=10, maxval=50, 
+     tooltip="More bins = finer detail. Fewer bins = cleaner view. 30 recommended for most cases.", 
+     group="Histogram")
+bool auto_bin_width = input.bool(true, "Auto Bin Width", 
+     tooltip="Automatically calculate optimal bin width based on data range", 
+     group="Histogram")
+float manual_bin_width = input.float(0.001, "Manual Bin Width", minval=0.0001, step=0.0001, group="Histogram")
+float rows = float(input.int(50, "Bar Resolution [1 to 50]", minval=1, maxval=50, group="Histogram"))
+float row_height = input.float(60, "Height (% of Panel) [33 to 100]", minval=33, maxval=100, group="Histogram") / rows
+
+// Colors - Updated for quartile coloring
+bool use_quartile_colors = input.bool(true, "Use Risk Quartile Colors", 
+     tooltip="Green=Low Risk (0-25%), Yellow=Med-Low (25-50%), Orange=Med-High (50-75%), Red=High Risk (75-100%)", 
+     group="Colors")
+color q1_color = input.color(color.new(color.green, 20), "Q1 - Low Risk (0-25%)", group="Colors")
+color q2_color = input.color(color.new(color.yellow, 20), "Q2 - Med-Low Risk (25-50%)", group="Colors")
+color q3_color = input.color(color.new(color.orange, 20), "Q3 - Med-High Risk (50-75%)", group="Colors")
+color q4_color = input.color(color.new(color.red, 20), "Q4 - High Risk (75-100%)", group="Colors")
+color hist_color = input.color(color.new(color.blue, 20), "Single Color (if quartiles off)", group="Colors")
+bool show_current_emoji = input.bool(true, "Show Current Risk Emoji", group="Colors")
+string current_emoji = input.string("🎯", "Current Risk Emoji", 
+     tooltip="Marks your current risk level in the histogram. Try: 🎯📍⚡💀🔥", 
+     group="Colors")
+
+// Table Font Settings
+string table_font_size = input.string("Tiny", "Table Font Size", 
+     options=["Tiny", "Small", "Normal"], 
+     tooltip="Tiny: Best for 30+ bins\nSmall: Good for 20+ bins\nNormal: Use with <20 bins", 
+     group="Table Font")
+color table_text_color = input.color(color.white, "Table Text Color", group="Table Font")
+color table_bg_color = input.color(color.new(color.black, 70), "Table Background Color", group="Table Font")
+color table_header_color = input.color(color.new(color.blue, 30), "Table Header Color", group="Table Font")
+
+// Label colors
+color clr_lbl_pos_num = input.color(color.rgb(155, 255, 135), "Positive Values Color", group="Colors")
+color clr_lbl_neg_num = input.color(color.rgb(255, 155, 135), "Negative Values Color", group="Colors")
+int label_precision = input.int(4, "Label Precision [0 to 8]", minval=0, maxval=8, 
+     tooltip="Number of decimal places shown in risk values", 
+     group="Colors")
+
+// Convert font size string to size constant
+get_font_size() =>
+    switch table_font_size
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        => size.tiny
+
+// Colors based on histogram color
+base_color = use_quartile_colors ? color.blue : hist_color
+color clr_unfilled = color.new(base_color, 95)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// VARIABLE DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Table for histogram with integrated data table
+var table tbl_hist = table.new(
+     position.bottom_center,
+     num_bins + Y_AXIS_LABEL_COLUMNS,
+     int(rows) + X_AXIS_LABEL_ROWS,
+     border_width=0)
+
+// VERIFIED DATA COLLECTION - SINGLE SOURCE OF TRUTH
+var array<float> verified_data = array.new<float>()
+var array<int> bin_counts = array.new<int>(num_bins, 0)
+var array<float> bin_probs = array.new<float>(num_bins, 0.0)
+
+// Statistics
+var float data_min = na
+var float data_max = na
+var float data_mean = na
+var float data_std = na
+var float bin_width = na
+var bool initialized = false
+
+// Quartile values
+var float q1_value = na
+var float q2_value = na
+var float q3_value = na
+
+// Period tracking variables for drawdown
+var float period_high = na
+
+// External data
+vix_data = request.security("TVC:VIX", timeframe.period, close)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PERIOD TRACKING LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Determine if we're in a new period based on timeframe
+is_new_period = switch timeframe.period
+    "1" => ta.change(time("1")) != 0
+    "3" => ta.change(time("3")) != 0
+    "5" => ta.change(time("5")) != 0
+    "15" => ta.change(time("15")) != 0
+    "30" => ta.change(time("30")) != 0
+    "60" => ta.change(time("60")) != 0
+    "120" => ta.change(time("120")) != 0
+    "240" => ta.change(time("240")) != 0
+    "1D" => ta.change(time("1D")) != 0
+    "1W" => ta.change(time("1W")) != 0
+    "1M" => ta.change(time("1M")) != 0
+    => ta.change(time("1D")) != 0
+
+// Update period high tracking
+if is_new_period or na(period_high)
+    period_high := high
+else
+    period_high := math.max(period_high, high)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// Risk calculation function
+calculate_risk() =>
+    switch risk_method
+        "Standard Deviation" => 
+            daily_return = math.log(close/close[1])
+            math.abs(daily_return)
+            
+        "ATR" => 
+            ta.atr(14) / close
+            
+        "Downside Deviation" =>
+            daily_return = math.log(close/close[1])
+            daily_return < 0 ? math.abs(daily_return) : 0.0
+            
+        "Drawdown" => 
+            if dd_method == "Period High"
+                current_dd = (close - period_high) / period_high
+                math.abs(current_dd)
+            else
+                highest = ta.highest(high, dd_lookback)
+                current_dd = (close - highest) / highest
+                math.abs(current_dd)
+            
+        "Entropy-Based Risk (EVaR)" =>
+            returns = math.log(close/close[1])
+            if not na(returns)
+                rolling_std = ta.stdev(returns, 20)
+                rolling_std > 0 ? rolling_std * math.log(rolling_std + 1) : 0.0
+            else
+                0.0
+                
+        "VIX" => 
+            not na(vix_data) ? vix_data / 100 : 0.0
+            
+        => 0.0
+
+// Get risk unit description
+get_risk_unit() =>
+    switch risk_method
+        "Standard Deviation" => "Raw Daily Volatility (decimal)"
+        "ATR" => "% of Price (decimal)"
+        "Downside Deviation" => "Raw Daily Downside Vol (decimal)"
+        "Drawdown" => dd_method == "Period High" ? "Period Drawdown % (decimal)" : "Rolling Drawdown % (decimal)"
+        "Entropy-Based Risk (EVaR)" => "Entropy Risk Measure"
+        "VIX" => "VIX Level (decimal)"
+        => "Risk Measure"
+
+// Get quartile color
+get_quartile_color(float bin_center) =>
+    if not use_quartile_colors
+        hist_color
+    else if bin_center <= q1_value
+        q1_color
+    else if bin_center <= q2_value
+        q2_color
+    else if bin_center <= q3_value
+        q3_color
+    else
+        q4_color
+
+// Table cell helper
+x_axis_label_cell(int column, int label_row, string label_text, string text_halign, color text_clr, bool is_header = false) =>
+    int row = math.max(int(rows), math.min(int(rows) + label_row, int(rows) + X_AXIS_LABEL_ROWS - 1))
+    
+    table.cell_set_text(tbl_hist, column, row, label_text)
+    table.cell_set_text_color(tbl_hist, column, row, text_clr)
+    table.cell_set_text_halign(tbl_hist, column, row, text_halign)
+    table.cell_set_bgcolor(tbl_hist, column, row, is_header ? table_header_color : table_bg_color)
+    table.cell_set_text_size(tbl_hist, column, row, get_font_size())
+    table.cell_set_height(tbl_hist, column, row, 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// DATA COLLECTION - VERIFIED SINGLE SOURCE
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+current_risk = calculate_risk()
+
+// ONLY collect VERIFIED, VALID data into ONE array
+if not na(current_risk) and current_risk >= 0 and not na(close)
+    include_data = if use_date_range
+        time >= start_date and time <= end_date
+    else
+        true
+        
+    if include_data
+        array.push(verified_data, current_risk)
+        
+        // Apply lookback limit for performance
+        if lookback > 0 and array.size(verified_data) > lookback
+            array.shift(verified_data)
+
+// Use ONLY the verified data size everywhere
+current_data_size = array.size(verified_data)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// HISTOGRAM CREATION
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and current_data_size >= 10
+    
+    if not initialized
+        initialized := true
+        
+        // Initialize table cells
+        for row = 0 to int(rows) + X_AXIS_LABEL_ROWS - 1
+            for column = 0 to Y_AXIS_LABEL_COLUMNS + num_bins - 1
+                table.cell(
+                     table_id = tbl_hist,
+                     column = column,
+                     row = row,
+                     text = "",
+                     text_color = CLR_TRANSP,
+                     text_size = size.tiny,
+                     bgcolor = clr_unfilled,
+                     width = COLUMN_WIDTH,
+                     height = row_height)
+        
+        // Set up headers
+        x_axis_label_cell(0, 0, "Current Risk", text.align_left, table_text_color, true)
+        x_axis_label_cell(0, 1, get_risk_unit(), text.align_left, table_text_color, true)
+        x_axis_label_cell(0, 2, "Count", text.align_left, table_text_color, true)
+        x_axis_label_cell(0, 3, "PMF %", text.align_left, table_text_color, true)
+        x_axis_label_cell(0, 4, "CDF %", text.align_left, table_text_color, true)
+    
+    // Calculate statistics from VERIFIED data only
+    sorted_data = array.copy(verified_data)  // ← USE VERIFIED DATA
+    array.sort(sorted_data, order.ascending)
+    
+    data_min := array.first(sorted_data)
+    data_max := array.last(sorted_data)
+    data_mean := array.avg(sorted_data)
+    data_std := array.stdev(sorted_data)
+    
+    // Calculate quartiles
+    q1_index = math.round(current_data_size * 0.25) - 1
+    q2_index = math.round(current_data_size * 0.50) - 1
+    q3_index = math.round(current_data_size * 0.75) - 1
+    
+    q1_value := array.get(sorted_data, math.max(0, math.min(current_data_size - 1, q1_index)))
+    q2_value := array.get(sorted_data, math.max(0, math.min(current_data_size - 1, q2_index)))
+    q3_value := array.get(sorted_data, math.max(0, math.min(current_data_size - 1, q3_index)))
+    
+    // BINNING USING VERIFIED DATA ONLY
+    range_span = data_max - data_min
+    bin_width := range_span > 0 ? range_span / num_bins : 0.001
+    
+    // Reset ALL bin counts to zero
+    for i = 0 to num_bins - 1
+        array.set(bin_counts, i, 0)
+    
+    // Count EVERY verified data point EXACTLY ONCE
+    int total_points_binned = 0
+    for i = 0 to current_data_size - 1
+        value = array.get(verified_data, i)  // ← USE VERIFIED DATA
+        
+        // Calculate which bin this goes into
+        int target_bin = 0
+        if range_span > 0
+            normalized_pos = (value - data_min) / range_span
+            target_bin := math.floor(normalized_pos * num_bins)
+            target_bin := math.max(0, math.min(num_bins - 1, target_bin))
+        
+        // Increment the bin
+        current_count = array.get(bin_counts, target_bin)
+        array.set(bin_counts, target_bin, current_count + 1)
+        total_points_binned += 1
+    
+    // Find current risk bin using same logic
+    int current_bin = 0
+    if range_span > 0
+        normalized_current = (current_risk - data_min) / range_span
+        current_bin := math.max(0, math.min(num_bins - 1, math.floor(normalized_current * num_bins)))
+    
+    max_count = array.max(bin_counts)
+    
+    // Draw histogram using VERIFIED counts
+    int running_count = 0
+    
+    for bin = 0 to num_bins - 1
+        bin_count = array.get(bin_counts, bin)
+        running_count += bin_count
+        bin_center = data_min + (bin + 0.5) * bin_width
+        
+        empirical_height = max_count > 0 ? math.min(int(rows), math.ceil(bin_count / max_count * rows)) : 0
+        column = bin + Y_AXIS_LABEL_COLUMNS
+        is_current = bin == current_bin
+        
+        // Use total_points_binned (which equals current_data_size) for percentages
+        pmf_percentage = total_points_binned > 0 ? (bin_count * 100.0) / total_points_binned : 0.0
+        cdf_percentage = total_points_binned > 0 ? (running_count * 100.0) / total_points_binned : 0.0
+        
+        // Update table
+        x_axis_label_cell(column, 0, is_current and show_current_emoji ? current_emoji : "", text.align_center, table_text_color)
+        x_axis_label_cell(column, 1, str.tostring(bin_center, "#." + str.repeat("#", label_precision)), text.align_center, bin_center > 0 ? clr_lbl_pos_num : bin_center < 0 ? clr_lbl_neg_num : table_text_color)
+        x_axis_label_cell(column, 2, str.tostring(bin_count), text.align_center, table_text_color)
+        x_axis_label_cell(column, 3, str.tostring(pmf_percentage, "0.1") + "%", text.align_center, table_text_color)
+        x_axis_label_cell(column, 4, str.tostring(cdf_percentage, "0.1") + "%", text.align_center, table_text_color)
+        
+        // Draw bars
+        bar_color = get_quartile_color(bin_center)
+        for row = 0 to int(rows) - 1
+            pixels_from_bottom = int(rows) - row - 1
+            cell_color = pixels_from_bottom < empirical_height ? bar_color : clr_unfilled
+            table.cell_set_bgcolor(tbl_hist, column, row, cell_color)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+plot(na, "Hidden", color=color.new(color.white, 100), display=display.none)
+plot(current_data_size, "Sample Size", display=display.data_window)
+plot(data_mean, "Mean Risk", display=display.data_window)
+plot(data_std, "Risk Std Dev", display=display.data_window)
+plot(not na(data_mean) and data_std > 0 ? (current_risk - data_mean) / data_std : na, "Z-Score", display=display.data_window)
+plot(current_risk, "Current Risk", display=display.data_window)
+plot(q1_value, "Q1 (25th percentile)", display=display.data_window)
+plot(q2_value, "Q2 (50th percentile)", display=display.data_window)
+plot(q3_value, "Q3 (75th percentile)", display=display.data_window)
+
+// Warning for small sample size
+if barstate.islast and current_data_size < 30
+    var label warning_label = na
+    label.delete(warning_label)
+    warning_label := label.new(
+         x=bar_index, 
+         y=0, 
+         text="⚠️ Sample: " + str.tostring(current_data_size) + " (30+ recommended)", 
+         style=label.style_label_left, 
+         color=color.orange, 
+         textcolor=color.white, 
+         size=size.small)

@@ -1,0 +1,327 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+//@version=6
+indicator("BK AK-Tomahawk", shorttitle="🚀", overlay=false, max_labels_count=500)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// GROUPS
+//──────────────────────────────────────────────────────────────────────────────
+grpCore     = "Core"
+grpSmooth   = "Smoothing"
+grpVel      = "Velocity / Accel"
+grpFilters  = "Filters"
+grpMTF      = "MTF Alignment"
+grpSqueeze  = "Squeeze / Expansion"
+grpSession  = "Session (NY Time)"
+grpVisual   = "Visuals (Neon)"
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE
+//──────────────────────────────────────────────────────────────────────────────
+src         = input.source(hlc3, "Source", group=grpCore)
+momLen      = input.int(9, "Momentum Length (ROC)", minval=1, group=grpCore)                  // matches your screenshot
+normLen     = input.int(120, "Normalization Length (Z-Score)", minval=20, group=grpCore)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SMOOTHING
+//──────────────────────────────────────────────────────────────────────────────
+smoothType  = input.string("ALMA", "Smoother",
+             options=["SuperSmoother","EMA","HMA","ALMA","RMA","WMA"], group=grpSmooth)       // matches your screenshot
+momSmoothL  = input.int(10, "Momentum Smooth Length", minval=1, group=grpSmooth)              // matches your screenshot
+sigLen      = input.int(9, "Signal Length", minval=1, group=grpSmooth)                        // matches your screenshot
+almaOff     = input.float(0.85, "ALMA Offset", minval=0, maxval=1, step=0.05, group=grpSmooth)
+almaSig     = input.int(6, "ALMA Sigma", minval=1, group=grpSmooth)
+
+//──────────────────────────────────────────────────────────────────────────────
+// VELOCITY / ACCEL
+//──────────────────────────────────────────────────────────────────────────────
+velNormLen  = input.int(60, "Velocity Normalization Length", minval=10, group=grpVel)         // matches your screenshot
+velSmoothL  = input.int(3, "Velocity Smooth Length", minval=1, group=grpVel)                  // matches your screenshot
+extTh       = input.float(120, "Extreme Threshold (|mom| / |vel|)", minval=10, group=grpVel)
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTERS
+//──────────────────────────────────────────────────────────────────────────────
+useTrend    = input.bool(false, "Trend Filter (EMA)", group=grpFilters)
+trendLen    = input.int(200, "Trend EMA Length", minval=1, group=grpFilters)
+
+useVWAP     = input.bool(true, "VWAP Filter (intraday only)", group=grpFilters)
+useVolume   = input.bool(false, "Volume Gate (above avg × mult)", group=grpFilters)
+volLen      = input.int(20, "Volume SMA Length", minval=1, group=grpFilters)
+volMult     = input.float(1.2, "Volume Multiplier", minval=0.1, step=0.1, group=grpFilters)
+
+//──────────────────────────────────────────────────────────────────────────────
+// MTF
+//──────────────────────────────────────────────────────────────────────────────
+useMTF      = input.bool(true, "Use Higher Timeframe Alignment", group=grpMTF)
+htf         = input.timeframe("60", "HTF (e.g., 60, 240, D)", group=grpMTF)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SQUEEZE
+//──────────────────────────────────────────────────────────────────────────────
+useSqueeze  = input.bool(true, "Use Velocity Squeeze → Expansion", group=grpSqueeze)
+sqLen       = input.int(20, "Squeeze Length (stdev)", minval=5, group=grpSqueeze)
+sqMult      = input.float(0.70, "Squeeze Threshold (stdev < avg ×)", minval=0.1, maxval=1.0, step=0.05, group=grpSqueeze)
+expMult     = input.float(1.30, "Expansion Threshold (stdev > avg ×)", minval=1.0, maxval=3.0, step=0.05, group=grpSqueeze)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SESSION (NY)
+//──────────────────────────────────────────────────────────────────────────────
+useSession  = input.bool(false, "Trade Only NY Session", group=grpSession)
+nyTz        = input.string("America/New_York", "Timezone", group=grpSession)
+nySess      = input.session("0930-1600", "NY Session", group=grpSession)
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUALS (NEON)
+//──────────────────────────────────────────────────────────────────────────────
+showZero        = input.bool(true, "Show Zero Line", group=grpVisual)
+zeroCol         = input.color(color.new(color.gray, 75), "Zero Line Color", group=grpVisual)
+
+// Your exact momentum colors
+colMomBull      = input.color(color.rgb(55,255,12),  "Momentum Bull  #37ff0c", group=grpVisual)
+colMomBear      = input.color(color.rgb(255,0,20),   "Momentum Bear  #ff0014", group=grpVisual)
+
+showMom         = input.bool(true,  "Show Momentum Line", group=grpVisual)
+momWidth        = input.int(2, "Momentum Width", minval=1, maxval=5, group=grpVisual)
+
+showSignal      = input.bool(true,  "Show Signal Line", group=grpVisual)
+sigWidth        = input.int(2, "Signal Width", minval=1, maxval=5, group=grpVisual)
+sigColor        = input.color(color.rgb(235,235,235), "Signal Color (Ice)", group=grpVisual)
+sigTransp       = input.int(12, "Signal Transparency", minval=0, maxval=100, group=grpVisual)
+
+// Fill between momentum and signal (uses your green/red)
+showFill        = input.bool(true, "Fill Mom ↔ Signal (your colors)", group=grpVisual)
+fillTransp      = input.int(86, "Fill Transparency", minval=0, maxval=100, group=grpVisual)
+
+// ── EARLY COLOR FLIP (DEFAULT ON via Velocity)
+momColorDriver  = input.string("Velocity (Early)", "Momentum Color Driver",
+     options=["Velocity (Early)", "Signal (Classic)"], group=grpVisual)
+
+leadTh          = input.float(2.0, "Lead Threshold (higher = less early / less flicker)", minval=0.0, step=0.25, group=grpVisual)
+
+// Velocity (columns + line)
+showVelCols     = input.bool(true, "Show Velocity Columns", group=grpVisual)
+showVelLine     = input.bool(true, "Show Velocity Line", group=grpVisual)
+velLineWidth    = input.int(1, "Velocity Line Width", minval=1, maxval=5, group=grpVisual)
+velFillTransp   = input.int(80, "Velocity Columns Transparency", minval=0, maxval=100, group=grpVisual)
+velLineTransp   = input.int(65, "Velocity Line Transparency (lighter than signal)", minval=0, maxval=100, group=grpVisual)
+
+// Creative neon velocity colors
+velPosColor      = input.color(color.rgb(0, 227, 255),  "Velocity + Neon Cyan", group=grpVisual)    // #00E3FF
+velNegColor      = input.color(color.rgb(180, 0, 255),  "Velocity - Neon Violet", group=grpVisual)  // #B400FF
+
+// Acceleration (area under velocity; slightly darker but see-through)
+showAccelArea    = input.bool(true, "Show Acceleration Area (under velocity)", group=grpVisual)
+accFillTransp    = input.int(74, "Accel Area Transparency (darker than velocity)", minval=0, maxval=100, group=grpVisual)
+
+// Creative accel colors (deep neon tones; avoids your red/green conflict)
+accPosColor      = input.color(color.rgb(0, 120, 255), "Accel + Deep Blue", group=grpVisual)
+accNegColor      = input.color(color.rgb(90, 0, 180),  "Accel - Deep Purple", group=grpVisual)
+
+// Backgrounds
+showZones       = input.bool(true, "Show Bull/Bear Zone BG", group=grpVisual)
+zoneTransp      = input.int(95, "Zone Transparency", minval=0, maxval=100, group=grpVisual)
+
+showSqueezeBg   = input.bool(true, "Show Squeeze BG", group=grpVisual)
+sqColor         = input.color(color.rgb(255, 240, 0), "Squeeze Color (Neon Yellow)", group=grpVisual)
+sqTransp        = input.int(95, "Squeeze Transparency", minval=0, maxval=100, group=grpVisual)
+
+// Markers
+showThrustMarks = input.bool(true,  "Show Thrust Markers (L/S)", group=grpVisual)
+showExhaustDots = input.bool(true,  "Show Exhaustion Dots", group=grpVisual)
+markersOnPrice  = input.bool(false, "Markers on Price Chart", group=grpVisual)
+thrustColor     = input.color(color.rgb(255,255,255), "Thrust Marker Color", group=grpVisual)
+exhaustColor    = input.color(color.rgb(255,165,0),   "Exhaust Dot Color", group=grpVisual)
+
+// Responsiveness controls (signals)
+minSep          = input.float(8.0, "Min Separation |mom-sig| (lower=faster)", minval=0.0, group=grpVisual)
+velTh           = input.float(4.0, "Min |velocity| for thrust", minval=0.0, group=grpVisual)
+
+// Zero line must be global scope (toggle with display)
+zeroLine = hline(0, "Zero", color=zeroCol, linestyle=hline.style_solid, linewidth=1,
+     display = showZero ? display.all : display.none)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SMOOTHERS
+//──────────────────────────────────────────────────────────────────────────────
+f_supersmoother(series float x, int length) =>
+    int l = length < 1 ? 1 : length
+    float a1 = math.exp(-1.414 * math.pi / l)
+    float b1 = 2.0 * a1 * math.cos(1.414 * math.pi / l)
+    float c2 = b1
+    float c3 = -a1 * a1
+    float c1 = 1.0 - c2 - c3
+    float y  = na
+    y := c1 * (x + nz(x[1])) * 0.5 + c2 * nz(y[1]) + c3 * nz(y[2])
+    y
+
+f_smooth(series float x, int length) =>
+    switch smoothType
+        "EMA"  => ta.ema(x, length)
+        "HMA"  => ta.hma(x, length)
+        "ALMA" => ta.alma(x, length, almaOff, almaSig)
+        "RMA"  => ta.rma(x, length)
+        "WMA"  => ta.wma(x, length)
+        => f_supersmoother(x, length)
+
+// Oscillator core (tuple for security)
+f_osc(series float _src) =>
+    rawMom = ta.roc(_src, momLen)
+    mu  = ta.sma(rawMom, normLen)
+    sd  = ta.stdev(rawMom, normLen)
+    z   = sd != 0.0 ? (rawMom - mu) / sd : 0.0
+
+    mom     = z * 50.0
+    momS    = f_smooth(mom, momSmoothL)
+    sig     = f_smooth(momS, sigLen)
+
+    velRaw  = momS - nz(momS[1])
+    vMu     = ta.sma(velRaw, velNormLen)
+    vSd     = ta.stdev(velRaw, velNormLen)
+    vZ      = vSd != 0.0 ? (velRaw - vMu) / vSd : 0.0
+    velBase = vZ * 50.0
+    vel     = f_smooth(velBase, velSmoothL)
+    acc     = vel - nz(vel[1])
+
+    velStd  = ta.stdev(velRaw, sqLen)
+    velAvg  = ta.sma(velStd, sqLen)
+    [momS, sig, vel, acc, velStd, velAvg]
+
+// Current TF / HTF
+[momS, signal, velocity, accel, velStd, velStdAvg] = f_osc(src)
+[momS_htf, sig_htf, vel_htf, acc_htf, velStd_htf, velStdAvg_htf] =
+     request.security(syminfo.tickerid, htf, f_osc(src), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Filters
+trendEMA = ta.ema(close, trendLen)
+vwapVal  = timeframe.isintraday ? ta.vwap(hlc3) : na
+volOK    = not useVolume or (volume > ta.sma(volume, volLen) * volMult)
+
+vwapOK_long  = not useVWAP or not timeframe.isintraday or close > vwapVal
+vwapOK_short = not useVWAP or not timeframe.isintraday or close < vwapVal
+
+longFilter  = (not useTrend or close > trendEMA) and vwapOK_long  and volOK
+shortFilter = (not useTrend or close < trendEMA) and vwapOK_short and volOK
+
+sessOK = not useSession or not na(time(timeframe.period, nySess, nyTz))
+
+htfLongOK  = not useMTF or (momS_htf >= sig_htf and vel_htf > 0)
+htfShortOK = not useMTF or (momS_htf <= sig_htf and vel_htf < 0)
+
+// Squeeze
+squeeze   = useSqueeze and (velStdAvg != 0 ? (velStd < velStdAvg * sqMult) : false)
+expansion = useSqueeze and (velStdAvg != 0 ? (velStd > velStdAvg * expMult) : false)
+
+var bool wasSqueeze = false
+if squeeze
+    wasSqueeze := true
+squeezeRelease = wasSqueeze and expansion
+if squeezeRelease
+    wasSqueeze := false
+
+// Signals / State
+sepOK     = math.abs(momS - signal) >= minSep
+bullCross = ta.crossover(momS, signal) and sepOK
+bearCross = ta.crossunder(momS, signal) and sepOK
+
+var bool lastUp = false
+var bool lastDn = false
+if bullCross
+    lastUp := true
+    lastDn := false
+if bearCross
+    lastDn := true
+    lastUp := false
+
+setupBull = lastUp and momS >= signal and velocity > 0
+setupBear = lastDn and momS <= signal and velocity < 0
+
+sqGate = not useSqueeze or squeezeRelease or not squeeze
+
+thrustLong  = bullCross and (velocity >  velTh) and (accel > 0) and longFilter  and htfLongOK  and sessOK and sqGate
+thrustShort = bearCross and (velocity < -velTh) and (accel < 0) and shortFilter and htfShortOK and sessOK and sqGate
+
+momExtreme = math.abs(momS) >= extTh
+velExtreme = math.abs(velocity) >= extTh
+exhaustUp  = (momS > 0 and momExtreme and accel < 0) or (velocity > 0 and velExtreme and accel < 0)
+exhaustDn  = (momS < 0 and momExtreme and accel > 0) or (velocity < 0 and velExtreme and accel > 0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// EARLY COLOR LOGIC (velocity-driven with deadband + memory)
+//──────────────────────────────────────────────────────────────────────────────
+classicBull = momS >= signal
+
+// Default state comes from classic signal logic so it never starts "wrong"
+var int momState = 0
+if barstate.isfirst
+    momState := classicBull ? 1 : -1
+
+if momColorDriver == "Velocity (Early)"
+    if velocity > leadTh
+        momState := 1
+    else if velocity < -leadTh
+        momState := -1
+    // else keep state (deadband)
+else
+    momState := classicBull ? 1 : -1
+
+momCol = momState == 1 ? colMomBull : colMomBear
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUAL LAYERS (Order matters)
+// 1) Accel area (behind)
+// 2) Velocity columns + line
+// 3) Momentum + signal + fill (on top)
+// 4) Background + markers
+//──────────────────────────────────────────────────────────────────────────────
+
+// 1) Acceleration area (behind)
+accFillCol = accel >= 0 ? color.new(accPosColor, accFillTransp) : color.new(accNegColor, accFillTransp)
+plot(showAccelArea ? accel : na, "Acceleration (Area)", style=plot.style_area, color=accFillCol, linewidth=1)
+
+// 2) Velocity columns + line
+velCol = velocity >= 0 ? color.new(velPosColor, velFillTransp) : color.new(velNegColor, velFillTransp)
+velLn  = velocity >= 0 ? color.new(velPosColor, velLineTransp) : color.new(velNegColor, velLineTransp)
+
+plot(showVelCols ? velocity : na, "Velocity (Columns)", style=plot.style_columns, color=velCol, linewidth=1)
+plot(showVelLine ? velocity : na, "Velocity (Line)", color=velLn, linewidth=velLineWidth)
+
+// 3) Momentum + Signal + Fill (your green/red; uses early color if enabled)
+pMom = plot(showMom ? momS : na, "Momentum", color=momCol, linewidth=momWidth)
+
+sigColPlot = color.new(sigColor, sigTransp)
+pSig = plot(showSignal ? signal : na, "Signal", color=sigColPlot, linewidth=sigWidth)
+
+fill(pMom, pSig, color = (showFill and showMom and showSignal) ? color.new(momCol, fillTransp) : na)
+
+// 4) Backgrounds (subtle)
+bullBg = color.new(colMomBull, zoneTransp)
+bearBg = color.new(colMomBear, zoneTransp)
+sqBg   = color.new(sqColor, sqTransp)
+
+zoneColor = setupBull ? bullBg : setupBear ? bearBg : na
+bgcolor(showZones ? (showSqueezeBg and squeeze ? sqBg : zoneColor) : na)
+
+// Markers (force_overlay must be const → two branches)
+paneMarks  = not markersOnPrice
+priceMarks = markersOnPrice
+
+plotshape(showThrustMarks and paneMarks and thrustLong,  title="Thrust Long (Pane)",  style=shape.triangleup,   location=location.bottom, color=thrustColor, size=size.tiny, text="L")
+plotshape(showThrustMarks and paneMarks and thrustShort, title="Thrust Short (Pane)", style=shape.triangledown, location=location.top,    color=thrustColor, size=size.tiny, text="S")
+
+plotshape(showThrustMarks and priceMarks and thrustLong,  title="Thrust Long (Price)",  style=shape.triangleup,   location=location.belowbar, color=thrustColor, size=size.tiny, text="L", force_overlay=true)
+plotshape(showThrustMarks and priceMarks and thrustShort, title="Thrust Short (Price)", style=shape.triangledown, location=location.abovebar, color=thrustColor, size=size.tiny, text="S", force_overlay=true)
+
+plotshape(showExhaustDots and paneMarks and exhaustUp, title="Exhaust Up (Pane)", style=shape.circle, location=location.top,    color=exhaustColor, size=size.tiny)
+plotshape(showExhaustDots and paneMarks and exhaustDn, title="Exhaust Dn (Pane)", style=shape.circle, location=location.bottom, color=exhaustColor, size=size.tiny)
+
+plotshape(showExhaustDots and priceMarks and exhaustUp, title="Exhaust Up (Price)", style=shape.circle, location=location.abovebar, color=exhaustColor, size=size.tiny, force_overlay=true)
+plotshape(showExhaustDots and priceMarks and exhaustDn, title="Exhaust Dn (Price)", style=shape.circle, location=location.belowbar, color=exhaustColor, size=size.tiny, force_overlay=true)
+
+// Alerts
+alertcondition(thrustLong,  "BK MomoVel Long",  "Thrust Long")
+alertcondition(thrustShort, "BK MomoVel Short", "Thrust Short")
+alertcondition(exhaustUp,   "BK MomoVel Exhaust Up", "Exhaustion Up")
+alertcondition(exhaustDn,   "BK MomoVel Exhaust Dn", "Exhaustion Down")

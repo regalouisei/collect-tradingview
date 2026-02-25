@@ -1,0 +1,931 @@
+//@version=6
+indicator("Multi Divergence Indicator", overlay=true, shorttitle="Multi Div")
+
+// ============================================================
+// INPUTS - GENERAL SETTINGS
+// ============================================================
+maxDist = input.int(35, "Max Bar Distance", group="General Settings")
+lbL = input.int(8, "Pivot Lookback Left", group="General Settings")
+lbR = input.int(8, "Pivot Lookback Right", group="General Settings")
+offset_mult = input.float(0.5, "Label Offset Multiplier", group="General Settings", step=0.1)
+repaint = input.bool(true, "Allow Repaint for Last Bar Detection", group="General Settings", tooltip="Enables potential divergence detection on the last bar (may repaint)")
+
+// ============================================================
+// INPUTS - TREND FILTER
+// ============================================================
+trendMethod = input.string("Zigzag", "Trend Detection Method", ["None", "Zigzag", "MA Difference"], group="Trend Filter", tooltip="Zigzag uses previous swing direction (3 pivots needed)")
+maType = input.string("EMA", "MA Type", ["SMA", "EMA", "WMA", "HMA"], group="Trend Filter")
+maLength = input.int(300, "MA Length", minval=1, group="Trend Filter")
+
+// ============================================================
+// INPUTS - VOLUME FILTER
+// ============================================================
+volumeConfirmation = input.bool(true, "Require Volume Confirmation for Regular Divergences", group="Volume Filter", tooltip="Higher volume on lower lows for bullish regular, lower on higher highs for bearish regular")
+
+// ============================================================
+// INPUTS - LABEL COLORS
+// ============================================================
+bull_reg_bg = input.color(color.green, "Bullish Regular Label Background", group="Label Colors")
+bull_reg_text = input.color(color.black, "Bullish Regular Label Text", group="Label Colors")
+bull_hid_bg = input.color(color.lime, "Bullish Hidden Label Background", group="Label Colors")
+bull_hid_text = input.color(color.black, "Bullish Hidden Label Text", group="Label Colors")
+bear_reg_bg = input.color(color.red, "Bearish Regular Label Background", group="Label Colors")
+bear_reg_text = input.color(color.black, "Bearish Regular Label Text", group="Label Colors")
+bear_hid_bg = input.color(color.orange, "Bearish Hidden Label Background", group="Label Colors")
+bear_hid_text = input.color(color.black, "Bearish Hidden Label Text", group="Label Colors")
+
+// ============================================================
+// INPUTS - ARROW SETTINGS
+// ============================================================
+showArrows = input.bool(true, "Show Prediction Arrows", group="Arrow Settings", tooltip="Toggle visibility of prediction arrows")
+arrow_bull_color = input.color(color.green, "Bullish Arrow Color", group="Arrow Settings", inline="arrow1")
+arrow_bear_color = input.color(color.red, "Bearish Arrow Color", group="Arrow Settings", inline="arrow1")
+arrow_size = input.int(3, "Arrow Size (1-5)", minval=1, maxval=5, group="Arrow Settings", tooltip="Arrow thickness from 1 to 5")
+arrow_thickness = arrow_size
+arrow_layer = input.string("Front", "Arrow Layer", options=["Front", "Background"], group="Arrow Settings", tooltip="Front draws arrows on top of price bars, Background draws arrows behind price bars")
+predictionMultiplier = input.float(3.0, "Prediction Multiplier (ATR)", group="Arrow Settings", tooltip="Multiplier for ATR to calculate predicted price target")
+predictionBars = input.int(11, "Prediction Bars Forward", group="Arrow Settings", tooltip="Number of bars to project forward for diagonal arrow")
+
+// ============================================================
+// INPUTS - RSI SETTINGS
+// ============================================================
+rsi_len = input.int(21, "RSI Length", group="RSI Settings")
+rsi_src = input.source(close, "Source", group="RSI Settings")
+rsi_div = input.bool(true, "Calculate Divergence", group="RSI Settings")
+
+// ============================================================
+// INPUTS - MACD SETTINGS
+// ============================================================
+macd_fast = input.int(12, "Fast Length", group="MACD Settings")
+macd_slow = input.int(26, "Slow Length", group="MACD Settings")
+macd_sig = input.int(9, "Signal Smoothing", group="MACD Settings")
+macd_src = input.source(close, "Source", group="MACD Settings")
+macd_div = input.bool(true, "Calculate Divergence", group="MACD Settings")
+
+// ============================================================
+// INPUTS - STOCHASTIC SETTINGS
+// ============================================================
+stoch_k_len = input.int(14, "%K Length", group="Stochastic Settings")
+stoch_src = input.source(close, "Source", group="Stochastic Settings")
+stoch_smoothK = input.int(2, "Smooth K", group="Stochastic Settings")
+stoch_smoothD = input.int(3, "Smooth D", group="Stochastic Settings")
+stoch_div = input.bool(true, "Calculate Divergence", group="Stochastic Settings")
+
+// ============================================================
+// INPUTS - CCI SETTINGS
+// ============================================================
+cci_len = input.int(25, "Length", group="CCI Settings")
+cci_src = input.source(close, "Source", group="CCI Settings")
+cci_div = input.bool(true, "Calculate Divergence", group="CCI Settings")
+
+// ============================================================
+// INPUTS - MOMENTUM SETTINGS
+// ============================================================
+mom_len = input.int(10, "Length", group="Momentum Settings")
+mom_src = input.source(close, "Source", group="Momentum Settings")
+mom_div = input.bool(true, "Calculate Divergence", group="Momentum Settings")
+
+// ============================================================
+// INPUTS - WILLIAMS %R SETTINGS
+// ============================================================
+willr_len = input.int(14, "Length", group="Williams %R Settings")
+willr_div = input.bool(true, "Calculate Divergence", group="Williams %R Settings")
+
+// ============================================================
+// INPUTS - AWESOME OSCILLATOR SETTINGS
+// ============================================================
+ao_fast = input.int(5, "Fast Length", group="Awesome Oscillator Settings")
+ao_slow = input.int(34, "Slow Length", group="Awesome Oscillator Settings")
+ao_div = input.bool(true, "Calculate Divergence", group="Awesome Oscillator Settings")
+
+// ============================================================
+// INPUTS - OBV SETTINGS
+// ============================================================
+obv_div = input.bool(true, "Calculate Divergence", group="OBV Settings")
+
+// ============================================================
+// CALCULATIONS - MOVING AVERAGE
+// ============================================================
+ma = switch maType
+    "SMA" => ta.sma(close, maLength)
+    "EMA" => ta.ema(close, maLength)
+    "WMA" => ta.wma(close, maLength)
+    "HMA" => ta.hma(close, maLength)
+
+// ============================================================
+// CALCULATIONS - ATR
+// ============================================================
+atr = ta.atr(14)
+
+// ============================================================
+// CALCULATIONS - OSCILLATORS
+// ============================================================
+// RSI
+rsi = ta.rsi(rsi_src, rsi_len)
+
+// MACD
+[macdLine, signal, macdHist] = ta.macd(macd_src, macd_fast, macd_slow, macd_sig)
+
+// Stochastic
+stochK = ta.stoch(stoch_src, high, low, stoch_k_len)
+stoch_smooth = ta.sma(stochK, stoch_smoothK)
+stochD = ta.sma(stoch_smooth, stoch_smoothD)
+
+// CCI
+cci = ta.cci(cci_src, cci_len)
+
+// Momentum
+mom = ta.mom(mom_src, mom_len)
+
+// Williams %R
+willr = ta.wpr(willr_len)
+
+// Awesome Oscillator
+ao = ta.sma(hl2, ao_fast) - ta.sma(hl2, ao_slow)
+
+// OBV
+obv_val = ta.obv
+
+// ============================================================
+// VARIABLES - LOW PIVOTS
+// ============================================================
+var float prevPrevLowPrice = na
+var float prevLowPrice = na
+var int prevLowBar = na
+var int prevLowTime = na
+var float prevLowMA = na
+var float rsi_prevLow = na
+var float macd_prevLow = na
+var float stoch_prevLow = na
+var float cci_prevLow = na
+var float mom_prevLow = na
+var float willr_prevLow = na
+var float ao_prevLow = na
+var float obv_prevLow = na
+
+// ============================================================
+// VARIABLES - HIGH PIVOTS
+// ============================================================
+var float prevPrevHighPrice = na
+var float prevHighPrice = na
+var int prevHighBar = na
+var int prevHighTime = na
+var float prevHighMA = na
+var float rsi_prevHigh = na
+var float macd_prevHigh = na
+var float stoch_prevHigh = na
+var float cci_prevHigh = na
+var float mom_prevHigh = na
+var float willr_prevHigh = na
+var float ao_prevHigh = na
+var float obv_prevHigh = na
+
+// ============================================================
+// ARRAYS FOR LABEL TRACKING
+// ============================================================
+var array<label> bull_reg_labels = array.new<label>()
+var array<label> bull_hid_labels = array.new<label>()
+var array<label> bear_reg_labels = array.new<label>()
+var array<label> bear_hid_labels = array.new<label>()
+
+// ============================================================
+// ARRAYS FOR LINE TRACKING
+// ============================================================
+var array<line> bull_reg_lines = array.new<line>()
+var array<line> bull_hid_lines = array.new<line>()
+var array<line> bear_reg_lines = array.new<line>()
+var array<line> bear_hid_lines = array.new<line>()
+var array<line> arrow_lines = array.new<line>()
+
+// ============================================================
+// SIGNAL PLOTS
+// ============================================================
+bull_reg_count_plot = 0
+bull_hid_count_plot = 0
+bear_reg_count_plot = 0
+bear_hid_count_plot = 0
+
+// ============================================================
+// PIVOT DETECTION
+// ============================================================
+// Extract for potential pivots
+float lowestLeft = ta.lowest(low[1], lbL)
+float highestLeft = ta.highest(high[1], lbL)
+
+// ============================================================
+// CONFIRMED LOW PIVOTS
+// ============================================================
+float priceLowPivot = ta.pivotlow(low, lbL, lbR)
+
+if not na(priceLowPivot)
+    int pivotBar = bar_index - lbR
+    int currTime = time[lbR]
+    float currLowPrice = low[lbR]
+    float currHighPrice = high[lbR]
+    float currClosePrice = close[lbR]
+    float curr_rsi = rsi[lbR]
+    float curr_macd = macdHist[lbR]
+    float curr_stoch = stochD[lbR]
+    float curr_cci = cci[lbR]
+    float curr_mom = mom[lbR]
+    float curr_willr = willr[lbR]
+    float curr_ao = ao[lbR]
+    float curr_obv = obv_val[lbR]
+    float atr_val = atr[lbR]
+    float currMA = ma[lbR]
+    float currVolume = volume[lbR]
+    
+    int bull_reg_count = 0
+    int bull_hid_count = 0
+    string bull_reg_tooltip = ""
+    string bull_hid_tooltip = ""
+    
+    if not na(prevLowBar) and pivotBar - prevLowBar <= maxDist
+        // Trend detection
+        float lowPreviousSwing = 0.0
+        if trendMethod == "Zigzag" and not na(prevPrevLowPrice) and not na(prevLowPrice)
+            lowPreviousSwing := math.sign(prevLowPrice - prevPrevLowPrice)
+        
+        float lowMaSlope = 0.0
+        if trendMethod == "MA Difference" and not na(prevLowMA) and not na(currMA)
+            lowMaSlope := math.sign(currMA - prevLowMA)
+        
+        float lowTrend = trendMethod == "Zigzag" ? lowPreviousSwing : lowMaSlope
+        
+        bool lowRegularOK = trendMethod == "None" or (not na(lowTrend) and lowTrend <= 0)
+        bool lowHiddenOK = trendMethod == "None" or (not na(lowTrend) and lowTrend >= 0)
+        
+        // Volume filter
+        float prevVolume = na(prevLowBar) ? na : volume[bar_index - prevLowBar]
+        bool lowVolumeOK = not volumeConfirmation or (not na(prevVolume) and currVolume > prevVolume)
+        
+        // RSI Divergence
+        if rsi_div and currLowPrice < prevLowPrice and curr_rsi > rsi_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "RSI\n"
+        if rsi_div and currLowPrice > prevLowPrice and curr_rsi < rsi_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "RSI\n"
+        
+        // MACD Divergence
+        if macd_div and currLowPrice < prevLowPrice and curr_macd > macd_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "MACD\n"
+        if macd_div and currLowPrice > prevLowPrice and curr_macd < macd_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "MACD\n"
+        
+        // Stochastic Divergence
+        if stoch_div and currLowPrice < prevLowPrice and curr_stoch > stoch_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Stoch\n"
+        if stoch_div and currLowPrice > prevLowPrice and curr_stoch < stoch_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Stoch\n"
+        
+        // CCI Divergence
+        if cci_div and currLowPrice < prevLowPrice and curr_cci > cci_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "CCI\n"
+        if cci_div and currLowPrice > prevLowPrice and curr_cci < cci_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "CCI\n"
+        
+        // Momentum Divergence
+        if mom_div and currLowPrice < prevLowPrice and curr_mom > mom_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Mom\n"
+        if mom_div and currLowPrice > prevLowPrice and curr_mom < mom_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Mom\n"
+        
+        // Williams %R Divergence
+        if willr_div and currLowPrice < prevLowPrice and curr_willr > willr_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "W%R\n"
+        if willr_div and currLowPrice > prevLowPrice and curr_willr < willr_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "W%R\n"
+        
+        // Awesome Oscillator Divergence
+        if ao_div and currLowPrice < prevLowPrice and curr_ao > ao_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "AO\n"
+        if ao_div and currLowPrice > prevLowPrice and curr_ao < ao_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "AO\n"
+        
+        // OBV Divergence
+        if obv_div and currLowPrice < prevLowPrice and curr_obv > obv_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "OBV\n"
+        if obv_div and currLowPrice > prevLowPrice and curr_obv < obv_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "OBV\n"
+    
+    // ============================================================
+    // REGULAR BULLISH DIVERGENCE
+    // ============================================================
+    if bull_reg_count > 0
+        // Draw connecting line
+        line newLine = line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.green, width=1)
+        array.push(bull_reg_lines, newLine)
+        
+        // Create label - removed arrow, show number only
+        string labelText = str.tostring(bull_reg_count)
+        label myLabel = label.new(pivotBar, currLowPrice, labelText, xloc=xloc.bar_index, yloc=yloc.belowbar, color=bull_reg_bg, style=label.style_label_up, textcolor=bull_reg_text, tooltip="Regular Bullish: Price likely to go UP (Trend Reversal)\n" + bull_reg_tooltip)
+        array.push(bull_reg_labels, myLabel)
+        
+        // Prediction arrow - diagonal UP and RIGHT (starting from wick BOTTOM - low)
+        if showArrows
+            float predictedPrice = currLowPrice + (atr_val * predictionMultiplier)
+            int arrowStartBar = bar_index - lbR
+            int arrowEndBar = arrowStartBar + predictionBars
+            int arrowStartTime = time[lbR]
+            int arrowEndTime = time[lbR] + (predictionBars * (time - time[1]))
+            chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currLowPrice)
+            chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+            line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bull_color, width=arrow_thickness, style=line.style_arrow_right)
+            array.push(arrow_lines, arrowLine)
+        
+        alert("Bullish Regular Divergence detected\n" + bull_reg_tooltip, alert.freq_once_per_bar_close)
+        bull_reg_count_plot := bull_reg_count
+    
+    // ============================================================
+    // HIDDEN BULLISH DIVERGENCE
+    // ============================================================
+    if bull_hid_count > 0
+        // Draw connecting line
+        line newLine = line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.lime, width=1)
+        array.push(bull_hid_lines, newLine)
+        
+        // Create label - removed arrow, show number only
+        string labelText = str.tostring(bull_hid_count)
+        label myLabel = label.new(pivotBar, currLowPrice, labelText, xloc=xloc.bar_index, yloc=yloc.belowbar, color=bull_hid_bg, style=label.style_label_up, textcolor=bull_hid_text, tooltip="Hidden Bullish: Price likely to go UP (Trend Continuation)\n" + bull_hid_tooltip)
+        array.push(bull_hid_labels, myLabel)
+        
+        // Prediction arrow - diagonal UP and RIGHT (starting from wick BOTTOM - low)
+        if showArrows
+            float predictedPrice = currLowPrice + (atr_val * predictionMultiplier)
+            int arrowStartBar = bar_index - lbR
+            int arrowEndBar = arrowStartBar + predictionBars
+            chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currLowPrice)
+            chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+            line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bull_color, width=arrow_thickness, style=line.style_arrow_right)
+            array.push(arrow_lines, arrowLine)
+        
+        alert("Bullish Hidden Divergence detected\n" + bull_hid_tooltip, alert.freq_once_per_bar_close)
+        bull_hid_count_plot := bull_hid_count
+    
+    // Update previous values
+    prevPrevLowPrice := prevLowPrice
+    prevLowPrice := currLowPrice
+    prevLowBar := pivotBar
+    prevLowTime := currTime
+    prevLowMA := currMA
+    rsi_prevLow := curr_rsi
+    macd_prevLow := curr_macd
+    stoch_prevLow := curr_stoch
+    cci_prevLow := curr_cci
+    mom_prevLow := curr_mom
+    willr_prevLow := curr_willr
+    ao_prevLow := curr_ao
+    obv_prevLow := curr_obv
+
+// ============================================================
+// POTENTIAL LOW PIVOT (REPAINT)
+// ============================================================
+if repaint and barstate.islast and not na(prevLowBar) and bar_index - prevLowBar <= maxDist
+    bool potentialLow = low < lowestLeft
+    
+    if potentialLow
+        int currTime = time
+        float currLowPrice = low
+        float currClosePrice = close
+        float curr_rsi = rsi
+        float curr_macd = macdHist
+        float curr_stoch = stochD
+        float curr_cci = cci
+        float curr_mom = mom
+        float curr_willr = willr
+        float curr_ao = ao
+        float curr_obv = obv_val
+        float atr_val = atr
+        float currMA = ma
+        float currVolume = volume
+        
+        int bull_reg_count = 0
+        int bull_hid_count = 0
+        string bull_reg_tooltip = ""
+        string bull_hid_tooltip = ""
+        
+        // Trend detection
+        float lowPreviousSwing = 0.0
+        if trendMethod == "Zigzag" and not na(prevPrevLowPrice) and not na(prevLowPrice)
+            lowPreviousSwing := math.sign(prevLowPrice - prevPrevLowPrice)
+        
+        float lowMaSlope = 0.0
+        if trendMethod == "MA Difference" and not na(prevLowMA) and not na(currMA)
+            lowMaSlope := math.sign(currMA - prevLowMA)
+        
+        float lowTrend = trendMethod == "Zigzag" ? lowPreviousSwing : lowMaSlope
+        
+        bool lowRegularOK = trendMethod == "None" or (not na(lowTrend) and lowTrend <= 0)
+        bool lowHiddenOK = trendMethod == "None" or (not na(lowTrend) and lowTrend >= 0)
+        
+        // Volume filter
+        float prevVolume = na(prevLowBar) ? na : volume[bar_index - prevLowBar]
+        bool lowVolumeOK = not volumeConfirmation or (not na(prevVolume) and currVolume > prevVolume)
+        
+        // RSI Divergence
+        if rsi_div and currLowPrice < prevLowPrice and curr_rsi > rsi_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "RSI\n"
+        if rsi_div and currLowPrice > prevLowPrice and curr_rsi < rsi_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "RSI\n"
+        
+        // MACD Divergence
+        if macd_div and currLowPrice < prevLowPrice and curr_macd > macd_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "MACD\n"
+        if macd_div and currLowPrice > prevLowPrice and curr_macd < macd_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "MACD\n"
+        
+        // Stochastic Divergence
+        if stoch_div and currLowPrice < prevLowPrice and curr_stoch > stoch_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Stoch\n"
+        if stoch_div and currLowPrice > prevLowPrice and curr_stoch < stoch_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Stoch\n"
+        
+        // CCI Divergence
+        if cci_div and currLowPrice < prevLowPrice and curr_cci > cci_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "CCI\n"
+        if cci_div and currLowPrice > prevLowPrice and curr_cci < cci_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "CCI\n"
+        
+        // Momentum Divergence
+        if mom_div and currLowPrice < prevLowPrice and curr_mom > mom_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "Mom\n"
+        if mom_div and currLowPrice > prevLowPrice and curr_mom < mom_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "Mom\n"
+        
+        // Williams %R Divergence
+        if willr_div and currLowPrice < prevLowPrice and curr_willr > willr_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "W%R\n"
+        if willr_div and currLowPrice > prevLowPrice and curr_willr < willr_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "W%R\n"
+        
+        // Awesome Oscillator Divergence
+        if ao_div and currLowPrice < prevLowPrice and curr_ao > ao_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "AO\n"
+        if ao_div and currLowPrice > prevLowPrice and curr_ao < ao_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "AO\n"
+        
+        // OBV Divergence
+        if obv_div and currLowPrice < prevLowPrice and curr_obv > obv_prevLow and lowRegularOK and lowVolumeOK
+            bull_reg_count += 1
+            bull_reg_tooltip += "OBV\n"
+        if obv_div and currLowPrice > prevLowPrice and curr_obv < obv_prevLow and lowHiddenOK
+            bull_hid_count += 1
+            bull_hid_tooltip += "OBV\n"
+        
+        // ============================================================
+        // POTENTIAL REGULAR BULLISH DIVERGENCE
+        // ============================================================
+        if bull_reg_count > 0
+            // Draw connecting line (dashed for potential)
+            line newLine = line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.green, width=1, style=line.style_dashed)
+            array.push(bull_reg_lines, newLine)
+            
+            // Create label - removed arrow, show number only
+            string labelText = str.tostring(bull_reg_count) + " (pot)"
+            label myLabel = label.new(bar_index, currLowPrice, labelText, xloc=xloc.bar_index, yloc=yloc.belowbar, color=bull_reg_bg, style=label.style_label_up, textcolor=bull_reg_text, tooltip="Potential Regular Bullish: Price likely to go UP (Trend Reversal)\n" + bull_reg_tooltip)
+            array.push(bull_reg_labels, myLabel)
+            
+            // Prediction arrow - diagonal UP and RIGHT (starting from wick BOTTOM - low)
+            if showArrows
+                float predictedPrice = currLowPrice + (atr_val * predictionMultiplier)
+                int arrowStartBar = bar_index
+                int arrowEndBar = arrowStartBar + predictionBars
+                chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currLowPrice)
+                chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+                line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bull_color, width=arrow_thickness, style=line.style_arrow_right)
+                array.push(arrow_lines, arrowLine)
+            
+            alert("Potential Bullish Regular Divergence detected\n" + bull_reg_tooltip, alert.freq_once_per_bar_close)
+            bull_reg_count_plot := bull_reg_count
+        
+        // ============================================================
+        // POTENTIAL HIDDEN BULLISH DIVERGENCE
+        // ============================================================
+        if bull_hid_count > 0
+            // Draw connecting line (dashed for potential)
+            line newLine = line.new(prevLowTime, prevLowPrice, currTime, currLowPrice, xloc=xloc.bar_time, extend=extend.none, color=color.lime, width=1, style=line.style_dashed)
+            array.push(bull_hid_lines, newLine)
+            
+            // Create label - removed arrow, show number only
+            string labelText = str.tostring(bull_hid_count) + " (pot)"
+            label myLabel = label.new(bar_index, currLowPrice, labelText, xloc=xloc.bar_index, yloc=yloc.belowbar, color=bull_hid_bg, style=label.style_label_up, textcolor=bull_hid_text, tooltip="Potential Hidden Bullish: Price likely to go UP (Trend Continuation)\n" + bull_hid_tooltip)
+            array.push(bull_hid_labels, myLabel)
+            
+            // Prediction arrow - diagonal UP and RIGHT (starting from wick BOTTOM - low)
+            if showArrows
+                float predictedPrice = currLowPrice + (atr_val * predictionMultiplier)
+                int arrowStartBar = bar_index
+                int arrowEndBar = arrowStartBar + predictionBars
+                chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currLowPrice)
+                chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+                line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bull_color, width=arrow_thickness, style=line.style_arrow_right)
+                array.push(arrow_lines, arrowLine)
+            
+            alert("Potential Bullish Hidden Divergence detected\n" + bull_hid_tooltip, alert.freq_once_per_bar_close)
+            bull_hid_count_plot := bull_hid_count
+
+// ============================================================
+// CONFIRMED HIGH PIVOTS
+// ============================================================
+float priceHighPivot = ta.pivothigh(high, lbL, lbR)
+
+if not na(priceHighPivot)
+    int pivotBar = bar_index - lbR
+    int currTime = time[lbR]
+    float currHighPrice = high[lbR]
+    float currLowPrice = low[lbR]
+    float currClosePrice = close[lbR]
+    float curr_rsi = rsi[lbR]
+    float curr_macd = macdHist[lbR]
+    float curr_stoch = stochD[lbR]
+    float curr_cci = cci[lbR]
+    float curr_mom = mom[lbR]
+    float curr_willr = willr[lbR]
+    float curr_ao = ao[lbR]
+    float curr_obv = obv_val[lbR]
+    float atr_val = atr[lbR]
+    float currMA = ma[lbR]
+    float currVolume = volume[lbR]
+    
+    int bear_reg_count = 0
+    int bear_hid_count = 0
+    string bear_reg_tooltip = ""
+    string bear_hid_tooltip = ""
+    
+    if not na(prevHighBar) and pivotBar - prevHighBar <= maxDist
+        // Trend detection
+        float highPreviousSwing = 0.0
+        if trendMethod == "Zigzag" and not na(prevPrevHighPrice) and not na(prevHighPrice)
+            highPreviousSwing := math.sign(prevHighPrice - prevPrevHighPrice)
+        
+        float highMaSlope = 0.0
+        if trendMethod == "MA Difference" and not na(prevHighMA) and not na(currMA)
+            highMaSlope := math.sign(currMA - prevHighMA)
+        
+        float highTrend = trendMethod == "Zigzag" ? highPreviousSwing : highMaSlope
+        
+        bool highRegularOK = trendMethod == "None" or (not na(highTrend) and highTrend >= 0)
+        bool highHiddenOK = trendMethod == "None" or (not na(highTrend) and highTrend <= 0)
+        
+        // Volume filter
+        float prevVolume = na(prevHighBar) ? na : volume[bar_index - prevHighBar]
+        bool highVolumeOK = not volumeConfirmation or (not na(prevVolume) and currVolume < prevVolume)
+        
+        // RSI Divergence
+        if rsi_div and currHighPrice > prevHighPrice and curr_rsi < rsi_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "RSI\n"
+        if rsi_div and currHighPrice < prevHighPrice and curr_rsi > rsi_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "RSI\n"
+        
+        // MACD Divergence
+        if macd_div and currHighPrice > prevHighPrice and curr_macd < macd_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "MACD\n"
+        if macd_div and currHighPrice < prevHighPrice and curr_macd > macd_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "MACD\n"
+        
+        // Stochastic Divergence
+        if stoch_div and currHighPrice > prevHighPrice and curr_stoch < stoch_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Stoch\n"
+        if stoch_div and currHighPrice < prevHighPrice and curr_stoch > stoch_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Stoch\n"
+        
+        // CCI Divergence
+        if cci_div and currHighPrice > prevHighPrice and curr_cci < cci_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "CCI\n"
+        if cci_div and currHighPrice < prevHighPrice and curr_cci > cci_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "CCI\n"
+        
+        // Momentum Divergence
+        if mom_div and currHighPrice > prevHighPrice and curr_mom < mom_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Mom\n"
+        if mom_div and currHighPrice < prevHighPrice and curr_mom > mom_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Mom\n"
+        
+        // Williams %R Divergence
+        if willr_div and currHighPrice > prevHighPrice and curr_willr < willr_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "W%R\n"
+        if willr_div and currHighPrice < prevHighPrice and curr_willr > willr_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "W%R\n"
+        
+        // Awesome Oscillator Divergence
+        if ao_div and currHighPrice > prevHighPrice and curr_ao < ao_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "AO\n"
+        if ao_div and currHighPrice < prevHighPrice and curr_ao > ao_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "AO\n"
+        
+        // OBV Divergence
+        if obv_div and currHighPrice > prevHighPrice and curr_obv < obv_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "OBV\n"
+        if obv_div and currHighPrice < prevHighPrice and curr_obv > obv_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "OBV\n"
+    
+    // ============================================================
+    // REGULAR BEARISH DIVERGENCE
+    // ============================================================
+    if bear_reg_count > 0
+        // Draw connecting line
+        line newLine = line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.red, width=1)
+        array.push(bear_reg_lines, newLine)
+        
+        // Create label - removed arrow, show number only
+        string labelText = str.tostring(bear_reg_count)
+        label myLabel = label.new(pivotBar, currHighPrice, labelText, xloc=xloc.bar_index, yloc=yloc.abovebar, color=bear_reg_bg, style=label.style_label_down, textcolor=bear_reg_text, tooltip="Regular Bearish: Price likely to go DOWN (Trend Reversal)\n" + bear_reg_tooltip)
+        array.push(bear_reg_labels, myLabel)
+        
+        // Prediction arrow - diagonal DOWN and RIGHT (starting from wick TOP - high)
+        if showArrows
+            float predictedPrice = currHighPrice - (atr_val * predictionMultiplier)
+            int arrowStartBar = bar_index - lbR
+            int arrowEndBar = arrowStartBar + predictionBars
+            chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currHighPrice)
+            chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+            line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bear_color, width=arrow_thickness, style=line.style_arrow_right)
+            array.push(arrow_lines, arrowLine)
+        
+        alert("Bearish Regular Divergence detected\n" + bear_reg_tooltip, alert.freq_once_per_bar_close)
+        bear_reg_count_plot := bear_reg_count
+    
+    // ============================================================
+    // HIDDEN BEARISH DIVERGENCE
+    // ============================================================
+    if bear_hid_count > 0
+        // Draw connecting line
+        line newLine = line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.orange, width=1)
+        array.push(bear_hid_lines, newLine)
+        
+        // Create label - removed arrow, show number only
+        string labelText = str.tostring(bear_hid_count)
+        label myLabel = label.new(pivotBar, currHighPrice, labelText, xloc=xloc.bar_index, yloc=yloc.abovebar, color=bear_hid_bg, style=label.style_label_down, textcolor=bear_hid_text, tooltip="Hidden Bearish: Price likely to go DOWN (Trend Continuation)\n" + bear_hid_tooltip)
+        array.push(bear_hid_labels, myLabel)
+        
+        // Prediction arrow - diagonal DOWN and RIGHT (starting from wick TOP - high)
+        if showArrows
+            float predictedPrice = currHighPrice - (atr_val * predictionMultiplier)
+            int arrowStartBar = bar_index - lbR
+            int arrowEndBar = arrowStartBar + predictionBars
+            chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currHighPrice)
+            chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+            line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bear_color, width=arrow_thickness, style=line.style_arrow_right)
+            array.push(arrow_lines, arrowLine)
+        
+        alert("Bearish Hidden Divergence detected\n" + bear_hid_tooltip, alert.freq_once_per_bar_close)
+        bear_hid_count_plot := bear_hid_count
+    
+    // Update previous values
+    prevPrevHighPrice := prevHighPrice
+    prevHighPrice := currHighPrice
+    prevHighBar := pivotBar
+    prevHighTime := currTime
+    prevHighMA := currMA
+    rsi_prevHigh := curr_rsi
+    macd_prevHigh := curr_macd
+    stoch_prevHigh := curr_stoch
+    cci_prevHigh := curr_cci
+    mom_prevHigh := curr_mom
+    willr_prevHigh := curr_willr
+    ao_prevHigh := curr_ao
+    obv_prevHigh := curr_obv
+
+// ============================================================
+// POTENTIAL HIGH PIVOT (REPAINT)
+// ============================================================
+if repaint and barstate.islast and not na(prevHighBar) and bar_index - prevHighBar <= maxDist
+    bool potentialHigh = high > highestLeft
+    
+    if potentialHigh
+        int currTime = time
+        float currHighPrice = high
+        float currLowPrice = low
+        float currClosePrice = close
+        float curr_rsi = rsi
+        float curr_macd = macdHist
+        float curr_stoch = stochD
+        float curr_cci = cci
+        float curr_mom = mom
+        float curr_willr = willr
+        float curr_ao = ao
+        float curr_obv = obv_val
+        float atr_val = atr
+        float currMA = ma
+        float currVolume = volume
+        
+        int bear_reg_count = 0
+        int bear_hid_count = 0
+        string bear_reg_tooltip = ""
+        string bear_hid_tooltip = ""
+        
+        // Trend detection
+        float highPreviousSwing = 0.0
+        if trendMethod == "Zigzag" and not na(prevPrevHighPrice) and not na(prevHighPrice)
+            highPreviousSwing := math.sign(prevHighPrice - prevPrevHighPrice)
+        
+        float highMaSlope = 0.0
+        if trendMethod == "MA Difference" and not na(prevHighMA) and not na(currMA)
+            highMaSlope := math.sign(currMA - prevHighMA)
+        
+        float highTrend = trendMethod == "Zigzag" ? highPreviousSwing : highMaSlope
+        
+        bool highRegularOK = trendMethod == "None" or (not na(highTrend) and highTrend >= 0)
+        bool highHiddenOK = trendMethod == "None" or (not na(highTrend) and highTrend <= 0)
+        
+        // Volume filter
+        float prevVolume = na(prevHighBar) ? na : volume[bar_index - prevHighBar]
+        bool highVolumeOK = not volumeConfirmation or (not na(prevVolume) and currVolume < prevVolume)
+        
+        // RSI Divergence
+        if rsi_div and currHighPrice > prevHighPrice and curr_rsi < rsi_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "RSI\n"
+        if rsi_div and currHighPrice < prevHighPrice and curr_rsi > rsi_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "RSI\n"
+        
+        // MACD Divergence
+        if macd_div and currHighPrice > prevHighPrice and curr_macd < macd_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "MACD\n"
+        if macd_div and currHighPrice < prevHighPrice and curr_macd > macd_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "MACD\n"
+        
+        // Stochastic Divergence
+        if stoch_div and currHighPrice > prevHighPrice and curr_stoch < stoch_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Stoch\n"
+        if stoch_div and currHighPrice < prevHighPrice and curr_stoch > stoch_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Stoch\n"
+        
+        // CCI Divergence
+        if cci_div and currHighPrice > prevHighPrice and curr_cci < cci_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "CCI\n"
+        if cci_div and currHighPrice < prevHighPrice and curr_cci > cci_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "CCI\n"
+        
+        // Momentum Divergence
+        if mom_div and currHighPrice > prevHighPrice and curr_mom < mom_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "Mom\n"
+        if mom_div and currHighPrice < prevHighPrice and curr_mom > mom_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "Mom\n"
+        
+        // Williams %R Divergence
+        if willr_div and currHighPrice > prevHighPrice and curr_willr < willr_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "W%R\n"
+        if willr_div and currHighPrice < prevHighPrice and curr_willr > willr_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "W%R\n"
+        
+        // Awesome Oscillator Divergence
+        if ao_div and currHighPrice > prevHighPrice and curr_ao < ao_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "AO\n"
+        if ao_div and currHighPrice < prevHighPrice and curr_ao > ao_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "AO\n"
+        
+        // OBV Divergence
+        if obv_div and currHighPrice > prevHighPrice and curr_obv < obv_prevHigh and highRegularOK and highVolumeOK
+            bear_reg_count += 1
+            bear_reg_tooltip += "OBV\n"
+        if obv_div and currHighPrice < prevHighPrice and curr_obv > obv_prevHigh and highHiddenOK
+            bear_hid_count += 1
+            bear_hid_tooltip += "OBV\n"
+        
+        // ============================================================
+        // POTENTIAL REGULAR BEARISH DIVERGENCE
+        // ============================================================
+        if bear_reg_count > 0
+            // Draw connecting line (dashed for potential)
+            line newLine = line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.red, width=1, style=line.style_dashed)
+            array.push(bear_reg_lines, newLine)
+            
+            // Create label - removed arrow, show number only
+            string labelText = str.tostring(bear_reg_count) + " (pot)"
+            label myLabel = label.new(bar_index, currHighPrice, labelText, xloc=xloc.bar_index, yloc=yloc.abovebar, color=bear_reg_bg, style=label.style_label_down, textcolor=bear_reg_text, tooltip="Potential Regular Bearish: Price likely to go DOWN (Trend Reversal)\n" + bear_reg_tooltip)
+            array.push(bear_reg_labels, myLabel)
+            
+            // Prediction arrow - diagonal DOWN and RIGHT (starting from wick TOP - high)
+            if showArrows
+                float predictedPrice = currHighPrice - (atr_val * predictionMultiplier)
+                int arrowStartBar = bar_index
+                int arrowEndBar = arrowStartBar + predictionBars
+                chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currHighPrice)
+                chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+                line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bear_color, width=arrow_thickness, style=line.style_arrow_right)
+                array.push(arrow_lines, arrowLine)
+            
+            alert("Potential Bearish Regular Divergence detected\n" + bear_reg_tooltip, alert.freq_once_per_bar_close)
+            bear_reg_count_plot := bear_reg_count
+        
+        // ============================================================
+        // POTENTIAL HIDDEN BEARISH DIVERGENCE
+        // ============================================================
+        if bear_hid_count > 0
+            // Draw connecting line (dashed for potential)
+            line newLine = line.new(prevHighTime, prevHighPrice, currTime, currHighPrice, xloc=xloc.bar_time, extend=extend.none, color=color.orange, width=1, style=line.style_dashed)
+            array.push(bear_hid_lines, newLine)
+            
+            // Create label - removed arrow, show number only
+            string labelText = str.tostring(bear_hid_count) + " (pot)"
+            label myLabel = label.new(bar_index, currHighPrice, labelText, xloc=xloc.bar_index, yloc=yloc.abovebar, color=bear_hid_bg, style=label.style_label_down, textcolor=bear_hid_text, tooltip="Potential Hidden Bearish: Price likely to go DOWN (Trend Continuation)\n" + bear_hid_tooltip)
+            array.push(bear_hid_labels, myLabel)
+            
+            // Prediction arrow - diagonal DOWN and RIGHT (starting from wick TOP - high)
+            if showArrows
+                float predictedPrice = currHighPrice - (atr_val * predictionMultiplier)
+                int arrowStartBar = bar_index
+                int arrowEndBar = arrowStartBar + predictionBars
+                chart.point arrowStartPoint = chart.point.from_index(arrowStartBar, currHighPrice)
+                chart.point arrowEndPoint = chart.point.from_index(arrowEndBar, predictedPrice)
+                line arrowLine = line.new(arrowStartPoint, arrowEndPoint, xloc=xloc.bar_index, extend=extend.none, color=arrow_bear_color, width=arrow_thickness, style=line.style_arrow_right)
+                array.push(arrow_lines, arrowLine)
+            
+            alert("Potential Bearish Hidden Divergence detected\n" + bear_hid_tooltip, alert.freq_once_per_bar_close)
+            bear_hid_count_plot := bear_hid_count
+
+// ============================================================
+// LIVE COLOR UPDATE (FIXED)
+// ============================================================
+// Update label colors to reflect any user changes to color inputs
+if barstate.islast
+    if array.size(bull_reg_labels) > 0
+        for i = 0 to array.size(bull_reg_labels) - 1
+            label lbl = array.get(bull_reg_labels, i)
+            label.set_color(lbl, bull_reg_bg)
+            label.set_textcolor(lbl, bull_reg_text)
+
+    if array.size(bull_hid_labels) > 0
+        for i = 0 to array.size(bull_hid_labels) - 1
+            label lbl = array.get(bull_hid_labels, i)
+            label.set_color(lbl, bull_hid_bg)
+            label.set_textcolor(lbl, bull_hid_text)
+
+    if array.size(bear_reg_labels) > 0
+        for i = 0 to array.size(bear_reg_labels) - 1
+            label lbl = array.get(bear_reg_labels, i)
+            label.set_color(lbl, bear_reg_bg)
+            label.set_textcolor(lbl, bear_reg_text)
+
+    if array.size(bear_hid_labels) > 0
+        for i = 0 to array.size(bear_hid_labels) - 1
+            label lbl = array.get(bear_hid_labels, i)
+            label.set_color(lbl, bear_hid_bg)
+            label.set_textcolor(lbl, bear_hid_text)
+
+// ============================================================
+// SCREENER PLOTS
+// ============================================================
+plot(bull_reg_count_plot, "Bullish Regular Divergence Count", color.green, display=display.data_window)
+plot(bull_hid_count_plot, "Bullish Hidden Divergence Count", color.lime, display=display.data_window)
+plot(bear_reg_count_plot, "Bearish Regular Divergence Count", color.red, display=display.data_window)
+plot(bear_hid_count_plot, "Bearish Hidden Divergence Count", color.orange, display=display.data_window)

@@ -1,0 +1,308 @@
+//@version=6
+indicator("PulseRPO Zero-Lag Bands", shorttitle="RPO-VB", overlay=false, precision=2)
+
+// ═══════════════════════════════════════════════════════════════
+//                    INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════
+
+g_rpo = "RPO Settings"
+rpo_fast = input.int(12, "Fast Period", minval=1, maxval=50, group=g_rpo, tooltip="Fast moving average period")
+rpo_slow = input.int(26, "Slow Period", minval=2, maxval=200, group=g_rpo, tooltip="Slow moving average period")
+rpo_signal = input.int(9, "Signal Period", minval=1, maxval=50, group=g_rpo, tooltip="Signal line smoothing period")
+ma_type = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "RMA", "HMA", "ZLEMA"], group=g_rpo, tooltip="Moving average type for RPO calculation")
+show_signal = input.bool(true, "Show Signal Line", group=g_rpo)
+show_histogram = input.bool(true, "Show Histogram", group=g_rpo)
+
+g_bands = "Volatility Band Settings"
+band_length = input.int(20, "Band Period", minval=5, maxval=100, group=g_bands, tooltip="Period for volatility calculation")
+band_mult = input.float(2.0, "Band Multiplier", minval=0.5, maxval=5.0, step=0.1, group=g_bands, tooltip="Standard deviation multiplier")
+band_method = input.string("ATR", "Volatility Method", options=["StdDev", "ATR", "Range", "Hybrid"], group=g_bands, tooltip="Method for band calculation")
+adaptive_bands = input.bool(true, "Adaptive Bands", group=g_bands, tooltip="Bands adapt to oscillator volatility")
+
+g_zerolag = "Zero Lag Settings"
+enable_zerolag = input.bool(true, "Enable Zero Lag", group=g_zerolag, tooltip="Apply zero lag techniques")
+zl_gain = input.float(2.0, "Zero Lag Gain", minval=0.5, maxval=10.0, step=0.1, group=g_zerolag, tooltip="Higher values = more aggressive lag reduction")
+zl_method = input.string("ZLEMA", "ZL Method", options=["ZLEMA", "DEMA", "TEMA", "HMA"], group=g_zerolag)
+
+g_signals = "Signal Settings"
+show_ob_os = input.bool(true, "Show OB/OS Levels", group=g_signals, tooltip="Show overbought/oversold levels")
+ob_level = input.float(2.0, "Overbought Level", step=0.1, group=g_signals)
+os_level = input.float(-2.0, "Oversold Level", step=0.1, group=g_signals)
+show_divergence = input.bool(true, "Show Divergences", group=g_signals)
+show_crosses = input.bool(true, "Show Band Crosses", group=g_signals)
+
+g_display = "Display Settings"
+rpo_color = input.color(color.blue, "RPO Color", group=g_display)
+signal_color = input.color(color.orange, "Signal Color", group=g_display)
+upper_band_color = input.color(color.red, "Upper Band", group=g_display)
+lower_band_color = input.color(color.green, "Lower Band", group=g_display)
+fill_bands = input.bool(true, "Fill Bands", group=g_display)
+fill_opacity = input.int(90, "Fill Opacity", minval=0, maxval=100, group=g_display)
+
+// ═══════════════════════════════════════════════════════════════
+//                    ZERO LAG FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+// Zero Lag EMA
+zlema(src, length, gain) =>
+    lag = math.round((length - 1) / 2)
+    data = lag > 0 and bar_index >= lag ? src + (src - nz(src[lag], src)) * gain : src
+    ta.ema(data, length)
+
+// Double EMA
+dema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    2 * ema1 - ema2
+
+// Triple EMA
+tema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    ema3 = ta.ema(ema2, length)
+    3 * (ema1 - ema2) + ema3
+
+// Hull MA
+hma(src, length) =>
+    half_length = math.round(length / 2)
+    sqrt_length = math.round(math.sqrt(length))
+    wma1 = ta.wma(src, half_length)
+    wma2 = ta.wma(src, length)
+    ta.wma(2 * wma1 - wma2, sqrt_length)
+
+// Apply Zero Lag
+applyZeroLag(src, method, length, gain) =>
+    switch method
+        "ZLEMA" => zlema(src, length, gain)
+        "DEMA" => dema(src, length)
+        "TEMA" => tema(src, length)
+        "HMA" => hma(src, length)
+        => src
+
+// ═══════════════════════════════════════════════════════════════
+//                    RPO CALCULATION
+// ═══════════════════════════════════════════════════════════════
+
+// Calculate moving averages based on type
+calcMA(source, length, matype) =>
+    switch matype
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "WMA" => ta.wma(source, length)
+        "RMA" => ta.rma(source, length)
+        "HMA" => hma(source, length)
+        "ZLEMA" => zlema(source, length, zl_gain)
+        => ta.ema(source, length)
+
+// Calculate fast and slow MAs
+fast_ma = calcMA(close, rpo_fast, ma_type)
+slow_ma = calcMA(close, rpo_slow, ma_type)
+
+// Calculate RPO (percentage difference)
+rpo_raw = ((fast_ma - slow_ma) / slow_ma) * 100
+
+// Apply zero lag if enabled
+rpo = enable_zerolag ? applyZeroLag(rpo_raw, zl_method, 5, zl_gain) : rpo_raw
+
+// Signal line
+signal_line = calcMA(rpo, rpo_signal, "EMA")
+
+// Histogram
+histogram = rpo - signal_line
+
+// ═══════════════════════════════════════════════════════════════
+//                    VOLATILITY BAND CALCULATION
+// ═══════════════════════════════════════════════════════════════
+
+// Calculate RPO volatility using different methods
+calcRPOVolatility(method, length) =>
+    switch method
+        "StdDev" => ta.stdev(rpo, length)
+        "ATR" => 
+            // ATR-like calculation for oscillator
+            rpo_high = ta.highest(rpo, 1)
+            rpo_low = ta.lowest(rpo, 1)
+            rpo_tr = math.max(math.abs(rpo_high - rpo_low), math.max(math.abs(rpo_high - nz(rpo[1])), math.abs(rpo_low - nz(rpo[1]))))
+            ta.rma(rpo_tr, length)
+        "Range" =>
+            // Range-based volatility
+            highest_rpo = ta.highest(rpo, length)
+            lowest_rpo = ta.lowest(rpo, length)
+            (highest_rpo - lowest_rpo) / 4
+        "Hybrid" =>
+            // Combination of methods
+            std = ta.stdev(rpo, length)
+            rng = (ta.highest(rpo, length) - ta.lowest(rpo, length)) / 4
+            (std + rng) / 2
+        => ta.stdev(rpo, length)
+
+// Calculate base volatility
+base_volatility = calcRPOVolatility(band_method, band_length)
+
+// Adaptive band adjustment
+adaptiveMultiplier() =>
+    if not adaptive_bands
+        1.0
+    else
+        // Measure RPO momentum
+        rpo_momentum = math.abs(rpo - nz(rpo[1], rpo))
+        avg_momentum = ta.sma(rpo_momentum, band_length)
+        
+        // Volatility regime detection
+        current_vol = base_volatility
+        avg_vol = ta.sma(base_volatility, band_length * 2)
+        vol_ratio = avg_vol > 0 ? current_vol / avg_vol : 1
+        
+        // Adjust multiplier based on regime
+        if vol_ratio > 1.5  // High volatility
+            0.8  // Tighten bands
+        else if vol_ratio < 0.5  // Low volatility
+            1.2  // Widen bands
+        else
+            1.0
+
+// Calculate dynamic multiplier
+dynamic_mult = band_mult * adaptiveMultiplier()
+
+// Calculate bands around zero (since RPO oscillates around zero)
+upper_band_raw = dynamic_mult * base_volatility
+lower_band_raw = -dynamic_mult * base_volatility
+
+// Apply zero lag to bands if enabled
+upper_band = enable_zerolag ? applyZeroLag(upper_band_raw, zl_method, 5, zl_gain) : upper_band_raw
+lower_band = enable_zerolag ? applyZeroLag(lower_band_raw, zl_method, 5, zl_gain) : lower_band_raw
+
+// Dynamic OB/OS levels based on volatility
+dynamic_ob = math.max(ob_level, upper_band * 1.2)
+dynamic_os = math.min(os_level, lower_band * 1.2)
+
+// ═══════════════════════════════════════════════════════════════
+//                    SIGNAL DETECTION
+// ═══════════════════════════════════════════════════════════════
+
+// Band crosses
+upper_cross = ta.crossover(rpo, upper_band)
+lower_cross = ta.crossunder(rpo, lower_band)
+signal_cross_up = ta.crossover(rpo, signal_line)
+signal_cross_down = ta.crossunder(rpo, signal_line)
+
+// Divergence detection
+bullish_div = rpo < lower_band and rpo > rpo[1] and low < low[1]
+bearish_div = rpo > upper_band and rpo < rpo[1] and high > high[1]
+
+// Momentum signals
+strong_bullish = rpo > upper_band and rpo > rpo[1]
+strong_bearish = rpo < lower_band and rpo < rpo[1]
+
+// Squeeze detection
+band_width = upper_band - lower_band
+avg_width = ta.sma(band_width, band_length)
+squeeze = band_width < avg_width * 0.7
+
+// ═══════════════════════════════════════════════════════════════
+//                    PLOTTING
+// ═══════════════════════════════════════════════════════════════
+
+// Plot RPO
+plot(rpo, "RPO", color=rpo_color, linewidth=2)
+
+// Plot signal line
+plot(show_signal ? signal_line : na, "Signal", color=signal_color, linewidth=1)
+
+// Plot histogram
+plot(show_histogram ? histogram : na, "Histogram", 
+     color=histogram > 0 ? color.new(color.green, 50) : color.new(color.red, 50),
+     style=plot.style_histogram, linewidth=1)
+
+// Plot bands
+p_upper = plot(upper_band, "Upper Band", color=upper_band_color, linewidth=2)
+p_lower = plot(lower_band, "Lower Band", color=lower_band_color, linewidth=2)
+
+// Fill between bands
+fill(p_upper, p_lower, color=fill_bands ? color.new(color.gray, fill_opacity) : na)
+
+// Plot OB/OS levels (using plot for dynamic levels)
+plot(show_ob_os ? dynamic_ob : na, "Overbought", color=color.new(color.red, 70), linewidth=1, style=plot.style_line)
+plot(show_ob_os ? dynamic_os : na, "Oversold", color=color.new(color.green, 70), linewidth=1, style=plot.style_line)
+hline(0, "Zero", color=color.gray, linestyle=hline.style_solid)
+
+// Fixed OB/OS reference lines (optional)
+hline(ob_level, "Fixed OB", color=color.new(color.red, 90), linestyle=hline.style_dotted)
+hline(os_level, "Fixed OS", color=color.new(color.green, 90), linestyle=hline.style_dotted)
+
+// ═══════════════════════════════════════════════════════════════
+//                    SIGNAL VISUALIZATION
+// ═══════════════════════════════════════════════════════════════
+
+// Band cross signals
+plotshape(show_crosses and upper_cross, "Upper Cross", shape.triangledown, location.top, 
+         color=color.red, size=size.small)
+plotshape(show_crosses and lower_cross, "Lower Cross", shape.triangleup, location.bottom, 
+         color=color.green, size=size.small)
+
+// Divergence signals
+plotshape(show_divergence and bullish_div, "Bullish Div", shape.labelup, location.bottom, 
+         color=color.green, text="Bull Div", textcolor=color.white, size=size.small)
+plotshape(show_divergence and bearish_div, "Bearish Div", shape.labeldown, location.top, 
+         color=color.red, text="Bear Div", textcolor=color.white, size=size.small)
+
+// Background color for squeeze
+bgcolor(squeeze ? color.new(color.yellow, 90) : na, title="Squeeze")
+
+// Color bars based on momentum
+barcolor(strong_bullish ? color.green : strong_bearish ? color.red : na)
+
+// ═══════════════════════════════════════════════════════════════
+//                    INFORMATION TABLE
+// ═══════════════════════════════════════════════════════════════
+
+var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.white, 90), border_width=1)
+
+if barstate.islast
+    table.cell(info_table, 0, 0, "RPO-VB Info", bgcolor=color.new(color.blue, 80), text_color=color.white)
+    table.cell(info_table, 1, 0, "Value", bgcolor=color.new(color.blue, 80), text_color=color.white)
+    
+    table.cell(info_table, 0, 1, "RPO")
+    table.cell(info_table, 1, 1, str.tostring(rpo, "#.##"))
+    
+    table.cell(info_table, 0, 2, "Signal")
+    table.cell(info_table, 1, 2, str.tostring(signal_line, "#.##"))
+    
+    table.cell(info_table, 0, 3, "Upper Band")
+    table.cell(info_table, 1, 3, str.tostring(upper_band, "#.##"))
+    
+    table.cell(info_table, 0, 4, "Lower Band")
+    table.cell(info_table, 1, 4, str.tostring(lower_band, "#.##"))
+    
+    table.cell(info_table, 0, 5, "Volatility")
+    table.cell(info_table, 1, 5, str.tostring(base_volatility, "#.##"))
+    
+    // Position status
+    position_text = rpo > upper_band ? "Overbought" : rpo < lower_band ? "Oversold" : "Neutral"
+    position_color = rpo > upper_band ? color.red : rpo < lower_band ? color.green : color.gray
+    table.cell(info_table, 0, 6, "Position")
+    table.cell(info_table, 1, 6, position_text, text_color=position_color)
+    
+    // Squeeze status
+    table.cell(info_table, 0, 7, "Squeeze")
+    table.cell(info_table, 1, 7, squeeze ? "Active" : "Inactive", 
+             text_color=squeeze ? color.orange : color.gray)
+
+// ═══════════════════════════════════════════════════════════════
+//                    ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(upper_cross, "RPO Upper Band Cross", "RPO crossed above upper volatility band")
+alertcondition(lower_cross, "RPO Lower Band Cross", "RPO crossed below lower volatility band")
+alertcondition(signal_cross_up, "RPO Signal Cross Up", "RPO crossed above signal line")
+alertcondition(signal_cross_down, "RPO Signal Cross Down", "RPO crossed below signal line")
+alertcondition(bullish_div, "Bullish Divergence", "Bullish divergence detected")
+alertcondition(bearish_div, "Bearish Divergence", "Bearish divergence detected")
+alertcondition(squeeze and not squeeze[1], "Volatility Squeeze Started", "Entering low volatility squeeze")
+alertcondition(not squeeze and squeeze[1], "Volatility Squeeze Ended", "Exiting low volatility squeeze")
+
+// Additional alerts for extreme readings
+extreme_ob = rpo > dynamic_ob
+extreme_os = rpo < dynamic_os
+alertcondition(extreme_ob and not extreme_ob[1], "Extreme Overbought", "RPO reached extreme overbought level")
+alertcondition(extreme_os and not extreme_os[1], "Extreme Oversold", "RPO reached extreme oversold level")

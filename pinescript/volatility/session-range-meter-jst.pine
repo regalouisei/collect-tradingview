@@ -1,0 +1,309 @@
+//@version=6
+indicator("Session Range Meter (JST) v1.01", overlay=true)
+
+//=============================
+// Inputs
+//=============================
+grpSess = "Sessions (JST fixed)"
+tz = input.string("Asia/Tokyo", "Timezone", group=grpSess)
+
+tokyoSess  = input.session("0900-1500", "Tokyo",  group=grpSess)
+londonSess = input.session("1600-0000", "London", group=grpSess)
+nySess     = input.session("2100-0500", "NewYork", group=grpSess)
+
+grpAvg = "Averages"
+n1 = input.int(10, "Avg Window 1", minval=3, maxval=200, group=grpAvg)
+n2 = input.int(30, "Avg Window 2", minval=3, maxval=200, group=grpAvg)
+
+grpUI = "Panel UI"
+panelVPos   = input.string("Top", "Panel Vertical Position", options=["Top","Middle","Bottom"], group=grpUI)
+panelSide   = input.string("Right", "Panel Side", options=["Right","Left"], group=grpUI)
+textSizeOpt = input.string("Normal", "Text Size", options=["Tiny","Small","Normal","Large"], group=grpUI)
+
+// --- v1.01 (display only)
+ver = input.string("v1.01", "Version (display only)", group=grpUI)
+
+headerBg   = input.color(color.new(color.black, 0),  "Header BG", group=grpUI)
+headerText = input.color(color.white,                "Header Text", group=grpUI)
+
+labelBg    = input.color(color.new(color.black, 70), "Label BG", group=grpUI)
+labelText  = input.color(color.white,                "Label Text", group=grpUI)
+
+valueBg    = input.color(color.new(color.black, 60), "Value BG", group=grpUI)
+valueText  = input.color(color.white,                "Value Text", group=grpUI)
+
+borderW    = input.int(1, "Border Width", minval=0, maxval=5, group=grpUI)
+
+useHeat = input.bool(true, "Color Used% cells (heat)", group=grpUI)
+warn80  = input.float(0.80, "Warn 80%", step=0.05, group=grpUI)
+warn100 = input.float(1.00, "Warn 100%", step=0.05, group=grpUI)
+
+showDebug = input.bool(false, "Debug plots", group=grpUI)
+
+//=============================
+// Helpers (safe)
+//=============================
+f_push(arr, val, maxN) =>
+    if not na(val)
+        array.push(arr, val)
+        while array.size(arr) > maxN
+            array.shift(arr)
+
+f_avg_last(arr, n) =>
+    int sz = array.size(arr)
+    if sz == 0
+        na
+    else
+        int k = math.min(n, sz)
+        float s = 0.0
+        for i = 0 to k - 1
+            s += array.get(arr, sz - 1 - i)
+        s / k
+
+f_fmt(v) =>
+    na(v) ? "NA" : str.tostring(v, "#.##")
+
+f_pct(v) =>
+    na(v) ? "NA" : str.tostring(v * 100, "#") + "%"
+
+// size (no type keyword)
+f_size() =>
+    out = size.normal
+    if textSizeOpt == "Tiny"
+        out := size.tiny
+    else if textSizeOpt == "Small"
+        out := size.small
+    else if textSizeOpt == "Large"
+        out := size.large
+    else
+        out := size.normal
+    out
+
+f_heat(pct) =>
+    c = valueBg
+    if na(pct)
+        c := valueBg
+    else if pct >= warn100
+        c := color.new(color.red, 0)
+    else if pct >= warn80
+        c := color.new(color.orange, 0)
+    else if pct >= 0.5
+        c := color.new(color.yellow, 0)
+    else
+        c := color.new(color.green, 0)
+    c
+
+//=============================
+// Session parsing (0900-1500 etc.)
+//=============================
+f_parseSess(sessStr) =>
+    // sessStr like "0900-1500"
+    string s1 = str.substring(sessStr, 0, 4)
+    string s2 = str.substring(sessStr, 5, 9)
+    int sh = int(str.tonumber(str.substring(s1, 0, 2)))
+    int sm = int(str.tonumber(str.substring(s1, 2, 4)))
+    int eh = int(str.tonumber(str.substring(s2, 0, 2)))
+    int em = int(str.tonumber(str.substring(s2, 2, 4)))
+    [sh, sm, eh, em]
+
+// JST time-based in-session (wrap supported)
+f_inSessionByClock(sessStr) =>
+    [sh, sm, eh, em] = f_parseSess(sessStr)
+    int nowM = hour(time, tz) * 60 + minute(time, tz)
+    int stM  = sh * 60 + sm
+    int enM  = eh * 60 + em
+    bool wrap = enM <= stM
+    wrap ? (nowM >= stM or nowM < enM) : (nowM >= stM and nowM < enM)
+
+//=============================
+// Session update
+//=============================
+f_update(inSess, inPrev, hi0, lo0, last0, hist, keep) =>
+    bool start  = inSess and not inPrev
+    bool finish = (not inSess) and inPrev
+
+    float hi = hi0
+    float lo = lo0
+    float last = last0
+    bool ended = false
+
+    if start
+        hi := high
+        lo := low
+
+    if inSess and not start
+        hi := na(hi) ? high : math.max(hi, high)
+        lo := na(lo) ? low  : math.min(lo, low)
+
+    if finish
+        last := hi - lo
+        f_push(hist, last, keep)
+        ended := true
+
+    [hi, lo, last, ended]
+
+//=============================
+// Vars
+//=============================
+var float tk_hi = na
+var float tk_lo = na
+var float tk_last = na
+var array<float> tk_hist = array.new_float()
+
+var float ln_hi = na
+var float ln_lo = na
+var float ln_last = na
+var array<float> ln_hist = array.new_float()
+
+var float ny_hi = na
+var float ny_lo = na
+var float ny_last = na
+var array<float> ny_hist = array.new_float()
+
+var string lastSessName = "NONE"
+var float  lastSessRange = na
+
+//=============================
+// States (JST clock-based)
+//=============================
+inTK = f_inSessionByClock(tokyoSess)
+inLN = f_inSessionByClock(londonSess)
+inNY = f_inSessionByClock(nySess)
+
+// prev (bool safe)
+inTKprev = bar_index > 0 ? inTK[1] : false
+inLNprev = bar_index > 0 ? inLN[1] : false
+inNYprev = bar_index > 0 ? inNY[1] : false
+
+keep = math.max(n1, n2)
+
+//=============================
+// Update each session
+//=============================
+[tk_hi_new, tk_lo_new, tk_last_new, tk_end] = f_update(inTK, inTKprev, tk_hi, tk_lo, tk_last, tk_hist, keep)
+tk_hi := tk_hi_new
+tk_lo := tk_lo_new
+tk_last := tk_last_new
+
+[ln_hi_new, ln_lo_new, ln_last_new, ln_end] = f_update(inLN, inLNprev, ln_hi, ln_lo, ln_last, ln_hist, keep)
+ln_hi := ln_hi_new
+ln_lo := ln_lo_new
+ln_last := ln_last_new
+
+[ny_hi_new, ny_lo_new, ny_last_new, ny_end] = f_update(inNY, inNYprev, ny_hi, ny_lo, ny_last, ny_hist, keep)
+ny_hi := ny_hi_new
+ny_lo := ny_lo_new
+ny_last := ny_last_new
+
+// store last finished session
+if tk_end
+    lastSessName := "TOKYO"
+    lastSessRange := tk_last
+if ln_end
+    lastSessName := "LONDON"
+    lastSessRange := ln_last
+if ny_end
+    lastSessName := "NEWYORK"
+    lastSessRange := ny_last
+
+//=============================
+// Current selection (LIVE preferred)
+//=============================
+bool inAny = inTK or inLN or inNY
+
+string curSessName = ""
+if inTK
+    curSessName := "TOKYO"
+else if inLN
+    curSessName := "LONDON"
+else if inNY
+    curSessName := "NEWYORK"
+else
+    curSessName := lastSessName
+
+string curMode = inAny ? "LIVE" : "LAST"
+
+float curRange =
+     inTK ? (tk_hi - tk_lo) :
+     inLN ? (ln_hi - ln_lo) :
+     inNY ? (ny_hi - ny_lo) :
+     lastSessRange
+
+array<float> curHist =
+     inTK ? tk_hist :
+     inLN ? ln_hist :
+     inNY ? ny_hist :
+     lastSessName == "TOKYO" ? tk_hist :
+     lastSessName == "LONDON" ? ln_hist :
+     lastSessName == "NEWYORK" ? ny_hist : na
+
+float avg1 = not na(curHist) ? f_avg_last(curHist, n1) : na
+float avg2 = not na(curHist) ? f_avg_last(curHist, n2) : na
+
+float used1 = (not na(avg1) and avg1 > 0 and not na(curRange)) ? (curRange / avg1) : na
+float used2 = (not na(avg2) and avg2 > 0 and not na(curRange)) ? (curRange / avg2) : na
+
+float rem1 = (not na(avg1) and not na(curRange)) ? math.max(avg1 - curRange, 0) : na
+float rem2 = (not na(avg2) and not na(curRange)) ? math.max(avg2 - curRange, 0) : na
+
+//=============================
+// Panel position
+//=============================
+pos =
+     panelSide == "Right" and panelVPos == "Top"    ? position.top_right :
+     panelSide == "Right" and panelVPos == "Middle" ? position.middle_right :
+     panelSide == "Right" and panelVPos == "Bottom" ? position.bottom_right :
+     panelSide == "Left"  and panelVPos == "Top"    ? position.top_left :
+     panelSide == "Left"  and panelVPos == "Middle" ? position.middle_left :
+                                                       position.bottom_left
+
+//=============================
+// Table
+//=============================
+var table t = table.new(pos, 2, 10, border_width=borderW)
+
+f_cell(r, c, txt, bg, tc) =>
+    table.cell(t, c, r, txt, bgcolor=bg, text_color=tc, text_size=f_size())
+
+if barstate.islast
+    f_cell(0,0,"SESSION", headerBg, headerText)
+    f_cell(0,1,curSessName + " [" + curMode + "]", headerBg, headerText)
+
+    f_cell(1,0,"CurRange", labelBg, labelText)
+    f_cell(1,1,f_fmt(curRange), valueBg, valueText)
+
+    f_cell(2,0,"Avg(" + str.tostring(n1) + ")", labelBg, labelText)
+    f_cell(2,1,f_fmt(avg1), valueBg, valueText)
+
+    f_cell(3,0,"Used%(" + str.tostring(n1) + ")", labelBg, labelText)
+    f_cell(3,1,f_pct(used1), useHeat ? f_heat(used1) : valueBg, valueText)
+
+    f_cell(4,0,"Remain(" + str.tostring(n1) + ")", labelBg, labelText)
+    f_cell(4,1,f_fmt(rem1), valueBg, valueText)
+
+    f_cell(5,0,"Avg(" + str.tostring(n2) + ")", labelBg, labelText)
+    f_cell(5,1,f_fmt(avg2), valueBg, valueText)
+
+    f_cell(6,0,"Used%(" + str.tostring(n2) + ")", labelBg, labelText)
+    f_cell(6,1,f_pct(used2), useHeat ? f_heat(used2) : valueBg, valueText)
+
+    f_cell(7,0,"Remain(" + str.tostring(n2) + ")", labelBg, labelText)
+    f_cell(7,1,f_fmt(rem2), valueBg, valueText)
+
+    // debug: current JST time
+    int nowH = hour(time, tz)
+    int nowM = minute(time, tz)
+    string nowStr = str.tostring(nowH, "00") + ":" + str.tostring(nowM, "00")
+    f_cell(8,0,"JST", labelBg, labelText)
+    f_cell(8,1,nowStr, valueBg, valueText)
+
+    // v1.01: version display
+    f_cell(9,0,"VER", labelBg, labelText)
+    f_cell(9,1,ver, valueBg, valueText)
+
+//=============================
+// Debug plots (optional)
+//=============================
+plot(showDebug ? curRange : na, title="CurRange", linewidth=2)
+plot(showDebug ? avg1 : na, title="Avg(Win1)", linewidth=2)
+plot(showDebug ? avg2 : na, title="Avg(Win2)", linewidth=2)

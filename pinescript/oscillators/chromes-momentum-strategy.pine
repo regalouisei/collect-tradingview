@@ -1,0 +1,128 @@
+//@version=6
+strategy("Momentum Strategy with Stop Loss", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=10000, process_orders_on_close=true)
+
+// --- Backtest Date Range ---
+startDate = timestamp(2021, 1, 23, 0, 0)  // 5 years ago from 2026-01-23
+inDateRange = time >= startDate
+
+// --- Inputs ---
+stopLossPercent = input.float(0.25, title="Stop Loss % Below Swing Low", minval=0.1, step=0.1)
+profitMultiplier = input.float(1.5, title="Profit Multiplier (Stop Loss * Multiplier)", minval=1.0, step=0.1)
+swingLookback = input.int(14, title="Swing Low Lookback Period", minval=1, step=1)
+
+// --- Indicators ---
+// Stochastic (14,3,3)
+stochK = ta.sma(ta.stoch(close, high, low, 14), 3)
+stochD = ta.sma(stochK, 3)
+
+// MACD (12,26,9)
+[macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+macdCrossOver = ta.crossover(macdLine, signalLine)
+
+// RSI (14)
+rsiValue = ta.rsi(close, 14)
+
+// --- Trade Logic State Variables ---
+var bool step1Triggered = false
+var bool step2Triggered = false
+var bool step3Triggered = false
+var bool stochasticResumed = false
+
+// Variables to store entry price and swing low at time of entry
+var float entryPrice = na
+var float entrySwingLow = na
+var float stopLossLevel = na
+var float profitTargetLevel = na
+
+// Track exit flags
+var bool exitedByStop = false
+var bool exitedByProfit = false
+
+// Track trade info for line display
+var int entryBar = na
+var int exitBar = na
+var float exitPrice = na
+var float plPercent = na
+
+// Reset state if Stochastic K or D rises above 80
+if (stochK > 80) or (stochD > 80)
+    step1Triggered := false
+    step2Triggered := false
+    step3Triggered := false
+    stochasticResumed := true
+
+// Step 1: Stochastic D% under 20
+if (stochD < 20) and not step1Triggered
+    step1Triggered := true
+    stochasticResumed := false
+
+// Step 2: MACD crossover (only if Step 1 is triggered and Stochastic hasn't resumed above 80)
+if step1Triggered and not stochasticResumed and macdCrossOver
+    step2Triggered := true
+
+// Step 3: RSI above 50 (only if Step 2 is triggered and Stochastic hasn't resumed above 80)
+if step2Triggered and not stochasticResumed and (rsiValue > 50)
+    step3Triggered := true
+
+// Final Confirmation: Stochastic K% or D% under 80 when all steps are triggered
+entryCondition = step3Triggered and not stochasticResumed and (stochK < 80) and (stochD < 80)
+
+// Calculate swing low only when entry condition is met and no position is open
+currentSwingLow = ta.lowest(low, swingLookback)
+
+// --- Entry Logic ---
+if (strategy.position_size == 0) and entryCondition and inDateRange
+    // Store entry price and swing low at time of entry
+    entryPrice := close
+    entrySwingLow := currentSwingLow
+    stopLossLevel := entrySwingLow * (1 - stopLossPercent / 100)
+    
+    // Calculate the stop loss distance as a percentage of entry price
+    stopLossDistancePct = (entryPrice - stopLossLevel) / entryPrice
+    
+    // Calculate profit target based on the actual stop loss distance
+    profitTargetLevel := entryPrice * (1 + (stopLossDistancePct * profitMultiplier))
+    
+    strategy.entry("Long", strategy.long)
+    
+    // Store entry bar
+    entryBar := bar_index
+    
+    // Reset exit flags on new entry
+    exitedByStop := false
+    exitedByProfit := false
+    
+    // Set exit orders with fixed prices calculated at entry
+    strategy.exit("Exit", "Long", stop=stopLossLevel, limit=profitTargetLevel)
+
+// Check for stop loss exit (at the stop price, not the low)
+if strategy.position_size > 0 and low <= stopLossLevel and not exitedByStop
+    strategy.close("Long", comment="Stop Loss")
+    exitedByStop := true
+    exitBar := bar_index
+    exitPrice := stopLossLevel
+    plPercent := (stopLossLevel - entryPrice) / entryPrice * 100
+
+// Check for profit target exit
+if strategy.position_size > 0 and high >= profitTargetLevel and not exitedByProfit
+    strategy.close("Long", comment="Profit Target")
+    exitedByProfit := true
+    exitBar := bar_index
+    exitPrice := profitTargetLevel
+    plPercent := (profitTargetLevel - entryPrice) / entryPrice * 100
+
+// Draw line with trade info when position closes
+if not na(exitBar) and bar_index == exitBar
+    lineY = stopLossLevel * 0.98
+    line.new(entryBar, lineY, exitBar, lineY, color=color.black, width=2)
+    label.new(int(math.avg(entryBar, exitBar)), lineY, text="Entry: " + str.tostring(entryPrice) + " | Exit: " + str.tostring(exitPrice) + " | P/L: " + str.tostring(plPercent, "#.##") + "%", color=color.black, style=label.style_label_center, textcolor=color.white, size=size.normal)
+
+// Reset state after entry
+if entryCondition
+    step1Triggered := false
+    step2Triggered := false
+    step3Triggered := false
+
+// --- Plotting ---
+plot(strategy.position_size > 0 ? stopLossLevel : na, color=color.red, style=plot.style_circles, linewidth=2, title="Stop Loss")
+plot(strategy.position_size > 0 ? profitTargetLevel : na, color=color.green, style=plot.style_circles, linewidth=2, title="Profit Target")

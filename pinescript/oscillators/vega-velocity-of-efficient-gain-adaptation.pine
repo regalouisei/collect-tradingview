@@ -1,0 +1,213 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// VEGA - Velocity of Efficient Gain Adaptation
+// An indicator by
+
+// ######:   . ####:     :##:    ######:  
+// #######   #######:     ##     #######  
+// ##   :##  #:.   ##    ####    ##   :## 
+// ##    ##        ##    ####    ##    ## 
+// ##   :##        ##   :#  #:   ##   :## 
+// #######.    #####     #::#    #######: 
+// #######.    #####.   ##  ##   ######   
+// ##   :##        ##   ######   ##   ##. 
+// ##    ##        ##  .######.  ##   ##  
+// ##   :##  #:    ##  :##  ##:  ##   :## 
+// ########  #######:  ###  ###  ##    ##:
+// ######    :#####:   ##:  :##  ##    ##:
+                                        
+//@version=6
+indicator("VEGA Squeeze Pro", shorttitle="VEGA Pro", overlay=false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Adaptive MA Settings
+grp_ama      = "Adaptive MA Settings"
+length       = input.int(40, "ER Length", minval=2, tooltip="Lookback period for Efficiency Ratio calculation", group=grp_ama)
+fast_length  = input.int(3, "Fast Smoothing", minval=1, tooltip="Fast smoothing constant for adaptive calculation", group=grp_ama)
+slow_length  = input.int(30, "Slow Smoothing", minval=1, tooltip="Slow smoothing constant for adaptive calculation", group=grp_ama)
+
+// Source Settings
+grp_src      = "Source Settings"
+use_linreg   = input.bool(true, "Use LinReg Smoothed Candles", tooltip="Mix linear regression candles with regular candles for smoother output", group=grp_src)
+linreg_len   = input.int(7, "LinReg Length", minval=2, tooltip="Linear regression period", group=grp_src)
+linreg_mix   = input.float(0.5, "LinReg Mix", minval=0.0, maxval=1.0, step=0.1, tooltip="0 = regular candles, 1 = full linreg candles", group=grp_src)
+
+// Normalization
+grp_norm     = "Normalization"
+norm_type    = input.string("Z-Score", "Normalization", options=["ATR", "Z-Score"], tooltip="ATR = divide by ATR, Z-Score = standard deviations from mean", group=grp_norm)
+atr_length   = input.int(14, "ATR Length", minval=1, group=grp_norm)
+zscore_length = input.int(10, "Z-Score Lookback", minval=2, tooltip="Period for calculating mean and standard deviation", group=grp_norm)
+zscore_deadzone_type = input.string("Soft Fade", "Z-Score Dead Zone Type", options=["Snap", "Soft Fade", "None"], tooltip="Snap = hard cutoff, Soft Fade = gradual reduction, None = no dead zone", group=grp_norm)
+zscore_deadzone = input.float(0.5, "Z-Score Dead Zone", minval=0.0, maxval=2.0, step=0.1, tooltip="Values within this range are affected by dead zone", group=grp_norm)
+
+// Squeeze Pro Settings
+grp_sqz      = "Squeeze Pro Settings"
+sqz_enabled  = input.bool(true, "Enable Squeeze Detection", group=grp_sqz)
+bb_length    = input.int(14, "BB Length", minval=1, group=grp_sqz)
+bb_mult      = input.float(2.0, "BB Multiplier", minval=0.1, step=0.1, group=grp_sqz)
+kc_length    = input.int(20, "KC Length", minval=1, group=grp_sqz)
+kc_mult_high = input.float(1.6, "KC High Multiplier", minval=0.1, step=0.1, group=grp_sqz)
+kc_mult_mid  = input.float(1.2, "KC Mid Multiplier", minval=0.1, step=0.1, group=grp_sqz)
+kc_mult_low  = input.float(0.8, "KC Low Multiplier", minval=0.1, step=0.1, group=grp_sqz)
+
+// Squeeze Pro Colors
+sqz_off_color    = input.color(color.new(#00ffff, 100), "No Squeeze", group=grp_sqz)
+sqz_low_color    = input.color(color.rgb(0, 195, 255), "Low Squeeze", group=grp_sqz)
+sqz_mid_color    = input.color(#e5ff00, "Mid Squeeze", group=grp_sqz)
+sqz_high_color   = input.color(color.new(#ff0000, 0), "High Squeeze", group=grp_sqz)
+
+// Visual Settings
+grp_vis      = "Visual Settings"
+color_candles= input.bool(true, "Color Main Chart Candles", tooltip="Colors the price candles based on VEGA momentum", group=grp_vis)
+bull_strong  = input.color(color.new(#00ffff, 0), "Bullish Rising", group=grp_vis)
+bull_weak    = input.color(color.new(#00ffff, 40), "Bullish Falling", group=grp_vis)
+bear_strong  = input.color(color.new(#ff0000, 0), "Bearish Falling", group=grp_vis)
+bear_weak    = input.color(color.new(#ff0000, 40), "Bearish Rising", group=grp_vis)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE CALCULATION (LinReg Mixed Candles)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Linear regression smoothed candles
+linreg_close = ta.linreg(close, linreg_len, 0)
+
+// Mix regular and linreg candles based on mix ratio
+src = use_linreg ? close * (1 - linreg_mix) + linreg_close * linreg_mix : close
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADAPTIVE MA CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Efficiency Ratio (ER)
+change_abs   = math.abs(src - src[length])
+volatility   = math.sum(math.abs(src - src[1]), length)
+er           = volatility != 0 ? change_abs / volatility : 0
+
+// Smoothing Constants
+fast_sc = 2.0 / (fast_length + 1)
+slow_sc = 2.0 / (slow_length + 1)
+
+// Adaptive Smoothing Constant
+sc = math.pow(er * (fast_sc - slow_sc) + slow_sc, 2)
+
+// Adaptive MA
+var float adaptive_ma = na
+adaptive_ma := na(adaptive_ma[1]) ? src : sc * src + (1 - sc) * adaptive_ma[1]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VELOCITY CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Raw velocity
+velocity_raw = adaptive_ma - nz(adaptive_ma[1])
+
+// Normalization options
+atr_val = ta.atr(atr_length)
+velocity_mean = ta.sma(velocity_raw, zscore_length)
+velocity_stdev = ta.stdev(velocity_raw, zscore_length)
+
+velocity_norm = switch norm_type
+    "ATR" => atr_val != 0 ? velocity_raw / atr_val * 100 : velocity_raw
+    "Z-Score" => velocity_stdev != 0 ? (velocity_raw - velocity_mean) / velocity_stdev : 0
+    => velocity_raw
+
+// Apply dead zone for Z-Score
+float velocity = velocity_norm
+if norm_type == "Z-Score" and zscore_deadzone_type != "None"
+    if zscore_deadzone_type == "Snap"
+        velocity := math.abs(velocity_norm) < zscore_deadzone ? 0.0 : velocity_norm
+    else if zscore_deadzone_type == "Soft Fade"
+        if math.abs(velocity_norm) < zscore_deadzone
+            fade_factor = math.abs(velocity_norm) / zscore_deadzone
+            velocity := velocity_norm * fade_factor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SQUEEZE PRO UPDATE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Bollinger Bands
+bb_basis = ta.sma(close, bb_length)
+bb_dev   = bb_mult * ta.stdev(close, bb_length)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+
+// Keltner Channel - 3 Levels
+kc_basis = ta.sma(close, kc_length)
+kc_range = ta.atr(kc_length)
+
+// KC Level 1 (Low - 0.08 ATR)
+kc_upper_low = kc_basis + kc_mult_low * kc_range
+kc_lower_low = kc_basis - kc_mult_low * kc_range
+
+// KC Level 2 (Mid - 1.2 ATR)
+kc_upper_mid = kc_basis + kc_mult_mid * kc_range
+kc_lower_mid = kc_basis - kc_mult_mid * kc_range
+
+// KC Level 3 (High - 1.6 ATR)
+kc_upper_high = kc_basis + kc_mult_high * kc_range
+kc_lower_high = kc_basis - kc_mult_high * kc_range
+
+// Squeeze Detection at each level
+sqz_in_kc_1 = bb_lower > kc_lower_low and bb_upper < kc_upper_low    // Tightest - BB inside 1.0 ATR KC
+sqz_in_kc_15 = bb_lower > kc_lower_mid and bb_upper < kc_upper_mid   // Medium - BB inside 1.5 ATR KC
+sqz_in_kc_2 = bb_lower > kc_lower_high and bb_upper < kc_upper_high  // Widest - BB inside 2.0 ATR KC
+
+// Squeeze Pro State (check tightest first)
+int sqz_state = 0
+if sqz_in_kc_1
+    sqz_state := 3  // High compression
+else if sqz_in_kc_15
+    sqz_state := 2  // Mid compression
+else if sqz_in_kc_2
+    sqz_state := 1  // Low compression
+else
+    sqz_state := 0  // No squeeze
+
+// Squeeze color based on compression level
+sqz_color = switch sqz_state
+    3 => sqz_high_color   // Bright red - maximum compression
+    2 => sqz_mid_color    // Medium red
+    1 => sqz_low_color    // Light red
+    => sqz_off_color      // Cyan - no squeeze
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COLORS & PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Histogram Color
+velocity_rising = velocity > nz(velocity[1])
+hist_color = if velocity >= 0
+    velocity_rising ? bull_strong : bull_weak
+else
+    velocity_rising ? bear_weak : bear_strong
+
+// 1. Zero line
+hline(0, "Zero", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+
+// 2. Reference Bands
+upper_band_2 = plot(norm_type == "Z-Score" ? 2.0 : na, "Upper Band +2σ", color=color.new(color.red, 70), linestyle=plot.linestyle_dashed)
+lower_band_2 = plot(norm_type == "Z-Score" ? -2.0 : na, "Lower Band -2σ", color=color.new(color.red, 70), linestyle=plot.linestyle_dashed)
+
+// 3. Histogram
+plot(velocity, "VEGA", color=hist_color, style=plot.style_histogram, linewidth=4)
+
+// 4. Squeeze Pro Dots on Zero Line
+plot(sqz_enabled ? 0.0 : na, "Squeeze Pro", color=sqz_color, style=plot.style_circles, linewidth=4)
+
+// 5. Candle Coloring (Main Chart)
+barcolor(color_candles ? hist_color : na, title="Candle Colors")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(ta.crossover(velocity, 0), "Bullish Zero Cross", "VEGA crossed above zero")
+alertcondition(ta.crossunder(velocity, 0), "Bearish Zero Cross", "VEGA crossed below zero")
+
+// Squeeze state change alerts
+alertcondition(sqz_state[1] == 0 and sqz_state > 0, "Squeeze Started", "VEGA squeeze started")
+alertcondition(sqz_state[1] > 0 and sqz_state == 0, "Squeeze Fired", "VEGA squeeze fired (volatility expanding)")
+alertcondition(sqz_state == 3 and sqz_state[1] != 3, "High Squeeze", "VEGA entered high compression squeeze")
+alertcondition(sqz_state[1] == 3 and sqz_state < 3, "High Squeeze Released", "VEGA high compression squeeze releasing")

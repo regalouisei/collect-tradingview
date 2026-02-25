@@ -1,0 +1,745 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=5
+indicator("Earnings Price Move Cheat Sheet [Kioseff Trading]", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 5000)
+
+//  ________________________________________________
+// |                                               |  
+// |       ---------------------------------       | 
+// |      | K̲ i̲ o̲ s̲ e̲ f̲ f̲     T̲ r̲ a̲ d̲ i̲ n̲ g |      | 
+// |      |                                 |      |  
+// |      | ƃ u ᴉ p ɐ ɹ ꓕ     ⅎ ⅎ ǝ s o ᴉ ꓘ |      |  
+// |       --------------------------------        |  
+// |                                               | 
+// |_______________________________________________|
+
+// _______________________________________________________
+//
+// Free Parameters                       
+// _______________________________________________________  
+
+len = input.int(title = "Calculation Period -- This Setting Defines the Calculated %Gain/Loss Period BEFORE and AFTER Earnings", defval = 10, minval = 1, maxval = 20, group = "Utility")
+all = input.string(title = "Use All Historical Sessions for VaR Calculation? ([250 Sessions] Otherwise)", defval = "Yes", options = ["Yes", "No"])
+conf = input.int(title = "VaR Confidence Level", defval = 95, maxval = 99, minval = 95, tooltip = 'Value at Risk (VaR) Is a Measure Which Attempts to Quantify the Risk of Potential Losses. There Are a Few Ways to Calculate the Metric; This Indicator Uses the Historical Method to Calculate VaR. A Confidence Level Is Assigned to the Calculation. Using the Historical Method, for This Script, All Return Values Are Appended to Array A. The Lowest Return Values (Greatest Losses), Based on the Assigned Confidence Level, Are Extracted and Appended to Array B. The Greatest Measurement in Array B Reflects the VaR Measurement at the Assigned Confidence Level. For Instance, if VaR Confidence Is Set to 95%, Returns are Categorized by the Lowest 5% Of Returns and the Greatest 95% Of Returns. The Highest Measure (Lowest Loss) In the 5th Percentile for Returns Is Considered the VaR Measure. Ideally, One Could Look at the VaR Measure (95% Confidence) and Proclaim (“I Am 95% Confident That Any One-Session Loss Over the Next [Month, Year, Quarter, Etc] Will Not Be Greater Than the VaR 95% Measure”.) Of Course, the Inevitable Black Swan Is an Incalculable Occurrence - Be Sure to Assess Results With This in Mind. ')
+sfi = input.string("READ TOOLTIP", title = "Expected Shortfall (CVaR) Explanation", options = ["READ TOOLTIP", "⚫🦢 <= Keep In Mind!"], tooltip = "CVaR Is a Supplementary Risk Measure That Quantifies the Magnitude of Tail Risk. CVaR Averages Losses That Extend Beyond the VaR Threshold. Simply, CVaR Measures the Average Return (Loss) When the Return Is Less Than the VaR Measurement. For Instance, if VaR Incorporates a 95% Confidence Level and the Measure Is -2.43%, CVaR Calculates All Losses That Exceed -2.43% and Averages Them. For This Script, if a Losing Return Exceeds the VaR Measure the Return Is Appended to an Array. The Average Is Taken of All Values in the Array. If the CVaR (Expected Shortfall Measurement) Is - 3.12%, and the VaR Measurement Is -2.43%, It Means That When a Loss Is Greater Than -2.43%, on Average, That Loss Will Be -3.12%. This Is Generally Done Within the Context of Portfolio Management; However, This Only Script Uses Daily Asset Returns.")
+lope = input.string(defval = "Off", title = "Use Linear Interploation Pine Function for VaR and Expected Shortfall?", options = ["Off", "On"])
+
+
+// _______________________________________________________
+//
+// Display Setting                       
+// _______________________________________________________  
+
+statLabel = input.string("On", title = "Show Fundamental Statistics Label?", options = ["On", "Off", "Half"], group = "Display")
+tab = input.string("No", title = "Hide Table?", options = ["No", "Yes"])
+Band = input.string("Off", title = "Show CVaR and VaR as Bands? ", options = ["Off", "On"])
+sizE = input.string(defval = "Tiny", title = "Label Size", options = ["Tiny", "Small", "Auto"])
+LLHHlabels = input.string(defval = "On", title = "Show Highest/High and Lowest Low Labels?", options = ["On", "Off"])
+
+// _______________________________________________________
+//
+// Earnings Identifiers                     
+// _______________________________________________________  
+
+earnings() => request.earnings(syminfo.tickerid, earnings.actual, ignore_invalid_symbol = true)
+est() => request.earnings(syminfo.tickerid, earnings.estimate, ignore_invalid_symbol = true)
+surp = ta.change(earnings()) and earnings() > est()
+miss = ta.change(earnings()) and earnings() < est()
+
+pScore = request.financial(syminfo.tickerid, "PIOTROSKI_F_SCORE", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+zScore = request.financial(syminfo.tickerid, "ALTMAN_Z_SCORE", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+qScore = request.financial(syminfo.tickerid, "QUICK_RATIO", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+bScore = request.financial(syminfo.tickerid, "BENEISH_M_SCORE", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+sScore = request.financial(syminfo.tickerid, "SLOAN_RATIO", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+kScore = request.financial(syminfo.tickerid, "KZ_INDEX", "FY", currency = syminfo.currency, ignore_invalid_symbol = true)
+
+
+dI = request.financial(syminfo.tickerid, "DAYS_INVENT", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+dE = request.financial(syminfo.tickerid, "DEBT_TO_EBITDA", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+hScore = request.financial(syminfo.tickerid, "FULMER_H_FACTOR", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+gN = request.financial(syminfo.tickerid, "GRAHAM_NUMBERS", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+nR = request.financial(syminfo.tickerid, "NCAVPS_RATIO", "FQ", currency = syminfo.currency, ignore_invalid_symbol = true)
+PEG = request.financial(syminfo.tickerid, "PEG_RATIO", "FY", currency = syminfo.currency, ignore_invalid_symbol = true)
+
+totalShort = request.security(syminfo.ticker + "_SHORT_VOLUME", "D", close, ignore_invalid_symbol = true)
+
+
+// _______________________________________________________
+//
+// Array Creation                      
+// _______________________________________________________  
+
+var float []  x = array.new_float()
+var int   []  y = array.new_int() 
+
+var float [] x2 = array.new_float()
+var int   [] y2 = array.new_int() 
+
+var float [] x3 = array.new_float()
+var int []   y3 = array.new_int()
+
+var float [] x4 = array.new_float()
+var float [] x5 = array.new_float()
+
+var float [] x6 = array.new_float()
+var float [] x7 = array.new_float()
+
+var float [] x8 = array.new_float()
+var int [] y4 = array.new_int()
+
+var float [] x9 = array.new_float()
+var float [] x10 = array.new_float()
+
+var float [] x11 = array.new_float()
+
+var float [] q1 = array.new_float()
+var float [] q2 = array.new_float()
+var float [] q3 = array.new_float()
+var float [] q4 = array.new_float()
+
+var int [] q1count = array.new_int()
+var int [] q2count = array.new_int()
+var int [] q3count = array.new_int()
+var int [] q4count = array.new_int()
+
+var float [] track1 = array.new_float()
+var float [] track2 = array.new_float()
+var float [] track3 = array.new_float()
+var float [] track4 = array.new_float()
+
+var float [] zx = array.new_float()
+var float [] zx1 = array.new_float()
+var float [] zx2 = array.new_float()
+var float [] zx3 = array.new_float()
+var float [] zx4 = array.new_float()
+var float [] zx5 = array.new_float()
+var float [] zx6 = array.new_float()
+var float [] zx7 = array.new_float()
+
+var float date   = na
+var float date1  = na
+var float date2  = na
+var float date3  = na
+var float date4  = na
+var float date5  = na
+var float date6  = na
+var float date7  = na
+var float date8  = na
+var float date9  = na
+var float date10 = na
+var float date11 = na
+
+
+// _______________________________________________________
+//
+// PnL Caclculation                       
+// _______________________________________________________  
+
+pl(x, y) =>
+    ((x / y) - 1) * 100
+    
+// _______________________________________________________
+//
+// Array Appending                      
+// _______________________________________________________      
+    
+
+if ta.change(earnings())
+    array.push(x, pl(close, close[len]))
+    array.push(y, 1)
+    array.push(y3, bar_index)
+    array.push(x4, close)
+    array.push(x5, high)
+    array.push(x6, ohlc4)
+    array.push(x7, volume)
+    array.push(x8, totalShort)
+    array.push(x9, pl(close, close[1]))
+    for i = 0 to len - 1
+        array.push(x10, volume[i])
+        array.push(x11, totalShort[i])
+    if totalShort > 0 
+        array.push(y4, 1)
+    if month(time) >= 1 and month(time) <= 3
+        array.push(track1, earnings() - est())
+        array.push(zx, earnings())
+        array.push(zx1, est())
+        date := year(time)
+        date1 := month(time)
+        date2 := dayofmonth(time)
+    if month(time) >= 4 and month(time) <= 6
+        array.push(track2, earnings() - est())
+        array.push(zx2, earnings())
+        array.push(zx3, est())
+        date3 := year(time)
+        date4 := month(time)
+        date5 := dayofmonth(time)
+    if month(time) >= 7 and month(time) <= 9
+        array.push(track3, earnings() - est())
+        array.push(zx4, earnings())
+        array.push(zx5, est())
+        date6 := year(time)
+        date7 := month(time)
+        date8 := dayofmonth(time)
+    if month(time) >= 10 and month(time) <= 12
+        array.push(track4, earnings() - est())
+        array.push(zx6, earnings())
+        array.push(zx7, est())
+        date9 := year(time)
+        date10 := month(time)
+        date11 := dayofmonth(time)
+
+
+if ta.barssince(ta.change(earnings())) == len
+    array.push(x2, pl(close, close[len]))
+    array.push(y2, 1)
+    array.push(x3, pl(close, close[20]))
+    if month(time) >= 1 and month(time) <= 3
+        array.push(q1, pl(close, close[len]))
+        array.push(q1count, 1)
+    if month(time) >= 4 and month(time) <= 6
+        array.push(q2, pl(close, close[len]))
+        array.push(q2count, 1)
+    if month(time) >= 7 and month(time) <= 9
+        array.push(q3, pl(close, close[len]))
+        array.push(q3count, 1)
+    if month(time) >= 10 and month(time) <= 12
+        array.push(q4, pl(close, close[len]))
+        array.push(q4count, 1)
+
+
+// _______________________________________________________
+//
+// Average PnL Calculation                       
+// _______________________________________________________  
+
+calc(j, z) =>
+    array.sum(j) / array.sum(z)
+
+b4   = calc(x, y)
+aftr = calc(x2, y2)
+vol = calc(x7, y)
+shortvol = calc(x8, y4)
+q1x = calc(q1, q1count)
+q2x = calc(q2, q2count)
+q3x = calc(q3, q3count)
+q4x = calc(q4, q4count)
+
+sizeOption = sizE == "Tiny" ? size.tiny : sizE == "Small" ? size.small : size.auto
+
+// _______________________________________________________
+//
+// Line/Label Arrays                    
+// _______________________________________________________  
+
+var int counter = 0
+var int counter1 = 0
+
+var label [] f = array.new_label()
+var line [] fx = array.new_line()
+var line [] fxx = array.new_line()
+
+
+var label [] f1 = array.new_label()
+var line [] fx1 = array.new_line()
+
+var label[] f2 = array.new_label()
+var line [] f2x = array.new_line()
+var line [] fxxx = array.new_line()
+
+var label z1 = na
+var label z2 = na
+var label z3 = na
+
+var line o  = na
+var line o1 = na
+
+var label [] stats = array.new_label()
+var line [] statsLine = array.new_line()
+var line [] statsLine1 = array.new_line()
+
+// _______________________________________________________
+//
+// HH/LL                     
+// _______________________________________________________  
+
+llfix = ta.lowest(low, 20)
+hh = ta.highest(array.size(y3) > 0 ? bar_index + 1 - array.get(y3, array.size(y3) - 1): 1)
+ll = ta.lowest(array.size(y3) > 0 ? bar_index + 1 - array.get(y3, array.size(y3) - 1): 1)
+
+difference(x,y) =>
+    j = math.abs(x) - math.abs(y)
+    n = j / ((x + y) / 2)
+    fin = n * 100
+    fin
+
+difference1 = ta.barssince(hh != hh[1]) > ta.barssince(ll != ll[1]) ? ((ll / hh) - 1) * 100 : ((hh / ll) - 1) * 100
+
+hls = difference1 < 0.0 ? "\n(HH to LL)" : "\n(LL to HH)"
+
+hPlot = plot(hh, color = counter == 1 ? color.new(color.white, 50) : color(na))
+lPlot = plot(ll, color = counter == 1 ? color.new(color.white, 50) : color(na))
+
+fill(hPlot, lPlot, color = counter == 1 ? color.new(color.blue, 75) : na)
+
+
+
+if counter[1] == 0 and counter == 1
+    o := line.new(bar_index, hh, bar_index, ll, color = color.new(color.white, 50))
+if counter > 0
+    counter1 += 1
+if counter == 0
+    counter1 := 0
+
+// _______________________________________________________
+//
+// Line/Label Plots                   
+// _______________________________________________________  
+
+if ta.change(earnings())
+    counter := 1
+    array.push(f, 
+     label.new(
+     bar_index - len, 
+     high * 1.04, 
+     color = array.get(x, array.size(x) - 1) >= 0.0 ? color.new(color.green, 50) : color.new(color.red, 50), 
+     textcolor = color.white, 
+     text = str.tostring(len, "#") + "-Session Gain/Loss Prior to Earnings: " + str.tostring(array.get(x, array.size(x) - 1), format.percent) + "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Prior to Earnings: "
+     + str.tostring(b4, format.percent),
+     size = sizeOption
+     ))
+    
+    if year(time) > 2013
+        if statLabel == "Half"
+            array.push(stats, label.new(bar_index[len], llfix, text = "F-Score: " + str.tostring(pScore, "#") + "\nAltZ-Score: " + str.tostring(zScore, format.mintick) + "\nQuick Ratio: " 
+                 + str.tostring(qScore, format.mintick) + "\n Beneish-M: " + str.tostring(bScore, format.mintick) + "\nSloan Ratio: " + str.tostring(sScore, format.mintick) + 
+                     "\n  KZ Index: " + str.tostring(kScore, format.mintick)
+                     , style = label.style_label_up, textcolor = color.white, color = color.new(color.blue, 75), size = sizeOption))
+             
+            array.push(statsLine, 
+                 line.new(
+                 bar_index[len], 
+                 high * 1.04,
+                 bar_index[len], 
+                 llfix,
+                 color = color.white,
+                 style = line.style_dashed
+                 ))     
+             
+             
+        if statLabel == "On"
+            array.push(stats, label.new(bar_index[len], llfix, text = "F-Score: " + str.tostring(pScore, "#") + "\nAltZ-Score: " + str.tostring(zScore, format.mintick) + "\nQuick Ratio: " 
+                 + str.tostring(qScore, format.mintick) + "\n Beneish-M: " + str.tostring(bScore, format.mintick) + "\nSloan Ratio: " + str.tostring(sScore, format.mintick) + 
+                     "\n  KZ Index: " + str.tostring(kScore, format.mintick) + "\n___________\nDays Inventory: " + str.tostring(dI, format.mintick) + "\nDebt to EBITDA: " + str.tostring(dE, format.mintick) + 
+                         "\nH-Factor: " + str.tostring(hScore, format.mintick) + "\nGraham: " + str.tostring(gN) + "\nNCAVPS Ratio: " + str.tostring(nR, format.mintick) + "\nPEG: " + str.tostring(PEG, format.mintick)
+                     , style = label.style_label_up, textcolor = color.white, color = color.new(color.blue, 75), size = sizeOption))
+
+
+        
+            array.push(statsLine, 
+             line.new(
+             bar_index[len], 
+             high * 1.04,
+             bar_index[len], 
+             llfix,
+             color = color.white,
+             style = line.style_dashed
+             ))
+           
+     
+     
+     
+    array.push(fx, 
+     line.new(
+     bar_index, 
+     high * 1.04,
+     bar_index, 
+     high,
+     color = color.white,
+     style = line.style_dashed
+     ))
+  
+ 
+if counter[1] == 1
+    line.delete(o[1])
+    o := line.new(bar_index, hh, bar_index, ll, color = color.new(color.white, 50))
+    array.push(f1,
+     label.new(
+     bar_index,
+     high * 1.04, 
+     text = str.tostring(counter1, "#") + "-Session Gain/Loss After Earnings: " + str.tostring(close / array.get(x4, array.size(x4) - 1), format.percent),
+     color = array.get(x, array.size(x) - 1) >= 0.0 ? color.new(color.green, 50) : color.new(color.red, 50), 
+     textcolor = color.white
+     
+     ))
+    if counter != 0 and LLHHlabels == "On"
+        label.delete(z1[1])
+        label.delete(z2[1])
+        label.delete(z3[1])
+        z1 := label.new(bar_index, hh, text = "Highest High: $" + str.tostring(hh, format.mintick), color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+        z2 := label.new(bar_index, ll, text = "Lowest Low: $" + str.tostring(ll, format.mintick), color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+        z3 := label.new(bar_index, math.avg(hh, ll), text = "High/Low Difference: " + str.tostring(difference(hh, ll), format.percent) + "\nPercent Change: " + str.tostring(difference1, format.percent) + hls, color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+
+    
+    if counter[2] == 0
+
+        array.push(fx, 
+         line.new(
+         array.get(y3, array.size(y3) - 1), 
+         array.get(x5, array.size(x5) - 1) * 1.04, 
+         array.get(y3, array.size(y3) - 1) - len, 
+         array.get(x5, array.size(x5) - 1) * 1.04,
+         color = color.white,
+         style = line.style_dashed
+         ))
+
+
+     
+    array.push(fx1,
+     line.new(
+     array.get(y3, array.size(y3) - 1),
+     array.get(x5, array.size(x5) - 1), 
+     bar_index,
+     high * 1.04,
+     style = line.style_dashed,
+     color = color.white
+     ))
+     
+     
+    if array.size(f1) > 1
+        label.delete(array.shift(f1))
+        line.delete(array.shift(fx1))
+
+        
+
+    
+if ta.barssince(counter[1] == 0 and counter == 1) == len
+    counter := 0
+    o := line.new(bar_index, hh, bar_index, ll, color = color.new(color.white, 50))
+    label.delete(array.shift(f1))
+    line.delete(array.shift(fx1))  
+    array.push(f2, 
+     label.new(
+     bar_index, 
+     array.get(x2, array.size(x2) -1 ) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.08 : array.get(x5, array.size(x5) - 1) * 1.04, 
+     text = str.tostring(len, "#") + "-Session Gain/Loss After Earnings: " + str.tostring(array.get(x2, array.size(x2) - 1), format.percent) + "\nAverage " + str.tostring(len, "#") + 
+         "-Session Gain/Loss After Earnings: " + str.tostring(aftr, format.percent),
+     textcolor = color.white,
+     color = array.get(x2, array.size(x2) - 1) >= 0.0 ? color.new(color.green, 50) : color.new(color.red, 50),
+     size = sizeOption
+     ))
+
+
+
+
+    label.delete(array.get(f, array.size(f) - 1))
+    array.push(f, 
+     label.new(
+     bar_index - (len * 2),
+     array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.04 : array.get(x5, array.size(x5) - 1) * 1.08, 
+     color = array.get(x, array.size(x) - 1) >= 0.0 ? color.new(color.green, 50) : color.new(color.red, 50), 
+     textcolor = color.white, 
+     text = str.tostring(len, "#") + "-Session Gain/Loss Prior to Earnings: " + str.tostring(array.get(x, array.size(x) - 1), format.percent) + "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Prior to Earnings: " 
+         + str.tostring(b4, format.percent),
+     size = sizeOption
+     ))
+    
+    if LLHHlabels == "On"
+        label.delete(z1[1])
+        label.delete(z2[1])
+        label.delete(z3[1])
+    
+        z1 := label.new(bar_index, hh, text = "Highest High: $" + str.tostring(hh, format.mintick), color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+        z2 := label.new(bar_index, ll, text = "Lowest Low: $" + str.tostring(ll, format.mintick), color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+        z3 := label.new(bar_index, math.avg(hh, ll), text = "High/Low Difference: " + str.tostring(difference(hh, ll), format.percent) + "\nPercent Change: " + str.tostring(difference1, format.percent) +hls, color = na, textcolor = color.white, size = sizE == "Tiny" ? size.auto : sizE == "Auto" ? size.auto : size.auto)
+     
+    array.push(fx,
+     line.new(
+     bar_index - len,
+     array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.04 : array.get(x5, array.size(x5) - 1) * 1.08, 
+     bar_index - (len * 2),
+     label.get_y(array.get(f, array.size(f) - 1)), 
+     color = color.white,
+     style = line.style_dashed))
+    
+    
+    
+    array.push(fxx,
+     line.new(
+     bar_index - len,
+     array.get(x5, array.size(x5) - 1) * 1.08,
+     bar_index - len,
+     high[len], 
+     color = color.white,
+     style = line.style_dashed
+     ))
+    
+    array.push(fxxx,
+     line.new(
+     bar_index - len, 
+     array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.08 : array.get(x5, array.size(x5) - 1) * 1.04, 
+     bar_index, 
+     array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.08 : array.get(x5, array.size(x5) - 1) * 1.04, 
+     color = color.white, 
+     style = line.style_dashed
+     ))
+    
+    if year(time) > 2013
+        if statLabel == "On"
+            array.push(statsLine, 
+             line.new(
+             bar_index[len], 
+             array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.04 : array.get(x5, array.size(x5) - 1) * 1.08, 
+             bar_index[len], 
+             label.get_y(array.get(f, array.size(f) - 1)), 
+             color = color.white,
+             style = line.style_dashed
+             ))    
+             
+            array.push(statsLine1, 
+             line.new(
+             bar_index[len * 2], 
+             array.get(x2, array.size(x2) - 1) > array.get(x, array.size(x) - 1) ? array.get(x5, array.size(x5) - 1) * 1.04 : array.get(x5, array.size(x5) - 1) * 1.08, 
+             bar_index[len * 2], 
+             high[len] * 1.04, 
+             color = color.white,
+             style = line.style_dashed
+             ))   
+    
+    if array.size(fx) > 3 
+        line.delete(array.get(fx, array.size(fx) - 3))
+        line.delete(array.get(fx, array.size(fx) - 2))
+ 
+// _______________________________________________________
+//
+// VaR 95% and CVaR 95% Calculations                   
+// _______________________________________________________   
+    
+var float [] min = array.new_float(all == "Yes" ? bar_index : 250)
+var float [] earnmin = array.new_float()
+var float [] es = array.new_float()
+
+
+if ta.change(bar_index) 
+    array.push(min, pl(close, close[1]))
+if all == "No" and array.size(min) > 250
+    array.shift(min)
+
+fin = array.min(min, math.round(array.size(min) * ((100 - conf) / 100)))
+
+if pl(close, close[1]) < fin
+    array.push(es, pl(close, close[1]))
+if all == "No" 
+    if ta.change(year(time))
+        array.shift(es)
+
+
+altInterpolation = ta.percentile_linear_interpolation(pl(close, close[1]), all == "No" and bar_index > 250 ? 250 : all == "Yes" and bar_index > 5000 ? 5000 : all == "No" and bar_index < 250 ? bar_index + 1: all == "Yes" and bar_index < 5000 ? bar_index + 1: 1, (100 - conf))
+
+
+// _______________________________________________________
+//
+// Average PnL Following EPS Surprise/Miss                  
+// _______________________________________________________  
+
+
+var int earnCount = 0
+var int surpriseCount = 0
+var int missCount = 0
+
+var float i = 0.0
+var float i1 = 0.0
+if ta.change(earnings())
+    earnCount += 1
+if surp
+    surpriseCount += 1
+if ta.barssince(surpriseCount != surpriseCount[1]) == len
+    i := pl(close, close[len])
+    i := i[1] + i
+    
+finsurp = i / surpriseCount    
+
+if miss
+    missCount += 1
+if ta.barssince(missCount != missCount[1]) == len
+    i1 := pl(close, close[len])
+    i1 := i1[1] + i1
+
+finmiss = i1 / missCount
+
+
+var float alt1 = 0.0
+var int altcount = 0
+if pl(close, close[1]) < altInterpolation
+    alt1 := pl(close, close[1])
+    alt1 := alt1[1] + alt1
+    altcount += 1
+
+finalt = alt1 / altcount    
+
+earn5(x) =>
+    if ta.change(earnCount[1])
+        array.push(earnmin, pl(close, close[1]))
+    round = array.size(earnmin) > 0 ? math.round(array.size(earnmin) * x) : na
+    fin2 =  array.size(earnmin) > 10 ? array.min(earnmin, round) : array.min(earnmin, 0)
+    fin2
+    
+barChange = ta.change(bar_index)    
+    
+n = plot(barstate.islast and lope == "Off" and Band == "Off" ? close[1] * (1 + (fin/100)) : barstate.islast and lope == "On" and Band == "Off"? close[1] * (1 + (altInterpolation/100)) : 
+     barChange and lope == "Off" and Band == "On" ? close[1] * (1 + (fin/100)) : barChange and lope == "On" and Band == "On"? close[1] * (1 + (altInterpolation/100)) : na, style = Band == "Off" ? plot.style_stepline_diamond : plot.style_line, color = #00f6ff, linewidth = Band == "Off" ? 4 : 2)    
+n1 = plot(low, display = display.none)
+n2 = plot(barstate.islast and lope == "Off" and Band == "Off" ? close[1] * (1 + (array.avg(es) / 100)) : barstate.islast and lope == "On"  and Band == "Off" ? close[1] * (1 + (finalt/100)) : 
+     barChange and lope == "Off" and Band == "On" ?  close[1] * (1 + (array.avg(es) / 100)) : barChange and lope == "On"  and Band == "On" ? close[1] * (1 + (finalt/100)) : na
+     , style = Band == "Off" ? plot.style_stepline_diamond : plot.style_line, color = color.red, linewidth = Band == "Off" ? 4 : 2)
+
+var label [] VaRl = array.new_label() 
+var label [] CVaRl = array.new_label() 
+
+var line [] VaRlC = array.new_line()
+var line [] CVaRlC = array.new_line()
+
+
+if ta.change(bar_index)
+    array.push(VaRl,   label.new(bar_index + 5,  lope == "Off" ? close[1] * (1 + (fin/100)) : close[1] * (1 + (altInterpolation/100)), color = #00f6ff, style = label.style_label_left, text = lope == "Off" ? "Price Level VaR Measure (" + str.tostring(fin, format.percent) + " Less Than Last Close)" : "Price Level VaR Measure (" + str.tostring(altInterpolation, format.percent) + " Less Than Last Close)"))
+    array.push(VaRlC,  line.new (bar_index + 5,  lope == "Off" ? close[1] * (1 + (fin/100)) : close[1] * (1 + (altInterpolation/100)), bar_index, lope == "Off" ? close[1] * (1 + (fin/100)) : close[1] * (1 + (altInterpolation/100)), color = #00f6ff, width = 2))
+    array.push(CVaRl,  label.new(bar_index + 5,  lope == "Off" ? close[1] * (1 + (array.avg(es) / 100)) : close[1] * (1 + (finalt/100)), color = color.red, style = label.style_label_left, text = lope == "Off" ? "CVaR Measure (" + str.tostring(array.avg(es), format.percent) + " Less Than Last Close)" : "CVaR Measure (" + str.tostring(finalt, format.percent) + " Less Than Last Close)"))
+    array.push(CVaRlC, line.new (bar_index + 5,  lope == "Off" ? close[1] * (1 + (array.avg(es) / 100)) : close[1] * (1 + (finalt/100)), bar_index, lope == "Off" ? close[1] * (1 + (array.avg(es) / 100)) : close[1] * (1 + (finalt/100)), color = color.red, width = 2))
+
+if array.size(VaRl) > 1
+    label.delete(array.shift(VaRl))
+    line.delete (array.shift(VaRlC))
+    label.delete(array.shift(CVaRl))
+    line.delete (array.shift(CVaRlC))
+
+
+// _______________________________________________________
+//
+// Table Plots                  
+// _______________________________________________________ 
+
+percstring = 100 - conf == 1 ? "st Percentile Loss Threshold Following \nan Earnings Release: " : 100 - conf == 2 ? "nd Percentile Loss Threshold Following \nan Earnings Release: " : 100 - conf == 3 ? "rd Percentile Loss Threshold Following \nan Earnings Release: " : 
+     "th Percentile Loss Threshold Following \nan Earnings Release: "
+
+percX = earn5((100 - conf) / 100)
+avgVol = ta.sma(volume, 50)
+t1 = table.new(position.bottom_right, 10, 10, bgcolor = color.new(color.white, 100), frame_color = color.white, frame_width = 1, border_color = color.white, border_width = 1)
+t2 = table.new(position.top_right, 10, 10, bgcolor = color.new(color.white, 100))
+
+if barstate.islast 
+    if tab == "No"
+    
+        table.cell(t1, 0, 0, text = str.tostring(syminfo.tickerid), text_color = #ff6d00, bgcolor = color.new(#ff6d00, 90))
+        table.cell(t1, 0, 1, text = "Earnings Price Moves", text_color = color.yellow, bgcolor = color.new(color.yellow, 90))
+        table.cell(t1, 0, 3, text = "Risk Measures", text_color = #fb5c5c, bgcolor = color.new(#fb5c5c, 90))
+        table.merge_cells(t1, 0, 0, 1, 0)
+        
+        table.cell(t1, 1,1, text = "Number of EPS Beats: " + str.tostring(surpriseCount, "#") + "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Following an EPS Beat: " + str.tostring(finsurp, format.percent) + 
+             "\n\nNumber of EPS Misses: " + str.tostring(missCount, "#") +  "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Following an EPS Miss: " + str.tostring(finmiss, format.percent), text_color = color.white, bgcolor = color.new(color.white, 90))
+        
+        if lope == "Off"
+            table.cell(t1, 1,3, text = "\nVaR " + str.tostring(conf, "#") + "% Confidence: " + str.tostring(fin, format.percent) + "\n\nExpected Shortfall: " + str.tostring(array.avg(es), format.percent) + 
+             "\n\n" + str.tostring(100 - conf, "#") + percstring + str.tostring(percX, format.percent)+ "\n\nLargest Close to Close Gain After Earnings: " + str.tostring(array.max(x9), format.percent), text_color = color.white,bgcolor = color.new(color.white, 95))
+        else if lope == "On"
+            table.cell(t1, 1,3, text ="\nVaR " + str.tostring(conf, "#") + "% Confidence: " + str.tostring(altInterpolation, format.percent) + "\n\nExpected Shortfall: " + str.tostring(finalt, format.percent) + 
+             "\n\n" + str.tostring(100 - conf, "#") + percstring + str.tostring(percX, format.percent) + "\n\nLargest Close to Close Gain After Earnings: " + str.tostring(array.max(x9), format.percent), text_color = color.white, bgcolor = color.new(color.white, 95))
+          
+        table.cell(t1, 0,4, text ="Volume", text_color = color.blue, bgcolor = color.new(color.blue, 75))
+        table.cell(t1, 1,4, text ="50-Session Volume Average: " + str.tostring(avgVol, format.volume) + "\nAverage Volume on Earnings Day: " + str.tostring(vol, format.volume) +"\nAverage Short Volume on Earnings Day: " + str.tostring(shortvol, format.volume)
+             +"\n\nAverage " + str.tostring(len, "#") + "-Session Daily Volume Before Earnings: " + str.tostring(array.avg(x10), format.volume) + "\nAverage " + str.tostring(len, "#") + "-Session Daily Short Volume Before Earnings: " + str.tostring(array.avg(x11), format.volume),  text_color = color.white, bgcolor = color.new(color.white, 90))
+        
+          
+        table.cell(t1, 1,2, text = " Average " + str.tostring(len, "#") + "-Session Gain/Loss Following Q1 Report: " + str.tostring(q1x, format.percent) 
+             + "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Following Q2 Report: " + str.tostring(q2x, format.percent)
+             + "\n Average " + str.tostring(len, "#") + "-Session Gain/Loss Following Q3 Report: " + str.tostring(q3x, format.percent)
+             + "\nAverage " + str.tostring(len, "#") + "-Session Gain/Loss Following Q4 Report: " + str.tostring(q4x, format.percent)
+             , text_color = color.white, bgcolor = color.new(color.white, 95))
+        table.cell(t1, 0,2, text ="Quarterly Price Moves ", text_color = color.green, bgcolor = color.new(color.green, 90)) 
+if barstate.islast          
+    table.cell(t2, 0, 0, text = "Q1\n", text_size = size.huge, bgcolor = month(time) >= 1 and month(time) <= 3 ? color.new(color.blue, 75) : na, text_color = color.blue)
+    table.cell(t2, 1, 0, text = "Q2\n", text_size = size.huge, bgcolor = month(time) >= 4 and month(time) <= 6 ? color.new(color.green, 75) : na, text_color =color.green)
+    table.cell(t2, 2, 0, text = "Q3\n", text_size = size.huge, bgcolor = month(time) >= 7 and month(time) <= 9 ? color.new(color.red, 75) : na, text_color =color.red)
+    table.cell(t2, 3, 0, text = "Q4\n", text_size = size.huge, bgcolor = month(time) >= 10 and month(time) <= 12 ? color.new(color.yellow, 75) : na, text_color =color.yellow)
+
+
+var float qString1 = 0.0
+var int qStringa1 = 0
+var float qString2 = 0.0
+var int qStringa2 = 0
+var float qString3 = 0.0
+var int qStringa3 = 0
+var float qString4 = 0.0
+var int qStringa4 = 0
+
+if ta.change(earnings())
+    qStringa1 := 1
+if ta.change(earnings()) and qStringa1[1] == 1
+    qStringa2 := 1
+if ta.change(earnings()) and qStringa2[1] == 1
+    qStringa3 := 1
+if ta.change(earnings()) and qStringa3[1] == 1
+    qStringa4 := 1
+if ta.change(year(time))
+    qStringa1 := 0
+    qStringa2 := 0
+    qStringa3 := 0
+    qStringa4 := 0
+    
+// 
+if array.size(track1) > 0 and qStringa1 == 1
+    qString1 := array.get(track1, array.size(track1) - 1)
+else if qStringa1 == 0
+    qString1 := 0
+else if array.size(track1) < 1
+    qString1 := 0
+
+
+// 
+if array.size(track2) > 0 and qStringa2 == 1
+    qString2 := array.get(track2, array.size(track2) - 1)
+else if qStringa2 == 0
+    qString2 := 0
+else if array.size(track2) < 1
+    qString2 := 0
+
+// 
+if array.size(track3) > 0 and qStringa3 == 1
+    qString3 := array.get(track3, array.size(track3) - 1)
+else if qStringa2 == 0
+    qString3 := 0
+else if array.size(track3) < 1
+    qString3 := 0
+// 
+if array.size(track4) > 0 and qStringa4 == 1
+    qString4 := array.get(track4, array.size(track4) - 1)
+else if qStringa2 == 0
+    qString4 := 0
+else if array.size(track4) < 1
+    qString4 := 0
+
+if barstate.islast
+    table.cell(t2, 0, 1, text = qString1 != 0 ? str.tostring(date, "#") + "/" + str.tostring(date1, "#") +  "/" + str.tostring(date2, "#") + "\n__" : "--\n__", text_size = size.small, bgcolor = month(time) >= 1 and month(time) <= 3 ? color.new(color.blue, 75) : na, text_color = color.blue)
+    table.cell(t2, 1, 1, text = qString2 != 0 ? str.tostring(date3, "#") + "/" + str.tostring(date4, "#") +  "/" + str.tostring(date5, "#") + "\n__" : "--\n__", text_size = size.small, bgcolor = month(time) >= 4 and month(time) <= 6 ? color.new(color.green, 75) : na, text_color =color.green)
+    table.cell(t2, 2, 1, text = qString3 != 0 ? str.tostring(date6, "#") + "/" + str.tostring(date7, "#") +  "/" + str.tostring(date8, "#") + "\n__" : "--\n__", text_size = size.small, bgcolor = month(time) >= 7 and month(time) <= 9 ? color.new(color.red, 75) : na, text_color =color.red)
+    table.cell(t2, 3, 1, text = qString4 != 0 ? str.tostring(date9, "#") + "/" + str.tostring(date10, "#") +  "/" + str.tostring(date11, "#") + "\n__" : "--\n__", text_size = size.small, bgcolor = month(time) >= 10 and month(time) <= 12 ? color.new(color.yellow, 75) : na, text_color =color.yellow)
+
+if barstate.islast
+    if array.size(zx) > 1
+        table.cell(t2, 0, 2, text = qString1 > 0.000000 ? "Actual: " + str.tostring(array.get(zx, array.size(zx) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx1, array.size(zx1) - 1), format.mintick) + "\nSurprise" : qString1 == 0 ? "--" : "Actual: " + str.tostring(array.get(zx, array.size(zx) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx1, array.size(zx1) - 1), format.mintick)+  "\nMiss", text_size = size.small, text_color = color.blue)
+    if array.size(zx2) > 1
+        table.cell(t2, 1, 2, text = qString2 > 0.000000 ? "Actual: " + str.tostring(array.get(zx2, array.size(zx2) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx3, array.size(zx3) - 1), format.mintick) + "\nSurprise" : qString2 == 0 ? "--" : "Actual: " + str.tostring(array.get(zx2, array.size(zx2) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx3, array.size(zx3) - 1), format.mintick)+  "\nMiss", text_size = size.small, text_color = color.green)
+    if array.size(zx4) > 1
+        table.cell(t2, 2, 2, text = qString3 > 0.000000 ? "Actual: " + str.tostring(array.get(zx4, array.size(zx4) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx5, array.size(zx5) - 1), format.mintick) + "\nSurprise" : qString3 == 0 ? "--" : "Actual: " + str.tostring(array.get(zx4, array.size(zx4) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx5, array.size(zx5) - 1), format.mintick)+  "\nMiss", text_size = size.small, text_color = color.red)
+    if array.size(zx6) > 1
+        table.cell(t2, 3, 2, text = qString4 > 0.000000 ? "Actual: " + str.tostring(array.get(zx6, array.size(zx6) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx7, array.size(zx7) - 1), format.mintick) + "\nSurprise" : qString4 == 0 ? "--" : "Actual: " + str.tostring(array.get(zx6, array.size(zx6) - 1), format.mintick) + "\nEstimate: " + str.tostring(array.get(zx7, array.size(zx7) - 1), format.mintick)+  "\nMiss", text_size = size.small, text_color = color.yellow)
+
+
+var line [] tri = array.new_line()
+var line [] tri1 = array.new_line()
+var line [] tri2 = array.new_line()
+
+if barstate.islast
+    table.cell(t2, 0, 3, text = qString1 == 0 ? "◠" : qString1 > 0.000000 ?  "✔" : "╳" ,text_size = size.huge, text_color = color.blue)
+    table.cell(t2, 1, 3, text = qString2 == 0 ? "◠" : qString2 > 0.000000 ?  "✔" : "╳" ,text_size = size.huge, text_color = color.green)
+    table.cell(t2, 2, 3, text = qString3 == 0 ? "◠" : qString3 > 0.000000 ?  "✔" : "╳" ,text_size = size.huge, text_color = color.red)
+    table.cell(t2, 3, 3, text = qString4 == 0 ? "◠" : qString4 > 0.000000 ?  "✔" : "╳" ,text_size = size.huge, text_color = color.yellow)

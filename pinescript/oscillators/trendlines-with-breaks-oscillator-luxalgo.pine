@@ -1,0 +1,170 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('Trendlines with Breaks Oscillator [LuxAlgo]','LuxAlgo - Trendlines with Breaks Oscillator', max_lines_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+//CONSTANTS & STRINGS & INPUTS
+//---------------------------------------------------------------------------------------------------------------------{
+GREEN                   = #089981
+RED                     = #F23645
+GREEN_80                = color.new(GREEN,80)
+RED_80                  = color.new(RED,80)
+
+NONE                    = 'None'
+RMA                     = 'RMA'
+SMA                     = 'SMA'
+TMA                     = 'TMA'
+EMA                     = 'EMA'
+DEMA                    = 'DEMA'
+TEMA                    = 'TEMA'
+HMA                     = 'HMA'
+WMA                     = 'WMA'
+SWMA                    = 'SWMA'
+VWMA                    = 'VWMA'
+
+DATA_GROUP              = 'Trendlines'
+PROCESSING_GROUP        = 'Oscillator'
+STYLE_GROUP             = 'Style'
+
+EM_SPACE                = ' '
+EN_SPACE                = ' '
+FOUR_PER_EM_SPACE       = ' '
+
+smoothSpacing           = EM_SPACE+EM_SPACE+EM_SPACE+EM_SPACE+EM_SPACE
+divergencesSpacing      = EM_SPACE+EM_SPACE+EM_SPACE+EM_SPACE+EN_SPACE+FOUR_PER_EM_SPACE
+smoothingTag            = 'Smoothing Signal'+smoothSpacing
+
+lengthInput             = input.int(    14,     'Swing Detection Lookback', group = DATA_GROUP)
+multiplierInput         = input.float(  1.,     'Slope',                    group = DATA_GROUP, minval = 0, step = .1 )
+calcMethodInput         = input.string( 'Atr',  'Slope Calculation Method', group = DATA_GROUP, options = ['Atr','Stdev','Linreg'])
+
+shortAlphaLengthInput   = input.int(    9,      'Short Alpha Length',   group = PROCESSING_GROUP)
+longAlphaLengthInput    = input.int(    20,     'Long Alpha Length',    group = PROCESSING_GROUP)
+smoothingInput          = input.string( EMA,    smoothingTag,           group = PROCESSING_GROUP, inline = 'data',    options = [NONE,RMA,SMA,TMA,EMA,DEMA,TEMA,HMA,WMA,SWMA,VWMA])
+smoothingLengthInput    = input.int(    10,     '',                     group = PROCESSING_GROUP, inline = 'data',    minval = 2)
+divergencesInput        = input.bool(   true,   'Divergences',          group = PROCESSING_GROUP, inline = 'divergences')
+divergencesLengthInput  = input.int(    4,      divergencesSpacing,     group = PROCESSING_GROUP, inline = 'divergences')
+
+bullishColorInput       = input.color(  GREEN_80,   'Bullish',     group = STYLE_GROUP)
+bearishColorInput       = input.color(  RED_80,     'Bearish',     group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//DATA STRUCTURES & VARIABLES
+//---------------------------------------------------------------------------------------------------------------------{
+var float shortAlpha    = 2 / (shortAlphaLengthInput    + 1)
+var float longAlpha     = 2 / (longAlphaLengthInput     + 1)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//USER-DEFINED FUNCTIONS
+//---------------------------------------------------------------------------------------------------------------------{
+signals() =>
+    var upper           = 0.
+    var lower           = 0.
+    var slope_ph        = 0.
+    var slope_pl        = 0.
+    var upos            = 0
+    var dnos            = 0
+    var bullish         = 0.
+    var bearish         = 0.
+    bool bullishBreak   = false
+    bool bearishBreak   = false
+
+    int n           = bar_index
+    float src       = close
+    float ph        = ta.pivothigh(lengthInput,lengthInput)
+    float pl        = ta.pivotlow(lengthInput,lengthInput)
+
+    bool newPivotHigh   = not na(ph)
+    bool newPivotLow    = not na(pl)
+
+    slope = switch calcMethodInput
+        'Atr'    => ta.atr(lengthInput) / lengthInput * multiplierInput
+        'Stdev'  => ta.stdev(src,lengthInput) / lengthInput * multiplierInput
+        'Linreg' => math.abs(ta.sma(src * n, lengthInput) - ta.sma(src, lengthInput) * ta.sma(n, lengthInput)) / ta.variance(n, lengthInput) / 2 * multiplierInput
+
+    slope_ph    := newPivotHigh ? slope : slope_ph
+    slope_pl    := newPivotLow  ? slope : slope_pl
+    upper       := newPivotHigh ? ph - slope_ph * lengthInput : upper - slope_ph
+    lower       := newPivotLow  ? pl + slope_pl * lengthInput : lower + slope_pl
+    upos        := newPivotHigh ? 0 : close > upper ? 1 : upos
+    dnos        := newPivotLow  ? 0 : close < lower ? 1 : dnos
+
+    if upos > upos[1]
+        bullishBreak := true
+        bullish += (close - upper - bullish) * shortAlpha
+    else if upos == 1
+        bullish += (math.max(close - upper, 0) - bullish) * longAlpha
+    else
+        bullish -= bullish * longAlpha
+
+    if dnos > dnos[1]
+        bearishBreak := true
+        bearish += (lower - close - bearish) * shortAlpha
+    else if dnos == 1
+        bearish += (math.max(lower - close, 0) - bearish) * longAlpha
+    else
+        bearish -= bearish * longAlpha
+
+    [bullish, bearish, bullishBreak, bearishBreak]
+
+smooth(float data, string smoothing, int length) =>
+    switch smoothing
+        RMA     => ta.rma(data,length)
+        SMA     => ta.sma(data,length)
+        TMA     => ta.sma(ta.sma(data,length),length)
+        EMA     => ta.ema(data,length)
+        DEMA    => 2 * ta.ema(data,length) - ta.ema(ta.ema(data,length),length)
+        TEMA    => 3 * ta.ema(data,length) - 3 * ta.ema(ta.ema(data,length),length) + ta.ema(ta.ema(ta.ema(data,length),length),length)
+        HMA     => ta.hma(data,length)
+        WMA     => ta.wma(data,length)
+        SWMA    => ta.swma(data)
+        VWMA    => ta.vwma(data,length)
+        => data
+
+divergences(float data, int length) =>
+    var array<float> chartHighs     = array.new<float>()
+    var array<float> chartLows      = array.new<float>()
+    var array<chart.point> highs    = array.new<chart.point>()
+    var array<chart.point> lows     = array.new<chart.point>()
+
+    chartData   = close[length]
+    pivotHigh   = ta.pivothigh(data,length,length)
+    pivotLow    = ta.pivotlow(data,length,length)
+    
+    if not na(pivotHigh) and data > 0
+        currentHigh = chart.point.new(time[length],bar_index[length],pivotHigh)
+
+        if highs.size() > 0 and currentHigh.price < highs.last().price and chartData >= chartHighs.last()
+            line.new(highs.last(), currentHigh,xloc = xloc.bar_time, color = color.new(bearishColorInput,0), width = 1)
+        
+        highs.push(currentHigh)
+        chartHighs.push(chartData)
+        
+    if not na(pivotLow) and data < 0
+        currentLow = chart.point.new(time[length],bar_index[length],pivotLow)
+
+        if lows.size() > 0  and currentLow.price > lows.last().price and chartData <= chartLows.last()
+            line.new(lows.last(), currentLow, xloc = xloc.bar_time, color = color.new(bullishColorInput,0), width = 1)
+
+        lows.push(currentLow)
+        chartLows.push(chartData)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//MUTABLE VARIABLES & EXECUTION
+//---------------------------------------------------------------------------------------------------------------------{
+[bullish, bearish, bullishBreak, bearishBreak] = signals()
+float signalDelta   = bullish - bearish
+float smoothDelta   = smooth(signalDelta,smoothingInput,smoothingLengthInput)
+
+histogramPlot       = plot(signalDelta, 'Histogram', signalDelta > 0 ? color.new(bullishColorInput,0) : color.new(bearishColorInput,0))
+signalPlot          = plot(smoothDelta, 'Signal', chart.fg_color)
+basePlot            = plot(0,'base line',display = display.none,color = color(na))
+fill(histogramPlot,basePlot,math.max(signalDelta,0),math.min(signalDelta,0),signalDelta > 0 ? color.new(bullishColorInput,50) : color.new(bearishColorInput,100),signalDelta > 0 ? color.new(bullishColorInput,100) : color.new(bearishColorInput,50))
+
+plot(signalDelta,'Trendline Break',bullishBreak ? color.new(bullishColorInput,0) : bearishBreak ? color.new(bearishColorInput,0) : color(na),style = plot.style_circles, linewidth = 3)
+
+if divergencesInput
+    divergences(signalDelta,divergencesLengthInput)
+
+//---------------------------------------------------------------------------------------------------------------------}

@@ -1,0 +1,276 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+//Build by CryptoForMoney
+
+//@version=6
+indicator("Crypto Fear & Greed Index", shorttitle="FGI", overlay=false, precision=0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DESCRIPTION
+// Approximates the Crypto Fear & Greed Index using on-chain
+// TradingView data. The original index uses: Volatility (25%), Momentum/Volume
+// (25%), Social Media (15%), Surveys (15%), BTC Dominance (10%), Google Trends
+// (10%). Since social media, surveys, and Google Trends aren't natively
+// available, we redistribute weights across available proxies and add
+// stablecoin dominance as a fear/greed proxy.
+//
+// Components:
+//   1. Volatility Score        (25%) — BTC volatility vs 30/90d baseline
+//   2. Momentum Score          (25%) — Price momentum vs 30/90d baseline
+//   3. Volume Score            (15%) — Volume vs 30/90d baseline
+//   4. BTC Dominance Score     (15%) — BTC.D trend as risk appetite gauge
+//   5. Stablecoin Flow Score   (20%) — USDT.D as proxy for risk-on/risk-off
+//
+// Apply to: BTCUSD / BTCUSDT (daily timeframe recommended)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── INPUTS ──────────────────────────────────────────────────────────────────
+
+grp_params   = "Parameters"
+shortLen     = input.int(30,  "Short Lookback (days)",  minval=5,  maxval=100, group=grp_params)
+longLen      = input.int(90,  "Long Lookback (days)",   minval=20, maxval=365, group=grp_params)
+smoothLen    = input.int(1,   "Smoothing (EMA, 1=off)", minval=1,  maxval=21,  group=grp_params)
+
+grp_weights  = "Component Weights"
+w_vol        = input.float(25, "Volatility %",          minval=0, maxval=100, group=grp_weights)
+w_mom        = input.float(25, "Momentum %",            minval=0, maxval=100, group=grp_weights)
+w_volume     = input.float(15, "Volume %",              minval=0, maxval=100, group=grp_weights)
+w_btcd       = input.float(15, "BTC Dominance %",       minval=0, maxval=100, group=grp_weights)
+w_stable     = input.float(20, "Stablecoin Dominance %",minval=0, maxval=100, group=grp_weights)
+
+grp_vis      = "Display"
+showBands    = input.bool(true,  "Show Sentiment Zones",   group=grp_vis)
+showTable    = input.bool(true,  "Show Score Breakdown",   group=grp_vis)
+showHist     = input.bool(true,  "Show Histogram Fill",    group=grp_vis)
+tablePos     = input.string("Top Right", "Table Position", 
+                 options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grp_vis)
+
+// ── DATA SOURCES ────────────────────────────────────────────────────────────
+
+btcClose  = request.security("BINANCE:BTCUSDT", timeframe.period, close)
+btcVol    = request.security("BINANCE:BTCUSDT", timeframe.period, volume)
+btcHigh   = request.security("BINANCE:BTCUSDT", timeframe.period, high)
+btcLow    = request.security("BINANCE:BTCUSDT", timeframe.period, low)
+btcDom    = request.security("BTC.D",           timeframe.period, close)
+usdtDom   = request.security("USDT.D",          timeframe.period, close)
+
+// ── HELPER FUNCTIONS ────────────────────────────────────────────────────────
+
+// Normalize a value to 0-100 range using percentile rank over a lookback
+percentileRank(src, len) =>
+    count = 0
+    for i = 1 to len
+        if src > src[i]
+            count += 1
+    100.0 * count / len
+
+// Clamp value between 0 and 100
+clamp(val) => math.max(0.0, math.min(100.0, val))
+
+// ── 1. VOLATILITY SCORE (inverted: high vol = fear) ────────────────────────
+// Measures current realized volatility vs historical baseline.
+// High volatility relative to the past → fear → low score.
+
+trueRange    = btcHigh - btcLow
+volShort     = ta.sma(trueRange / btcClose * 100, shortLen)
+volLong      = ta.sma(trueRange / btcClose * 100, longLen)
+volBaseline  = (volShort + volLong) / 2
+
+// Current vol as ratio to baseline — >1 means elevated vol
+volCurrent   = ta.sma(trueRange / btcClose * 100, 7)
+volRatio     = volCurrent / volBaseline
+
+// Invert: high vol ratio → fear (low score), low vol ratio → greed (high score)
+// Map ratio ~0.5 (calm) → 90, ~2.0 (extreme vol) → 10
+volScore     = clamp(100 - (volRatio - 0.5) * 60)
+
+// ── 2. MOMENTUM SCORE ──────────────────────────────────────────────────────
+// Compares current price to short/long moving averages.
+// Price well above averages = greed, below = fear.
+
+maShort      = ta.sma(btcClose, shortLen)
+maLong       = ta.sma(btcClose, longLen)
+
+// Deviation from both MAs as percentage
+devShort     = (btcClose - maShort) / maShort * 100
+devLong      = (btcClose - maLong)  / maLong  * 100
+devAvg       = (devShort + devLong) / 2
+
+// Map: -30% below MA → 0, +30% above → 100
+momScore     = clamp(50 + devAvg * (50.0 / 30.0))
+
+// ── 3. VOLUME SCORE ────────────────────────────────────────────────────────
+// High buying volume in uptrend = greed, high volume in downtrend = fear.
+
+volMaShort   = ta.sma(btcVol, shortLen)
+volMaLong    = ta.sma(btcVol, longLen)
+volMaWeek    = ta.sma(btcVol, 7)
+
+// Volume ratio: current week vs average of short/long
+volAvgBase   = (volMaShort + volMaLong) / 2
+volBuyRatio  = volMaWeek / volAvgBase
+
+// Direction bias: weight volume by price direction
+priceDir     = ta.sma(ta.change(btcClose), 7) > 0 ? 1.0 : -1.0
+
+// High volume + uptrend = greed, high volume + downtrend = fear
+volDirScore  = volBuyRatio * priceDir
+volumeScore  = clamp(50 + volDirScore * 30)
+
+// ── 4. BTC DOMINANCE SCORE (inverted) ──────────────────────────────────────
+// Rising BTC dominance = fear (flight to safety within crypto)
+// Falling BTC dominance = greed (risk appetite for altcoins)
+
+btcdMaShort  = ta.sma(btcDom, shortLen)
+btcdMaLong   = ta.sma(btcDom, longLen)
+btcdMa       = (btcdMaShort + btcdMaLong) / 2
+
+// Deviation of current dominance from baseline
+btcdDev      = (btcDom - btcdMa) / btcdMa * 100
+
+// Invert: rising dominance = fear (lower score)
+// Map: +5% above average → 10, -5% below → 90
+btcdScore    = clamp(50 - btcdDev * 8)
+
+// ── 5. STABLECOIN DOMINANCE SCORE (inverted) ───────────────────────────────
+// Rising USDT dominance = capital fleeing to safety = fear
+// Falling USDT dominance = capital moving to risk assets = greed
+
+usdtMaShort  = ta.sma(usdtDom, shortLen)
+usdtMaLong   = ta.sma(usdtDom, longLen)
+usdtMa       = (usdtMaShort + usdtMaLong) / 2
+
+// Deviation from baseline
+usdtDev      = (usdtDom - usdtMa) / usdtMa * 100
+
+// Invert: rising stablecoin dom = fear
+// Map: +10% above avg → 10, -10% below → 90
+stableScore  = clamp(50 - usdtDev * 5)
+
+// ── COMPOSITE INDEX ────────────────────────────────────────────────────────
+
+totalWeight  = w_vol + w_mom + w_volume + w_btcd + w_stable
+rawIndex     = (volScore   * w_vol   + 
+                momScore   * w_mom   + 
+                volumeScore* w_volume+ 
+                btcdScore  * w_btcd  + 
+                stableScore* w_stable) / (totalWeight > 0 ? totalWeight : 1)
+
+fgi          = smoothLen > 1 ? ta.ema(rawIndex, smoothLen) : rawIndex
+
+// ── SENTIMENT CLASSIFICATION ───────────────────────────────────────────────
+
+sentimentText = switch
+    fgi >= 75 => "Extreme Greed"
+    fgi >= 53 => "Greed"
+    fgi >= 47 => "Neutral"
+    fgi >= 25 => "Fear"
+    => "Extreme Fear"
+
+sentimentColor = switch
+    fgi >= 75 => color.new(#00e676, 0)   // extreme greed — bright green
+    fgi >= 53 => color.new(#66bb6a, 0)   // greed — green
+    fgi >= 47 => color.new(#fdd835, 0)   // neutral — yellow
+    fgi >= 25 => color.new(#ef6c00, 0)   // fear — orange
+    => color.new(#e53935, 0)             // extreme fear — red
+
+// ── PLOTTING ───────────────────────────────────────────────────────────────
+
+// Background zones
+bgExtFear  = color.new(#e53935, 92)
+bgFear     = color.new(#ef6c00, 94)
+bgNeutral  = color.new(#fdd835, 95)
+bgGreed    = color.new(#66bb6a, 94)
+bgExtGreed = color.new(#00e676, 92)
+
+// Zone bands
+h100 = hline(100, "100", color.new(color.gray, 85), linestyle=hline.style_dotted)
+h75  = hline(75,  "Extreme Greed",  color.new(#00e676, 70), linestyle=hline.style_dashed)
+h53  = hline(53,  "Greed",          color.new(#66bb6a, 80), linestyle=hline.style_dotted)
+h47  = hline(47,  "Fear",           color.new(#ef6c00, 80), linestyle=hline.style_dotted)
+h25  = hline(25,  "Extreme Fear",   color.new(#e53935, 70), linestyle=hline.style_dashed)
+h0   = hline(0,   "0",   color.new(color.gray, 85), linestyle=hline.style_dotted)
+
+fill(h100, h75,  showBands ? bgExtGreed : na, title="Extreme Greed Zone")
+fill(h75,  h53,  showBands ? bgGreed    : na, title="Greed Zone")
+fill(h53,  h47,  showBands ? bgNeutral  : na, title="Neutral Zone")
+fill(h47,  h25,  showBands ? bgFear     : na, title="Fear Zone")
+fill(h25,  h0,   showBands ? bgExtFear  : na, title="Extreme Fear Zone")
+
+// Main line
+plot(fgi, "Fear & Greed Index", sentimentColor, linewidth=2)
+
+// Histogram
+plot(showHist ? fgi : na, "Histogram", sentimentColor, style=plot.style_columns, 
+     histbase=50, linewidth=1)
+
+// 50 midline
+hline(50, "Midline", color.new(color.white, 70), linestyle=hline.style_solid)
+
+// ── INFO TABLE ─────────────────────────────────────────────────────────────
+
+if showTable and barstate.islast
+    tblPos = switch tablePos
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+
+    var tbl = table.new(tblPos, 3, 8, 
+                 bgcolor=color.new(#111118, 10), 
+                 border_width=1, 
+                 border_color=color.new(#2a2a3a, 0),
+                 frame_width=1,
+                 frame_color=color.new(#2a2a3a, 0))
+
+    headerBg = color.new(#1a1a28, 0)
+    txtColor = color.new(#cccccc, 0)
+
+    // Header
+    table.cell(tbl, 0, 0, "FEAR & GREED INDEX", 
+         text_color=color.new(#f7931a, 0), text_size=size.small, 
+         bgcolor=headerBg, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, str.tostring(math.round(fgi)), 
+         text_color=sentimentColor, text_size=size.normal, 
+         bgcolor=headerBg, text_halign=text.align_right)
+    table.cell(tbl, 2, 0, sentimentText, 
+         text_color=sentimentColor, text_size=size.small, 
+         bgcolor=headerBg, text_halign=text.align_right)
+
+    // Component rows
+    compNames  = array.from("Volatility",     "Momentum",      "Volume",         "BTC Dominance",  "Stablecoin Dom.")
+    compScores = array.from(volScore,          momScore,        volumeScore,      btcdScore,        stableScore)
+    compWeight = array.from(w_vol,             w_mom,           w_volume,         w_btcd,           w_stable)
+
+    for i = 0 to 4
+        score = math.round(array.get(compScores, i))
+        weight = math.round(array.get(compWeight, i))
+        sColor = score >= 75 ? color.new(#00e676, 0) : score >= 53 ? color.new(#66bb6a, 0) : score >= 47 ? color.new(#fdd835, 0) : score >= 25 ? color.new(#ef6c00, 0) : color.new(#e53935, 0)
+        rowBg = color.new(#111118, 0)
+        
+        table.cell(tbl, 0, i + 1, array.get(compNames, i), 
+             text_color=txtColor, text_size=size.tiny, 
+             bgcolor=rowBg, text_halign=text.align_left)
+        table.cell(tbl, 1, i + 1, str.tostring(score), 
+             text_color=sColor, text_size=size.tiny, 
+             bgcolor=rowBg, text_halign=text.align_right)
+        table.cell(tbl, 2, i + 1, str.tostring(weight) + "%", 
+             text_color=color.new(#666666, 0), text_size=size.tiny, 
+             bgcolor=rowBg, text_halign=text.align_right)
+
+    // Footer
+    table.cell(tbl, 0, 6, "Lookback", 
+         text_color=color.new(#555555, 0), text_size=size.tiny, 
+         bgcolor=color.new(#0e0e16, 0), text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(shortLen) + "/" + str.tostring(longLen) + "d", 
+         text_color=color.new(#555555, 0), text_size=size.tiny, 
+         bgcolor=color.new(#0e0e16, 0), text_halign=text.align_right)
+    table.cell(tbl, 2, 6, "", bgcolor=color.new(#0e0e16, 0))
+
+// ── ALERTS ─────────────────────────────────────────────────────────────────
+
+alertcondition(ta.crossunder(fgi, 25), "Entered Extreme Fear",  "FGI dropped below 25 — Extreme Fear")
+alertcondition(ta.crossunder(fgi, 10), "Deep Extreme Fear",     "FGI dropped below 10 — Deep Extreme Fear")
+alertcondition(ta.crossover(fgi, 75),  "Entered Extreme Greed", "FGI rose above 75 — Extreme Greed")
+alertcondition(ta.crossover(fgi, 50),  "Crossed Above Neutral", "FGI crossed above 50")
+alertcondition(ta.crossunder(fgi, 50), "Crossed Below Neutral", "FGI crossed below 50")

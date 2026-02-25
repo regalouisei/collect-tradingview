@@ -1,0 +1,123 @@
+//This is inpired by the original Tradingview RSI.
+//But Vizualization as Histogram. This is better readable in a small window.
+
+//@version=6
+indicator(title="RSI Histogram", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+visibleBar = 60
+visibleLine = 40
+
+rsiLengthInput = input.int(14, minval=1, title="RSI Length", group="RSI Settings")
+rsiSourceInput = input.source(close, "Source", group="RSI Settings")
+calculateDivergence = input.bool(false, title="Calculate Divergence", group="RSI Settings", display = display.none, tooltip = "Calculating divergences is needed in order for divergence alerts to fire.")
+
+//Visuals
+grVis = "Visual Settings"
+lowerTh      = input.float(30, "Lower Threshold", minval=0, maxval=100, tooltip = "Default is 30", group=grVis)
+upperTh      = input.float(70, "Upper Threshold", minval=0, maxval=100, tooltip = "Default is 70", group=grVis)
+uppestTh     = input.float(80, "Hightest Threshold", minval=0, maxval=100, tooltip = "Addition to Standard RSI. Use this for Growth Stocks", group=grVis)
+col_under    = input.color(color.new(color.green, visibleBar), "Colors (Low to High)", inline="cols", group=grVis)
+col_mid_dn   = input.color(color.new(color.gray, visibleBar),  "/",                    inline="cols", group=grVis)
+col_mid_up   = input.color(color.new(color.gray, visibleBar),  "/",                    inline="cols", group=grVis)
+col_over     = input.color(color.new(color.red, visibleBar),   "/",                    inline="cols", group=grVis)
+col_over_ext = input.color(color.new(#8b0000, visibleBar),     "/",                    inline="cols", group=grVis)
+
+change = ta.change(rsiSourceInput)
+up = ta.rma(math.max(change, 0), rsiLengthInput)
+down = ta.rma(-math.min(change, 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+
+// --- Bar color logic ---
+bar_col = rsi > (uppestTh)     ? col_over_ext :
+          rsi > upperTh        ? col_over :
+          rsi < lowerTh        ? col_under :
+          rsi >= 50            ? col_mid_up :
+                                 col_mid_dn
+
+plot(rsi, "RSI", style=plot.style_columns, color=bar_col, histbase=50)
+
+// --- Lines: 100% visible, adapts to light/dark theme ---
+hline(upperTh, "Upper Band",  color=color.new(#9c9c9c, visibleLine), linestyle=hline.style_dotted,  linewidth=1)
+hline(50,      "Middle Band", color=color.new(chart.fg_color, visibleLine), linestyle=hline.style_dotted, linewidth=1)
+hline(lowerTh, "Lower Band",  color=color.new(#9c9c9c, visibleLine), linestyle=hline.style_dotted,  linewidth=1)
+
+// Smoothing MA inputs
+GRP = "Smoothing"
+maShowInput = input.bool(true, "Show MA", inline="ma_cols", group=GRP)
+maColorUp = input.color(color.new(color.orange, 0), "Up / Down", inline="ma_cols", group=GRP)
+maColorDn = input.color(color.new(color.blue, 0), "", inline="ma_cols", group=GRP)
+TT_BB = "Only applies when 'SMA + Bollinger Bands' is selected. Determines the distance between the SMA and the bands."
+maTypeInput = input.string("SMA", "Type", options = ["None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = GRP, display = display.none)
+var isBB = maTypeInput == "SMA + Bollinger Bands"
+maLengthInput = input.int(14, "Length", group = GRP, display = display.none, active = maTypeInput != "None")
+bbMultInput = input.float(2.0, "BB StdDev", minval = 0.001, maxval = 50, step = 0.5, tooltip = TT_BB, group = GRP, display = display.none, active = isBB)
+var enableMA = maShowInput and maTypeInput != "None"
+
+// Smoothing MA Calculation
+ma(source, length, MAtype) =>
+    switch MAtype
+        "SMA"                   => ta.sma(source, length)
+        "SMA + Bollinger Bands" => ta.sma(source, length)
+        "EMA"                   => ta.ema(source, length)
+        "SMMA (RMA)"            => ta.rma(source, length)
+        "WMA"                   => ta.wma(source, length)
+        "VWMA"                  => ta.vwma(source, length)
+
+// Smoothing MA plots
+smoothingMA = enableMA ? ma(rsi, maLengthInput, maTypeInput) : na
+smoothingStDev = isBB ? ta.stdev(rsi, maLengthInput) * bbMultInput : na
+plot(smoothingMA, "RSI-based MA", color=ta.change(smoothingMA) < 0 ? maColorDn : maColorUp, linewidth=1, display= maShowInput ? display.pane : display.none, editable = enableMA)
+bbUpperBand = plot(smoothingMA + smoothingStDev, title = "Upper Bollinger Band", color=color.new(color.green, visibleBar), display = isBB ? display.all : display.none, editable = isBB)
+bbLowerBand = plot(smoothingMA - smoothingStDev, title = "Lower Bollinger Band", color=color.new(color.green, visibleBar), display = isBB ? display.all : display.none, editable = isBB)
+fill(bbUpperBand, bbLowerBand, color= isBB ? color.new(color.green, 90) : na, title="Bollinger Bands Background Fill", display = isBB ? display.all : display.none, editable = isBB)
+
+// Divergence
+lookbackRight = 5
+lookbackLeft = 5
+rangeUpper = 60
+rangeLower = 5
+bearColor = color.new(color.red, visibleBar)
+bullColor = color.new(color.green, visibleBar)
+textColor = color.new(color.white, visibleBar)
+noneColor = color.new(color.white, 100)
+
+_inRange(bool cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+plFound = false
+phFound = false
+
+bullCond = false
+bearCond = false
+
+rsiLBR = rsi[lookbackRight]
+
+if calculateDivergence
+    //------------------------------------------------------------------------------
+    // Regular Bullish
+    // rsi: Higher Low
+    plFound := not na(ta.pivotlow(rsi, lookbackLeft, lookbackRight))    
+    rsiHL = rsiLBR > ta.valuewhen(plFound, rsiLBR, 1) and _inRange(plFound[1])
+    // Price: Lower Low
+    lowLBR = low[lookbackRight]
+    priceLL = lowLBR < ta.valuewhen(plFound, lowLBR, 1)
+    bullCond := priceLL and rsiHL and plFound
+
+    //------------------------------------------------------------------------------
+    // Regular Bearish
+    // rsi: Lower High
+    phFound := not na(ta.pivothigh(rsi, lookbackLeft, lookbackRight))
+    rsiLH = rsiLBR < ta.valuewhen(phFound, rsiLBR, 1) and _inRange(phFound[1])
+    // Price: Higher High
+    highLBR = high[lookbackRight]
+    priceHH = highLBR > ta.valuewhen(phFound, highLBR, 1)
+    bearCond := priceHH and rsiLH and phFound
+
+plot(plFound ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bullish", linewidth = 2, color = (bullCond ? bullColor : noneColor), display = display.pane, editable = calculateDivergence)
+plotshape(bullCond ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bullish Label", text = " Bull ", style = shape.labelup, location = location.absolute, color = bullColor, textcolor = textColor, display = display.pane, editable = calculateDivergence)
+plot(phFound ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bearish", linewidth = 2, color = (bearCond ? bearColor : noneColor), display = display.pane, editable = calculateDivergence)
+plotshape(bearCond ? rsiLBR : na, offset = -lookbackRight, title = "Regular Bearish Label", text = " Bear ", style = shape.labeldown, location = location.absolute, color = bearColor, textcolor = textColor, display = display.pane, editable = calculateDivergence)
+
+alertcondition(bullCond, title='Regular Bullish Divergence', message="Found a new Regular Bullish Divergence, `Pivot Lookback Right` number of bars to the left of the current bar.")
+alertcondition(bearCond, title='Regular Bearish Divergence', message='Found a new Regular Bearish Divergence, `Pivot Lookback Right` number of bars to the left of the current bar.')

@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MPL-2.0
+// This Pine Script® file is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © 2025 JopAlgo [JopAlgo]
+//
+// ORIGINAL UPSTREAM WORK & ATTRIBUTION
+//   Original concept/code reference: "Relative Strength Index" (RSI) by TradingView (Pine Script® v6 built-in).
+//   The RSI idea and baseline implementation are authored by TradingView. This script is a derivative work.
+//
+// MODIFICATIONS BY JopAlgo (this derivative):
+//   • Introduced VW-RSI engine option (volume-weighted up/down averages) in addition to Wilder/Cutler engines.
+//   • Replaced multi-MA types with a single VWAP-based "Rolling Line" (VWAP of RSI) and removed labels.
+//   • Added pure VWAP adaptation (blending between fast/slow VWAP variants based on volume regime).
+//   • Added Adaptive Bands (μ ± k·σ) computed from the Rolling Line, with optional static 70/30.
+//   • Added visual shadow between RSI and Rolling Line plus lighter highlights only beyond user lines.
+//   • Kept simple divergence lines (no buy/sell labels), optional session gating.
+//
+// DISCLAIMER
+//   This script is provided “AS IS”, without warranty of any kind, for educational purposes only.
+//   It does not constitute financial advice. Trading involves substantial risk.
+//   This work is independent and not affiliated with, sponsored by, or endorsed by TradingView.
+//   Redistribution is allowed under MPL-2.0; please keep this header intact.
+//
+// PUBLISHING NOTE (TradingView):
+//   When publishing, choose “Open-source” and keep this license/attribution header unchanged.
+
+//@version=6
+indicator(title="RSI VWAP v1 [JopAlgo]", shorttitle="RSIV1", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+// ====== RSI ENGINE (unique) ======
+GRP_R = "RSI Engine"
+rsiEngine     = input.string("VW-RSI", "Engine", options = ["VW-RSI", "Wilder", "Cutler"], group=GRP_R, tooltip="VW-RSI uses volume-weighted averages of up/down moves; Wilder uses RMA; Cutler uses SMA.")
+rsiLength     = input.int(14, minval=1, title="RSI Length", group=GRP_R)
+rsiSource     = input.source(close, "Source", group=GRP_R)
+
+calc_rsi(_src, _len, _engine) =>
+    ch   = ta.change(_src)
+    upS  = math.max(ch, 0)
+    dnS  = math.max(-ch, 0)
+    upA  = switch _engine
+        "Wilder" => ta.rma(upS, _len)
+        "Cutler" => ta.sma(upS, _len)
+        =>           ta.vwma(upS, _len)      // "VW-RSI" (default)
+    dnA  = switch _engine
+        "Wilder" => ta.rma(dnS, _len)
+        "Cutler" => ta.sma(dnS, _len)
+        =>           ta.vwma(dnS, _len)      // "VW-RSI" (default)
+    dnA == 0 ? 100 : upA == 0 ? 0 : 100 - (100 / (1 + upA / dnA))
+
+rsi = calc_rsi(rsiSource, rsiLength, rsiEngine)
+
+// ====== BASE PLOTS & STATIC BANDS ======
+rsiPlot      = plot(rsi, "RSI", color=#7E57C2)
+hOB_static   = hline(70, "Static OB 70", color=#787B86)
+midline      = hline(50, "Middle 50",    color=color.new(#787B86, 50))
+hOS_static   = hline(30, "Static OS 30", color=#787B86)
+fill(hOB_static, hOS_static, color=color.rgb(126, 87, 194, 90), title="RSI Background Fill")
+
+// Gradient around 50 (kept)
+midLinePlot  = plot(50, color=na, display=display.none)
+fill(rsiPlot, midLinePlot, 100, 70, top_color=color.new(color.green, 0),   bottom_color=color.new(color.green, 100), title="Overbought Gradient Fill")
+fill(rsiPlot, midLinePlot, 30,   0,  top_color=color.new(color.red, 100), bottom_color=color.new(color.red, 0),     title="Oversold Gradient Fill")
+
+// ====== ROLLING LINE (VWAP ONLY) + PURE VWAP ADAPTATION ======
+GRP_S = "Rolling Line"
+rollLen       = input.int(20, "Rolling Line Length", minval=1, group=GRP_S)
+rollColor     = input.color(color.rgb(0, 229, 255), "Rolling Line Color", group=GRP_S) // #00E5FF
+
+// Factors to build fast/slow VWAP variants of RSI
+fastFactor    = input.float(0.5, "Fast Length Factor", minval=0.1, maxval=1.0, step=0.05, group=GRP_S, tooltip="Fast length = factor × Rolling Line Length")
+slowFactor    = input.float(2.0, "Slow Length Factor", minval=1.1, maxval=5.0, step=0.1,  group=GRP_S, tooltip="Slow length = factor × Rolling Line Length")
+
+fastLen = int(math.max(1, math.round(rollLen * fastFactor)))
+slowLen = int(math.max(1, math.round(rollLen * slowFactor)))
+
+vw_base = ta.vwma(rsi, rollLen)
+vw_fast = ta.vwma(rsi, fastLen)
+vw_slow = ta.vwma(rsi, slowLen)
+
+// Helpers
+clamp(x, lo, hi) => math.min(math.max(x, lo), hi)
+
+// --- Low-volume acceleration (toward fast VWAP)
+GRP_A = "Adaptive (Low-Volume / Spikes)"
+enableLowVol     = input.bool(true,  "Speed-up on Low Volume", group=GRP_A)
+lowVolThresh     = input.float(0.80, "Low Volume Threshold (rel. to SMA)", minval=0.1, maxval=2.0, step=0.05, group=GRP_A)
+maxFastBlend     = input.float(0.50, "Max Blend → Fast VWAP", minval=0.0, maxval=1.0, step=0.05, group=GRP_A)
+
+volSMA = ta.sma(volume, rollLen)
+relVol = volSMA > 0 ? volume / volSMA : 1.0
+wFast  = enableLowVol and (relVol < lowVolThresh) ? clamp((lowVolThresh - relVol) / lowVolThresh, 0.0, 1.0) * maxFastBlend : 0.0
+
+// --- Spike dampener (toward slow VWAP)
+enableSpike     = input.bool(true,  "Dampen Spikes", group=GRP_A)
+zStart          = input.float(2.0,  "Z-Score Start", minval=0.5, maxval=6.0, step=0.1, group=GRP_A)
+zMax            = input.float(4.0,  "Z-Score Max",   minval=1.0, maxval=10.0, step=0.1, group=GRP_A)
+maxSlowBlend    = input.float(0.70, "Max Blend → Slow VWAP", minval=0.0, maxval=1.0, step=0.05, group=GRP_A)
+
+volSD   = ta.stdev(volume, rollLen)
+zVol    = (volSD > 0) ? (volume - volSMA) / volSD : 0.0
+wSlow   = enableSpike ? clamp((zVol - zStart) / math.max(zMax - zStart, 0.0001), 0.0, 1.0) * maxSlowBlend : 0.0
+
+// Combine (pure VWAP blend): base + fast + slow contributions
+rollingLine = vw_base + wFast * (vw_fast - vw_base) + wSlow * (vw_slow - vw_base)
+rollingPlot = plot(rollingLine, "Rolling Line", color=rollColor, linewidth=2)
+
+// ====== ADAPTIVE BANDS (distinctive) ======
+GRP_BD   = "Bands"
+bandsMode = input.string("Static 70/30", "Mode", options=["Static 70/30","Adaptive μ±kσ"], group=GRP_BD,
+     tooltip="Adaptive levels are computed from the Rolling Line: mean ± k·stdev.")
+bandLen   = input.int(100, "Adaptive Lookback", minval=10, group=GRP_BD)
+bandK     = input.float(1.0, "k (StdDev Multiplier)", minval=0.1, maxval=3.0, step=0.1, group=GRP_BD)
+obDyn     = clamp(ta.sma(rollingLine, bandLen) + bandK*ta.stdev(rollingLine, bandLen), 0, 100)
+osDyn     = clamp(ta.sma(rollingLine, bandLen) - bandK*ta.stdev(rollingLine, bandLen), 0, 100)
+OB        = bandsMode == "Adaptive μ±kσ" ? obDyn : 70.0
+OS        = bandsMode == "Adaptive μ±kσ" ? osDyn : 30.0
+
+showAdaptive = input.bool(true, "Show Adaptive Lines", group=GRP_BD)
+plot(showAdaptive and bandsMode=="Adaptive μ±kσ" ? OB : na, "Adaptive OB", color=color.new(color.orange, 0), style=plot.style_circles)
+plot(showAdaptive and bandsMode=="Adaptive μ±kσ" ? OS : na, "Adaptive OS", color=color.new(color.teal,   0), style=plot.style_circles)
+
+// ====== Visual shading ======
+GRP_V = "Visual"
+showBaseRef   = input.bool(true,  "Show Base Rolling (reference)", group=GRP_V)
+showDiffShade = input.bool(true,  "Shade between RSI and Rolling", group=GRP_V)
+
+// Base Rolling (pre-adaptation) as reference
+plot(showBaseRef ? vw_base : na, "Base Rolling (ref)", color=color.new(rollColor, 40), linewidth=1)
+
+// Shadow between RSI and Rolling Line
+rsiAbove = plot(showDiffShade and rsi > rollingLine ? rsi : na, "RSI>Rolling", color=na)
+rsiBelow = plot(showDiffShade and rsi < rollingLine ? rsi : na, "RSI<Rolling", color=na)
+fill(rsiAbove, rollingPlot, color=color.new(color.green, 85), title="Above Fill")
+fill(rsiBelow, rollingPlot, color=color.new(color.red,   85), title="Below Fill")
+
+// OB/OS (divergence) highlight uses dynamic OB/OS (or 70/30 in static mode)
+showOBLight  = input.bool(true,  "Highlight Above OB", group=GRP_V)
+obLightColor = input.color(color.new(color.lime, 65), "OB Fill Color", group=GRP_V)
+showOSLight  = input.bool(true,  "Highlight Below OS", group=GRP_V)
+osLightColor = input.color(color.new(color.red,  65), "OS Fill Color", group=GRP_V)
+
+condOB = showDiffShade and showOBLight and (rsi > OB or rollingLine > OB)
+condOS = showDiffShade and showOSLight and (rsi < OS or rollingLine < OS)
+
+rsiOB   = plot(condOB ? math.max(rsi,         OB) : na, color=na, title="RSI>OB mask")
+lineOB  = plot(condOB ? math.max(rollingLine, OB) : na, color=na, title="Line>OB mask")
+fill(rsiOB,  lineOB,  color = condOB ? obLightColor : na, title="OB Highlight")
+
+rsiOS   = plot(condOS ? math.min(rsi,         OS) : na, color=na, title="RSI<OS mask")
+lineOS  = plot(condOS ? math.min(rollingLine, OS) : na, color=na, title="Line<OS mask")
+fill(rsiOS,  lineOS,  color = condOS ? osLightColor : na, title="OS Highlight")
+
+// ====== Signal gating (optional) ======
+GRP_G = "Signal Gating"
+ignoreFirstBars = input.int(0, "Ignore First Bars of Day (signals only)", minval=0, maxval=50, group=GRP_G)
+newDay  = ta.change(time("D")) != 0
+var int barsFromDayStart = 0
+barsFromDayStart := newDay ? 0 : barsFromDayStart + 1
+signalsAllowed = barsFromDayStart >= ignoreFirstBars
+
+// ====== Divergence lines (labels removed, lines kept) ======
+lookbackRight = 5
+lookbackLeft  = 5
+rangeUpper    = 60
+rangeLower    = 5
+bullColor     = color.green
+bearColor     = color.red
+noneColor     = color.new(color.white, 100)
+
+_inRange(bool cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+plFoundRaw = not na(ta.pivotlow(rsi, lookbackLeft, lookbackRight))
+phFoundRaw = not na(ta.pivothigh(rsi, lookbackLeft, lookbackRight))
+plInRange  = _inRange(plFoundRaw[1])
+phInRange  = _inRange(phFoundRaw[1])
+
+rsiLBR   = rsi[lookbackRight]
+
+// Regular Bullish / Bearish conditions (for coloring only)
+rsiHL   = rsiLBR > ta.valuewhen(plFoundRaw, rsiLBR, 1) and plInRange
+lowLBR  = low[lookbackRight]
+priceLL = lowLBR < ta.valuewhen(plFoundRaw, lowLBR, 1)
+bullCond = signalsAllowed and priceLL and rsiHL and plFoundRaw
+
+rsiLH   = rsiLBR < ta.valuewhen(phFoundRaw, rsiLBR, 1) and phInRange
+highLBR = high[lookbackRight]
+priceHH = highLBR > ta.valuewhen(phFoundRaw, highLBR, 1)
+bearCond = signalsAllowed and priceHH and rsiLH and phFoundRaw
+
+// Keep only the lines, no labels
+plot(plFoundRaw ? rsiLBR : na, offset=-lookbackRight, title="Regular Bullish", linewidth=2,
+     color=(bullCond ? bullColor : noneColor), display=display.pane)
+
+plot(phFoundRaw ? rsiLBR : na, offset=-lookbackRight, title="Regular Bearish", linewidth=2,
+     color=(bearCond ? bearColor : noneColor), display=display.pane)

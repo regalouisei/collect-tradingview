@@ -1,0 +1,706 @@
+// This Pine Script™ code is subject to the terms of the Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("ICT MMM / AMD (Power of 3) [UAlgo]", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+GROUP_SESSIONS = "Sessions (Killzones)"
+GROUP_RULES    = "Rules"
+GROUP_OTE      = "OTE / FVG"
+GROUP_TARGETS  = "Targets"
+GROUP_DEALING  = "Dealing Range"
+GROUP_VISUALS  = "Visuals"
+
+// Sessions
+simple string tzInput     = input.string("America/New_York", "Timezone (IANA)", group = GROUP_SESSIONS)
+simple string accSession  = input.session("1900-0200", "Accumulation (Asia)", group = GROUP_SESSIONS)
+simple string manipWindow = input.session("0200-0500", "Manipulation (London)", group = GROUP_SESSIONS)
+simple string distWindow  = input.session("0700-0930", "Distribution (NY AM)", group = GROUP_SESSIONS, tooltip = "Used as an optional filter for ENTRY labels.")
+
+// Rules
+atrLen           = input.int(14, "ATR Length", minval = 1, group = GROUP_RULES)
+minSweepTicks    = input.int(0, "Sweep Min Ticks", minval = 0, group = GROUP_RULES)
+minSweepATR      = input.float(0.20, "Sweep Min ATR", minval = 0.0, step = 0.05, group = GROUP_RULES)
+useWicksForSweep = input.bool(true, "Sweep Uses Wicks (High/Low)", group = GROUP_RULES)
+pivotLenMSS      = input.int(3, "MSS Pivot Length", minval = 1, maxval = 20, group = GROUP_RULES, tooltip = "Confirmed pivots (delayed). Higher = stricter.")
+
+// OTE / FVG
+showFvg             = input.bool(true, "Show FVG", group = GROUP_OTE)
+dispMinAtr          = input.float(0.60, "Displacement Min ATR", minval = 0.0, step = 0.05, group = GROUP_OTE)
+dispMinBodyPct      = input.float(0.55, "Displacement Min Body %", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_OTE)
+requireDisplacement = input.bool(true, "Require Displacement Before FVG", group = GROUP_OTE)
+fvgSearchBars       = input.int(30, "FVG Search Bars After MSS", minval = 1, maxval = 200, group = GROUP_OTE)
+removeMitigatedFvg  = input.bool(true, "Remove Mitigated FVG", group = GROUP_OTE)
+showEntry           = input.bool(true, "Show ENTRY + SL", group = GROUP_OTE)
+entryOnlyInDist     = input.bool(true, "ENTRY Only In Distribution Window", group = GROUP_OTE)
+slPadTicks          = input.int(1, "SL Padding (ticks)", minval = 0, maxval = 20, group = GROUP_OTE)
+
+// Targets
+targetMode  = input.string("PDH/PDL + Range", "Target Mode", options = ["PDH/PDL", "Range", "PDH/PDL + Range"], group = GROUP_TARGETS)
+showTargets = input.bool(true, "Show Targets (per cycle)", group = GROUP_TARGETS)
+showPDH_PDL = input.bool(true, "Show PDH/PDL (global)", group = GROUP_TARGETS)
+
+// Dealing Range
+showDealingRange = input.bool(true, "Show Dealing Range (last pivots)", group = GROUP_DEALING)
+drPivotLen       = input.int(5, "Dealing Range Pivot Length", minval = 1, maxval = 50, group = GROUP_DEALING)
+
+clrAcc     = input.color(color.new(color.aqua, 0), "Accumulation", group = GROUP_VISUALS)
+clrManip   = input.color(color.new(color.orange, 0), "Sweep", group = GROUP_VISUALS)
+clrBull    = input.color(color.new(color.lime, 0), "Bull", group = GROUP_VISUALS)
+clrBear    = input.color(color.new(color.red, 0), "Bear", group = GROUP_VISUALS)
+clrTargetA = input.color(color.new(color.yellow, 0), "Target A", group = GROUP_VISUALS)
+clrTargetB = input.color(color.new(color.blue, 0), "Target B", group = GROUP_VISUALS)
+clrPD      = input.color(color.new(color.gray, 0), "PDH/PDL", group = GROUP_VISUALS)
+clrDR      = input.color(color.new(color.fuchsia, 0), "Dealing Range", group = GROUP_VISUALS)
+
+lineWidth       = input.int(1, "Line Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+accLineStyle    = input.string("Dashed", "Accumulation Line Style", options = ["Solid", "Dashed", "Dotted"], group = GROUP_VISUALS)
+targetLineStyle = input.string("Dotted", "Target Line Style", options = ["Solid", "Dashed", "Dotted"], group = GROUP_VISUALS)
+extendRight     = input.bool(false, "Extend Lines Into Future", group = GROUP_VISUALS, tooltip = "Off = lines stop at the last bar (cleaner). On = extend lines to the right (more clutter).")
+
+showAccumBox    = input.bool(true, "Show Accumulation Box (border only)", group = GROUP_VISUALS)
+showPhaseLabels = input.bool(true, "Show Labels (no bg)", group = GROUP_VISUALS)
+keepCycles      = input.int(10, "Keep Last Cycles", minval = 1, maxval = 50, group = GROUP_VISUALS)
+labelSizeInput  = input.string("Tiny", "Label Size", options = ["Tiny", "Small", "Normal"], group = GROUP_VISUALS)
+showSweepLines  = input.bool(true, "Show Sweep Level/Wick", group = GROUP_VISUALS)
+showMssLines    = input.bool(true, "Show MSS Break Level", group = GROUP_VISUALS)
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_inSession(simple string sess, simple string tz) =>
+    not na(time(timeframe.period, sess, tz))
+
+f_lineStyle(simple string s) =>
+    s == "Solid" ? line.style_solid : s == "Dotted" ? line.style_dotted : line.style_dashed
+
+f_extend() =>
+    extendRight ? extend.right : extend.none
+
+simple string lblSize =
+     labelSizeInput == "Tiny" ? size.tiny :
+     labelSizeInput == "Small" ? size.small :
+     size.normal
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+type MmmCycle
+    int   startBar     = na
+    float accHigh      = na
+    float accLow       = na
+    bool  accFinalized = false
+
+    box   accBox       = na
+    line  accHighLine  = na
+    line  accLowLine   = na
+    label accLbl       = na
+
+    bool  swept        = false
+    int   sweepDir     = 0   // 1: BSL sweep (above highs), -1: SSL sweep (below lows)
+    int   sweepBar     = na
+    float sweepPrice   = na
+    float sweepLevel   = na
+    label sweepLbl     = na
+    line  sweepLvlLn   = na
+    line  sweepWickLn  = na
+
+    bool  mss          = false
+    int   mssDir       = 0   // 1: bullish MSS, -1: bearish MSS
+    int   mssBar       = na
+    float mssLevel     = na
+    line  mssLvlLn     = na
+    label mssLbl       = na
+
+    bool  displaced    = false
+    int   dispBar      = na
+
+    bool  fvgActive    = false
+    int   fvgBar       = na
+    float fvgTop       = na
+    float fvgBot       = na
+    line  fvgTopLine   = na
+    line  fvgBotLine   = na
+    label fvgLbl       = na
+    bool  fvgMitigated = false
+
+    bool  entryMarked  = false
+    label entryLbl     = na
+    float slPrice      = na
+    line  slLine       = na
+    label slLbl        = na
+    bool  slHit        = false
+
+    line  targetLine1  = na
+    label targetLbl1   = na
+    line  targetLine2  = na
+    label targetLbl2   = na
+    bool  tgt1Hit      = false
+    bool  tgt2Hit      = false
+
+type DealingRange
+    float hi    = na
+    float lo    = na
+    float eq    = na
+    int   x1    = na
+    line  hiLn  = na
+    line  loLn  = na
+    line  eqLn  = na
+    label hiLb  = na
+    label loLb  = na
+    label eqLb  = na
+
+// -----------------------------------------------------------------------------
+// Methods (Cycle)
+// -----------------------------------------------------------------------------
+method clear(MmmCycle this) =>
+    if not na(this.accBox)
+        box.delete(this.accBox)
+    if not na(this.accHighLine)
+        line.delete(this.accHighLine)
+    if not na(this.accLowLine)
+        line.delete(this.accLowLine)
+    if not na(this.accLbl)
+        label.delete(this.accLbl)
+    if not na(this.sweepLbl)
+        label.delete(this.sweepLbl)
+    if not na(this.sweepLvlLn)
+        line.delete(this.sweepLvlLn)
+    if not na(this.sweepWickLn)
+        line.delete(this.sweepWickLn)
+    if not na(this.mssLbl)
+        label.delete(this.mssLbl)
+    if not na(this.mssLvlLn)
+        line.delete(this.mssLvlLn)
+    if not na(this.fvgTopLine)
+        line.delete(this.fvgTopLine)
+    if not na(this.fvgBotLine)
+        line.delete(this.fvgBotLine)
+    if not na(this.fvgLbl)
+        label.delete(this.fvgLbl)
+    if not na(this.entryLbl)
+        label.delete(this.entryLbl)
+    if not na(this.slLine)
+        line.delete(this.slLine)
+    if not na(this.slLbl)
+        label.delete(this.slLbl)
+    if not na(this.targetLine1)
+        line.delete(this.targetLine1)
+    if not na(this.targetLbl1)
+        label.delete(this.targetLbl1)
+    if not na(this.targetLine2)
+        line.delete(this.targetLine2)
+    if not na(this.targetLbl2)
+        label.delete(this.targetLbl2)
+    0
+
+method beginAccumulation(MmmCycle this, int bar, float h, float l) =>
+    this.startBar     := bar
+    this.accHigh      := h
+    this.accLow       := l
+    this.accFinalized := false
+    this.swept        := false
+    this.sweepDir     := 0
+    this.sweepBar     := na
+    this.sweepPrice   := na
+    this.sweepLevel   := na
+    this.mss          := false
+    this.mssDir       := 0
+    this.mssBar       := na
+    this.mssLevel     := na
+    this.displaced    := false
+    this.dispBar      := na
+    this.fvgActive    := false
+    this.fvgMitigated := false
+    this.fvgBar       := na
+    this.fvgTop       := na
+    this.fvgBot       := na
+    this.entryMarked  := false
+    this.slPrice      := na
+    this.slHit        := false
+    this.tgt1Hit      := false
+    this.tgt2Hit      := false
+
+    if showAccumBox
+        this.accBox := box.new(bar, h, bar, l, bgcolor = na, border_color = clrAcc)
+    if showPhaseLabels
+        this.accLbl := label.new(bar, h, "ACC", style = label.style_none, textcolor = clrAcc, size = lblSize, yloc = yloc.abovebar)
+    0
+
+method updateAccumulation(MmmCycle this, int bar, float h, float l) =>
+    this.accHigh := na(this.accHigh) ? h : math.max(this.accHigh, h)
+    this.accLow  := na(this.accLow)  ? l : math.min(this.accLow,  l)
+    if showAccumBox and not na(this.accBox)
+        box.set_right(this.accBox, bar)
+        box.set_top(this.accBox, this.accHigh)
+        box.set_bottom(this.accBox, this.accLow)
+    if showPhaseLabels and not na(this.accLbl)
+        label.set_x(this.accLbl, bar)
+        label.set_y(this.accLbl, this.accHigh)
+    0
+
+method finalizeAccumulation(MmmCycle this, int bar) =>
+    this.accFinalized := true
+    if na(this.accHighLine)
+        this.accHighLine := line.new(this.startBar, this.accHigh, bar, this.accHigh, extend = f_extend(), color = clrAcc, style = f_lineStyle(accLineStyle), width = lineWidth)
+    if na(this.accLowLine)
+        this.accLowLine := line.new(this.startBar, this.accLow, bar, this.accLow, extend = f_extend(), color = clrAcc, style = f_lineStyle(accLineStyle), width = lineWidth)
+    0
+
+method trySweep(MmmCycle this, int bar, bool inWindow, float h, float l, float thr) =>
+    if this.accFinalized and not this.swept and inWindow and not na(this.accHigh) and not na(this.accLow)
+        float upLevel = this.accHigh + thr
+        float dnLevel = this.accLow - thr
+        float upProbe = useWicksForSweep ? h : close
+        float dnProbe = useWicksForSweep ? l : close
+        bool sweptUp = upProbe > upLevel
+        bool sweptDn = dnProbe < dnLevel
+        if sweptUp or sweptDn
+            this.swept := true
+            this.sweepBar := bar
+            if sweptUp and not sweptDn
+                this.sweepDir := 1
+                this.sweepPrice := h
+                this.sweepLevel := this.accHigh
+                if showPhaseLabels
+                    this.sweepLbl := label.new(bar, h, "SWEEP\nBSL", style = label.style_none, textcolor = clrManip, size = lblSize, yloc = yloc.abovebar)
+            else if sweptDn and not sweptUp
+                this.sweepDir := -1
+                this.sweepPrice := l
+                this.sweepLevel := this.accLow
+                if showPhaseLabels
+                    this.sweepLbl := label.new(bar, l, "SWEEP\nSSL", style = label.style_none, textcolor = clrManip, size = lblSize, yloc = yloc.belowbar)
+            else
+                float upDist = upProbe - upLevel
+                float dnDist = dnLevel - dnProbe
+                bool pickUp = upDist >= dnDist
+                this.sweepDir := pickUp ? 1 : -1
+                this.sweepPrice := pickUp ? h : l
+                this.sweepLevel := pickUp ? this.accHigh : this.accLow
+                if showPhaseLabels
+                    this.sweepLbl := label.new(bar, this.sweepPrice, pickUp ? "SWEEP\nBSL" : "SWEEP\nSSL", style = label.style_none, textcolor = clrManip, size = lblSize, yloc = pickUp ? yloc.abovebar : yloc.belowbar)
+            if showSweepLines
+                if not na(this.sweepLevel) and na(this.sweepLvlLn)
+                    this.sweepLvlLn := line.new(this.startBar, this.sweepLevel, bar, this.sweepLevel, extend = extend.none, color = clrManip, style = line.style_dashed, width = lineWidth)
+                if not na(this.sweepPrice) and na(this.sweepWickLn)
+                    this.sweepWickLn := line.new(bar, this.sweepPrice, bar + 1, this.sweepPrice, extend = extend.none, color = clrManip, style = line.style_dotted, width = lineWidth)
+    0
+
+method updateSweepLines(MmmCycle this, int bar) =>
+    if showSweepLines and not extendRight and not na(this.sweepWickLn)
+        int x2 = this.mss ? this.mssBar : bar
+        line.set_x2(this.sweepWickLn, x2)
+    0
+
+method tryMss(MmmCycle this, int bar, float c, float lastPh, float lastPl, int lastPhBar, int lastPlBar) =>
+    if this.swept and not this.mss and bar > this.sweepBar
+        if this.sweepDir == 1 and not na(lastPl) and c < lastPl
+            this.mss := true
+            this.mssDir := -1
+            this.mssBar := bar
+            this.mssLevel := lastPl
+            if showPhaseLabels
+                this.mssLbl := label.new(bar, high, "MSS\nBEAR", style = label.style_none, textcolor = clrBear, size = lblSize, yloc = yloc.abovebar)
+            if showMssLines and na(this.mssLvlLn) and not na(this.mssLevel)
+                int x1 = na(lastPlBar) ? this.sweepBar : lastPlBar
+                this.mssLvlLn := line.new(x1, this.mssLevel, bar, this.mssLevel, extend = extend.none, color = clrBear, style = line.style_dotted, width = lineWidth)
+        if this.sweepDir == -1 and not na(lastPh) and c > lastPh
+            this.mss := true
+            this.mssDir := 1
+            this.mssBar := bar
+            this.mssLevel := lastPh
+            if showPhaseLabels
+                this.mssLbl := label.new(bar, low, "MSS\nBULL", style = label.style_none, textcolor = clrBull, size = lblSize, yloc = yloc.belowbar)
+            if showMssLines and na(this.mssLvlLn) and not na(this.mssLevel)
+                int x1 = na(lastPhBar) ? this.sweepBar : lastPhBar
+                this.mssLvlLn := line.new(x1, this.mssLevel, bar, this.mssLevel, extend = extend.none, color = clrBull, style = line.style_dotted, width = lineWidth)
+    0
+
+method tryDisplacement(MmmCycle this, int bar, float o, float h, float l, float c, float atr) =>
+    if this.mss and not this.displaced and bar > this.mssBar
+        float body = math.abs(c - o)
+        float rng = math.max(h - l, syminfo.mintick)
+        bool bodyOk = (body / rng) >= dispMinBodyPct
+        bool atrOk = body >= (dispMinAtr * atr)
+        bool bullDisp = c > o and c > high[1]
+        bool bearDisp = c < o and c < low[1]
+        if this.mssDir == 1 and bodyOk and atrOk and bullDisp
+            this.displaced := true
+            this.dispBar := bar
+        if this.mssDir == -1 and bodyOk and atrOk and bearDisp
+            this.displaced := true
+            this.dispBar := bar
+    0
+
+method tryFvg(MmmCycle this, int bar) =>
+    if showFvg and this.mss and not this.fvgActive and not this.fvgMitigated and bar > this.mssBar and (bar - this.mssBar) <= fvgSearchBars
+        bool dispOk = not requireDisplacement or (this.displaced and not na(this.dispBar) and bar > this.dispBar)
+        if dispOk
+            bool bullFvg = low > high[2]
+            bool bearFvg = high < low[2]
+            if this.mssDir == 1 and bullFvg
+                this.fvgActive := true
+                this.fvgBar := bar
+                this.fvgTop := low
+                this.fvgBot := high[2]
+            if this.mssDir == -1 and bearFvg
+                this.fvgActive := true
+                this.fvgBar := bar
+                this.fvgTop := low[2]
+                this.fvgBot := high
+    0
+
+method drawFvg(MmmCycle this, int bar) =>
+    if this.fvgActive and not na(this.fvgTop) and not na(this.fvgBot)
+        color fvgColor = this.mssDir == 1 ? clrBull : clrBear
+        if na(this.fvgTopLine)
+            this.fvgTopLine := line.new(this.fvgBar, this.fvgTop, bar, this.fvgTop, extend = f_extend(), color = fvgColor, style = line.style_solid, width = lineWidth)
+            this.fvgBotLine := line.new(this.fvgBar, this.fvgBot, bar, this.fvgBot, extend = f_extend(), color = fvgColor, style = line.style_solid, width = lineWidth)
+            if showPhaseLabels
+                this.fvgLbl := label.new(bar, this.fvgTop, "FVG", style = label.style_none, textcolor = fvgColor, size = lblSize, yloc = yloc.price)
+        else
+            if not extendRight
+                line.set_x2(this.fvgTopLine, bar)
+            line.set_y1(this.fvgTopLine, this.fvgTop)
+            line.set_y2(this.fvgTopLine, this.fvgTop)
+            if not extendRight
+                line.set_x2(this.fvgBotLine, bar)
+            line.set_y1(this.fvgBotLine, this.fvgBot)
+            line.set_y2(this.fvgBotLine, this.fvgBot)
+            if showPhaseLabels and not na(this.fvgLbl)
+                label.set_x(this.fvgLbl, bar)
+                label.set_y(this.fvgLbl, this.fvgTop)
+    0
+
+method onFvgTouch(MmmCycle this, int bar, bool inDist, float slPad) =>
+    if this.fvgActive and not this.fvgMitigated
+        bool touched = low <= this.fvgTop and high >= this.fvgBot
+        if touched
+            bool canEntry = showEntry and not this.entryMarked and (not entryOnlyInDist or inDist)
+            if canEntry
+                this.entryMarked := true
+                color dirColor = this.mssDir == 1 ? clrBull : clrBear
+                this.entryLbl := label.new(bar, close, this.mssDir == 1 ? "ENTRY (BULL)" : "ENTRY (BEAR)", style = label.style_none, textcolor = dirColor, size = lblSize, yloc = yloc.price)
+
+                // SL at sweep extreme (+ padding)
+                this.slPrice := this.sweepDir == 1 ? (this.sweepPrice + slPad) : (this.sweepPrice - slPad)
+                this.slLine := line.new(bar, this.slPrice, bar + 1, this.slPrice, extend = f_extend(), color = dirColor, style = line.style_dashed, width = lineWidth)
+                this.slLbl := label.new(bar, this.slPrice, "SL", style = label.style_none, textcolor = dirColor, size = lblSize, yloc = yloc.price)
+
+            this.fvgMitigated := true
+            this.fvgActive := false
+            if removeMitigatedFvg
+                if not na(this.fvgTopLine)
+                    line.delete(this.fvgTopLine)
+                    this.fvgTopLine := na
+                if not na(this.fvgBotLine)
+                    line.delete(this.fvgBotLine)
+                    this.fvgBotLine := na
+                if not na(this.fvgLbl)
+                    label.delete(this.fvgLbl)
+                    this.fvgLbl := na
+    0
+
+method updateStops(MmmCycle this, int bar) =>
+    if not na(this.slLine) and not this.slHit and not na(this.slPrice)
+        if not extendRight
+            line.set_x2(this.slLine, bar)
+        bool hit = this.mssDir == 1 ? low <= this.slPrice : high >= this.slPrice
+        if hit
+            this.slHit := true
+            line.set_extend(this.slLine, extend.none)
+            line.set_x2(this.slLine, bar)
+    0
+
+method updateTargets(MmmCycle this, int bar, float pdh, float pdl) =>
+    if showTargets and this.mss
+        bool wantPD = targetMode == "PDH/PDL" or targetMode == "PDH/PDL + Range"
+        bool wantRange = targetMode == "Range" or targetMode == "PDH/PDL + Range"
+
+        float t1 = na
+        string t1Name = ""
+        float t2 = na
+        string t2Name = ""
+
+        if this.mssDir == 1
+            if wantPD and not na(pdh)
+                t1 := pdh
+                t1Name := "PDH"
+            if wantRange and not na(this.accHigh)
+                t2 := this.accHigh
+                t2Name := "RANGE HIGH"
+        else if this.mssDir == -1
+            if wantPD and not na(pdl)
+                t1 := pdl
+                t1Name := "PDL"
+            if wantRange and not na(this.accLow)
+                t2 := this.accLow
+                t2Name := "RANGE LOW"
+
+        if not na(t1)
+            if na(this.targetLine1)
+                this.targetLine1 := line.new(this.mssBar, t1, bar, t1, extend = f_extend(), color = clrTargetA, style = f_lineStyle(targetLineStyle), width = lineWidth)
+                if showPhaseLabels
+                    this.targetLbl1 := label.new(bar, t1, t1Name, style = label.style_none, textcolor = clrTargetA, size = lblSize, yloc = yloc.price)
+            else
+                if not extendRight
+                    line.set_x2(this.targetLine1, bar)
+                line.set_y1(this.targetLine1, t1)
+                line.set_y2(this.targetLine1, t1)
+                if showPhaseLabels and not na(this.targetLbl1)
+                    label.set_x(this.targetLbl1, bar)
+                    label.set_y(this.targetLbl1, t1)
+                    label.set_text(this.targetLbl1, t1Name)
+            // Stop target line when hit.
+            if not this.tgt1Hit and not na(this.targetLine1)
+                bool hit1 = this.mssDir == 1 ? high >= t1 : low <= t1
+                if hit1
+                    this.tgt1Hit := true
+                    line.set_extend(this.targetLine1, extend.none)
+                    line.set_x2(this.targetLine1, bar)
+
+        if not na(t2)
+            if na(this.targetLine2)
+                this.targetLine2 := line.new(this.mssBar, t2, bar, t2, extend = f_extend(), color = clrTargetB, style = f_lineStyle(targetLineStyle), width = lineWidth)
+                if showPhaseLabels
+                    this.targetLbl2 := label.new(bar, t2, t2Name, style = label.style_none, textcolor = clrTargetB, size = lblSize, yloc = yloc.price)
+            else
+                if not extendRight
+                    line.set_x2(this.targetLine2, bar)
+                line.set_y1(this.targetLine2, t2)
+                line.set_y2(this.targetLine2, t2)
+                if showPhaseLabels and not na(this.targetLbl2)
+                    label.set_x(this.targetLbl2, bar)
+                    label.set_y(this.targetLbl2, t2)
+                    label.set_text(this.targetLbl2, t2Name)
+            if not this.tgt2Hit and not na(this.targetLine2)
+                bool hit2 = this.mssDir == 1 ? high >= t2 : low <= t2
+                if hit2
+                    this.tgt2Hit := true
+                    line.set_extend(this.targetLine2, extend.none)
+                    line.set_x2(this.targetLine2, bar)
+    0
+
+// -----------------------------------------------------------------------------
+// Methods (Dealing Range)
+// -----------------------------------------------------------------------------
+method update(DealingRange this, int bar, float lastPh, float lastPl, int lastPhBar, int lastPlBar) =>
+    if not showDealingRange
+        if not na(this.hiLn)
+            line.delete(this.hiLn)
+            this.hiLn := na
+        if not na(this.loLn)
+            line.delete(this.loLn)
+            this.loLn := na
+        if not na(this.eqLn)
+            line.delete(this.eqLn)
+            this.eqLn := na
+        if not na(this.hiLb)
+            label.delete(this.hiLb)
+            this.hiLb := na
+        if not na(this.loLb)
+            label.delete(this.loLb)
+            this.loLb := na
+        if not na(this.eqLb)
+            label.delete(this.eqLb)
+            this.eqLb := na
+        this.hi := na
+        this.lo := na
+        this.eq := na
+    else if not na(lastPh) and not na(lastPl)
+        this.x1 := na(lastPhBar) or na(lastPlBar) ? bar : math.min(lastPhBar, lastPlBar)
+        this.hi := math.max(lastPh, lastPl)
+        this.lo := math.min(lastPh, lastPl)
+        this.eq := (this.hi + this.lo) / 2.0
+
+        if na(this.hiLn)
+            this.hiLn := line.new(this.x1, this.hi, bar, this.hi, extend = f_extend(), color = clrDR, style = line.style_solid, width = lineWidth)
+        else
+            if not extendRight
+                line.set_x2(this.hiLn, bar)
+            line.set_x1(this.hiLn, this.x1)
+            line.set_y1(this.hiLn, this.hi)
+            line.set_y2(this.hiLn, this.hi)
+
+        if na(this.loLn)
+            this.loLn := line.new(this.x1, this.lo, bar, this.lo, extend = f_extend(), color = clrDR, style = line.style_solid, width = lineWidth)
+        else
+            if not extendRight
+                line.set_x2(this.loLn, bar)
+            line.set_x1(this.loLn, this.x1)
+            line.set_y1(this.loLn, this.lo)
+            line.set_y2(this.loLn, this.lo)
+
+        if na(this.eqLn)
+            this.eqLn := line.new(this.x1, this.eq, bar, this.eq, extend = f_extend(), color = color.new(clrDR, 40), style = line.style_dashed, width = lineWidth)
+        else
+            if not extendRight
+                line.set_x2(this.eqLn, bar)
+            line.set_x1(this.eqLn, this.x1)
+            line.set_y1(this.eqLn, this.eq)
+            line.set_y2(this.eqLn, this.eq)
+
+        if showPhaseLabels
+            if na(this.hiLb)
+                this.hiLb := label.new(bar, this.hi, "DR PREMIUM", style = label.style_none, textcolor = clrDR, size = lblSize, yloc = yloc.price)
+            else
+                label.set_x(this.hiLb, bar)
+                label.set_y(this.hiLb, this.hi)
+
+            if na(this.loLb)
+                this.loLb := label.new(bar, this.lo, "DR DISCOUNT", style = label.style_none, textcolor = clrDR, size = lblSize, yloc = yloc.price)
+            else
+                label.set_x(this.loLb, bar)
+                label.set_y(this.loLb, this.lo)
+
+            if na(this.eqLb)
+                this.eqLb := label.new(bar, this.eq, "DR EQ (50%)", style = label.style_none, textcolor = color.new(clrDR, 35), size = lblSize, yloc = yloc.price)
+            else
+                label.set_x(this.eqLb, bar)
+                label.set_y(this.eqLb, this.eq)
+    0
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+var MmmCycle curr = MmmCycle.new()
+var MmmCycle[] cycles = array.new<MmmCycle>()
+var DealingRange dr = DealingRange.new()
+
+f_pruneCycles(MmmCycle[] arr, int keep) =>
+    while array.size(arr) > keep
+        MmmCycle old = array.shift(arr)
+        old.clear()
+    0
+
+// -----------------------------------------------------------------------------
+// Core calculations
+// -----------------------------------------------------------------------------
+inAcc   = f_inSession(accSession, tzInput)
+inManip = f_inSession(manipWindow, tzInput)
+inDist  = f_inSession(distWindow, tzInput)
+
+float inAccF = inAcc ? 1.0 : 0.0
+accStart = ta.crossover(inAccF, 0.5)
+accEnd   = ta.crossunder(inAccF, 0.5)
+
+atr = ta.atr(atrLen)
+thr = math.max(minSweepTicks * syminfo.mintick, minSweepATR * atr)
+slPad = slPadTicks * syminfo.mintick
+
+// MSS pivots
+phMss = ta.pivothigh(high, pivotLenMSS, pivotLenMSS)
+plMss = ta.pivotlow(low, pivotLenMSS, pivotLenMSS)
+lastPhMss = ta.valuewhen(not na(phMss), phMss, 0)
+lastPlMss = ta.valuewhen(not na(plMss), plMss, 0)
+lastPhMssBar = ta.valuewhen(not na(phMss), bar_index[pivotLenMSS], 0)
+lastPlMssBar = ta.valuewhen(not na(plMss), bar_index[pivotLenMSS], 0)
+
+// Dealing range pivots
+phDr = ta.pivothigh(high, drPivotLen, drPivotLen)
+plDr = ta.pivotlow(low, drPivotLen, drPivotLen)
+lastPhDr = ta.valuewhen(not na(phDr), phDr, 0)
+lastPlDr = ta.valuewhen(not na(plDr), plDr, 0)
+lastPhDrBar = ta.valuewhen(not na(phDr), bar_index[drPivotLen], 0)
+lastPlDrBar = ta.valuewhen(not na(plDr), bar_index[drPivotLen], 0)
+
+// Daily PDH/PDL
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]])
+
+// -----------------------------------------------------------------------------
+// Cycle lifecycle
+// -----------------------------------------------------------------------------
+if accStart
+    if not na(curr.startBar)
+        array.push(cycles, curr)
+        f_pruneCycles(cycles, keepCycles)
+    curr := MmmCycle.new()
+    curr.beginAccumulation(bar_index, high, low)
+
+if inAcc and not na(curr.startBar)
+    curr.updateAccumulation(bar_index, high, low)
+
+if accEnd and not na(curr.startBar)
+    curr.finalizeAccumulation(bar_index)
+
+// -----------------------------------------------------------------------------
+// Detection flow (current cycle)
+// -----------------------------------------------------------------------------
+curr.trySweep(bar_index, inManip, high, low, thr)
+curr.tryMss(bar_index, close, lastPhMss, lastPlMss, lastPhMssBar, lastPlMssBar)
+curr.updateSweepLines(bar_index)
+curr.tryDisplacement(bar_index, open, high, low, close, atr)
+curr.tryFvg(bar_index)
+curr.drawFvg(bar_index)
+curr.onFvgTouch(bar_index, inDist, slPad)
+curr.updateTargets(bar_index, pdh, pdl)
+curr.updateStops(bar_index)
+
+// -----------------------------------------------------------------------------
+// Dealing range + PDH/PDL (global)
+// -----------------------------------------------------------------------------
+dr.update(bar_index, lastPhDr, lastPlDr, lastPhDrBar, lastPlDrBar)
+
+var line pdhLine = na
+var line pdlLine = na
+var label pdhLbl = na
+var label pdlLbl = na
+var int dayStartBar = na
+
+newDay = ta.change(time("D")) != 0
+if barstate.isfirst or newDay
+    dayStartBar := bar_index
+    if not na(pdhLine)
+        line.delete(pdhLine)
+        pdhLine := na
+    if not na(pdlLine)
+        line.delete(pdlLine)
+        pdlLine := na
+    if not na(pdhLbl)
+        label.delete(pdhLbl)
+        pdhLbl := na
+    if not na(pdlLbl)
+        label.delete(pdlLbl)
+        pdlLbl := na
+
+if showPDH_PDL and not na(pdh) and not na(pdl)
+    if na(pdhLine)
+        int x1 = na(dayStartBar) ? bar_index : dayStartBar
+        pdhLine := line.new(x1, pdh, bar_index, pdh, extend = f_extend(), color = clrPD, style = line.style_dashed, width = lineWidth)
+        pdlLine := line.new(x1, pdl, bar_index, pdl, extend = f_extend(), color = clrPD, style = line.style_dashed, width = lineWidth)
+        if showPhaseLabels
+            pdhLbl := label.new(bar_index, pdh, "PDH", style = label.style_none, textcolor = clrPD, size = lblSize, yloc = yloc.price)
+            pdlLbl := label.new(bar_index, pdl, "PDL", style = label.style_none, textcolor = clrPD, size = lblSize, yloc = yloc.price)
+    else
+        int x1 = na(dayStartBar) ? bar_index : dayStartBar
+        line.set_x1(pdhLine, x1)
+        line.set_x1(pdlLine, x1)
+        if not extendRight
+            line.set_x2(pdhLine, bar_index)
+        line.set_y1(pdhLine, pdh)
+        line.set_y2(pdhLine, pdh)
+        if not extendRight
+            line.set_x2(pdlLine, bar_index)
+        line.set_y1(pdlLine, pdl)
+        line.set_y2(pdlLine, pdl)
+        if showPhaseLabels and not na(pdhLbl) and not na(pdlLbl)
+            label.set_x(pdhLbl, bar_index)
+            label.set_y(pdhLbl, pdh)
+            label.set_x(pdlLbl, bar_index)
+            label.set_y(pdlLbl, pdl)
+else
+    if not na(pdhLine)
+        line.delete(pdhLine)
+        pdhLine := na
+    if not na(pdlLine)
+        line.delete(pdlLine)
+        pdlLine := na
+    if not na(pdhLbl)
+        label.delete(pdhLbl)
+        pdhLbl := na
+    if not na(pdlLbl)
+        label.delete(pdlLbl)
+        pdlLbl := na

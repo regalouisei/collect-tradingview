@@ -1,0 +1,332 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AndersonWin
+
+//@version=5
+strategy("Momentum Reversal / Dip Buyer [Score Based]", shorttitle="Rev Score Strat", overlay=true, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, currency=currency.USD)
+
+// ==============================================
+// INPUTS
+// ==============================================
+
+// Group labels
+grp_risk      = "Risk & Limits"
+grp_advStops  = "Advanced Stops (Breakeven & Trailing)"
+grp_session   = "Trading Window"
+grp_ind       = "Indicator Settings"
+
+// --- Trade Limits ---
+maxDailyTrades    = input.int(3, "Max Daily Trades", group=grp_risk)
+hardStopPercent   = input.float(0.3, "Hard Stop %", step=0.1, group=grp_risk) / 100
+targetATR         = input.float(8.0, "Target ATR Multiplier", group=grp_risk)
+atrLength         = input.int(14, "Main ATR Length", group=grp_risk)
+
+// --- Advanced Stops: Breakeven & Trailing ---
+enableBE          = input.bool(true,  "Enable Breakeven Stop", group=grp_advStops)
+beTriggerATR      = input.float(1.0,  "Breakeven Trigger (x Main ATR)", step=0.1, group=grp_advStops)
+beOffsetATR       = input.float(0.0,  "Breakeven Offset (x Main ATR)",  step=0.1, group=grp_advStops)
+
+enableTrail       = input.bool(true,  "Enable Trailing Stop", group=grp_advStops)
+trailAtrLength    = input.int(14,     "Trailing ATR Length", group=grp_advStops)
+trailTriggerATR   = input.float(2.0,  "Trail Start (x Trail ATR)",    step=0.1, group=grp_advStops)
+trailDistanceATR  = input.float(1.0,  "Trail Distance (x Trail ATR)", step=0.1, group=grp_advStops)
+
+// --- Trading Window ---
+useSession        = input.bool(false, "Enable Trading Window", group=grp_session)
+sessionStr        = input.session("0930-1600", "Session (Exchange Time)", group=grp_session)
+forceFlatAtEnd    = input.bool(true, "Force Close At Session End", group=grp_session)
+
+// --- Indicator Settings ---
+smaLength         = input.int(100, "SMA Length", group=grp_ind)
+emaLength         = input.int(1000, "EMA Length", group=grp_ind)
+rsiLength         = input.int(14, "RSI Length", group=grp_ind)
+rsiOverbought     = input.int(70, "RSI OB", group=grp_ind)
+rsiOversold       = input.int(30, "RSI OS", group=grp_ind)
+vwmoLength        = input.int(20, "VWMO Length", group=grp_ind)
+adxLength         = input.int(14, "ADX Length", group=grp_ind)
+stochLength       = input.int(14, "Stoch Length", group=grp_ind)
+stochD            = input.int(3, "Stoch D", group=grp_ind)
+stochOverbought   = input.int(80, "Stoch OB", group=grp_ind)
+stochOversold     = input.int(20, "Stoch OS", group=grp_ind)
+cciLength         = input.int(14, "CCI Length", group=grp_ind)
+cciOverbought     = input.int(100, "CCI OB", group=grp_ind)
+cciOversold       = input.int(-100, "CCI OS", group=grp_ind)
+mfiLength         = input.int(14, "MFI Length", group=grp_ind)
+volSmaLength      = input.int(20, "Vol SMA Length", group=grp_ind)
+
+// ==============================================
+// CALCULATIONS
+// ==============================================
+
+// Moving Averages
+sma100   = ta.sma(close, smaLength)
+ema1000  = ta.ema(close, emaLength)
+vwapVal  = ta.vwap(close) // Standard Session VWAP
+
+// ATRs
+atr      = ta.atr(atrLength)          // main ATR (targets, BE)
+trailAtr = ta.atr(trailAtrLength)     // trailing ATR (trail logic)
+
+// RSI
+rsi      = ta.rsi(close, rsiLength)
+
+// VWMO (Volume Weighted Momentum Oscillator)
+vwmaCurrent = ta.vwma(close, vwmoLength)
+vwmaPast    = vwmaCurrent[vwmoLength]
+vwmo        = (vwmaPast != 0) ? (vwmaCurrent - vwmaPast) / vwmaPast * 100 : 0
+
+// ADX
+[diPlus, diMinus, adx] = ta.dmi(adxLength, adxLength)
+
+// Cumulative Delta
+delta = 0.0
+if close > close[1]
+    delta := volume
+else if close < close[1]
+    delta := -volume
+else
+    delta := 0.0
+
+cumDelta        = ta.cum(delta)
+cumDeltaRising  = cumDelta > cumDelta[1]
+cumDeltaFalling = cumDelta < cumDelta[1]
+
+// Stochastic
+k           = ta.stoch(close, high, low, stochLength)
+d           = ta.sma(k, stochD)
+stochFullK  = k
+
+// CCI
+cci         = ta.cci(close, cciLength)
+
+// MFI
+mfi         = ta.mfi(close, mfiLength)
+
+// Volatility & Volume
+atrAvg         = ta.sma(atr, 20)
+highVolatility = atr > atrAvg * 1.5
+lowVolatility  = atr < atrAvg * 0.5
+
+volSma         = ta.sma(volume, volSmaLength)
+
+// ==============================================
+// TRADING WINDOW LOGIC
+// ==============================================
+
+// rawInSession: true only when current bar is inside defined session
+rawInSession = not na(time(timeframe.period, sessionStr))
+// inSession: if trading window disabled, always true; else use session membership
+inSession    = useSession ? rawInSession : true
+// Detect the bar right after session ends
+sessionJustEnded = useSession and rawInSession[1] and not rawInSession
+
+// ==============================================
+// SCORING SYSTEM
+// ==============================================
+
+// Price Location
+priceAboveAll = close > sma100 and close > ema1000 and close > vwapVal
+priceBelowAll = close < sma100 and close < ema1000 and close < vwapVal
+
+priceScore = priceAboveAll ? 50 : (priceBelowAll ? 0 : 25)
+
+// RSI Score
+rsiScore = 0
+if rsi > rsiOverbought
+    rsiScore := 25
+else if rsi < rsiOversold
+    rsiScore := 0
+else if rsi > 50
+    rsiScore := 15
+else
+    rsiScore := 5
+
+// VWMO Score
+vwmoScore = 0
+if vwmo > 1
+    vwmoScore := 25
+else if vwmo < -1
+    vwmoScore := 0
+else if vwmo > 0
+    vwmoScore := 15
+else
+    vwmoScore := 5
+
+// ADX Score
+adxScore = 0
+if adx > 40
+    adxScore := 20
+else if adx > 25
+    adxScore := 10
+else
+    adxScore := 0
+
+// Stoch Score
+stochScore = 0
+if stochFullK > stochOverbought
+    stochScore := 20
+else if stochFullK < stochOversold
+    stochScore := 0
+else if stochFullK > 50
+    stochScore := 12
+else
+    stochScore := 4
+
+// CCI Score
+cciScore = 0
+if cci > cciOverbought
+    cciScore := 20
+else if cci < cciOversold
+    cciScore := 0
+else if cci > 0
+    cciScore := 12
+else
+    cciScore := 4
+
+// MFI Score
+mfiScore = 0
+if mfi > 80
+    mfiScore := 15
+else if mfi < 20
+    mfiScore := 0
+else if mfi > 50
+    mfiScore := 10
+else
+    mfiScore := 3
+
+// Volatility Score
+volScore       = highVolatility ? 10 : (lowVolatility ? 0 : 5)
+
+// Cum Delta Score
+cumDeltaScore  = cumDeltaRising ? 15 : (cumDeltaFalling ? 0 : 8)
+
+// TOTAL MOMENTUM SCORE
+momentumScore  = priceScore + rsiScore + vwmoScore + adxScore + stochScore + cciScore + mfiScore + volScore + cumDeltaScore
+
+// ==============================================
+// STRATEGY TRIGGERS
+// ==============================================
+
+// 1. Setup Conditions
+scoreLow  = momentumScore < 70
+scoreHigh = momentumScore > 130 and momentumScore < 190
+
+// 2. Trigger Events
+cciBuySignal  = ta.crossover(cci, -100)
+cciSellSignal = ta.crossunder(cci, 100)
+
+// 3. Daily Limit Logic
+var int dailyTradeCount = 0
+var int lastTradeDay    = 0
+
+if dayofmonth(time) != lastTradeDay
+    dailyTradeCount := 0
+    lastTradeDay    := dayofmonth(time)
+
+canTrade = dailyTradeCount < maxDailyTrades
+
+// 4. Final Signals (SESSION FILTER APPLIED HERE)
+LongSignal  = canTrade and inSession and scoreLow  and cciBuySignal
+ShortSignal = canTrade and inSession and scoreHigh and cciSellSignal
+
+// ==============================================
+// EXECUTION
+// ==============================================
+
+if LongSignal
+    strategy.entry("REV_LONG", strategy.long, comment="Score: " + str.tostring(momentumScore))
+    dailyTradeCount += 1
+
+if ShortSignal
+    strategy.entry("REV_SHORT", strategy.short, comment="Score: " + str.tostring(momentumScore))
+    dailyTradeCount += 1
+
+// ==============================================
+// EXITS (ATR + Breakeven + Trailing)
+// ==============================================
+
+// Base stops/targets from original logic (always defined off current avg price, using MAIN ATR)
+longStopBase     = strategy.position_avg_price * (1 - hardStopPercent)
+longTargetPrice  = strategy.position_avg_price + (atr * targetATR)
+
+shortStopBase    = strategy.position_avg_price * (1 + hardStopPercent)
+shortTargetPrice = strategy.position_avg_price - (atr * targetATR)
+
+// Dynamic versions that will be adjusted by BE / trailing logic
+longStopDynamic  = longStopBase
+shortStopDynamic = shortStopBase
+
+// LONG MANAGEMENT
+if strategy.position_size > 0
+    entryPrice = strategy.position_avg_price
+    profit     = close - entryPrice         // > 0 when long is green
+
+    // --- Breakeven: move stop to entry (optional small offset) after X * MAIN ATR in profit
+    if enableBE and profit >= atr * beTriggerATR
+        bePrice         = entryPrice + atr * beOffsetATR
+        longStopDynamic := math.max(longStopDynamic, bePrice)
+
+    // --- Trailing: once profit exceeds trigger, trail by N * TRAIL ATR from current price
+    if enableTrail and profit >= trailAtr * trailTriggerATR
+        trailStop       = close - trailAtr * trailDistanceATR
+        longStopDynamic := math.max(longStopDynamic, trailStop)
+
+    strategy.exit("Exit Long", "REV_LONG", stop=longStopDynamic, limit=longTargetPrice)
+
+// SHORT MANAGEMENT
+if strategy.position_size < 0
+    entryPrice = strategy.position_avg_price
+    profit     = entryPrice - close        // > 0 when short is green
+
+    // --- Breakeven for shorts (MAIN ATR)
+    if enableBE and profit >= atr * beTriggerATR
+        bePrice           = entryPrice - atr * beOffsetATR
+        shortStopDynamic := math.min(shortStopDynamic, bePrice)
+
+    // --- Trailing for shorts (TRAIL ATR)
+    if enableTrail and profit >= trailAtr * trailTriggerATR
+        trailStop         = close + trailAtr * trailDistanceATR
+        shortStopDynamic  = math.min(shortStopDynamic, trailStop)
+
+    strategy.exit("Exit Short", "REV_SHORT", stop=shortStopDynamic, limit=shortTargetPrice)
+
+// ==============================================
+// FORCE CLOSE AT SESSION END
+// ==============================================
+
+if forceFlatAtEnd and sessionJustEnded and strategy.position_size != 0
+    strategy.close("REV_LONG")
+    strategy.close("REV_SHORT")
+
+// ==============================================
+// VISUALS & DASHBOARD
+// ==============================================
+
+// Plot Arrows
+plotshape(LongSignal,  title="Long Signal",  location=location.belowbar, color=color.green, style=shape.arrowup,   size=size.small)
+plotshape(ShortSignal, title="Short Signal", location=location.abovebar, color=color.red,   style=shape.arrowdown, size=size.small)
+
+// Optional: show session on chart (helpful for debugging)
+bgcolor(useSession and not inSession ? color.new(color.red, 95) : na)
+
+// Dashboard Table
+var table dashTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 50), border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(dashTable, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 0, "Value",  text_color=color.white, text_size=size.small)
+
+    // Score
+    ColorScore = momentumScore > 130 ? color.red : (momentumScore < 70 ? color.green : color.gray)
+    table.cell(dashTable, 0, 1, "Momentum Score", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 1, str.tostring(momentumScore, "#"), text_color=ColorScore, text_size=size.small)
+
+    // Daily Trades
+    ColorTrades = dailyTradeCount >= maxDailyTrades ? color.red : color.white
+    table.cell(dashTable, 0, 2, "Daily Trades", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 2, str.tostring(dailyTradeCount) + "/" + str.tostring(maxDailyTrades), text_color=ColorTrades, text_size=size.small)
+
+    // CCI Status
+    ColorCCI = cci > 100 ? color.red : (cci < -100 ? color.green : color.yellow)
+    table.cell(dashTable, 0, 3, "CCI", text_color=color.white, text_size=size.small)
+    table.cell(dashTable, 1, 3, str.tostring(cci, "#.##"), text_color=ColorCCI, text_size=size.small)

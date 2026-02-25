@@ -1,0 +1,157 @@
+//@version=5
+strategy("RSI + Мартингейл", overlay=true,
+     pyramiding=50,
+     initial_capital=10000,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0)
+
+//====================
+// Настройки
+//====================
+src           = input.source(close, "Источник RSI")
+rsiLen        = input.int(14, "Длина RSI", minval=1)
+
+rsiOverbought = input.float(70.0, "RSI перекупленность (вход в ШОРТ при пересечении вверх)", step=0.1)
+rsiOversold   = input.float(30.0, "RSI перепроданность (вход в ЛОНГ при пересечении вниз)", step=0.1)
+
+// ВАЖНО: профит и шаг задаются В ТИКАХ
+tpTicks       = input.int(20, "Тейк-профит (в тиках от средней цены)", minval=0)
+stepTicks     = input.int(20, "Шаг усреднения (в тиках против позиции)", minval=0)
+
+firstQty      = input.float(1.0, "Размер первого входа (контрактов)", step=1.0, minval=0.0)
+maxPosQty     = input.float(16.0, "Максимальный размер позиции (контрактов)", step=1.0, minval=0.0)
+
+mgMultiplier  = input.float(2.0, "Множитель мартингейла для докупки", step=0.1, minval=1.0)
+
+showTpMarks   = input.bool(true, "Показывать стрелку TP (фиолетовую)")
+
+// Перевод тиков в цену
+tpPrice   = tpTicks   * syminfo.mintick
+stepPrice = stepTicks * syminfo.mintick
+
+//====================
+// Сигналы RSI
+//====================
+rsi = ta.rsi(src, rsiLen)
+
+sigLong  = ta.crossunder(rsi, rsiOversold)
+sigShort = ta.crossover(rsi, rsiOverbought)
+
+//====================
+// Состояние
+//====================
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+var float lastAddPrice = na
+var float lastAddQty   = na
+
+if strategy.position_size == 0
+    lastAddPrice := na
+    lastAddQty   := na
+
+remainingQty() =>
+    math.max(0.0, maxPosQty - math.abs(strategy.position_size))
+
+clampToMax(q) =>
+    math.min(q, remainingQty())
+
+//====================
+// Первый вход
+//====================
+if not isLong and not isShort
+    if sigLong and firstQty > 0
+        q = clampToMax(firstQty)
+        if q > 0
+            strategy.entry("L", strategy.long, qty=q)
+            lastAddPrice := close
+            lastAddQty   := q
+    if sigShort and firstQty > 0
+        q = clampToMax(firstQty)
+        if q > 0
+            strategy.entry("S", strategy.short, qty=q)
+            lastAddPrice := close
+            lastAddQty   := q
+
+//====================
+// Реверс по противоположному сигналу RSI
+//====================
+if isLong and sigShort
+    strategy.cancel("TP")
+    strategy.close("L")
+    q = clampToMax(firstQty)
+    if q > 0
+        strategy.entry("S", strategy.short, qty=q)
+        lastAddPrice := close
+        lastAddQty   := q
+
+if isShort and sigLong
+    strategy.cancel("TP")
+    strategy.close("S")
+    q = clampToMax(firstQty)
+    if q > 0
+        strategy.entry("L", strategy.long, qty=q)
+        lastAddPrice := close
+        lastAddQty   := q
+
+//====================
+// Усреднение по мартингейлу
+//====================
+if isLong and stepPrice > 0 and remainingQty() > 0
+    if not na(lastAddPrice) and close <= (lastAddPrice - stepPrice)
+        nextDesired = (na(lastAddQty) ? firstQty : lastAddQty * mgMultiplier)
+        q = clampToMax(nextDesired)
+        if q > 0
+            strategy.entry("L", strategy.long, qty=q)
+            lastAddPrice := close
+            lastAddQty   := q
+
+if isShort and stepPrice > 0 and remainingQty() > 0
+    if not na(lastAddPrice) and close >= (lastAddPrice + stepPrice)
+        nextDesired = (na(lastAddQty) ? firstQty : lastAddQty * mgMultiplier)
+        q = clampToMax(nextDesired)
+        if q > 0
+            strategy.entry("S", strategy.short, qty=q)
+            lastAddPrice := close
+            lastAddQty   := q
+
+//====================
+// Тейк-профит ОДНОЙ сделкой
+//====================
+posQtyAbs = math.abs(strategy.position_size)
+
+if posQtyAbs == 0
+    strategy.cancel("TP")
+else
+    if isLong
+        limitPrice = strategy.position_avg_price + tpPrice
+        strategy.order("TP", strategy.short, qty=posQtyAbs, limit=limitPrice)
+    if isShort
+        limitPrice = strategy.position_avg_price - tpPrice
+        strategy.order("TP", strategy.long, qty=posQtyAbs, limit=limitPrice)
+
+//====================
+// Фиолетовая стрелка на баре закрытия по TP
+// (исправлено: метка ставится на exit_bar_index сделки, и вызов label.new в 1 строку)
+//====================
+var int lastClosedCount = 0
+closedCount = strategy.closedtrades
+
+if showTpMarks and closedCount > lastClosedCount
+    for i = lastClosedCount to closedCount - 1
+        if strategy.closedtrades.exit_id(i) == "TP"
+            exitBar   = strategy.closedtrades.exit_bar_index(i)
+            exitPrice = strategy.closedtrades.exit_price(i)
+            tradeSize = strategy.closedtrades.size(i)
+            // long закрывается продажей (стрелка вниз), short закрывается покупкой (стрелка вверх)
+            lblStyle  = tradeSize > 0 ? label.style_arrowdown : label.style_arrowup
+            label.new(exitBar, exitPrice, "TP", xloc=xloc.bar_index, yloc=yloc.price, style=lblStyle, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+lastClosedCount := closedCount
+
+//====================
+// Скрытые линии RSI
+//====================
+plot(rsi, "RSI", display=display.none)
+hline(rsiOverbought, "Перекупленность", color=color.new(color.red, 0), display=display.none)
+hline(rsiOversold, "Перепроданность", color=color.new(color.green, 0), display=display.none)

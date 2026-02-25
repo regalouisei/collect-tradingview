@@ -1,0 +1,668 @@
+//@version=6
+indicator("Risk-Adjusted Momentum Oscillator", shorttitle="RAMO", overlay=false, precision=4, max_bars_back=5000)
+
+// ============================================================================
+// DESCRIPTION
+// ============================================================================
+// Risk-Adjusted Momentum Oscillator (RAMO) is an advanced momentum indicator that 
+// dynamically adjusts momentum signals based on current market risk conditions.
+//
+// CORE INNOVATION:
+// Unlike traditional momentum oscillators, RAMO incorporates real-time drawdown analysis
+// to dampen momentum signals during high-risk periods and enhance them during favorable
+// conditions. This approach significantly reduces false signals in volatile markets.
+//
+// KEY FEATURES:
+// • Risk-Adaptive Algorithm: Momentum is scaled by current vs. maximum drawdown ratio
+// • Leading Indicators: Momentum acceleration, linear regression prediction, exhaustion detection
+// • Multi-Algorithm Support: Rate of Change, Price Momentum, Log Returns
+// • Adaptive Smoothing: Dynamic response based on market volatility
+// • Statistical Robustness: Z-score normalization with outlier protection
+// • Professional Visualization: Theme-adaptive colors, comprehensive analytics table
+//
+// INSTITUTIONAL APPROACH:
+// • Risk-first methodology commonly used by hedge funds and institutional traders
+// • Combines momentum analysis with systematic risk management
+// • Advanced signal filtering to reduce drawdown exposure
+// • Comprehensive alert system for automated trading strategies
+//
+// USAGE:
+// • Long Entry: Bullish crossover with favorable risk conditions
+// • Short Entry: Bearish crossover (less risk-dependent)
+// • Risk Management: Automatic signal dampening in high-drawdown environments
+// • Leading Signals: Early warnings via acceleration and prediction components
+//
+// RECOMMENDED SETTINGS:
+// • Stocks/ETFs: Default settings, Rate of Change algorithm
+// • Crypto: Enable Leading Mode, Log Returns algorithm, higher risk scaling
+// • Forex: Shorter momentum period (10-15), adaptive smoothing enabled
+// ============================================================================
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Core Momentum Settings
+momentum_length = input.int(20, title="Momentum Calculation Period", minval=5, maxval=500, group="Core Parameters", 
+                           tooltip="Period for momentum calculation. Shorter = more responsive, Longer = smoother")
+momentum_type = input.string("Rate of Change", title="Momentum Algorithm", 
+                           options=["Rate of Change", "Price Momentum", "Log Returns"], group="Core Parameters",
+                           tooltip="Rate of Change: Percentage change\nPrice Momentum: Absolute price difference\nLog Returns: Logarithmic returns (preferred for volatile assets)")
+
+// Risk Adjustment Settings  
+dd_lookback = input.int(252, title="Risk Assessment Period", minval=50, maxval=2000, group="Risk Parameters",
+                       tooltip="Lookback period for maximum drawdown calculation (252 = 1 trading year)")
+dd_smoothing = input.int(5, title="Risk Smoothing Factor", minval=1, maxval=50, group="Risk Parameters",
+                         tooltip="Smoothing for drawdown calculations to reduce noise")
+risk_scaling = input.float(1.0, title="Risk Scaling Factor", minval=0.1, maxval=3.0, step=0.1, group="Risk Parameters",
+                          tooltip="Adjusts the intensity of risk-based momentum dampening")
+
+// Signal Generation
+signal_length = input.int(14, title="Signal Line Period", minval=5, maxval=100, group="Signal Parameters",
+                         tooltip="EMA period for signal line generation")
+normalization_period = input.int(40, title="Z-Score Normalization Period", minval=20, maxval=200, group="Signal Parameters",
+                                 tooltip="Period for statistical normalization (Z-Score calculation)")
+
+// Leading Indicator Settings
+enable_leading_mode = input.bool(true, title="Enable Leading Mode", group="Leading Indicators",
+                                 tooltip="Activates predictive components for earlier signals")
+acceleration_period = input.int(5, title="Acceleration Period", minval=3, maxval=20, group="Leading Indicators",
+                               tooltip="Period for momentum acceleration calculation")
+prediction_length = input.int(10, title="Regression Length", minval=5, maxval=50, group="Leading Indicators",
+                              tooltip="Lookback period for linear regression")
+prediction_offset = input.int(3, title="Prediction Forward Bars", minval=1, maxval=10, group="Leading Indicators",
+                              tooltip="How many bars to project forward")
+exhaustion_threshold = input.float(2.0, title="Exhaustion Threshold", minval=1.0, maxval=3.0, step=0.1, group="Leading Indicators",
+                                  tooltip="Threshold for detecting momentum exhaustion")
+adaptive_smoothing_enabled = input.bool(true, title="Adaptive Smoothing", group="Leading Indicators",
+                                      tooltip="Dynamically adjust smoothing based on volatility")
+
+// Dynamic Thresholds
+use_dynamic_thresholds = input.bool(true, title="Use Adaptive Thresholds", group="Threshold Settings",
+                                   tooltip="Enable dynamic thresholds based on market volatility")
+threshold_multiplier = input.float(0.75, title="Threshold Sensitivity", minval=0.1, maxval=2.0, step=0.05, group="Threshold Settings",
+                                  tooltip="Multiplier for dynamic threshold calculation")
+static_upper = input.float(0.5, title="Static Upper Threshold", minval=0, maxval=3, step=0.1, group="Threshold Settings")
+static_lower = input.float(-0.5, title="Static Lower Threshold", minval=-3, maxval=0, step=0.1, group="Threshold Settings")
+
+// Visual Display Options
+show_signals = input.bool(true, title="Display Entry/Exit Signals", group="Display Options")
+show_histogram = input.bool(true, title="Display MACD-Style Histogram", group="Display Options")
+show_confidence_bands = input.bool(true, title="Display Confidence Bands", group="Display Options")
+show_risk_table = input.bool(true, title="Display Risk Analytics Table", group="Display Options")
+
+// Appearance Settings (Theme-Adaptive)
+use_dark_mode = input.bool(true, title="Dark Mode Optimization", group="Appearance", 
+                          tooltip="Optimize colors for dark backgrounds")
+enable_custom_colors = input.bool(false, title="Custom Color Scheme", group="Appearance")
+custom_bullish = input.color(#4CAF50, title="Bullish", group="Appearance", inline="colors")
+custom_bearish = input.color(#FF5252, title="Bearish", group="Appearance", inline="colors") 
+custom_neutral = input.color(#2196F3, title="Neutral", group="Appearance", inline="colors")
+
+// ============================================================================
+// COLOR SCHEME CONFIGURATION (Theme-Adaptive)
+// ============================================================================
+
+// Base colors optimized for both themes
+neutral_color = use_dark_mode ? #2196F3 : #1976D2
+bull_color = use_dark_mode ? #4CAF50 : #388E3C  
+bear_color = use_dark_mode ? #FF5252 : #D32F2F
+
+// Apply custom colors if enabled
+final_neutral_color = enable_custom_colors ? custom_neutral : neutral_color
+final_bull_color = enable_custom_colors ? custom_bullish : bull_color
+final_bear_color = enable_custom_colors ? custom_bearish : bear_color
+
+// Transparency settings (auto-optimized for theme)
+bg_transparency = use_dark_mode ? 85 : 92
+zone_transparency = use_dark_mode ? 90 : 95
+band_transparency = use_dark_mode ? 70 : 85
+table_transparency = use_dark_mode ? 80 : 15
+
+// ============================================================================
+// CORE CALCULATION FUNCTIONS
+// ============================================================================
+
+// Enhanced Maximum Drawdown Calculation with Running Maximum Tracking
+calc_maximum_drawdown(price_series, lookback_period) =>
+    var float running_peak = na
+    var float max_drawdown_value = 0.0
+    
+    // Track running maximum (peak)
+    running_peak := na(running_peak) ? price_series : math.max(running_peak, price_series)
+    
+    // Calculate current drawdown from peak
+    current_drawdown = (price_series - running_peak) / running_peak
+    
+    // Calculate maximum drawdown over specified lookback period
+    max_drawdown_value := ta.lowest(current_drawdown, lookback_period) * -1
+    
+    [current_drawdown * -1, max_drawdown_value]
+
+// Multi-Algorithm Momentum Calculation
+calc_momentum_by_type(price_series, calculation_period, algorithm_type) =>
+    momentum_value = switch algorithm_type
+        "Rate of Change" => (price_series - price_series[calculation_period]) / price_series[calculation_period] * 100
+        "Price Momentum" => price_series - price_series[calculation_period]  
+        "Log Returns" => math.log(price_series / price_series[calculation_period]) * 100
+        => (price_series - price_series[calculation_period]) / price_series[calculation_period] * 100
+    
+    momentum_value
+
+// Momentum Acceleration (Second Derivative) - LEADING COMPONENT
+calc_momentum_acceleration(momentum_series, accel_period) =>
+    // Calculate rate of change of momentum
+    momentum_roc = momentum_series - momentum_series[accel_period]
+    
+    // Smooth to reduce noise
+    smoothed_acceleration = ta.ema(momentum_roc, accel_period)
+    smoothed_acceleration
+
+// Linear Regression Prediction - LEADING COMPONENT
+calc_linear_regression_prediction(data_series, reg_length, prediction_offset) =>
+    // Calculate linear regression
+    linreg_value = ta.linreg(data_series, reg_length, 0)
+    linreg_slope = ta.linreg(data_series, reg_length, 0) - ta.linreg(data_series, reg_length, 1)
+    
+    // Project forward
+    predicted_value = linreg_value + (linreg_slope * prediction_offset)
+    [predicted_value, linreg_slope]
+
+// Adaptive Smoothing Factor - LEADING COMPONENT
+calc_adaptive_smoothing(volatility, min_alpha, max_alpha) =>
+    // Normalize volatility (0-1 range)
+    vol_percentile = ta.percentrank(volatility, 100)
+    
+    // High volatility = higher alpha (faster response, less smoothing)
+    // Low volatility = lower alpha (more smoothing, noise reduction)
+    adaptive_alpha = min_alpha + ((max_alpha - min_alpha) * vol_percentile / 100)
+    adaptive_alpha
+
+// Momentum Exhaustion Detection - LEADING COMPONENT
+detect_momentum_exhaustion(momentum, volume_data, exhaustion_threshold) =>
+    // Check if momentum is extreme but volume is declining
+    momentum_extreme = math.abs(momentum) > exhaustion_threshold
+    volume_declining = volume_data < ta.sma(volume_data, 20)
+    
+    // Exhaustion pattern: extreme momentum with declining volume
+    bullish_exhaustion = momentum < -exhaustion_threshold and volume_declining
+    bearish_exhaustion = momentum > exhaustion_threshold and volume_declining
+    
+    [bullish_exhaustion, bearish_exhaustion]
+
+// Risk-Adjusted Momentum Core Algorithm
+calc_risk_adjusted_momentum(raw_momentum, current_dd, max_dd, scaling_factor) =>
+    // Risk adjustment factor: Higher current drawdown reduces momentum sensitivity
+    risk_factor = 1 - (current_dd / max_dd * scaling_factor)
+    risk_factor := math.max(risk_factor, 0.05) // Minimum factor to prevent over-dampening
+    
+    // Apply risk adjustment to momentum
+    risk_adjusted_value = raw_momentum * risk_factor
+    risk_adjusted_value
+
+// Statistical Normalization (Z-Score with Outlier Protection)
+normalize_with_zscore(data_series, normalization_length) =>
+    mean_value = ta.sma(data_series, normalization_length)
+    std_deviation = ta.stdev(data_series, normalization_length)
+    
+    z_score = if not na(data_series) and normalization_length > 0 and not na(mean_value) and not na(std_deviation)
+        std_deviation > 0 ? (data_series - mean_value) / std_deviation : 0.0
+    else
+        0.0
+    
+    // Limit extreme values for stability
+    math.max(-3.5, math.min(3.5, z_score))
+
+// Dynamic Threshold Calculation
+calc_adaptive_thresholds(indicator_series, threshold_period, sensitivity_multiplier) =>
+    indicator_mean = ta.sma(indicator_series, threshold_period)
+    indicator_std = ta.stdev(indicator_series, threshold_period)
+    
+    upper_threshold = indicator_mean + (sensitivity_multiplier * indicator_std)
+    lower_threshold = indicator_mean - (sensitivity_multiplier * indicator_std)
+    neutral_line = indicator_mean
+    
+    [upper_threshold, lower_threshold, neutral_line]
+
+// ============================================================================
+// MAIN INDICATOR CALCULATIONS
+// ============================================================================
+
+// Primary data source
+price_source = close
+
+// Step 1: Calculate raw momentum using selected algorithm
+raw_momentum = calc_momentum_by_type(price_source, momentum_length, momentum_type)
+
+// Step 2: Calculate current and maximum drawdown metrics
+[current_drawdown, maximum_drawdown] = calc_maximum_drawdown(price_source, dd_lookback)
+
+// Step 3: Apply smoothing to drawdown values for stability
+// Use adaptive smoothing if enabled
+current_volatility = ta.stdev(price_source, 20) / ta.sma(price_source, 20) * 100
+adaptive_alpha = adaptive_smoothing_enabled ? 
+                 calc_adaptive_smoothing(current_volatility, 0.1, 0.5) : (2.0 / (dd_smoothing + 1.0))
+
+// Manual adaptive EMA calculation
+var float smoothed_current_dd = na
+var float smoothed_maximum_dd = na
+smoothed_current_dd := na(smoothed_current_dd) ? current_drawdown : smoothed_current_dd + adaptive_alpha * (current_drawdown - smoothed_current_dd)
+smoothed_maximum_dd := na(smoothed_maximum_dd) ? maximum_drawdown : smoothed_maximum_dd + adaptive_alpha * (maximum_drawdown - smoothed_maximum_dd)
+
+// Step 4: Apply risk adjustment to momentum
+risk_adjusted_momentum = calc_risk_adjusted_momentum(raw_momentum, smoothed_current_dd, smoothed_maximum_dd, risk_scaling)
+
+// Step 5: Calculate momentum acceleration (leading component)
+momentum_acceleration = enable_leading_mode ? 
+                       calc_momentum_acceleration(risk_adjusted_momentum, acceleration_period) : 0
+
+// Step 6: Calculate predictive component using linear regression
+predicted_momentum = risk_adjusted_momentum
+momentum_slope = 0.0
+if enable_leading_mode
+    [predicted_momentum, momentum_slope] = calc_linear_regression_prediction(risk_adjusted_momentum, prediction_length, prediction_offset)
+
+// Step 7: Detect momentum exhaustion patterns
+volume_data = volume
+bullish_exhaustion = false
+bearish_exhaustion = false
+if enable_leading_mode
+    [bullish_exhaustion, bearish_exhaustion] = detect_momentum_exhaustion(risk_adjusted_momentum, volume_data, exhaustion_threshold)
+
+// Step 8: Combine components for leading indicator
+// Weight: 60% current momentum, 30% predicted momentum, 10% acceleration
+leading_momentum = enable_leading_mode ? 
+                  (risk_adjusted_momentum * 0.6 + predicted_momentum * 0.3 + momentum_acceleration * 0.1) : 
+                  risk_adjusted_momentum
+
+// Apply exhaustion dampening
+exhaustion_factor = bullish_exhaustion ? 1.2 : bearish_exhaustion ? 0.8 : 1.0
+final_momentum = leading_momentum * exhaustion_factor
+
+// Step 9: Normalize the final momentum using Z-Score
+normalized_ramo = normalize_with_zscore(final_momentum, normalization_period)
+
+// Step 10: Generate signal line using adaptive EMA
+signal_alpha = adaptive_smoothing_enabled ? 
+              calc_adaptive_smoothing(current_volatility, 0.05, 0.3) : (2.0 / (signal_length + 1.0))
+
+// Manual adaptive signal line calculation
+var float signal_line = na
+signal_line := na(signal_line) ? normalized_ramo : signal_line + signal_alpha * (normalized_ramo - signal_line)
+
+// Step 7: Calculate MACD-style histogram (difference between indicator and signal)
+macd_histogram = normalized_ramo - signal_line
+
+// Step 8: Calculate confidence bands for statistical significance
+volatility_band = ta.stdev(normalized_ramo, signal_length)
+upper_confidence_band = normalized_ramo + volatility_band
+lower_confidence_band = normalized_ramo - volatility_band
+
+// Step 9: Determine thresholds (dynamic or static)
+[dynamic_upper, dynamic_lower, dynamic_neutral] = calc_adaptive_thresholds(normalized_ramo, normalization_period, threshold_multiplier)
+
+final_upper_threshold = use_dynamic_thresholds ? dynamic_upper : static_upper
+final_lower_threshold = use_dynamic_thresholds ? dynamic_lower : static_lower
+final_neutral_line = use_dynamic_thresholds ? dynamic_neutral : 0.0
+
+// ============================================================================
+// SIGNAL GENERATION & TREND ANALYSIS
+// ============================================================================
+
+// Trend Direction Analysis
+bullish_trend = normalized_ramo > signal_line and normalized_ramo > final_lower_threshold
+bearish_trend = normalized_ramo < signal_line and normalized_ramo < final_upper_threshold
+neutral_trend = not bullish_trend and not bearish_trend
+
+// Momentum Strength Classification
+momentum_strength = math.abs(normalized_ramo - signal_line)
+strong_momentum = momentum_strength > 0.5
+moderate_momentum = momentum_strength > 0.25 and momentum_strength <= 0.5
+weak_momentum = momentum_strength <= 0.25
+
+// Early Warning Signals (Leading Mode)
+early_long_warning = enable_leading_mode and momentum_acceleration > 0 and normalized_ramo < signal_line and 
+                     normalized_ramo > normalized_ramo[1] and normalized_ramo > final_lower_threshold
+early_short_warning = enable_leading_mode and momentum_acceleration < 0 and normalized_ramo > signal_line and 
+                     normalized_ramo < normalized_ramo[1] and normalized_ramo < final_upper_threshold
+
+// Primary Entry Signals (Crossover with confirmation)
+long_entry_signal = ta.crossover(normalized_ramo, signal_line) and normalized_ramo > final_lower_threshold
+short_entry_signal = ta.crossunder(normalized_ramo, signal_line) and normalized_ramo < final_upper_threshold
+
+// Enhanced Entry Signals with Early Warning
+long_entry_enhanced = long_entry_signal or early_long_warning
+short_entry_enhanced = short_entry_signal or early_short_warning
+
+// Risk-Based Entry Filters (Additional confirmation using drawdown levels)
+low_risk_environment = smoothed_current_dd < (smoothed_maximum_dd * 0.3)
+medium_risk_environment = smoothed_current_dd >= (smoothed_maximum_dd * 0.3) and smoothed_current_dd < (smoothed_maximum_dd * 0.7)
+high_risk_environment = smoothed_current_dd >= (smoothed_maximum_dd * 0.7)
+
+// Enhanced Entry Signals with Risk Filtering
+long_entry_confirmed = (enable_leading_mode ? long_entry_enhanced : long_entry_signal) and (low_risk_environment or medium_risk_environment)
+short_entry_confirmed = enable_leading_mode ? short_entry_enhanced : short_entry_signal // Short signals less affected by drawdown in bear markets
+
+// Exit Signals
+long_exit_signal = ta.crossunder(normalized_ramo, signal_line) or normalized_ramo > final_upper_threshold
+short_exit_signal = ta.crossover(normalized_ramo, signal_line) or normalized_ramo < final_lower_threshold
+
+// Extreme Market Conditions
+extreme_oversold_condition = normalized_ramo < final_lower_threshold and normalized_ramo < normalized_ramo[1]
+extreme_overbought_condition = normalized_ramo > final_upper_threshold and normalized_ramo > normalized_ramo[1]
+
+// Enhanced Divergence Detection with Leading Components
+lookback_div = enable_leading_mode ? 3 : 5
+price_pivot_high = ta.pivothigh(high, lookback_div, lookback_div)
+price_pivot_low = ta.pivotlow(low, lookback_div, lookback_div)
+
+// Early divergence using momentum slope
+slope_divergence_bull = enable_leading_mode and momentum_slope > 0 and price_source < price_source[1]
+slope_divergence_bear = enable_leading_mode and momentum_slope < 0 and price_source > price_source[1]
+
+// Traditional divergence detection
+price_higher_high = high > high[1] and high[1] > high[2]
+price_lower_low = low < low[1] and low[1] < low[2]
+indicator_lower_high = normalized_ramo < normalized_ramo[1] and normalized_ramo[1] < normalized_ramo[2]
+indicator_higher_low = normalized_ramo > normalized_ramo[1] and normalized_ramo[1] > normalized_ramo[2]
+
+// Combine traditional and leading divergence
+bearish_divergence = (price_higher_high and indicator_lower_high) or slope_divergence_bear
+bullish_divergence = (price_lower_low and indicator_higher_low) or slope_divergence_bull
+
+// Momentum shift detection (leading)
+momentum_shift_up = enable_leading_mode and momentum_acceleration > 0 and momentum_acceleration[1] <= 0
+momentum_shift_down = enable_leading_mode and momentum_acceleration < 0 and momentum_acceleration[1] >= 0
+
+// ============================================================================
+// ADVANCED VISUALIZATION & PLOTTING
+// ============================================================================
+
+// Dynamic Color Calculation for Main Indicator Line
+indicator_color = normalized_ramo >= 1.0 ? final_bear_color : 
+                 normalized_ramo <= -1.0 ? final_bull_color : 
+                 normalized_ramo > 0 ? color.from_gradient(normalized_ramo, 0, 1, final_neutral_color, final_bear_color) :
+                 color.from_gradient(normalized_ramo, -1, 0, final_bull_color, final_neutral_color)
+
+// Main Indicator Line (Risk-Adjusted Momentum Oscillator)
+plot(normalized_ramo, title="Risk-Adjusted Momentum", color=indicator_color, linewidth=2, 
+     display=display.all)
+
+// Signal Line with Adaptive Transparency
+signal_color = color.new(final_neutral_color, 20)
+plot(signal_line, title="Signal Line", color=signal_color, linewidth=1, display=display.none)
+
+// Predicted Momentum Line (Leading Component)
+predicted_line_value = enable_leading_mode ? predicted_momentum / (risk_adjusted_momentum != 0 ? risk_adjusted_momentum : 1) * normalized_ramo : na
+predicted_color = color.new(final_neutral_color, 50)
+plot(predicted_line_value, title="Predicted Momentum", color=predicted_color, linewidth=1, style=plot.style_line, display=display.none)
+
+// Dynamic Threshold Lines
+plot(final_upper_threshold, title="Upper Threshold", color=color.new(final_bear_color, 30), 
+     linewidth=1, style=plot.style_stepline, display=display.none)
+plot(final_lower_threshold, title="Lower Threshold", color=color.new(final_bull_color, 30), 
+     linewidth=1, style=plot.style_stepline, display=display.none)
+plot(final_neutral_line, title="Neutral Line", color=color.new(color.gray, 50), 
+     linewidth=1, style=plot.style_line, display=display.all)
+
+// Confidence Bands (Optional Display)
+upper_band_plot = plot(show_confidence_bands ? upper_confidence_band : na, title="Upper Confidence Band", 
+                      color=color.new(color.gray, band_transparency), display=display.none)
+lower_band_plot = plot(show_confidence_bands ? lower_confidence_band : na, title="Lower Confidence Band", 
+                      color=color.new(color.gray, band_transparency), display=display.none)
+fill(upper_band_plot, lower_band_plot, color=color.new(color.gray, band_transparency), 
+     title="Confidence Bands", display=display.none)
+
+// Enhanced MACD-Style Histogram with Dynamic Coloring
+histogram_color = macd_histogram >= 0 ? 
+     (macd_histogram > macd_histogram[1] ? color.new(final_bull_color, 40) : color.new(final_bull_color, 60)) :
+     (macd_histogram < macd_histogram[1] ? color.new(final_bear_color, 40) : color.new(final_bear_color, 60))
+
+plot(show_histogram ? macd_histogram : na, title="MACD Histogram", 
+     style=plot.style_columns, color=histogram_color, display=display.none)
+
+// Background Gradient for Market Regimes
+norm_value = normalized_ramo / 2.0
+bg_color = norm_value >= 1.0 ? 
+           color.new(final_bear_color, bg_transparency - 5) : 
+           norm_value <= -1.0 ? 
+           color.new(final_bull_color, bg_transparency - 5) :
+           norm_value > 0 ? 
+           color.from_gradient(norm_value, 0, 1, color.new(final_neutral_color, bg_transparency), color.new(final_bear_color, bg_transparency)) :
+           color.from_gradient(norm_value, -1, 0, color.new(final_bull_color, bg_transparency), color.new(final_neutral_color, bg_transparency))
+
+bgcolor(bg_color, title="Regime Background")
+
+// Zone Fills for Visual Clarity
+fill(plot(final_neutral_line, display=display.none), plot(final_upper_threshold, display=display.none), 
+     color=color.new(final_bear_color, zone_transparency), title="Bearish Zone")
+fill(plot(final_neutral_line, display=display.none), plot(final_lower_threshold, display=display.none), 
+     color=color.new(final_bull_color, zone_transparency), title="Bullish Zone")
+
+// ============================================================================
+// PROFESSIONAL SIGNAL VISUALIZATION
+// ============================================================================
+
+// Enhanced Entry Signals with Risk Context
+plotshape(show_signals and long_entry_confirmed, title="Long Entry (Confirmed)", 
+         style=shape.triangleup, location=location.bottom, 
+         color=color.new(final_bull_color, 0), size=size.small,
+         text="L", textcolor=color.white, display=display.none)
+
+plotshape(show_signals and short_entry_confirmed, title="Short Entry (Confirmed)", 
+         style=shape.triangledown, location=location.top, 
+         color=color.new(final_bear_color, 0), size=size.small,
+         text="S", textcolor=color.white, display=display.none)
+
+// Exit Signals
+plotshape(show_signals and long_exit_signal, title="Long Exit", 
+         style=shape.xcross, location=location.top, 
+         color=color.new(final_bear_color, 0), size=size.tiny, display=display.none)
+
+plotshape(show_signals and short_exit_signal, title="Short Exit", 
+         style=shape.xcross, location=location.bottom, 
+         color=color.new(final_bull_color, 0), size=size.tiny, display=display.none)
+
+// Extreme Market Conditions
+plotshape(extreme_oversold_condition, title="Extreme Oversold", 
+         style=shape.diamond, location=location.bottom, 
+         color=color.new(color.yellow, 0), size=size.tiny,
+         text="OS", textcolor=color.black, display=display.none)
+
+plotshape(extreme_overbought_condition, title="Extreme Overbought", 
+         style=shape.diamond, location=location.top, 
+         color=color.new(color.yellow, 0), size=size.tiny,
+         text="OB", textcolor=color.black, display=display.none)
+
+// Divergence Signals (Advanced)
+plotshape(bullish_divergence, title="Bullish Divergence", 
+         style=shape.labelup, location=location.bottom, 
+         color=color.new(final_bull_color, 20), size=size.small,
+         text="DIV+", textcolor=color.white, display=display.none)
+
+plotshape(bearish_divergence, title="Bearish Divergence", 
+         style=shape.labeldown, location=location.top, 
+         color=color.new(final_bear_color, 20), size=size.small,
+         text="DIV-", textcolor=color.white, display=display.none)
+
+// Momentum Shift Signals (Leading)
+plotshape(enable_leading_mode and momentum_shift_up, title="Momentum Shift Up", 
+         style=shape.arrowup, location=location.bottom, 
+         color=color.new(final_bull_color, 0), size=size.tiny,
+         text="↑", textcolor=color.white, display=display.none)
+
+plotshape(enable_leading_mode and momentum_shift_down, title="Momentum Shift Down", 
+         style=shape.arrowdown, location=location.top, 
+         color=color.new(final_bear_color, 0), size=size.tiny,
+         text="↓", textcolor=color.white, display=display.none)
+
+// Exhaustion Signals
+plotshape(enable_leading_mode and bullish_exhaustion, title="Bullish Exhaustion", 
+         style=shape.circle, location=location.bottom, 
+         color=color.new(final_bull_color, 30), size=size.tiny,
+         text="EX", textcolor=color.white, display=display.none)
+
+plotshape(enable_leading_mode and bearish_exhaustion, title="Bearish Exhaustion", 
+         style=shape.circle, location=location.top, 
+         color=color.new(final_bear_color, 30), size=size.tiny,
+         text="EX", textcolor=color.white, display=display.none)
+
+// ============================================================================
+// PROFESSIONAL ANALYTICS TABLE
+// ============================================================================
+
+if show_risk_table and barstate.islast
+    // Theme-adaptive table configuration
+    table_bg_color = use_dark_mode ? color.new(#000000, table_transparency) : color.new(#FFFFFF, table_transparency)
+    header_text_color = use_dark_mode ? color.white : color.black
+    label_text_color = use_dark_mode ? color.white : color.black
+    
+    var table analytics_table = table.new(position.top_right, 2, enable_leading_mode ? 15 : 12, border_width=1, bgcolor=table_bg_color)
+    
+    table.clear(analytics_table, 0, 0)
+    
+    // Header Section
+    table.cell(analytics_table, 0, 0, "RAMO Analytics", text_color=header_text_color, 
+              bgcolor=table_bg_color, text_size=size.normal)
+    table.cell(analytics_table, 1, 0, "Current Values", text_color=header_text_color, 
+              bgcolor=table_bg_color, text_size=size.normal)
+    
+    // Core Metrics
+    table.cell(analytics_table, 0, 1, "Indicator", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 1, str.tostring(normalized_ramo, "#.###"), 
+              text_color=indicator_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    table.cell(analytics_table, 0, 2, "Signal Line", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 2, str.tostring(signal_line, "#.###"), 
+              text_color=signal_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Trend Analysis
+    trend_status = bullish_trend ? "BULLISH" : bearish_trend ? "BEARISH" : "NEUTRAL"
+    trend_display_color = bullish_trend ? final_bull_color : bearish_trend ? final_bear_color : final_neutral_color
+    table.cell(analytics_table, 0, 3, "Market Trend", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 3, trend_status, text_color=trend_display_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    
+    // Momentum Strength
+    strength_text = strong_momentum ? "STRONG" : moderate_momentum ? "MODERATE" : "WEAK"
+    strength_color = strong_momentum ? final_bear_color : moderate_momentum ? final_neutral_color : final_bull_color
+    table.cell(analytics_table, 0, 4, "Momentum", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 4, strength_text, text_color=strength_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    
+    // Risk Environment
+    risk_status = low_risk_environment ? "LOW RISK" : medium_risk_environment ? "MEDIUM RISK" : "HIGH RISK"
+    risk_color = low_risk_environment ? final_bull_color : medium_risk_environment ? final_neutral_color : final_bear_color
+    table.cell(analytics_table, 0, 5, "Risk Level", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 5, risk_status, text_color=risk_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    
+    // Drawdown Metrics
+    table.cell(analytics_table, 0, 6, "Current DD", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 6, str.tostring(smoothed_current_dd * 100, "#.##") + "%", 
+              text_color=final_bear_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    table.cell(analytics_table, 0, 7, "Max DD", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 7, str.tostring(smoothed_maximum_dd * 100, "#.##") + "%", 
+              text_color=final_bear_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Raw vs Adjusted Momentum
+    table.cell(analytics_table, 0, 8, "Raw Momentum", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 8, str.tostring(raw_momentum, "#.##"), 
+              text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    table.cell(analytics_table, 0, 9, "Risk Adjusted", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 9, str.tostring(risk_adjusted_momentum, "#.##"), 
+              text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Threshold Configuration
+    threshold_type = use_dynamic_thresholds ? "ADAPTIVE" : "STATIC"
+    threshold_color = use_dynamic_thresholds ? final_neutral_color : label_text_color
+    table.cell(analytics_table, 0, 10, "Thresholds", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 10, threshold_type, text_color=threshold_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    
+    // Algorithm Information
+    table.cell(analytics_table, 0, 11, "Algorithm", text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    table.cell(analytics_table, 1, 11, momentum_type, text_color=label_text_color, 
+              bgcolor=table_bg_color, text_size=size.small)
+    
+    // Leading Mode Information (if enabled)
+    if enable_leading_mode
+        // Leading Mode Status
+        table.cell(analytics_table, 0, 12, "Mode", text_color=label_text_color, 
+                  bgcolor=table_bg_color, text_size=size.small)
+        table.cell(analytics_table, 1, 12, "LEADING", text_color=final_neutral_color, 
+                  bgcolor=table_bg_color, text_size=size.small)
+        
+        // Momentum Acceleration
+        accel_color = momentum_acceleration > 0 ? final_bull_color : momentum_acceleration < 0 ? final_bear_color : final_neutral_color
+        table.cell(analytics_table, 0, 13, "Acceleration", text_color=label_text_color, 
+                  bgcolor=table_bg_color, text_size=size.small)
+        table.cell(analytics_table, 1, 13, str.tostring(momentum_acceleration, "#.###"), 
+                  text_color=accel_color, bgcolor=table_bg_color, text_size=size.small)
+        
+        // Prediction Status
+        prediction_text = momentum_slope > 0 ? "RISING" : momentum_slope < 0 ? "FALLING" : "FLAT"
+        prediction_color = momentum_slope > 0 ? final_bull_color : momentum_slope < 0 ? final_bear_color : final_neutral_color
+        table.cell(analytics_table, 0, 14, "Prediction", text_color=label_text_color, 
+                  bgcolor=table_bg_color, text_size=size.small)
+        table.cell(analytics_table, 1, 14, prediction_text, text_color=prediction_color, 
+                  bgcolor=table_bg_color, text_size=size.small)
+
+// ============================================================================
+// COMPREHENSIVE ALERT SYSTEM
+// ============================================================================
+
+// Primary Trading Alerts
+alertcondition(long_entry_confirmed, title="Long Entry Confirmed", 
+              message="RAMO: Long entry signal confirmed with favorable risk conditions")
+alertcondition(short_entry_confirmed, title="Short Entry Confirmed", 
+              message="RAMO: Short entry signal confirmed")
+alertcondition(long_exit_signal, title="Long Position Exit", 
+              message="RAMO: Exit long position - signal deterioration detected")
+alertcondition(short_exit_signal, title="Short Position Exit", 
+              message="RAMO: Exit short position - signal deterioration detected")
+
+// Risk Management Alerts
+alertcondition(high_risk_environment, title="High Risk Environment", 
+              message="RAMO: High drawdown environment detected - exercise caution")
+alertcondition(extreme_oversold_condition, title="Extreme Oversold", 
+              message="RAMO: Extreme oversold conditions - potential reversal zone")
+alertcondition(extreme_overbought_condition, title="Extreme Overbought", 
+              message="RAMO: Extreme overbought conditions - potential reversal zone")
+
+// Advanced Signals
+alertcondition(bullish_divergence, title="Bullish Divergence", 
+              message="RAMO: Bullish divergence detected - momentum may be shifting")
+alertcondition(bearish_divergence, title="Bearish Divergence", 
+              message="RAMO: Bearish divergence detected - momentum may be weakening")
+
+// Trend Change Alerts
+trend_bullish_change = bullish_trend and not bullish_trend[1]
+trend_bearish_change = bearish_trend and not bearish_trend[1]
+alertcondition(trend_bullish_change, title="Trend Shift Bullish", 
+              message="RAMO: Market trend shifting to bullish")
+alertcondition(trend_bearish_change, title="Trend Shift Bearish", 
+              message="RAMO: Market trend shifting to bearish")
+
+// Leading Mode Specific Alerts
+alertcondition(enable_leading_mode and momentum_shift_up, title="Momentum Acceleration Up", 
+              message="RAMO Leading: Momentum starting to accelerate upward")
+alertcondition(enable_leading_mode and momentum_shift_down, title="Momentum Acceleration Down", 
+              message="RAMO Leading: Momentum starting to accelerate downward")
+alertcondition(enable_leading_mode and bullish_exhaustion, title="Bullish Exhaustion Pattern", 
+              message="RAMO Leading: Bullish exhaustion detected - potential reversal")
+alertcondition(enable_leading_mode and bearish_exhaustion, title="Bearish Exhaustion Pattern", 
+              message="RAMO Leading: Bearish exhaustion detected - potential reversal")

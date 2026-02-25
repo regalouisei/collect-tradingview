@@ -1,0 +1,543 @@
+// ============================================================================
+// Bitcoin Miners Max Pain (BMMP) v1.0
+// ============================================================================
+// A composite long-term Bitcoin buy/sell indicator based on mining economics.
+//
+// Core thesis: Bitcoin's price oscillates around its production cost. When price
+// diverges significantly from production cost — combined with miner stress
+// signals — it historically marks major cycle turning points.
+//
+// Components:
+//   1. PPC Ratio (Price-to-Production Cost): Core mean-reversion signal
+//   2. Difficulty Momentum: Rate of change captures expansion vs capitulation
+//   3. Puell Multiple: Daily miner revenue vs 365-day average
+//   4. Hashrate Z-Score: Smoothed hashrate deviation from trend
+//
+// Signal Guide:
+//   MEI < -1.5 : Strong Buy (historically generational bottoms)
+//   MEI < -0.5 : Accumulation zone
+//   MEI ∈ [-0.5, 0.5] : Neutral / fair value
+//   MEI > 0.5  : Distribution zone
+//   MEI > 1.5  : Strong Sell (historically cycle tops)
+//
+// Usage: Apply to BTCUSD daily chart. Requires external data feeds for
+//        difficulty and hashrate (configured in inputs).
+//
+// Author: Dirk
+// Date: 2026-02-18
+// License: Free to use and modify
+// ============================================================================
+
+//@version=5
+indicator("Bitcoin Miners Max Pain",
+     shorttitle = "BMMP",
+     overlay    = false,
+     precision  = 3,
+     format     = format.price)
+
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- Data Sources ---
+grp_data = "📡 Data Sources"
+
+tooltip_diff = "Ticker for Bitcoin mining difficulty data.\n" +
+     "Options:\n" +
+     "• QUANDL:BCHAIN/DIFF (Quandl/Blockchain.com)\n" +
+     "• INTOTHEBLOCK:BTC_DIFFICULTY\n" +
+     "• GLASSNODE:BTC_DIFFICULTY\n" +
+     "Adjust to whichever feed is active on your TradingView plan."
+
+tooltip_hash = "Ticker for Bitcoin network hashrate data.\n" +
+     "Options:\n" +
+     "• QUANDL:BCHAIN/HRATE (Quandl/Blockchain.com)\n" +
+     "• INTOTHEBLOCK:BTC_HASHRATE\n" +
+     "• GLASSNODE:BTC_HASHRATE"
+
+tooltip_rev = "Ticker for daily miner revenue in USD.\n" +
+     "Used for Puell Multiple calculation.\n" +
+     "Options:\n" +
+     "• QUANDL:BCHAIN/MIREV\n" +
+     "• INTOTHEBLOCK:BTC_MINERREVENUE\n" +
+     "• GLASSNODE:BTC_REVENUE"
+
+i_diff_ticker = input.symbol("QUANDL:BCHAIN/DIFF", 
+     title   = "Difficulty Ticker", 
+     group   = grp_data,
+     tooltip = tooltip_diff)
+
+i_hash_ticker = input.symbol("QUANDL:BCHAIN/HRATE", 
+     title   = "Hashrate Ticker", 
+     group   = grp_data,
+     tooltip = tooltip_hash)
+
+i_rev_ticker  = input.symbol("QUANDL:BCHAIN/MIREV", 
+     title   = "Miner Revenue Ticker", 
+     group   = grp_data,
+     tooltip = tooltip_rev)
+
+// --- Production Cost Model ---
+grp_model = "⚙️ Production Cost Model"
+
+tooltip_model = "Choose estimation method:\n" +
+     "• Difficulty Regression: P* = k × D^α (Hayes 2018 model)\n" +
+     "• Electricity Model: Bottom-up from energy consumption\n" +
+     "• External Feed: Use a direct production cost data feed"
+
+i_model_type = input.string("Difficulty Regression",
+     title   = "Cost Model",
+     options = ["Difficulty Regression", "Electricity Model", "External Feed"],
+     group   = grp_model,
+     tooltip = tooltip_model)
+
+i_alpha = input.float(0.51, 
+     title   = "α (Difficulty Exponent)", 
+     minval  = 0.1, 
+     maxval  = 1.0, 
+     step    = 0.01,
+     group   = grp_model,
+     tooltip = "Power law exponent for difficulty regression.\nEmpirical fit ≈ 0.51 (Hayes 2018).\nHigher = more sensitive to difficulty changes.")
+
+i_cal_price = input.float(87000.0,
+     title   = "Calibration Price ($)",
+     group   = grp_model,
+     tooltip = "Reference BTC price for model calibration.\nDefault: $87k (Checkonchain estimate, Feb 2026).\nAdjust to match your preferred production cost source.")
+
+i_cal_diff = input.float(141.0,
+     title   = "Calibration Difficulty (T)",
+     group   = grp_model,
+     tooltip = "Difficulty (in trillions) at the calibration price.\nDefault: 141T (Jan 2026 pre-adjustment level).")
+
+// Electricity model params
+i_efficiency = input.float(25.0,
+     title   = "Fleet Efficiency (J/TH)",
+     minval  = 10.0, 
+     maxval  = 80.0,
+     group   = grp_model,
+     tooltip = "Average mining fleet efficiency.\nModern efficient: 15-20 J/TH\nFleet average 2026: ~25 J/TH\nOlder rigs: 30-50 J/TH")
+
+i_elec_cost = input.float(0.06,
+     title   = "Electricity Cost ($/kWh)",
+     minval  = 0.01, 
+     maxval  = 0.20, 
+     step    = 0.005,
+     group   = grp_model,
+     tooltip = "Average electricity cost for the mining network.\nGlobal average: $0.05-0.07/kWh")
+
+i_overhead = input.float(1.30,
+     title   = "Overhead Multiplier",
+     minval  = 1.0, 
+     maxval  = 2.0, 
+     step    = 0.05,
+     group   = grp_model,
+     tooltip = "Multiplier for non-electricity costs.\n1.0 = electricity only\n1.3 = typical (cooling, labor, rent, capex)\n1.5 = high overhead")
+
+i_block_reward = input.float(3.125,
+     title   = "Block Reward (BTC)",
+     group   = grp_model,
+     tooltip = "Current block subsidy.\n3.125 BTC after April 2024 halving.\nUpdate after next halving (~2028).")
+
+i_ext_cost_ticker = input.symbol("",
+     title   = "External Cost Feed (if used)",
+     group   = grp_model,
+     tooltip = "Direct production cost data feed.\nOnly used if model = 'External Feed'.")
+
+
+// --- Component Weights ---
+grp_weights = "⚖️ Component Weights"
+
+i_w_ppc  = input.float(0.40, title = "PPC Weight",        minval = 0, maxval = 1, step = 0.05, group = grp_weights)
+i_w_diff = input.float(0.20, title = "Difficulty Weight",  minval = 0, maxval = 1, step = 0.05, group = grp_weights)
+i_w_puel = input.float(0.25, title = "Puell Weight",       minval = 0, maxval = 1, step = 0.05, group = grp_weights)
+i_w_hash = input.float(0.15, title = "Hashrate Weight",    minval = 0, maxval = 1, step = 0.05, group = grp_weights)
+
+
+// --- Lookback Windows ---
+grp_windows = "📏 Lookback Periods"
+
+i_diff_fast    = input.int(14,  title = "Difficulty Fast ROC",  minval = 7,   maxval = 60,   group = grp_windows)
+i_diff_slow    = input.int(90,  title = "Difficulty Slow ROC",  minval = 30,  maxval = 180,  group = grp_windows)
+i_puell_ma     = input.int(365, title = "Puell MA Window",      minval = 100, maxval = 500,  group = grp_windows)
+i_hash_sma     = input.int(90,  title = "Hashrate SMA",         minval = 30,  maxval = 180,  group = grp_windows)
+i_norm_window  = input.int(730, title = "Normalization Window",  minval = 365, maxval = 1095, group = grp_windows,
+     tooltip = "Rolling window for z-score normalization.\n730 = 2 years (default).\nLonger = smoother but slower to react.")
+
+
+// --- Signal Thresholds ---
+grp_signals = "🎯 Signal Thresholds"
+
+i_strong_buy  = input.float(-1.5, title = "Strong Buy",  group = grp_signals)
+i_buy         = input.float(-0.5, title = "Buy",         group = grp_signals)
+i_sell        = input.float(0.5,  title = "Sell",        group = grp_signals)
+i_strong_sell = input.float(1.5,  title = "Strong Sell",  group = grp_signals)
+
+
+// --- Visual Settings ---
+grp_visual = "🎨 Display"
+
+i_show_components = input.bool(true,  title = "Show Component Scores", group = grp_visual)
+i_show_ppc_line   = input.bool(true,  title = "Show Raw PPC Ratio",    group = grp_visual)
+i_show_signals    = input.bool(true,  title = "Show Buy/Sell Signals",  group = grp_visual)
+i_show_zones      = input.bool(true,  title = "Show Zone Background",   group = grp_visual)
+i_mei_smooth      = input.int(5,      title = "MEI Smoothing (EMA)",    minval = 1, maxval = 30, group = grp_visual)
+
+
+// ============================================================================
+// DATA FETCHING
+// ============================================================================
+
+// Fetch external data series (daily timeframe)
+f_fetch(_ticker) =>
+    request.security(_ticker, "D", close, barmerge.gaps_on, barmerge.lookahead_off)
+
+difficulty    = f_fetch(i_diff_ticker)
+hashrate_raw  = f_fetch(i_hash_ticker)
+miner_rev_raw = f_fetch(i_rev_ticker)
+
+// Forward-fill gaps (on-chain data often has gaps on weekends)
+f_fill(_src) =>
+    var float filled = na
+    filled := not na(_src) ? _src : filled
+    filled
+
+diff_filled = f_fill(difficulty)
+hash_filled = f_fill(hashrate_raw)
+mrev_filled = f_fill(miner_rev_raw)
+
+
+// ============================================================================
+// COMPONENT 1: PRICE-TO-PRODUCTION COST RATIO (PPC)
+// ============================================================================
+
+// --- Production Cost Estimation ---
+
+// Method A: Difficulty Regression — P* = k × D^α
+// Auto-calibrate k from user-provided reference point
+f_production_cost_difficulty(_diff, _alpha, _cal_price, _cal_diff_t) =>
+    cal_diff = _cal_diff_t * 1e12 // Convert trillions to raw
+    k = _cal_price / math.pow(cal_diff, _alpha)
+    result = k * math.pow(_diff, _alpha)
+    result
+
+// Method B: Electricity Model
+// Cost = (Hashrate × Efficiency × 24h × Elec_Price × Overhead) / BTC_per_day
+f_production_cost_electricity(_hashrate, _efficiency, _elec_cost, _overhead, _block_reward) =>
+    btc_per_day = _block_reward * 144.0
+    // hashrate is typically in TH/s from data feeds
+    // Power (kW) = hashrate (TH/s) × efficiency (J/TH) / 1000
+    power_kw = _hashrate * _efficiency / 1000.0
+    energy_kwh_day = power_kw * 24.0
+    daily_cost = energy_kwh_day * _elec_cost
+    cost_per_btc = (daily_cost / btc_per_day) * _overhead
+    cost_per_btc
+
+// External cost feed (always fetched at top level — Pine v5 requirement)
+ext_cost_raw = f_fetch(i_ext_cost_ticker)
+ext_cost_filled = f_fill(ext_cost_raw)
+
+// Compute all models at top level, then select
+diff_reg_cost = f_production_cost_difficulty(diff_filled, i_alpha, i_cal_price, i_cal_diff)
+elec_cost     = f_production_cost_electricity(hash_filled, i_efficiency, i_elec_cost, i_overhead, i_block_reward)
+
+prod_cost = i_model_type == "Difficulty Regression" ? diff_reg_cost :
+     i_model_type == "Electricity Model" ? elec_cost :
+     ext_cost_filled
+
+// PPC Ratio
+ppc_ratio = close / prod_cost
+
+// Log-transformed PPC for scoring (symmetric around 0)
+log_ppc = math.log(ppc_ratio)
+
+
+// ============================================================================
+// COMPONENT 2: DIFFICULTY MOMENTUM
+// ============================================================================
+
+// Fast and slow rate of change
+diff_roc_fast = (diff_filled - diff_filled[i_diff_fast]) / diff_filled[i_diff_fast]
+diff_roc_slow = (diff_filled - diff_filled[i_diff_slow]) / diff_filled[i_diff_slow]
+
+// Momentum = divergence between fast and slow
+diff_momentum = diff_roc_fast - diff_roc_slow
+
+// Z-score of momentum
+diff_mom_mean = ta.sma(diff_momentum, 365)
+diff_mom_std  = ta.stdev(diff_momentum, 365)
+diff_zscore   = diff_mom_std != 0 ? (diff_momentum - diff_mom_mean) / diff_mom_std : 0.0
+
+
+// ============================================================================
+// COMPONENT 3: PUELL MULTIPLE
+// ============================================================================
+
+// If miner revenue data is available, use it directly
+// Otherwise estimate from price × daily issuance
+daily_issuance_usd = not na(mrev_filled) ? mrev_filled : close * i_block_reward * 144.0
+
+// 365-day moving average of daily issuance
+issuance_ma_365 = ta.sma(daily_issuance_usd, i_puell_ma)
+
+// Puell Multiple
+puell_multiple = issuance_ma_365 != 0 ? daily_issuance_usd / issuance_ma_365 : na
+
+// Log-transformed for scoring
+log_puell = puell_multiple > 0 ? math.log(puell_multiple) : na
+
+
+// ============================================================================
+// COMPONENT 4: HASHRATE Z-SCORE
+// ============================================================================
+
+// Smoothed hashrate trend
+hash_sma = ta.sma(hash_filled, i_hash_sma)
+
+// Percentage deviation from trend
+hash_deviation = hash_sma != 0 ? (hash_filled - hash_sma) / hash_sma : 0.0
+
+// Z-score of deviation
+hash_dev_mean = ta.sma(hash_deviation, 365)
+hash_dev_std  = ta.stdev(hash_deviation, 365)
+hash_zscore   = hash_dev_std != 0 ? (hash_deviation - hash_dev_mean) / hash_dev_std : 0.0
+
+
+// ============================================================================
+// NORMALIZATION (Rolling Z-Scores)
+// ============================================================================
+
+// Normalize each component to comparable scale using rolling z-score
+f_normalize(_src, _window) =>
+    _mean = ta.sma(_src, _window)
+    _std  = ta.stdev(_src, _window)
+    _result = _std != 0 ? (_src - _mean) / _std : 0.0
+    _result
+
+ppc_norm  = f_normalize(log_ppc,     i_norm_window)
+diff_norm = f_normalize(diff_zscore,  i_norm_window)
+puel_norm = f_normalize(log_puell,    i_norm_window)
+hash_norm = f_normalize(hash_zscore,  i_norm_window)
+
+
+// ============================================================================
+// COMPOSITE MEI
+// ============================================================================
+
+// Weighted sum of normalized components
+mei_raw = i_w_ppc  * nz(ppc_norm) + 
+          i_w_diff * nz(diff_norm) + 
+          i_w_puel * nz(puel_norm) + 
+          i_w_hash * nz(hash_norm)
+
+// Smooth the composite
+mei = i_mei_smooth > 1 ? ta.ema(mei_raw, i_mei_smooth) : mei_raw
+
+
+// ============================================================================
+// SIGNAL GENERATION
+// ============================================================================
+
+is_strong_buy  = mei <= i_strong_buy
+is_buy         = mei <= i_buy and mei > i_strong_buy
+is_sell        = mei >= i_sell and mei < i_strong_sell
+is_strong_sell = mei >= i_strong_sell
+is_neutral     = mei > i_buy and mei < i_sell
+
+// Signal transitions (for alert conditions)
+buy_signal       = ta.crossunder(mei, i_buy)
+strong_buy_signal = ta.crossunder(mei, i_strong_buy)
+sell_signal       = ta.crossover(mei, i_sell)
+strong_sell_signal = ta.crossover(mei, i_strong_sell)
+
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// --- Zone Background ---
+zone_color = i_show_zones ? 
+     is_strong_buy  ? color.new(#00C853, 80) :
+     is_buy         ? color.new(#69F0AE, 85) :
+     is_strong_sell ? color.new(#FF1744, 80) :
+     is_sell        ? color.new(#FF8A80, 85) :
+     color.new(color.gray, 95) : na
+bgcolor(zone_color, title = "Zone Background")
+
+// --- Threshold Lines ---
+h_sb = hline(i_strong_buy,  "Strong Buy",  color = color.new(#00C853, 40), linestyle = hline.style_dashed, linewidth = 1)
+h_b  = hline(i_buy,         "Buy",         color = color.new(#69F0AE, 40), linestyle = hline.style_dotted, linewidth = 1)
+h_z  = hline(0,             "Zero",        color = color.new(color.gray, 60), linestyle = hline.style_solid, linewidth = 1)
+h_s  = hline(i_sell,        "Sell",        color = color.new(#FF8A80, 40), linestyle = hline.style_dotted, linewidth = 1)
+h_ss = hline(i_strong_sell, "Strong Sell", color = color.new(#FF1744, 40), linestyle = hline.style_dashed, linewidth = 1)
+
+// Fill between thresholds
+fill(h_sb, h_b,  color = color.new(#00C853, 92), title = "Buy Zone Fill")
+fill(h_s,  h_ss, color = color.new(#FF1744, 92), title = "Sell Zone Fill")
+
+// --- MEI Line ---
+mei_color = mei <= i_strong_buy ? #00C853 :
+     mei <= i_buy ? #69F0AE :
+     mei >= i_strong_sell ? #FF1744 :
+     mei >= i_sell ? #FF8A80 :
+     #FFFFFF
+
+plot(mei, 
+     title     = "MEI Composite",
+     color     = mei_color,
+     linewidth = 3,
+     style     = plot.style_line)
+
+// --- Component Lines (optional) ---
+plot(i_show_components ? ppc_norm  : na, title = "PPC Score",        color = color.new(#2196F3, 40), linewidth = 1)
+plot(i_show_components ? diff_norm : na, title = "Difficulty Score",  color = color.new(#FF9800, 40), linewidth = 1)
+plot(i_show_components ? puel_norm : na, title = "Puell Score",       color = color.new(#9C27B0, 40), linewidth = 1)
+plot(i_show_components ? hash_norm : na, title = "Hashrate Score",    color = color.new(#00BCD4, 40), linewidth = 1)
+
+// --- Buy/Sell Signal Markers ---
+plotshape(i_show_signals and strong_buy_signal, 
+     title    = "Strong Buy Signal",
+     style    = shape.labelup,
+     location = location.bottom,
+     color    = #00C853,
+     text     = "STRONG\nBUY",
+     textcolor = color.white,
+     size     = size.normal)
+
+plotshape(i_show_signals and buy_signal and not strong_buy_signal,
+     title    = "Buy Signal",
+     style    = shape.triangleup,
+     location = location.bottom,
+     color    = #69F0AE,
+     size     = size.small)
+
+plotshape(i_show_signals and strong_sell_signal,
+     title    = "Strong Sell Signal",
+     style    = shape.labeldown,
+     location = location.top,
+     color    = #FF1744,
+     text     = "STRONG\nSELL",
+     textcolor = color.white,
+     size     = size.normal)
+
+plotshape(i_show_signals and sell_signal and not strong_sell_signal,
+     title    = "Sell Signal",
+     style    = shape.triangledown,
+     location = location.top,
+     color    = #FF8A80,
+     size     = size.small)
+
+
+// ============================================================================
+// INFO TABLE
+// ============================================================================
+
+var table info_table = table.new(position.top_right, 2, 10, 
+     bgcolor     = color.new(#1a1a2e, 10),
+     border_color = color.new(#30304a, 30),
+     border_width = 1,
+     frame_color  = color.new(#30304a, 30),
+     frame_width  = 1)
+
+f_signal_text(_mei) =>
+    _mei <= i_strong_buy  ? "🟢 STRONG BUY" :
+     _mei <= i_buy         ? "🟢 BUY" :
+     _mei >= i_strong_sell ? "🔴 STRONG SELL" :
+     _mei >= i_sell        ? "🔴 SELL" :
+     "⚪ NEUTRAL"
+
+f_signal_color(_mei) =>
+    _mei <= i_strong_buy  ? #00C853 :
+     _mei <= i_buy         ? #69F0AE :
+     _mei >= i_strong_sell ? #FF1744 :
+     _mei >= i_sell        ? #FF8A80 :
+     #AAAAAA
+
+if barstate.islast
+    // Header
+    table.cell(info_table, 0, 0, "Mining Equilibrium Indicator",
+         text_color = #FFFFFF, text_size = size.normal, text_halign = text.align_left,
+         bgcolor = color.new(#16213e, 10))
+    table.merge_cells(info_table, 0, 0, 1, 0)
+
+    // Signal
+    table.cell(info_table, 0, 1, "Signal",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 1, f_signal_text(mei),
+         text_color = f_signal_color(mei), text_size = size.normal, text_halign = text.align_right)
+
+    // MEI Value
+    table.cell(info_table, 0, 2, "MEI Score",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 2, str.tostring(mei, "#.###"),
+         text_color = f_signal_color(mei), text_size = size.small, text_halign = text.align_right)
+
+    // PPC Ratio
+    ppc_color = ppc_ratio < 0.85 ? #00C853 : ppc_ratio < 1.0 ? #69F0AE : ppc_ratio > 3.0 ? #FF1744 : #AAAAAA
+    table.cell(info_table, 0, 3, "PPC Ratio",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 3, str.tostring(ppc_ratio, "#.###"),
+         text_color = ppc_color, text_size = size.small, text_halign = text.align_right)
+
+    // Production Cost
+    table.cell(info_table, 0, 4, "Est. Prod. Cost",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 4, "$" + str.tostring(prod_cost, "#,###"),
+         text_color = #FFFFFF, text_size = size.small, text_halign = text.align_right)
+
+    // Puell Multiple
+    puell_color = puell_multiple < 0.5 ? #00C853 : puell_multiple < 0.8 ? #69F0AE : puell_multiple > 4.0 ? #FF1744 : #AAAAAA
+    table.cell(info_table, 0, 5, "Puell Multiple",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 5, str.tostring(puell_multiple, "#.##"),
+         text_color = puell_color, text_size = size.small, text_halign = text.align_right)
+
+    // Difficulty Change
+    diff_chg = diff_roc_fast * 100
+    diff_chg_color = diff_chg < -5 ? #00C853 : diff_chg > 10 ? #FF8A80 : #AAAAAA
+    table.cell(info_table, 0, 6, "Diff. Change (14d)",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 6, str.tostring(diff_chg, "#.#") + "%",
+         text_color = diff_chg_color, text_size = size.small, text_halign = text.align_right)
+
+    // Current Price
+    table.cell(info_table, 0, 7, "BTC Price",
+         text_color = #AAAAAA, text_size = size.small, text_halign = text.align_left)
+    table.cell(info_table, 1, 7, "$" + str.tostring(close, "#,###"),
+         text_color = #FFFFFF, text_size = size.small, text_halign = text.align_right)
+
+    // Model Type
+    table.cell(info_table, 0, 8, "Cost Model",
+         text_color = #666666, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(info_table, 1, 8, i_model_type,
+         text_color = #666666, text_size = size.tiny, text_halign = text.align_right)
+
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(strong_buy_signal,
+     title   = "MEI Strong Buy",
+     message = "🟢 MEI STRONG BUY: Bitcoin MEI crossed below {{plot_0}} — price significantly below production cost. Historical parallels: cycle bottom zone.")
+
+alertcondition(buy_signal,
+     title   = "MEI Buy",
+     message = "🟢 MEI BUY: Bitcoin MEI entered accumulation zone at {{plot_0}}. Price approaching or below production cost.")
+
+alertcondition(sell_signal,
+     title   = "MEI Sell",
+     message = "🔴 MEI SELL: Bitcoin MEI entered distribution zone at {{plot_0}}. Price significantly above production cost.")
+
+alertcondition(strong_sell_signal,
+     title   = "MEI Strong Sell",
+     message = "🔴 MEI STRONG SELL: Bitcoin MEI crossed above {{plot_0}} — price extremely elevated vs production cost. Historical parallels: cycle top zone.")
+
+alertcondition(ta.cross(mei, 0.0),
+     title   = "MEI Zero Cross",
+     message = "⚪ MEI crossed zero line at {{plot_0}}. Transitioning between bullish/bearish regime.")
+
+
+// ============================================================================
+// END
+// ============================================================================

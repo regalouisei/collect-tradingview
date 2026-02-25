@@ -1,0 +1,347 @@
+//@version=5
+indicator("Multi-Indicator Dashboard", overlay=true, max_lines_count=10, max_labels_count=10, max_bars_back=500)
+
+// ========== INPUTS ==========
+tablePosition = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"])
+tableSize = input.string("normal", "Table Size", options=["tiny", "small", "normal", "large", "huge"])
+decimalPlaces = input.int(1, "Decimal Places (RSI/ADX)", minval=0, maxval=4)
+tableBgColor = input.color(color.new(color.black, 10), "Table Background")
+headerColor = input.color(color.new(color.blue, 20), "Header Color")
+bullishColor = input.color(color.green, "Bullish Color")
+bearishColor = input.color(color.red, "Bearish Color")
+neutralColor = input.color(color.gray, "Neutral/Flat Color")
+textColor = input.color(color.white, "Text Color")
+
+// === HISTORICAL VIEW INPUTS ===
+enableHistoricalView = input.bool(false, "Enable Historical View", group="Historical Data")
+historicalDateTime = input.time(timestamp("2025-01-01 00:00"), "Historical Date/Time", group="Historical Data", tooltip="Select the exact date and time for historical analysis", confirm=true)
+showHistoricalLine = input.bool(true, "Show Historical Reference Line", group="Historical Data")
+historicalLineColor = input.color(color.new(color.yellow, 0), "Historical Line Color", group="Historical Data")
+historicalLineWidth = input.int(3, "Historical Line Width", minval=1, maxval=10, group="Historical Data")
+historicalLineStyle = input.string("Solid", "Historical Line Style", options=["Solid", "Dashed", "Dotted"], group="Historical Data")
+
+tf1 = input.timeframe("W", "Timeframe 1 (W)")
+tf2 = input.timeframe("D", "Timeframe 2 (D)")
+tf3 = input.timeframe("120", "Timeframe 3 (2H)")
+tf4 = input.timeframe("60", "Timeframe 4 (1H)")
+tf5 = input.timeframe("15", "Timeframe 5 (15M)")
+
+rsiLength = input.int(14, "RSI Length", minval=1)
+maFastLength = input.int(8, "Fast MA Length", minval=1)
+maSlowLength = input.int(20, "Slow MA Length", minval=1)
+adxLength = input.int(14, "ADX Length", minval=1)
+atrLength = input.int(14, "ATR Length", minval=1)
+mswingLength1 = input.int(20, "MSwing Length 1", minval=1)
+mswingLength2 = input.int(50, "MSwing Length 2", minval=1)
+enableIPOMswing = input.bool(true, "Enable IPO MSwing")
+mswingEMALength = input.int(9, "MSwing EMA Length", minval=1)
+
+// ========== HELPER FUNCTIONS ==========
+formatDecimal(value) =>
+    na(value) ? "N/A" : decimalPlaces == 0 ? str.tostring(math.round(value)) : decimalPlaces == 1 ? str.tostring(value, "#.#") : decimalPlaces == 2 ? str.tostring(value, "#.##") : decimalPlaces == 3 ? str.tostring(value, "#.###") : str.tostring(value, "#.####")
+
+getTFDisplay(tf) =>
+    tf == "W" ? "W" : tf == "D" ? "D" : tf == "120" ? "2H" : tf == "60" ? "1H" : tf == "15" ? "15M" : tf
+
+// ========== INDICATOR FUNCTIONS ==========
+calcADX(len) =>
+    TrueRange = math.max(math.max(high - low, math.abs(high - nz(close[1]))), math.abs(low - nz(close[1])))
+    DirectionalMovementPlus = high - nz(high[1]) > nz(low[1]) - low ? math.max(high - nz(high[1]), 0) : 0
+    DirectionalMovementMinus = nz(low[1]) - low > high - nz(high[1]) ? math.max(nz(low[1]) - low, 0) : 0
+    var float SmoothedTrueRange = na
+    SmoothedTrueRange := nz(SmoothedTrueRange[1]) - nz(SmoothedTrueRange[1]) / len + TrueRange
+    var float SmoothedDirectionalMovementPlus = na
+    SmoothedDirectionalMovementPlus := nz(SmoothedDirectionalMovementPlus[1]) - nz(SmoothedDirectionalMovementPlus[1]) / len + DirectionalMovementPlus
+    var float SmoothedDirectionalMovementMinus = na
+    SmoothedDirectionalMovementMinus := nz(SmoothedDirectionalMovementMinus[1]) - nz(SmoothedDirectionalMovementMinus[1]) / len + DirectionalMovementMinus
+    DIPlus = SmoothedTrueRange != 0 ? SmoothedDirectionalMovementPlus / SmoothedTrueRange * 100 : 0
+    DIMinus = SmoothedTrueRange != 0 ? SmoothedDirectionalMovementMinus / SmoothedTrueRange * 100 : 0
+    DX = (DIPlus + DIMinus) != 0 ? math.abs(DIPlus - DIMinus) / (DIPlus + DIMinus) * 100 : 0
+    ADX = ta.sma(DX, len)
+    [DIPlus, DIMinus, ADX, DIPlus > DIMinus]
+
+calcATR(length) =>
+    atrValue = ta.atr(length)
+    atrPercent = (atrValue / close) * 100
+    atrPercent
+
+f_momentum(src, len) =>
+    actual_len = math.max(len, 1)
+    denom = nz(src[actual_len], src)
+    denom != 0 ? (src - denom) * 100 / denom / actual_len : 0.0
+
+calcMSwing(len1, len2, enableIPO) =>
+    momo_20 = enableIPO ? f_momentum(close, len1) : (close - nz(close[len1], close)) * 100 / nz(close[len1], close) / len1
+    momo_50 = enableIPO ? f_momentum(close, len2) : (close - nz(close[len2], close)) * 100 / nz(close[len2], close) / len2
+    mswingValue = momo_20 + momo_50
+    mswingEMA = ta.ema(mswingValue, mswingEMALength)
+    aboveMean = mswingValue > mswingEMA
+    [mswingValue, mswingEMA, aboveMean]
+
+// ========== FIND HISTORICAL BAR OFFSET ==========
+findHistoricalOffset() =>
+    int offset = 0
+    if enableHistoricalView
+        for i = 0 to math.min(bar_index, 499)
+            if time[i] <= historicalDateTime
+                offset := i
+                break
+    offset
+
+chartOffset = findHistoricalOffset()
+
+// ========== REQUEST SECURITY DATA FOR EACH TIMEFRAME ==========
+// TF1 - Weekly
+rsi1_series = request.security(syminfo.tickerid, tf1, ta.rsi(close, rsiLength), barmerge.gaps_off, barmerge.lookahead_off)
+fastMA1_series = request.security(syminfo.tickerid, tf1, ta.sma(close, maFastLength), barmerge.gaps_off, barmerge.lookahead_off)
+slowMA1_series = request.security(syminfo.tickerid, tf1, ta.sma(close, maSlowLength), barmerge.gaps_off, barmerge.lookahead_off)
+[diPlus1_series, diMinus1_series, adx1_series, diCross1_series] = request.security(syminfo.tickerid, tf1, calcADX(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+atr1_series = request.security(syminfo.tickerid, tf1, calcATR(atrLength), barmerge.gaps_off, barmerge.lookahead_off)
+[mswing1_series, mswingEMA1_series, mswingAbove1_series] = request.security(syminfo.tickerid, tf1, calcMSwing(mswingLength1, mswingLength2, enableIPOMswing), barmerge.gaps_off, barmerge.lookahead_off)
+time1_series = request.security(syminfo.tickerid, tf1, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+// TF2 - Daily
+rsi2_series = request.security(syminfo.tickerid, tf2, ta.rsi(close, rsiLength), barmerge.gaps_off, barmerge.lookahead_off)
+fastMA2_series = request.security(syminfo.tickerid, tf2, ta.sma(close, maFastLength), barmerge.gaps_off, barmerge.lookahead_off)
+slowMA2_series = request.security(syminfo.tickerid, tf2, ta.sma(close, maSlowLength), barmerge.gaps_off, barmerge.lookahead_off)
+[diPlus2_series, diMinus2_series, adx2_series, diCross2_series] = request.security(syminfo.tickerid, tf2, calcADX(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+atr2_series = request.security(syminfo.tickerid, tf2, calcATR(atrLength), barmerge.gaps_off, barmerge.lookahead_off)
+[mswing2_series, mswingEMA2_series, mswingAbove2_series] = request.security(syminfo.tickerid, tf2, calcMSwing(mswingLength1, mswingLength2, enableIPOMswing), barmerge.gaps_off, barmerge.lookahead_off)
+time2_series = request.security(syminfo.tickerid, tf2, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+// TF3 - 2H
+rsi3_series = request.security(syminfo.tickerid, tf3, ta.rsi(close, rsiLength), barmerge.gaps_off, barmerge.lookahead_off)
+fastMA3_series = request.security(syminfo.tickerid, tf3, ta.sma(close, maFastLength), barmerge.gaps_off, barmerge.lookahead_off)
+slowMA3_series = request.security(syminfo.tickerid, tf3, ta.sma(close, maSlowLength), barmerge.gaps_off, barmerge.lookahead_off)
+[diPlus3_series, diMinus3_series, adx3_series, diCross3_series] = request.security(syminfo.tickerid, tf3, calcADX(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+atr3_series = request.security(syminfo.tickerid, tf3, calcATR(atrLength), barmerge.gaps_off, barmerge.lookahead_off)
+[mswing3_series, mswingEMA3_series, mswingAbove3_series] = request.security(syminfo.tickerid, tf3, calcMSwing(mswingLength1, mswingLength2, enableIPOMswing), barmerge.gaps_off, barmerge.lookahead_off)
+time3_series = request.security(syminfo.tickerid, tf3, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+// TF4 - 1H
+rsi4_series = request.security(syminfo.tickerid, tf4, ta.rsi(close, rsiLength), barmerge.gaps_off, barmerge.lookahead_off)
+fastMA4_series = request.security(syminfo.tickerid, tf4, ta.sma(close, maFastLength), barmerge.gaps_off, barmerge.lookahead_off)
+slowMA4_series = request.security(syminfo.tickerid, tf4, ta.sma(close, maSlowLength), barmerge.gaps_off, barmerge.lookahead_off)
+[diPlus4_series, diMinus4_series, adx4_series, diCross4_series] = request.security(syminfo.tickerid, tf4, calcADX(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+atr4_series = request.security(syminfo.tickerid, tf4, calcATR(atrLength), barmerge.gaps_off, barmerge.lookahead_off)
+[mswing4_series, mswingEMA4_series, mswingAbove4_series] = request.security(syminfo.tickerid, tf4, calcMSwing(mswingLength1, mswingLength2, enableIPOMswing), barmerge.gaps_off, barmerge.lookahead_off)
+time4_series = request.security(syminfo.tickerid, tf4, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+// TF5 - 15M
+rsi5_series = request.security(syminfo.tickerid, tf5, ta.rsi(close, rsiLength), barmerge.gaps_off, barmerge.lookahead_off)
+fastMA5_series = request.security(syminfo.tickerid, tf5, ta.sma(close, maFastLength), barmerge.gaps_off, barmerge.lookahead_off)
+slowMA5_series = request.security(syminfo.tickerid, tf5, ta.sma(close, maSlowLength), barmerge.gaps_off, barmerge.lookahead_off)
+[diPlus5_series, diMinus5_series, adx5_series, diCross5_series] = request.security(syminfo.tickerid, tf5, calcADX(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+atr5_series = request.security(syminfo.tickerid, tf5, calcATR(atrLength), barmerge.gaps_off, barmerge.lookahead_off)
+[mswing5_series, mswingEMA5_series, mswingAbove5_series] = request.security(syminfo.tickerid, tf5, calcMSwing(mswingLength1, mswingLength2, enableIPOMswing), barmerge.gaps_off, barmerge.lookahead_off)
+time5_series = request.security(syminfo.tickerid, tf5, time, barmerge.gaps_off, barmerge.lookahead_off)
+
+// ========== END OF PART 1 ==========
+// Type "Part 2" to continue
+// ========== PART 2 - CONTINUES FROM PART 1 ==========
+
+// ========== UNIFIED OFFSET FOR ALL TIMEFRAMES ==========
+unifiedOffset = enableHistoricalView ? chartOffset : 0
+
+// ========== GET VALUES WITH UNIFIED OFFSET ==========
+// TF1 Values
+rsi1 = rsi1_series[unifiedOffset]
+maCross1 = fastMA1_series[unifiedOffset] > slowMA1_series[unifiedOffset]
+adx1 = adx1_series[unifiedOffset]
+diCross1 = diPlus1_series[unifiedOffset] > diMinus1_series[unifiedOffset]
+atr1 = atr1_series[unifiedOffset]
+mswing1 = mswing1_series[unifiedOffset]
+mswingAbove1 = mswing1_series[unifiedOffset] > mswingEMA1_series[unifiedOffset]
+
+// TF2 Values
+rsi2 = rsi2_series[unifiedOffset]
+maCross2 = fastMA2_series[unifiedOffset] > slowMA2_series[unifiedOffset]
+adx2 = adx2_series[unifiedOffset]
+diCross2 = diPlus2_series[unifiedOffset] > diMinus2_series[unifiedOffset]
+atr2 = atr2_series[unifiedOffset]
+mswing2 = mswing2_series[unifiedOffset]
+mswingAbove2 = mswing2_series[unifiedOffset] > mswingEMA2_series[unifiedOffset]
+
+// TF3 Values
+rsi3 = rsi3_series[unifiedOffset]
+maCross3 = fastMA3_series[unifiedOffset] > slowMA3_series[unifiedOffset]
+adx3 = adx3_series[unifiedOffset]
+diCross3 = diPlus3_series[unifiedOffset] > diMinus3_series[unifiedOffset]
+atr3 = atr3_series[unifiedOffset]
+mswing3 = mswing3_series[unifiedOffset]
+mswingAbove3 = mswing3_series[unifiedOffset] > mswingEMA3_series[unifiedOffset]
+
+// TF4 Values
+rsi4 = rsi4_series[unifiedOffset]
+maCross4 = fastMA4_series[unifiedOffset] > slowMA4_series[unifiedOffset]
+adx4 = adx4_series[unifiedOffset]
+diCross4 = diPlus4_series[unifiedOffset] > diMinus4_series[unifiedOffset]
+atr4 = atr4_series[unifiedOffset]
+mswing4 = mswing4_series[unifiedOffset]
+mswingAbove4 = mswing4_series[unifiedOffset] > mswingEMA4_series[unifiedOffset]
+
+// TF5 Values
+rsi5 = rsi5_series[unifiedOffset]
+maCross5 = fastMA5_series[unifiedOffset] > slowMA5_series[unifiedOffset]
+adx5 = adx5_series[unifiedOffset]
+diCross5 = diPlus5_series[unifiedOffset] > diMinus5_series[unifiedOffset]
+atr5 = atr5_series[unifiedOffset]
+mswing5 = mswing5_series[unifiedOffset]
+mswingAbove5 = mswing5_series[unifiedOffset] > mswingEMA5_series[unifiedOffset]
+
+// ========== CALCULATE VIEW FOR EACH TF ==========
+calcViewStr(rsiVal, maCross, diCross, mswing) =>
+    bull = 0
+    bear = 0
+    bull += (not na(rsiVal) and rsiVal > 50) ? 1 : 0
+    bear += (not na(rsiVal) and rsiVal < 50) ? 1 : 0
+    bull += maCross ? 1 : 0
+    bear += not maCross ? 1 : 0
+    bull += diCross ? 1 : 0
+    bear += not diCross ? 1 : 0
+    bull += (not na(mswing) and mswing > 0) ? 1 : 0
+    bear += (not na(mswing) and mswing < 0) ? 1 : 0
+    bull > bear ? "Bullish" : bear > bull ? "Bearish" : "Flat"
+
+calcViewCol(rsiVal, maCross, diCross, mswing) =>
+    bull = 0
+    bear = 0
+    bull += (not na(rsiVal) and rsiVal > 50) ? 1 : 0
+    bear += (not na(rsiVal) and rsiVal < 50) ? 1 : 0
+    bull += maCross ? 1 : 0
+    bear += not maCross ? 1 : 0
+    bull += diCross ? 1 : 0
+    bear += not diCross ? 1 : 0
+    bull += (not na(mswing) and mswing > 0) ? 1 : 0
+    bear += (not na(mswing) and mswing < 0) ? 1 : 0
+    bull > bear ? bullishColor : bear > bull ? bearishColor : neutralColor
+
+view1 = calcViewStr(rsi1, maCross1, diCross1, mswing1)
+view2 = calcViewStr(rsi2, maCross2, diCross2, mswing2)
+view3 = calcViewStr(rsi3, maCross3, diCross3, mswing3)
+view4 = calcViewStr(rsi4, maCross4, diCross4, mswing4)
+view5 = calcViewStr(rsi5, maCross5, diCross5, mswing5)
+
+viewColor1 = calcViewCol(rsi1, maCross1, diCross1, mswing1)
+viewColor2 = calcViewCol(rsi2, maCross2, diCross2, mswing2)
+viewColor3 = calcViewCol(rsi3, maCross3, diCross3, mswing3)
+viewColor4 = calcViewCol(rsi4, maCross4, diCross4, mswing4)
+viewColor5 = calcViewCol(rsi5, maCross5, diCross5, mswing5)
+
+// ========== HISTORICAL REFERENCE LINE ==========
+var line histLine = na
+var label histLabel = na
+
+if enableHistoricalView and showHistoricalLine and barstate.islast
+    // Delete previous drawings
+    if not na(histLine)
+        line.delete(histLine)
+    if not na(histLabel)
+        label.delete(histLabel)
+    
+    // Line style
+    lineStyle = historicalLineStyle == "Dashed" ? line.style_dashed : historicalLineStyle == "Dotted" ? line.style_dotted : line.style_solid
+    
+    // Calculate position
+    histBarIndex = bar_index - chartOffset
+    histHighPrice = high[chartOffset]
+    histLowPrice = low[chartOffset]
+    
+    // Draw vertical line
+    histLine := line.new(histBarIndex, histLowPrice * 0.99, histBarIndex, histHighPrice * 1.01, 
+                         color=historicalLineColor, width=historicalLineWidth, style=lineStyle, extend=extend.both)
+    
+    // Draw label
+    histLabel := label.new(histBarIndex, histHighPrice * 1.02, 
+                          "◄ HISTORICAL\n" + str.format_time(historicalDateTime, "yyyy-MM-dd HH:mm"), 
+                          color=historicalLineColor, style=label.style_label_down, 
+                          textcolor=color.black, size=size.small)
+
+// ========== DASHBOARD TABLE ==========
+var table dashboard = table.new(position=tablePosition, columns=6, rows=10, bgcolor=tableBgColor, border_width=1)
+
+if barstate.islast
+    // Header row
+    headerTitle = enableHistoricalView ? "HIST MODE" : "Indicator"
+    histInfo = enableHistoricalView ? "\n" + str.format_time(historicalDateTime, "MM-dd HH:mm") : ""
+    
+    table.cell(dashboard, 0, 0, headerTitle + histInfo, bgcolor=enableHistoricalView ? color.orange : headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 0, getTFDisplay(tf1), bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 0, getTFDisplay(tf2), bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 0, getTFDisplay(tf3), bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 0, getTFDisplay(tf4), bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 0, getTFDisplay(tf5), bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 1: MA Cross
+    table.cell(dashboard, 0, 1, "MA Cross (8/20)", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 1, maCross1 ? "Yes" : "No", bgcolor=maCross1 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 1, maCross2 ? "Yes" : "No", bgcolor=maCross2 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 1, maCross3 ? "Yes" : "No", bgcolor=maCross3 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 1, maCross4 ? "Yes" : "No", bgcolor=maCross4 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 1, maCross5 ? "Yes" : "No", bgcolor=maCross5 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 2: RSI
+    table.cell(dashboard, 0, 2, "RSI [Momentum]", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 2, formatDecimal(rsi1), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 2, formatDecimal(rsi2), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 2, formatDecimal(rsi3), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 2, formatDecimal(rsi4), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 2, formatDecimal(rsi5), text_color=textColor, text_size=tableSize)
+    
+    // Row 3: MSwing Value
+    table.cell(dashboard, 0, 3, "MSwing Value", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 3, na(mswing1) ? "N/A" : str.tostring(mswing1, "#.##"), bgcolor=mswing1 > 0 ? bullishColor : mswing1 < 0 ? bearishColor : neutralColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 3, na(mswing2) ? "N/A" : str.tostring(mswing2, "#.##"), bgcolor=mswing2 > 0 ? bullishColor : mswing2 < 0 ? bearishColor : neutralColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 3, na(mswing3) ? "N/A" : str.tostring(mswing3, "#.##"), bgcolor=mswing3 > 0 ? bullishColor : mswing3 < 0 ? bearishColor : neutralColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 3, na(mswing4) ? "N/A" : str.tostring(mswing4, "#.##"), bgcolor=mswing4 > 0 ? bullishColor : mswing4 < 0 ? bearishColor : neutralColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 3, na(mswing5) ? "N/A" : str.tostring(mswing5, "#.##"), bgcolor=mswing5 > 0 ? bullishColor : mswing5 < 0 ? bearishColor : neutralColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 4: MSwing > EMA
+    table.cell(dashboard, 0, 4, "MSwing > EMA", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 4, mswingAbove1 ? "Yes" : "No", bgcolor=mswingAbove1 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 4, mswingAbove2 ? "Yes" : "No", bgcolor=mswingAbove2 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 4, mswingAbove3 ? "Yes" : "No", bgcolor=mswingAbove3 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 4, mswingAbove4 ? "Yes" : "No", bgcolor=mswingAbove4 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 4, mswingAbove5 ? "Yes" : "No", bgcolor=mswingAbove5 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 5: ADX
+    table.cell(dashboard, 0, 5, "ADX [Strength]", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 5, formatDecimal(adx1), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 5, formatDecimal(adx2), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 5, formatDecimal(adx3), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 5, formatDecimal(adx4), text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 5, formatDecimal(adx5), text_color=textColor, text_size=tableSize)
+    
+    // Row 6: DI+ > DI-
+    table.cell(dashboard, 0, 6, "DI+ > DI-", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 6, diCross1 ? "Yes" : "No", bgcolor=diCross1 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 6, diCross2 ? "Yes" : "No", bgcolor=diCross2 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 6, diCross3 ? "Yes" : "No", bgcolor=diCross3 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 6, diCross4 ? "Yes" : "No", bgcolor=diCross4 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 6, diCross5 ? "Yes" : "No", bgcolor=diCross5 ? bullishColor : bearishColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 7: ATR %
+    table.cell(dashboard, 0, 7, "ATR % [Volatility]", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 7, na(atr1) ? "N/A" : str.tostring(atr1, "#.##") + "%", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 7, na(atr2) ? "N/A" : str.tostring(atr2, "#.##") + "%", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 7, na(atr3) ? "N/A" : str.tostring(atr3, "#.##") + "%", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 7, na(atr4) ? "N/A" : str.tostring(atr4, "#.##") + "%", text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 7, na(atr5) ? "N/A" : str.tostring(atr5, "#.##") + "%", text_color=textColor, text_size=tableSize)
+    
+    // Row 8: Separator
+    table.cell(dashboard, 0, 8, "═══════════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 8, "═══════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 8, "═══════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 8, "═══════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 8, "═══════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 8, "═══════", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    
+    // Row 9: VIEW
+    table.cell(dashboard, 0, 9, "VIEW [Decision]", bgcolor=headerColor, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 1, 9, view1, bgcolor=viewColor1, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 2, 9, view2, bgcolor=viewColor2, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 3, 9, view3, bgcolor=viewColor3, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 4, 9, view4, bgcolor=viewColor4, text_color=textColor, text_size=tableSize)
+    table.cell(dashboard, 5, 9, view5, bgcolor=viewColor5, text_color=textColor, text_size=tableSize)
+
+// ========== END OF CODE ==========

@@ -1,0 +1,333 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Flatty25
+
+//@version=6
+//=============================================================================
+//    OB Identify + Verify v1.8
+//
+//    Purpose:
+//      Educational Order Block indicator that detects ICT-style OBs with clean
+//      visual markers. Icons on chart, explanations in this description.
+//
+//    ━━━ CHART LEGEND ━━━
+//    ▲ / ▼  = Order Block candle (last opposite-direction candle before displacement)
+//    ✓      = Displacement confirmed (candle closed beyond OB open)
+//    ───    = OB level line (price may return here as support/resistance)
+//    OB+    = Bullish Order Block (expect price to find support)
+//    OB-    = Bearish Order Block (expect price to find resistance)
+//
+//    ━━━ INVALIDATION ━━━
+//    An OB is invalidated when price CLOSES through the OB level:
+//    • OB+ invalid if price closes BELOW the line
+//    • OB- invalid if price closes ABOVE the line
+//
+//    Detection Logic:
+//      - OB+ (Bullish): Last down-close candle before bullish displacement
+//        (close above OB candle's open) with displacement body > ATR filter
+//      - OB- (Bearish): Last up-close candle before bearish displacement
+//        (close below OB candle's open) with displacement body > ATR filter
+//
+//    Changelog:
+//      v1.8  - Replaced text callouts with clean icons (▲▼✓)
+//            - Added green checkmark for displacement confirmation
+//            - Removed invalidation text callout (line shows level)
+//            - Added icon size toggle (tiny/small)
+//      v1.7  - Added vertical padding for callout labels
+//      v1.6  - OB+/OB- label above/below line, triangle marker
+//      v1.5  - Large font, force_overlay on labels
+//      v1.4  - Added callout offset, centered line label
+//      v1.3  - Mitigation requires CLOSE through level, skips displacement candle
+//            - Added ATR-based displacement filter
+//      v1.2  - Moved labels to right end of line
+//      v1.1  - Fixed array bounds error
+//      v1.0  - Initial release
+//=============================================================================
+indicator("OB Education Tool — Indicator — v1.8", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//=============================================================================
+// Inputs
+//=============================================================================
+string groupOB     = "Order Blocks"
+string groupFilter = "Filters"
+string groupViz    = "Visuals"
+string groupMit    = "Mitigation"
+
+// OB Settings
+int    maxBullOB   = input.int(5, "Max Bullish OBs", minval=1, maxval=15, group=groupOB,
+                     tooltip="Maximum number of bullish Order Blocks to display.\n\nWhat is an Order Block?\nThe last opposite-direction candle before a strong displacement move. Price often returns to this level as support/resistance.")
+int    maxBearOB   = input.int(5, "Max Bearish OBs", minval=1, maxval=15, group=groupOB)
+
+// Filter Settings
+string atrTooltip  = "How strong must the displacement candle be?\n\n" +
+                     "ATR (Average True Range) measures typical price movement.\n" +
+                     "The multiplier sets the minimum displacement body size:\n\n" +
+                     "• 0.5 = body must be ≥ half the ATR (more OBs, some weak)\n" +
+                     "• 1.0 = body must be ≥ full ATR (balanced)\n" +
+                     "• 1.5+ = only strong displacements (fewer OBs, higher quality)\n\n" +
+                     "━━━ Timeframe Guidance ━━━\n" +
+                     "ATR automatically adapts to your chart timeframe.\n" +
+                     "However, lower timeframes have more noise:\n\n" +
+                     "• 1m charts: Use 0.8 – 1.2 (filter noise)\n" +
+                     "• 5m charts: Use 0.5 – 1.0 (balanced)\n" +
+                     "• 15m charts: Use 0.5 – 0.8 (cleaner)\n" +
+                     "• 4H charts: Use 0.3 – 0.7 (moves are meaningful)\n\n" +
+                     "━━━ Warning ━━━\n" +
+                     "⚠ Below 0.3 = too much noise, many false OBs\n" +
+                     "⚠ Above 2.0 = may miss valid OBs"
+
+float  minDispATR  = input.float(1.0, "Min Displacement (ATR multiplier)", minval=0.1, maxval=3.0, step=0.1, group=groupFilter,
+                     tooltip=atrTooltip)
+int    atrLength   = input.int(14, "ATR Length", minval=1, group=groupFilter,
+                     tooltip="Number of bars used to calculate ATR.\n\nDefault 14 works well for most timeframes.\nLower values (7-10) = more responsive to recent volatility.\nHigher values (20-30) = smoother, less reactive.")
+
+// Visual Settings
+color  colorOBplus = input.color(#2962ff, "OB+ Color (Bullish)", group=groupViz)
+color  colorOBminus= input.color(#e91e63, "OB- Color (Bearish)", group=groupViz)
+int    lineWidth   = input.int(2, "Line Width", minval=1, maxval=4, group=groupViz)
+bool   showMarkers = input.bool(true, "Show OB Markers (▲▼✓)", group=groupViz,
+                     tooltip="Display triangle on OB candle and checkmark on displacement candle.\n\n▲▼ = Order Block candle\n✓ = Displacement confirmed")
+string iconSize    = input.string("Small", "Icon Size", options=["Tiny", "Small", "Normal"], group=groupViz,
+                     tooltip="Size of the marker icons on the chart.")
+
+// Mitigation Settings
+bool   stopAtMit   = input.bool(true, "Stop Line at Mitigation", group=groupMit,
+                     tooltip="End the OB line when price closes through the level.\nIf OFF, line extends forever.")
+
+//=============================================================================
+// Constants
+//=============================================================================
+int OB_BULL      = 1
+int OB_BEAR      = -1
+int STATE_ACTIVE = 1
+int STATE_DONE   = 0
+
+//=============================================================================
+// Calculations
+//=============================================================================
+float atrValue = ta.atr(atrLength)
+float dispBody = math.abs(close - open)
+
+// Icon size
+var string iconSizeVal = size.small
+iconSizeVal := iconSize == "Tiny" ? size.tiny : iconSize == "Small" ? size.small : size.normal
+
+
+//=============================================================================
+// OB Storage Arrays
+//=============================================================================
+var array<float> obLevels      = array.new_float()
+var array<int>   obBars        = array.new_int()
+var array<int>   obTypes       = array.new_int()
+var array<int>   obStates      = array.new_int()
+var array<int>   obDispBars    = array.new_int()
+var array<line>  obLines       = array.new_line()
+var array<label> obLineLabels  = array.new_label()
+var array<label> obMarkerOB    = array.new_label()
+var array<label> obMarkerDisp  = array.new_label()
+
+//=============================================================================
+// Helper Functions
+//=============================================================================
+// Count active OBs of a specific type
+countActiveOB(int obType) =>
+    int count = 0
+    int size = array.size(obTypes)
+    if size > 0
+        for i = 0 to size - 1
+            if array.get(obTypes, i) == obType and array.get(obStates, i) != STATE_DONE
+                count += 1
+    count
+
+// Remove oldest OB of a specific type to make room
+removeOldestOB(int obType) =>
+    int size = array.size(obTypes)
+    if size > 0
+        for i = 0 to size - 1
+            if array.get(obTypes, i) == obType
+                // Delete drawings
+                line.delete(array.get(obLines, i))
+                label.delete(array.get(obLineLabels, i))
+                label.delete(array.get(obMarkerOB, i))
+                label.delete(array.get(obMarkerDisp, i))
+                // Remove from arrays
+                array.remove(obLevels, i)
+                array.remove(obBars, i)
+                array.remove(obTypes, i)
+                array.remove(obStates, i)
+                array.remove(obDispBars, i)
+                array.remove(obLines, i)
+                array.remove(obLineLabels, i)
+                array.remove(obMarkerOB, i)
+                array.remove(obMarkerDisp, i)
+                break
+
+//=============================================================================
+// OB Detection
+//=============================================================================
+// Displacement filter: current candle body must be significant
+bool strongDisplacement = dispBody > (atrValue * minDispATR)
+
+// Bullish OB: down-close candle [1] followed by strong close [0] above open [1]
+bool isDownClose1   = close[1] < open[1]
+bool displacedUp    = close > open[1]
+bool newOBplus      = isDownClose1 and displacedUp and strongDisplacement
+
+// Bearish OB: up-close candle [1] followed by strong close [0] below open [1]
+bool isUpClose1     = close[1] > open[1]
+bool displacedDown  = close < open[1]
+bool newOBminus     = isUpClose1 and displacedDown and strongDisplacement
+
+//=============================================================================
+// Create New OBs
+//=============================================================================
+if newOBplus
+    // Check if we need to remove oldest to stay within limit
+    if countActiveOB(OB_BULL) >= maxBullOB
+        removeOldestOB(OB_BULL)
+    
+    float level = open[1]
+    int   obBar = bar_index - 1
+    int   dispBar = bar_index
+    
+    // Create line from OB candle extending right
+    line obLine = line.new(obBar, level, bar_index, level, 
+                           color=colorOBplus, width=lineWidth, style=line.style_solid)
+    
+    // OB+ label ABOVE the line (small font)
+    label lblLine = label.new(bar_index, level, "OB+", 
+                              style=label.style_label_down, 
+                              color=color.new(color.white, 100), 
+                              textcolor=colorOBplus,
+                              size=size.small,
+                              force_overlay=true)
+    
+    // Markers (if enabled)
+    label lblMarkerOB = na
+    label lblMarkerDisp = na
+    
+    if showMarkers
+        // Triangle marker on OB candle (below candle)
+        lblMarkerOB := label.new(obBar, low[1], "▲", 
+                                 style=label.style_label_up, 
+                                 color=color.new(color.white, 100), 
+                                 textcolor=colorOBplus,
+                                 size=iconSizeVal,
+                                 force_overlay=true)
+        
+        // Checkmark on displacement candle (above candle)
+        lblMarkerDisp := label.new(dispBar, high, "✓", 
+                                   style=label.style_label_down, 
+                                   color=color.new(color.white, 100), 
+                                   textcolor=colorOBplus,
+                                   size=iconSizeVal,
+                                   force_overlay=true)
+    
+    // Store OB data
+    array.push(obLevels, level)
+    array.push(obBars, obBar)
+    array.push(obTypes, OB_BULL)
+    array.push(obStates, STATE_ACTIVE)
+    array.push(obDispBars, dispBar)
+    array.push(obLines, obLine)
+    array.push(obLineLabels, lblLine)
+    array.push(obMarkerOB, lblMarkerOB)
+    array.push(obMarkerDisp, lblMarkerDisp)
+
+if newOBminus
+    // Check if we need to remove oldest to stay within limit
+    if countActiveOB(OB_BEAR) >= maxBearOB
+        removeOldestOB(OB_BEAR)
+    
+    float level = open[1]
+    int   obBar = bar_index - 1
+    int   dispBar = bar_index
+    
+    // Create line from OB candle extending right
+    line obLine = line.new(obBar, level, bar_index, level, 
+                           color=colorOBminus, width=lineWidth, style=line.style_solid)
+    
+    // OB- label BELOW the line (small font)
+    label lblLine = label.new(bar_index, level, "OB-", 
+                              style=label.style_label_up, 
+                              color=color.new(color.white, 100), 
+                              textcolor=colorOBminus,
+                              size=size.small,
+                              force_overlay=true)
+    
+    // Markers (if enabled)
+    label lblMarkerOB = na
+    label lblMarkerDisp = na
+    
+    if showMarkers
+        // Triangle marker on OB candle (above candle)
+        lblMarkerOB := label.new(obBar, high[1], "▼", 
+                                 style=label.style_label_down, 
+                                 color=color.new(color.white, 100), 
+                                 textcolor=colorOBminus,
+                                 size=iconSizeVal,
+                                 force_overlay=true)
+        
+        // Checkmark on displacement candle (below candle)
+        lblMarkerDisp := label.new(dispBar, low, "✓", 
+                                   style=label.style_label_up, 
+                                   color=color.new(color.white, 100), 
+                                   textcolor=colorOBminus,
+                                   size=iconSizeVal,
+                                   force_overlay=true)
+    
+    // Store OB data
+    array.push(obLevels, level)
+    array.push(obBars, obBar)
+    array.push(obTypes, OB_BEAR)
+    array.push(obStates, STATE_ACTIVE)
+    array.push(obDispBars, dispBar)
+    array.push(obLines, obLine)
+    array.push(obLineLabels, lblLine)
+    array.push(obMarkerOB, lblMarkerOB)
+    array.push(obMarkerDisp, lblMarkerDisp)
+
+//=============================================================================
+// Update Lines & Check Mitigation
+//=============================================================================
+int arrSize = array.size(obLevels)
+if arrSize > 0
+    for i = arrSize - 1 to 0
+        float level    = array.get(obLevels, i)
+        int   obType   = array.get(obTypes, i)
+        int   state    = array.get(obStates, i)
+        int   dispBar  = array.get(obDispBars, i)
+        line  obLine   = array.get(obLines, i)
+        label lblLine  = array.get(obLineLabels, i)
+        int   obBar    = array.get(obBars, i)
+        
+        if state == STATE_DONE
+            continue
+        
+        // Extend line to current bar
+        line.set_x2(obLine, bar_index)
+        
+        // Move line label to middle of line
+        int midPoint = math.round((obBar + bar_index) / 2)
+        label.set_x(lblLine, midPoint)
+        
+        // Only check mitigation AFTER the displacement bar
+        bool canCheckMitigation = bar_index > dispBar
+        
+        if state == STATE_ACTIVE and canCheckMitigation
+            // Check mitigation: price CLOSES through the OB level
+            bool mitigated = false
+            
+            // OB+ mitigated when close is below level
+            if obType == OB_BULL and close < level
+                mitigated := true
+            // OB- mitigated when close is above level
+            if obType == OB_BEAR and close > level
+                mitigated := true
+            
+            if mitigated and stopAtMit
+                // End the line here
+                array.set(obStates, i, STATE_DONE)
+                line.set_x2(obLine, bar_index)
+                // Recalculate midpoint for final position
+                int finalMid = math.round((obBar + bar_index) / 2)
+                label.set_x(lblLine, finalMid)

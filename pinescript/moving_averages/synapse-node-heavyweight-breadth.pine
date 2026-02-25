@@ -1,0 +1,181 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © BigBeluga
+
+//@version=6
+indicator('Synapse Node: Heavyweight Breadth', 'Synapse Breadth [Cortex]', overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ---------------------------
+// INPUTS
+// ---------------------------
+group_bridge = "Bridge Integration"
+bool bridge_mode  = input.bool(true, "Bridge Mode (Minimal)", group=group_bridge, tooltip="Hides redundant signals and background fills when using the Execution Bridge.")
+
+group_breadth = "Heavyweight Breadth Settings"
+int breadth_thresh = input.int(4, "Breadth Threshold (Max 6)", minval=1, maxval=6, group=group_breadth)
+
+group_trend = "Trend Settings"
+int fast_len = input.int(9, "Fast EMA", group=group_trend)
+int slow_len = input.int(21, "Slow EMA", group=group_trend)
+
+group_fp = "Footprint Engine (1S)"
+int fp_ticks    = input.int(10, "Footprint: Ticks Per Row", minval=1, group=group_fp)
+float imb_ratio = input.float(3.0, "Imbalance Ratio", group=group_fp)
+float sigma_dev = input.float(2.0, "Delta Sigma Threshold", group=group_fp)
+float min_delta = input.float(100, "Min Delta", group=group_fp)
+
+group_risk = "Trade Management (Visuals)"
+bool show_trades = input.bool(true, "Show Trade Paths", group=group_risk)
+int atrLen   = input.int(14, "ATR Length", group=group_risk)
+float riskMult = input.float(1.2, "Stop Size (ATR Mult)", group=group_risk)
+float tp1Mult  = input.float(1.0, "TP1", group=group_risk)
+float tp2Mult  = input.float(2.0, "TP2", group=group_risk)
+
+group_synapse = "Synapse Integration"
+bool  show_hud        = input.bool(true, "Show Synapse HUD", group=group_synapse)
+string hud_pos        = input.string(position.middle_right, "HUD Position", options=[position.top_right, position.top_center, position.top_left, position.middle_right, position.middle_center, position.middle_left, position.bottom_right, position.bottom_center, position.bottom_left], group=group_synapse)
+int   signal_cooldown = input.int(5, "Signal Cooldown (Bars)", minval=1, group=group_synapse)
+
+group_session = "Session Control"
+string sessionTime = input.session("0830-1500", "Trading Session (CST / UTC-6)", group=group_session)
+string timeZone    = input.string("America/Chicago", "Timezone", group=group_session)
+bool   inSession   = not na(time(timeframe.period, sessionTime, timeZone))
+
+// ---------------------------
+// COLORS
+// ---------------------------
+color color_bull = input.color(#26a69a, "Bullish Color", group="Color")
+color color_bear = input.color(#9b1c1c, "Bearish Color", group="Color")
+color color_base = input.color(#454b54, "Base Color", group="Color")
+color color_text = color.white
+
+// ---------------------------
+// FOOTPRINT ENGINE (1S)
+// ---------------------------
+fp = request.footprint(fp_ticks, 70.0, imb_ratio * 100)
+float foot_buy  = not na(fp) ? fp.buy_volume() : 0.0
+float foot_sell = not na(fp) ? fp.sell_volume() : 0.0
+float total_delta = not na(fp) ? fp.delta() : 0.0
+float avg_delta = ta.sma(math.abs(total_delta), 20)
+float std_delta = ta.stdev(math.abs(total_delta), 20)
+float delta_thresh = avg_delta + std_delta * sigma_dev
+
+bool delta_bull_anom = total_delta > math.max(delta_thresh, min_delta)
+bool delta_bear_anom = total_delta < -math.max(delta_thresh, min_delta)
+bool delta_bull = total_delta > 0
+bool delta_bear = total_delta < 0
+
+// ---------------------------
+// BREADTH ENGINE (NASDAQ HEAVYWEIGHTS)
+// ---------------------------
+// Evaluates trend direction of individual stocks (Price vs 20 EMA)
+f_get_breadth(sym) =>
+    c = request.security(sym, timeframe.period, close)
+    e = request.security(sym, timeframe.period, ta.ema(close, 20))
+    c > e ? 1 : -1
+
+int score =
+     f_get_breadth("NASDAQ:AAPL") +
+     f_get_breadth("NASDAQ:MSFT") +
+     f_get_breadth("NASDAQ:NVDA") +
+     f_get_breadth("NASDAQ:AMZN") +
+     f_get_breadth("NASDAQ:META") +
+     f_get_breadth("NASDAQ:GOOGL")
+
+bool breadth_bull = score >= breadth_thresh
+bool breadth_bear = score <= -breadth_thresh
+bool breadth_max_bull = score == 6
+bool breadth_max_bear = score == -6
+
+// ---------------------------
+// TREND ALIGNMENT (Visual Smoothing)
+// ---------------------------
+// We will simply use an EMA for visual shading, but the mathematical trigger is pure Breadth.
+float trend_ema = ta.ema(close, 20)
+bool  trend_up = close > trend_ema
+bool  trend_down = close < trend_ema
+
+// ---------------------------
+// SYNAPSE CONSENSUS LOGIC (Continuous Pressure)
+// ---------------------------
+// Breadth Node acts as a heavy confirmation layer for the Bridge. 
+// Instead of firing specific "Cross" signals, it maintains a continuous Pulse weight
+// based on the strength of the internal heavyweights and the institutional footprint.
+
+// Cooldown persistence (Visual Only for arrows)
+var int last_sig_bar = 0
+bool cooldown_ok = (bar_index - last_sig_bar >= signal_cooldown) or last_sig_bar == 0
+
+bool signal_long_visual  = breadth_bull and delta_bull_anom and cooldown_ok and inSession
+bool signal_short_visual = breadth_bear and delta_bear_anom and cooldown_ok and inSession
+
+if signal_long_visual or signal_short_visual
+    last_sig_bar := bar_index
+
+if show_trades
+    if signal_long_visual
+        label.new(bar_index, low, text="◆\n+" + str.tostring(score), color=color.new(color.black, 100), textcolor=color_bull, style=label.style_label_up, size=size.small)
+
+    if signal_short_visual
+        label.new(bar_index, high, text="◆\n" + str.tostring(score), color=color.new(color.black, 100), textcolor=color_bear, style=label.style_label_down, size=size.small)
+
+// Optional smoothing fill under the EMAs
+p1 = plot(close, color=color_base, display=display.none)
+p2 = plot(trend_ema, color=color_base, display=display.none)
+fill(p1, p2, color=bridge_mode ? na : (trend_up ? color.new(color_bull, 85) : color.new(color_bear, 85)))
+
+// ---------------------------
+// SYNAPSE BUS PROTOCOL (200.PBCCC)
+// ---------------------------
+float pulse = 0.0
+float bias  = 0.0
+
+// Bias Logic
+if breadth_bull
+    bias := 1.0 // Bullish
+else if breadth_bear
+    bias := 2.0 // Bearish
+else
+    bias := 0.0 // Neutral / Choppy / Weak
+
+// Pulse Logic (Continuous Strength Weighting)
+if (breadth_max_bull and delta_bull_anom) or (breadth_max_bear and delta_bear_anom)
+    pulse := 3.0 // High Conviction (Max 6/6 Breadth + Anomalous Delta)
+else if (score >= 5 and delta_bull) or (score <= -5 and delta_bear)
+    pulse := 2.0 // Strong Signal (5/6 Breadth + Favorable Delta)
+else if (breadth_bull and delta_bull) or (breadth_bear and delta_bear)
+    pulse := 1.0 // Moderate Confirmation (Meets threshold + Favorable Delta)
+else
+    pulse := 0.0
+
+float conf = (math.abs(score) == 6) ? 95.0 : (math.abs(score) >= 5 ? 85.0 : (math.abs(score) >= breadth_thresh ? 70.0 : 50.0))
+
+// Export via typical Synapse output format
+plot(200.0 + (pulse * 0.1) + (bias * 0.01) + (math.floor(conf * 10) / 1000000.0), "Bus Output", display=display.status_line)
+
+// ---------------------------
+// HUD (CORTEX MONOCHROME)
+// ---------------------------
+var table hud = table.new(hud_pos, 5, 2, bgcolor=color.new(color.black, 40), border_color=color.new(color_base, 50), border_width=1)
+if barstate.islast and show_hud
+    table.cell(hud, 0, 0, "BREADTH", text_color=color_text, text_size=size.tiny)
+    string txt_bias = bias == 1.0 ? "BULLISH" : bias == 2.0 ? "BEARISH" : "NEUTRAL"
+    table.cell(hud, 0, 1, txt_bias, text_color=bias == 1.0 ? color_bull : bias == 2.0 ? color_bear : color_base, text_size=size.tiny)
+    
+    table.cell(hud, 1, 0, "Session", text_color=color_base, text_size=size.tiny)
+    table.cell(hud, 1, 1, inSession ? "ACTIVE" : "CLOSED", text_color=inSession ? color_bull : color_base, text_size=size.tiny)
+
+    table.cell(hud, 2, 0, "Breadth Score", text_color=color_base, text_size=size.tiny)
+    string txt_score = str.tostring(score) + " / 6"
+    color col_score = score >= breadth_thresh ? color_bull : score <= -breadth_thresh ? color_bear : color_text
+    table.cell(hud, 2, 1, txt_score, text_color=col_score, text_size=size.tiny)
+    
+    table.cell(hud, 3, 0, "1S Delta", text_color=color_base, text_size=size.tiny)
+    string txt_delta = str.tostring(total_delta, "#.#")
+    if delta_bull_anom or delta_bear_anom
+        txt_delta += " [!]"
+    table.cell(hud, 3, 1, txt_delta, text_color=total_delta > 0 ? color_bull : total_delta < 0 ? color_bear : color_text, text_size=size.tiny)
+
+    table.cell(hud, 4, 0, "Pulse Tier", text_color=color_base, text_size=size.tiny)
+    color col_pulse = pulse == 3.0 ? color.yellow : pulse == 2.0 ? color_bull : color_base
+    table.cell(hud, 4, 1, str.tostring(pulse, "#.#") + (pulse == 3.0 ? " (MAX)" : ""), text_color=col_pulse, text_size=size.tiny)

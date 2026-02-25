@@ -1,0 +1,361 @@
+//@version=5
+indicator("Multi-Signal Trading Indicator + FVG + Liquidity", overlay=true, max_bars_back=500)
+
+// ============================================================================
+// INPUT PARAMETERS (ORIGINAL)
+// ============================================================================
+
+// Trend Settings
+emaFastLen = input.int(9, "Fast EMA Length", minval=1, group="Trend")
+emaSlowLen = input.int(21, "Slow EMA Length", minval=1, group="Trend")
+trendLen = input.int(50, "Trend EMA Length", minval=1, group="Trend")
+ema200Len = input.int(200, "200 EMA Length", minval=1, group="Trend")  // NEW
+emaFastColor = input.color(color.blue, "Fast EMA Color", group="Trend")
+emaSlowColor = input.color(color.orange, "Slow EMA Color", group="Trend")
+emaTrendColor = input.color(color.gray, "Trend EMA Color", group="Trend")
+ema200Color = input.color(color.purple, "200 EMA Color", group="Trend")
+
+// Momentum Settings
+rsiLen = input.int(14, "RSI Length", minval=1, group="Momentum")
+rsiOverbought = input.int(70, "RSI Overbought", minval=50, maxval=100, group="Momentum")
+rsiOversold = input.int(30, "RSI Oversold", minval=0, maxval=50, group="Momentum")
+
+// Volume Settings
+volLen = input.int(20, "Volume MA Length", minval=1, group="Volume")
+volMultiplier = input.float(1.5, "Volume Spike Multiplier", minval=1.0, group="Volume")
+
+// Signal Settings
+showBuySignals = input.bool(true, "Show Buy Signals", group="Signals")
+showSellSignals = input.bool(true, "Show Sell Signals", group="Signals")
+showTrendLine = input.bool(true, "Show Trend Line", group="Signals")
+
+// NEW: FVG Settings
+showFVG = input.bool(true, "Show Fair Value Gaps", group="FVG")
+fvgTransparency = input.int(85, "FVG Transparency", minval=50, maxval=95, group="FVG")
+fvgWidth = input.int(3, "FVG Box Width (candles)", minval=2, maxval=10, group="FVG")
+
+// NEW: Liquidity Settings (EXACT from provided indicator)
+major_length = input.int(20, "Major Liquidity Length", minval=5, maxval=50, group="Liquidity")
+minor_length = input.int(10, "Minor Liquidity Length", minval=3, maxval=25, group="Liquidity")
+show_major = input.bool(true, "Show Major Liquidity", group="Liquidity")
+show_minor = input.bool(true, "Show Minor Liquidity", group="Liquidity")
+max_levels = input.int(20, "Maximum Levels to Show", minval=5, maxval=50, group="Liquidity")
+major_high_color = input.color(color.red, "Major High Color", group="Liquidity")
+major_low_color = input.color(color.lime, "Major Low Color", group="Liquidity")
+minor_high_color = input.color(color.orange, "Minor High Color", group="Liquidity")
+minor_low_color = input.color(color.aqua, "Minor Low Color", group="Liquidity")
+major_line_style = input.string("Solid", "Major Liquidity Style", options=["Solid", "Dashed", "Dotted"], group="Liquidity")
+minor_line_style = input.string("Solid", "Minor Liquidity Style", options=["Solid", "Dashed", "Dotted"], group="Liquidity")
+major_line_width = input.int(1, "Major Line Width", minval=1, maxval=5, group="Liquidity")
+minor_line_width = input.int(1, "Minor Line Width", minval=1, maxval=5, group="Liquidity")
+major_line_left = input.int(10, "Major Line Left Extension", minval=0, maxval=100, group="Liquidity")
+major_line_right = input.int(50, "Major Line Right Extension", minval=10, maxval=200, group="Liquidity")
+minor_line_left = input.int(10, "Minor Line Left Extension", minval=0, maxval=100, group="Liquidity")
+minor_line_right = input.int(50, "Minor Line Right Extension", minval=10, maxval=200, group="Liquidity")
+
+// ============================================================================
+// CALCULATIONS (ORIGINAL)
+// ============================================================================
+
+// Moving Averages
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, trendLen)
+ema200 = ta.ema(close, ema200Len)  // NEW: 200 EMA
+
+// RSI
+rsi = ta.rsi(close, rsiLen)
+
+// Volume Analysis
+volMA = ta.sma(volume, volLen)
+volSpike = volume > volMA * volMultiplier
+
+// Trend Detection
+bullishTrend = close > emaTrend
+bearishTrend = close < emaTrend
+emaCrossUp = ta.crossover(emaFast, emaSlow)
+emaCrossDown = ta.crossunder(emaFast, emaSlow)
+
+// ============================================================================
+// SIGNAL LOGIC (ORIGINAL)
+// ============================================================================
+
+// Buy Signal: Fast EMA crosses above Slow EMA, price above trend, RSI not overbought
+buySignal = emaCrossUp and bullishTrend and rsi < rsiOverbought and showBuySignals
+
+// Sell Signal: Fast EMA crosses below Slow EMA, price below trend, RSI not oversold
+sellSignal = emaCrossDown and bearishTrend and rsi > rsiOversold and showSellSignals
+
+// Strong signals with volume confirmation
+strongBuy = buySignal and volSpike
+strongSell = sellSignal and volSpike
+
+// ============================================================================
+// NEW: FAIR VALUE GAP (FVG) DETECTION - CLEAN VERSION
+// ============================================================================
+
+// Bullish FVG: Gap between candle 3's high and candle 1's low (candle 2 doesn't fill it)
+bullishFVG = showFVG and (low > high[2]) and (close[1] > open[1])
+
+// Bearish FVG: Gap between candle 3's low and candle 1's high (candle 2 doesn't fill it)
+bearishFVG = showFVG and (high < low[2]) and (close[1] < open[1])
+
+// Arrays to store active FVG boxes with their price levels
+var box[] activeBullFVG = array.new_box()
+var float[] activeBullFVG_top = array.new_float()
+var float[] activeBullFVG_bottom = array.new_float()
+
+var box[] activeBearFVG = array.new_box()
+var float[] activeBearFVG_top = array.new_float()
+var float[] activeBearFVG_bottom = array.new_float()
+
+// Create new bullish FVG
+if bullishFVG
+    fvgTop = low
+    fvgBottom = high[2]
+    
+    // Create box with fixed width (3 candles)
+    fvgBox = box.new(bar_index - 2, fvgTop, bar_index + fvgWidth, fvgBottom, 
+                     border_color=color.new(color.green, 60), 
+                     bgcolor=color.new(color.green, fvgTransparency),
+                     border_width=1)
+    
+    array.push(activeBullFVG, fvgBox)
+    array.push(activeBullFVG_top, fvgTop)
+    array.push(activeBullFVG_bottom, fvgBottom)
+
+// Create new bearish FVG
+if bearishFVG
+    fvgTop = low[2]
+    fvgBottom = high
+    
+    // Create box with fixed width (3 candles)
+    fvgBox = box.new(bar_index - 2, fvgTop, bar_index + fvgWidth, fvgBottom, 
+                     border_color=color.new(color.red, 60), 
+                     bgcolor=color.new(color.red, fvgTransparency),
+                     border_width=1)
+    
+    array.push(activeBearFVG, fvgBox)
+    array.push(activeBearFVG_top, fvgTop)
+    array.push(activeBearFVG_bottom, fvgBottom)
+
+// Check and remove filled bullish FVGs
+if array.size(activeBullFVG) > 0
+    for i = array.size(activeBullFVG) - 1 to 0
+        fvgBottom = array.get(activeBullFVG_bottom, i)
+        fvgTop = array.get(activeBullFVG_top, i)
+        
+        // If price closes below the FVG bottom, gap is filled
+        if low <= fvgBottom
+            box.delete(array.get(activeBullFVG, i))
+            array.remove(activeBullFVG, i)
+            array.remove(activeBullFVG_top, i)
+            array.remove(activeBullFVG_bottom, i)
+
+// Check and remove filled bearish FVGs
+if array.size(activeBearFVG) > 0
+    for i = array.size(activeBearFVG) - 1 to 0
+        fvgTop = array.get(activeBearFVG_top, i)
+        fvgBottom = array.get(activeBearFVG_bottom, i)
+        
+        // If price closes above the FVG top, gap is filled
+        if high >= fvgTop
+            box.delete(array.get(activeBearFVG, i))
+            array.remove(activeBearFVG, i)
+            array.remove(activeBearFVG_top, i)
+            array.remove(activeBearFVG_bottom, i)
+
+// Limit total FVGs on chart (keep only last 5 of each)
+if array.size(activeBullFVG) > 5
+    box.delete(array.shift(activeBullFVG))
+    array.shift(activeBullFVG_top)
+    array.shift(activeBullFVG_bottom)
+
+if array.size(activeBearFVG) > 5
+    box.delete(array.shift(activeBearFVG))
+    array.shift(activeBearFVG_top)
+    array.shift(activeBearFVG_bottom)
+
+// ============================================================================
+// NEW: LIQUIDITY LEVELS (EXACT COPY from provided indicator)
+// ============================================================================
+
+var major_high_lines = array.new<line>()
+var major_low_lines = array.new<line>()
+var minor_high_lines = array.new<line>()
+var minor_low_lines = array.new<line>()
+
+clean_old_lines(line_array, max_count) =>
+    while array.size(line_array) >= max_count
+        old_line = array.shift(line_array)
+        line.delete(old_line)
+
+get_line_style(style_string) =>
+    switch style_string
+        "Solid" => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+create_liquidity_line(price, line_color, line_width, line_style, left_ext, right_ext) =>
+    line.new(x1=bar_index-left_ext, y1=price, x2=bar_index+right_ext, y2=price, 
+             color=line_color, width=line_width, style=get_line_style(line_style), extend=extend.right)
+
+if show_major
+    major_high = ta.pivothigh(high, major_length, major_length)
+    if not na(major_high)
+        clean_old_lines(major_high_lines, max_levels/4)
+        new_line = create_liquidity_line(major_high, major_high_color, major_line_width, major_line_style, major_line_left, major_line_right)
+        array.push(major_high_lines, new_line)
+
+if show_major
+    major_low = ta.pivotlow(low, major_length, major_length)
+    if not na(major_low)
+        clean_old_lines(major_low_lines, max_levels/4)
+        new_line = create_liquidity_line(major_low, major_low_color, major_line_width, major_line_style, major_line_left, major_line_right)
+        array.push(major_low_lines, new_line)
+
+if show_minor
+    minor_high = ta.pivothigh(high, minor_length, minor_length)
+    if not na(minor_high)
+        clean_old_lines(minor_high_lines, max_levels/4)
+        new_line = create_liquidity_line(minor_high, minor_high_color, minor_line_width, minor_line_style, minor_line_left, minor_line_right)
+        array.push(minor_high_lines, new_line)
+
+if show_minor
+    minor_low = ta.pivotlow(low, minor_length, minor_length)
+    if not na(minor_low)
+        clean_old_lines(minor_low_lines, max_levels/4)
+        new_line = create_liquidity_line(minor_low, minor_low_color, minor_line_width, minor_line_style, minor_line_left, minor_line_right)
+        array.push(minor_low_lines, new_line)
+
+check_liquidity_breaks() =>
+    if array.size(major_high_lines) > 0
+        for i = array.size(major_high_lines) - 1 to 0
+            line_obj = array.get(major_high_lines, i)
+            line_price = line.get_y1(line_obj)
+            if high > line_price
+                line.delete(line_obj)
+                array.remove(major_high_lines, i)
+    
+    if array.size(major_low_lines) > 0
+        for i = array.size(major_low_lines) - 1 to 0
+            line_obj = array.get(major_low_lines, i)
+            line_price = line.get_y1(line_obj)
+            if low < line_price
+                line.delete(line_obj)
+                array.remove(major_low_lines, i)
+    
+    if array.size(minor_high_lines) > 0
+        for i = array.size(minor_high_lines) - 1 to 0
+            line_obj = array.get(minor_high_lines, i)
+            line_price = line.get_y1(line_obj)
+            if high > line_price
+                line.delete(line_obj)
+                array.remove(minor_high_lines, i)
+    
+    if array.size(minor_low_lines) > 0
+        for i = array.size(minor_low_lines) - 1 to 0
+            line_obj = array.get(minor_low_lines, i)
+            line_price = line.get_y1(line_obj)
+            if low < line_price
+                line.delete(line_obj)
+                array.remove(minor_low_lines, i)
+
+check_liquidity_breaks()
+
+if barstate.islast
+    for line_obj in major_high_lines
+        line.set_x2(line_obj, bar_index + 20)
+    for line_obj in major_low_lines
+        line.set_x2(line_obj, bar_index + 20)
+    for line_obj in minor_high_lines
+        line.set_x2(line_obj, bar_index + 20)
+    for line_obj in minor_low_lines
+        line.set_x2(line_obj, bar_index + 20)
+
+isEqualHigh = array.size(major_high_lines) > 0
+isEqualLow = array.size(major_low_lines) > 0
+
+// ============================================================================
+// PLOTTING (ORIGINAL + NEW EMA)
+// ============================================================================
+
+// Plot EMAs
+plot(emaFast, "Fast EMA (9)", color=color.new(emaFastColor, 0), linewidth=2)
+plot(emaSlow, "Slow EMA (21)", color=color.new(emaSlowColor, 0), linewidth=2)
+plot(showTrendLine ? emaTrend : na, "Trend EMA (50)", color=color.new(emaTrendColor, 0), linewidth=2)
+plot(ema200, "200 EMA", color=color.new(ema200Color, 0), linewidth=3)  // NEW: 200 EMA
+
+// Plot Buy Signals (ORIGINAL)
+plotshape(strongBuy, "Strong Buy", shape.triangleup, location.belowbar, 
+          color=color.new(color.green, 0), size=size.normal, text="STRONG BUY")
+plotshape(buySignal and not strongBuy, "Buy", shape.triangleup, location.belowbar, 
+          color=color.new(color.lime, 30), size=size.small, text="BUY")
+
+// Plot Sell Signals (ORIGINAL)
+plotshape(strongSell, "Strong Sell", shape.triangledown, location.abovebar, 
+          color=color.new(color.red, 0), size=size.normal, text="STRONG SELL")
+plotshape(sellSignal and not strongSell, "Sell", shape.triangledown, location.abovebar, 
+          color=color.new(color.maroon, 30), size=size.small, text="SELL")
+
+// Background color based on trend (ORIGINAL)
+bgcolor(bullishTrend ? color.new(color.green, 95) : bearishTrend ? color.new(color.red, 95) : na)
+
+// ============================================================================
+// ALERTS (ORIGINAL)
+// ============================================================================
+
+alertcondition(strongBuy, "Strong Buy Signal", "Strong Buy Signal - High Volume Confirmation")
+alertcondition(buySignal, "Buy Signal", "Buy Signal Detected")
+alertcondition(strongSell, "Strong Sell Signal", "Strong Sell Signal - High Volume Confirmation")
+alertcondition(sellSignal, "Sell Signal", "Sell Signal Detected")
+
+// NEW ALERTS
+alertcondition(bullishFVG, "Bullish FVG", "Bullish Fair Value Gap Detected")
+alertcondition(bearishFVG, "Bearish FVG", "Bearish Fair Value Gap Detected")
+alertcondition(isEqualHigh and show_major, "Liquidity Above", "Major Liquidity Level Above Price")
+alertcondition(isEqualLow and show_major, "Liquidity Below", "Major Liquidity Level Below Price")
+
+// ============================================================================
+// INFO TABLE (ORIGINAL + UPDATES)
+// ============================================================================
+
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), 
+                                  frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Indicator", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Status", text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, bullishTrend ? "BULLISH" : bearishTrend ? "BEARISH" : "NEUTRAL", 
+               text_color=bullishTrend ? color.lime : bearishTrend ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "RSI", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(math.round(rsi, 2)), 
+               text_color=rsi > rsiOverbought ? color.red : rsi < rsiOversold ? color.lime : color.white, 
+               text_size=size.small)
+    
+    table.cell(infoTable, 0, 3, "Volume", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, volSpike ? "HIGH" : "NORMAL", 
+               text_color=volSpike ? color.yellow : color.white, text_size=size.small)
+    
+    // NEW: FVG Status
+    table.cell(infoTable, 0, 4, "FVG", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, bullishFVG ? "BULLISH" : bearishFVG ? "BEARISH" : "NONE", 
+               text_color=bullishFVG ? color.lime : bearishFVG ? color.red : color.gray, 
+               text_size=size.small)
+    
+    // NEW: Liquidity Count
+    table.cell(infoTable, 0, 5, "Liquidity", text_color=color.white, text_size=size.small)
+    liq_count = array.size(major_high_lines) + array.size(major_low_lines)
+    table.cell(infoTable, 1, 5, str.tostring(liq_count) + " Levels", 
+               text_color=color.yellow, text_size=size.small)
+    
+    table.cell(infoTable, 0, 6, "Signal", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, strongBuy ? "STRONG BUY" : buySignal ? "BUY" : 
+               strongSell ? "STRONG SELL" : sellSignal ? "SELL" : "NONE", 
+               text_color=strongBuy or buySignal ? color.lime : 
+               strongSell or sellSignal ? color.red : color.gray, text_size=size.small)

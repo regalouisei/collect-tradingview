@@ -1,0 +1,363 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("Machine Learning PSAR [BOSWaves]", overlay=true, max_labels_count=500)
+
+// ┌────────────────────────────── BOSWaves ─ Groups ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+GRP_PSAR   = "PSAR Settings"
+GRP_KMEANS = "K-Means Regime Detection"
+GRP_KNN    = "KNN Signal Validation"
+GRP_SMOOTH = "Smoothing Settings"
+GRP_VISUAL = "Visual Settings"
+
+
+// ┌────────────────────────────── BOSWaves ─ Tooltips ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+// ── PSAR ──
+const string tt_base_start     = "The initial Acceleration Factor value when a new trend begins. Lower values make the SAR start further from price, giving the trend more room before flipping."
+const string tt_base_increment = "How much the AF increases each time price makes a new extreme. Higher values cause the SAR to accelerate toward price more quickly as the trend matures."
+const string tt_base_max       = "The maximum value the AF can reach. Caps how tightly the SAR trails price, preventing it from becoming too sensitive during extended trends."
+
+// ── K-Means ──
+const string tt_use_kmeans          = "When enabled, the indicator classifies the market into choppy, neutral, or trending regimes and adjusts PSAR parameters accordingly. Disable to use fixed base AF values throughout."
+const string tt_training_period     = "How many bars of historical data the regime classifier looks back over to measure flip frequency. Longer periods give more stable regime readings but are slower to react to market changes."
+const string tt_choppy_threshold    = "Percentile of the flip-frequency range used as the choppy market centroid. At 0.75, a flip frequency in the upper 25% of its historical range is classified as choppy. Higher = harder to enter choppy regime."
+const string tt_trending_threshold  = "Percentile of the flip-frequency range used as the trending market centroid. At 0.25, a flip frequency in the lower 25% of its historical range is classified as trending. Lower = harder to enter trending regime."
+
+// ── KNN ──
+const string tt_use_knn        = "When enabled, each SAR flip is scored using K-Nearest Neighbors on historical flips. The score reflects how often similar past setups led to a successful reversal. Disable to treat all flips equally."
+const string tt_k_neighbors    = "How many of the closest historical matches to include when computing the confidence score. More neighbors = smoother, more stable scores. Fewer = more sensitive to individual historical examples."
+const string tt_knn_lookback   = "How far back (in bars) the KNN search scans for historical flip comparisons. Larger values give the model more examples to learn from but increase computation time."
+const string tt_min_confidence = "KNN confidence score threshold (0–100). Flips scoring below this value are treated as low-confidence — they still appear on the chart but are excluded from high-confidence alerts."
+
+// ── Smoothing ──
+const string tt_use_af_smoothing  = "Instead of incrementing the AF in discrete steps, this ramps it gradually using exponential smoothing. Produces a more fluid SAR line that is less prone to sudden jumps."
+const string tt_af_smooth_alpha   = "Controls how quickly the AF ramps toward its target on each bar. 1.0 = no smoothing (instant step). 0.01 = very gradual ramp. Has no effect if AF Smoothing is disabled."
+const string tt_use_kalman        = "Applies a Kalman filter to the SAR output to smooth the displayed dot positions. The filter snaps to the new SAR value on every flip so reversals are not delayed, then re-smooths from that point."
+const string tt_kalman_proc_noise = "Controls how much the Kalman filter trusts the SAR's own dynamics versus measurements. Higher values cause the filter to adapt faster to SAR changes, reducing smoothing lag."
+const string tt_kalman_meas_noise = "Controls how much the Kalman filter smooths the SAR line. Higher values apply more smoothing and make the line less responsive to each new SAR value. Lower values track the raw SAR more closely."
+const string tt_use_min_bars      = "Prevents SAR flips from occurring unless the current trend has lasted at least a minimum number of bars. Reduces whipsaws in fast, choppy markets."
+const string tt_min_flip_bars     = "The minimum number of bars a trend must run before a SAR flip is allowed. For example, 3 means the first two bars of a new trend are always protected from an immediate reversal."
+
+// ── Visual ──
+const string tt_bull_color             = "Color used for the SAR dots, fill, and labels when the trend is bullish (SAR below price)."
+const string tt_bear_color             = "Color used for the SAR dots, fill, and labels when the trend is bearish (SAR above price)."
+const string tt_show_confidence_labels = "Displays the KNN confidence percentage next to each flip label. Green = 70%+, Orange = 50–69%, Red = below 50%. Only visible when KNN Signal Scoring is enabled."
+const string tt_show_regime_labels     = "Displays the current market regime as a number on each bar: 3 = Trending, 2 = Neutral, 1 = Choppy. Useful for understanding how the K-Means system is classifying the market in real time."
+
+
+
+
+
+// ┌────────────────────────────── BOSWaves ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+base_start     = input.float(0.02, "Base AF Start",     minval=0.001, step=0.001, group=GRP_PSAR, tooltip=tt_base_start)
+base_increment = input.float(0.02, "Base AF Increment", minval=0.001, step=0.001, group=GRP_PSAR, tooltip=tt_base_increment)
+base_max       = input.float(0.1,  "Base AF Maximum",   step=0.01,                group=GRP_PSAR, tooltip=tt_base_max)
+
+use_kmeans         = input.bool(true,  "Enable K-Means Adaptation",  group=GRP_KMEANS, tooltip=tt_use_kmeans)
+training_period    = input.int(100,    "Training Data Period",        minval=20, maxval=500, group=GRP_KMEANS, tooltip=tt_training_period)
+choppy_threshold   = input.float(0.75, "Choppy Regime Percentile",   maxval=1,              group=GRP_KMEANS, tooltip=tt_choppy_threshold)
+trending_threshold = input.float(0.25, "Trending Regime Percentile", maxval=1,              group=GRP_KMEANS, tooltip=tt_trending_threshold)
+
+use_knn        = input.bool(true,  "Enable KNN Signal Scoring",  group=GRP_KNN, tooltip=tt_use_knn)
+k_neighbors    = input.int(8,      "K - Number of Neighbors",    minval=1, maxval=50,  group=GRP_KNN, tooltip=tt_k_neighbors)
+knn_lookback   = input.int(200,    "Historical Lookback Period", minval=50, maxval=500, group=GRP_KNN, tooltip=tt_knn_lookback)
+min_confidence = input.float(15.0, "Minimum Confidence Filter",  minval=0, maxval=100,  group=GRP_KNN, tooltip=tt_min_confidence)
+
+use_af_smoothing         = input.bool(true,  "Enable AF Smoothing",                    group=GRP_SMOOTH, tooltip=tt_use_af_smoothing)
+af_smooth_alpha          = input.float(0.01, "AF Smoothing Factor (lower = smoother)", minval=0.01, step=0.05, group=GRP_SMOOTH, tooltip=tt_af_smooth_alpha)
+use_kalman               = input.bool(true,  "Enable Kalman Filter",                   group=GRP_SMOOTH, tooltip=tt_use_kalman)
+kalman_process_noise     = input.float(0.015, "Kalman Process Noise",                  minval=0.001, maxval=0.5,  step=0.005, group=GRP_SMOOTH, tooltip=tt_kalman_proc_noise)
+kalman_measurement_noise = input.float(0.5,   "Kalman Measurement Noise",              minval=0.01,  maxval=5.0,  step=0.1,   group=GRP_SMOOTH, tooltip=tt_kalman_meas_noise)
+use_min_bars             = input.bool(true,  "Enable Minimum Bars Filter",             group=GRP_SMOOTH, tooltip=tt_use_min_bars)
+min_flip_bars            = input.int(3,      "Minimum Bars Before Flip",               minval=1, maxval=20, group=GRP_SMOOTH, tooltip=tt_min_flip_bars)
+
+bull_color             = input.color(#00C8FF, "Bullish",                group=GRP_VISUAL, inline="col", tooltip=tt_bull_color)
+bear_color             = input.color(#FF005D, "Bearish",                group=GRP_VISUAL, inline="col", tooltip=tt_bear_color)
+show_confidence_labels = input.bool(true,     "Show Confidence Scores", group=GRP_VISUAL, tooltip=tt_show_confidence_labels)
+show_regime_labels     = input.bool(true,     "Show Regime Numbers",    group=GRP_VISUAL, tooltip=tt_show_regime_labels)
+
+
+
+
+
+// ┌────────────────────────────── BOSWaves ─ Variables ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+var float sar               = na
+var float af                = na
+var float ep                = na
+var int   trend             = 1
+var int   bars_since_flip   = 0
+var float af_at_last_flip   = 0.0
+var int   last_trend_duration = 0
+var int   current_trend_bars = 0
+var float ep_progress       = 0.0
+var float flip_ep           = na
+var int   recent_flips      = 0
+var float signal_confidence = 50.0
+
+// ── Kalman State Variables ──
+var float kalman_estimate = na
+var float kalman_error    = 1.0
+
+// ┌────────────────────────────── BOSWaves ─ Initialization ─────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if na(sar)
+    sar               := high[1]
+    af                := base_start
+    ep                := low
+    trend             := -1
+    bars_since_flip   := 0
+    current_trend_bars := 0
+
+bool raw_bull_flip = false
+bool raw_bear_flip = false
+
+current_trend_bars += 1
+bars_since_flip    += 1
+
+// ┌────────────────────────────── BOSWaves ─ PSAR Calculation ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if trend == 1
+    if high > ep
+        ep_progress := (high - flip_ep) / nz(ta.atr(14), high - low)
+        ep          := high
+        float target_af = math.min(af + base_increment, base_max)
+        af := use_af_smoothing ? af + af_smooth_alpha * (target_af - af) : target_af
+    sar := sar + af * (ep - sar)
+    sar := math.min(sar, low[1])
+    if bar_index > 1
+        sar := math.min(sar, low[2])
+    if close < sar
+        bool allow_flip = not use_min_bars or current_trend_bars >= min_flip_bars
+        if allow_flip
+            raw_bear_flip       := true
+            last_trend_duration := current_trend_bars
+            af_at_last_flip     := af
+            trend               := -1
+            sar                 := ep
+            flip_ep             := ep
+            ep                  := low
+            af                  := base_start
+            current_trend_bars  := 0
+            bars_since_flip     := 0
+            ep_progress         := 0.0
+            recent_flips        += 1
+else
+    if low < ep
+        ep_progress := (flip_ep - low) / nz(ta.atr(14), high - low)
+        ep          := low
+        float target_af = math.min(af + base_increment, base_max)
+        af := use_af_smoothing ? af + af_smooth_alpha * (target_af - af) : target_af
+    sar := sar - af * (sar - ep)
+    sar := math.max(sar, high[1])
+    if bar_index > 1
+        sar := math.max(sar, high[2])
+    if close > sar
+        bool allow_flip = not use_min_bars or current_trend_bars >= min_flip_bars
+        if allow_flip
+            raw_bull_flip       := true
+            last_trend_duration := current_trend_bars
+            af_at_last_flip     := af
+            trend               := 1
+            sar                 := ep
+            flip_ep             := ep
+            ep                  := high
+            af                  := base_start
+            current_trend_bars  := 0
+            bars_since_flip     := 0
+            ep_progress         := 0.0
+            recent_flips        += 1
+
+// ┌────────────────────────────── BOSWaves ─ Kalman Filter ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if na(kalman_estimate)
+    kalman_estimate := sar
+    kalman_error    := 1.0
+
+if use_kalman
+    if raw_bull_flip or raw_bear_flip
+        kalman_estimate := sar
+        kalman_error    := 1.0
+    else
+        float kalman_gain = kalman_error / (kalman_error + kalman_measurement_noise)
+        kalman_estimate  := kalman_estimate + kalman_gain * (sar - kalman_estimate)
+        kalman_error     := (1.0 - kalman_gain) * kalman_error + kalman_process_noise
+
+float display_sar = use_kalman ? kalman_estimate : sar
+
+// ┌────────────────────────────── BOSWaves ─ K-Means Regime Detection ───────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+bool had_flip_long_ago = (raw_bull_flip[training_period] or raw_bear_flip[training_period])
+if had_flip_long_ago
+    recent_flips -= 1
+recent_flips := math.max(0, recent_flips)
+
+float flip_frequency = recent_flips / training_period * 100
+float ff_upper       = ta.highest(flip_frequency, training_period)
+float ff_lower       = ta.lowest(flip_frequency, training_period)
+
+float choppy_centroid   = ff_lower + (ff_upper - ff_lower) * choppy_threshold
+float neutral_centroid  = ff_lower + (ff_upper - ff_lower) * 0.5
+float trending_centroid = ff_lower + (ff_upper - ff_lower) * trending_threshold
+
+float dist_to_choppy   = math.abs(flip_frequency - choppy_centroid)
+float dist_to_neutral  = math.abs(flip_frequency - neutral_centroid)
+float dist_to_trending = math.abs(flip_frequency - trending_centroid)
+
+int market_regime = dist_to_choppy < dist_to_neutral and dist_to_choppy < dist_to_trending ? 0 : dist_to_trending < dist_to_choppy and dist_to_trending < dist_to_neutral ? 2 : 1
+
+// ┌────────────────────────────── BOSWaves ─ Adaptive Parameters ────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+float adaptive_start     = use_kmeans ? (market_regime == 0 ? base_start * 0.5 : market_regime == 2 ? base_start * 1.5 : base_start) : base_start
+float adaptive_increment = use_kmeans ? (market_regime == 0 ? base_increment * 0.4 : market_regime == 2 ? base_increment * 1.4 : base_increment) : base_increment
+float adaptive_max       = use_kmeans ? (market_regime == 0 ? base_max * 0.6 : market_regime == 2 ? base_max * 1.3 : base_max) : base_max
+
+if use_kmeans
+    af := math.min(af, adaptive_max)
+
+// ┌────────────────────────────── BOSWaves ─ KNN Signal Validation ──────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+if use_knn and (raw_bull_flip or raw_bear_flip)
+    float f1 = bars_since_flip[1] / 50.0
+    float f2 = last_trend_duration / 50.0
+    float f3 = af_at_last_flip / base_max
+    float f4 = flip_frequency / 10.0
+    float f5 = math.min(ep_progress[1], 5.0) / 5.0
+
+    var distances = array.new_float()
+    var outcomes  = array.new_float()
+    distances.clear()
+    outcomes.clear()
+
+    for i = 10 to knn_lookback
+        if i < bar_index
+            bool hist_bull_flip = trend[i] == 1 and trend[i + 1] == -1
+            bool hist_bear_flip = trend[i] == -1 and trend[i + 1] == 1
+
+            if (raw_bull_flip and hist_bull_flip) or (raw_bear_flip and hist_bear_flip)
+                float h1 = bars_since_flip[i + 1] / 50.0
+                float h2 = last_trend_duration[i] / 50.0
+                float h3 = af_at_last_flip[i] / base_max
+                float h4 = flip_frequency[i] / 10.0
+                float h5 = math.min(ep_progress[i + 1], 5.0) / 5.0
+
+                float dist = math.sqrt(math.pow(f1 - h1, 2) + math.pow(f2 - h2, 2) + math.pow(f3 - h3, 2) + math.pow(f4 - h4, 2) + math.pow(f5 - h5, 2))
+
+                float outcome = 0.0
+                if i > 10
+                    float price_change = (close[i - 5] - close[i]) / close[i]
+                    if raw_bull_flip and hist_bull_flip
+                        outcome := price_change > 0.001 ? 1.0 : 0.0
+                    else if raw_bear_flip and hist_bear_flip
+                        outcome := price_change < -0.001 ? 1.0 : 0.0
+
+                distances.push(dist)
+                outcomes.push(outcome)
+
+    int n = distances.size()
+    if n > 1
+        for i = 0 to math.min(k_neighbors, n - 1) - 1
+            int   min_idx = i
+            float min_val = distances.get(i)
+            for j = i + 1 to n - 1
+                if distances.get(j) < min_val
+                    min_val := distances.get(j)
+                    min_idx := j
+            if min_idx != i
+                float temp_dist = distances.get(i)
+                float temp_out  = outcomes.get(i)
+                distances.set(i, distances.get(min_idx))
+                outcomes.set(i, outcomes.get(min_idx))
+                distances.set(min_idx, temp_dist)
+                outcomes.set(min_idx, temp_out)
+
+        float weighted_success = 0.0
+        float total_weight     = 0.0
+        int   effective_k      = math.min(k_neighbors, n)
+
+        for i = 0 to effective_k - 1
+            float dist   = distances.get(i)
+            float weight = dist < 0.0001 ? 100.0 : 1.0 / dist
+            weighted_success += outcomes.get(i) * weight
+            total_weight     += weight
+
+        if total_weight > 0
+            signal_confidence := (weighted_success / total_weight) * 100
+
+// ┌────────────────────────────── BOSWaves ─ Signal Logic ───────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+bool bullish_flip = raw_bull_flip
+bool bearish_flip = raw_bear_flip
+
+bool high_conf_bull = bullish_flip and (not use_knn or signal_confidence >= min_confidence)
+bool high_conf_bear = bearish_flip and (not use_knn or signal_confidence >= min_confidence)
+bool low_conf_bull  = bullish_flip and use_knn and signal_confidence < min_confidence
+bool low_conf_bear  = bearish_flip and use_knn and signal_confidence < min_confidence
+
+// ┌────────────────────────────── BOSWaves ─ Plotting ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+color sar_color = trend == 1 ? bull_color : bear_color
+
+plot(display_sar, "Machine Learning PSAR", sar_color, style=plot.style_circles, linewidth=2)
+
+p_sar   = plot(display_sar, "SAR", color=sar_color, style=plot.style_circles, linewidth=2)
+p_price = plot(trend == 1 ? low : high, "Price Anchor", color=color.new(sar_color, 100), display=display.none)
+
+int conf_transp = int(90 - signal_confidence * 0.6)
+color conf_color = color.new(sar_color, conf_transp)
+
+fill(p_sar, p_price,
+     trend == 1 ? low : display_sar,
+     trend == 1 ? display_sar : high,
+     color.new(sar_color, conf_transp + 30),
+     conf_color,
+     title="Confidence Fill")
+
+
+
+
+
+// ┌────────────────────────────── BOSWaves ─ Labels ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+
+
+// ── Confidence Score Labels ──
+if show_confidence_labels and use_knn and (bullish_flip or bearish_flip)
+    string conf_text      = str.tostring(math.round(signal_confidence)) + "%"
+    color  conf_lbl_color = signal_confidence >= 70 ? #00ff88 : signal_confidence >= 50 ? #ffaa00 : #ff4444
+    label.new(bar_index, trend == 1 ? display_sar - ta.atr(14) * 0.8 : display_sar + ta.atr(14) * 0.8, conf_text,
+         style=label.style_none, textcolor=conf_lbl_color, size=size.normal)
+
+// ── Regime Number Labels ──
+if show_regime_labels and bar_index % 2 == 0
+    string regime_text  = str.tostring(3 - market_regime)
+    color  regime_color = color.from_gradient(market_regime + 1, 1, 3, color.new(sar_color, 20), color.new(sar_color, 80))
+    label.new(bar_index, trend == 1 ? display_sar - ta.atr(14) * 1.5 : display_sar + ta.atr(14) * 1.5, regime_text,
+         style=label.style_none, textcolor=regime_color, size=size.normal)
+
+// ┌────────────────────────────── BOSWaves ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+alertcondition(high_conf_bull and barstate.isconfirmed, "ML PSAR Buy",          "ML PSAR Buy Signal {{ticker}} {{interval}}")
+alertcondition(high_conf_bear and barstate.isconfirmed, "ML PSAR Sell",         "ML PSAR Sell Signal {{ticker}} {{interval}}")
+alertcondition(bullish_flip and signal_confidence >= 70 and barstate.isconfirmed, "High Confidence Buy",  "High confidence ML PSAR Buy {{ticker}} {{interval}}")
+alertcondition(bearish_flip and signal_confidence >= 70 and barstate.isconfirmed, "High Confidence Sell", "High confidence ML PSAR Sell {{ticker}} {{interval}}")
+alertcondition(market_regime == 0 and market_regime[1] != 0 and barstate.isconfirmed, "Choppy Market",   "Entered choppy market regime {{ticker}} {{interval}}")
+alertcondition(market_regime == 2 and market_regime[1] != 2 and barstate.isconfirmed, "Trending Market", "Entered trending market regime {{ticker}} {{interval}}")

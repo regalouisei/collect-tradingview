@@ -1,0 +1,124 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator("Kalman Hull Trend Score [BackQuant]", overlay=false)
+
+// Constants
+const string calc   = "Core Calculation Settings"
+const string thres  = "Signals Settings"
+const string ui     = "Plotting and Coloring"
+const color  GREEN  = #00ff00
+const color  RED    = #ff0000
+
+// User Inputs
+float pricesource       = input.source(close, "Kalman Price Source", group = calc)
+float measurementNoise  = input.float(3.0, title="Measurement Noise", group = calc, tooltip = "Lookback Period/ Calculation Length", step = 1.0)
+float processNoise      = input.float(0.01, title="Process Noise", step = 0.01, group = calc)
+
+bool  show_refs         = input.bool(true, "Show Reference Lines", group=thres)
+bool  showls            = input.bool(true, "Show Long and Short Signals On Chart?", group=thres)
+int   thresL            = input.int(40, "Long Threshold", group=thres, inline="t")
+int   thresS            = input.int(-10, "Short Threshold", group=thres, inline="t")
+
+color longcol           = input.color(GREEN, "Long Color", group=ui)
+color shortcol          = input.color(RED, "Short Color", group=ui)
+int   lineW             = input.int(5, "Line Width", group=ui)
+bool  showkh            = input.bool(true, "Show Kalman Hull Filter", group=ui)
+bool  paintCandles      = input.bool(true, "Paint Candles to Trend?", group=ui)
+bool  bgCol             = input.bool(false, "Background Color?", group=ui)
+
+method transp(color x, int t) =>
+    color.new(x, t)
+
+N = 5
+var float[] stateEstimate = array.new_float(N, na)
+var float[] errorCovariance = array.new_float(N, 100.0)
+f_init(series float pricesource) =>
+    if na(array.get(stateEstimate, 0))
+        for i = 0 to N-1
+            array.set(stateEstimate, i, pricesource)
+            array.set(errorCovariance, i, 1.0)
+
+f_kalman(series float pricesource, float measurementNoise) =>
+    // Prediction Step
+    predictedStateEstimate = array.new_float(N)
+    predictedErrorCovariance = array.new_float(N)
+    for i = 0 to N-1
+        array.set(predictedStateEstimate, i, array.get(stateEstimate, i)) // Simplified prediction
+        array.set(predictedErrorCovariance, i, array.get(errorCovariance, i) + processNoise)
+    
+    kalmanGain = array.new_float(N)
+    for i = 0 to N-1
+        kg = array.get(predictedErrorCovariance, i) / (array.get(predictedErrorCovariance, i) + measurementNoise)
+        array.set(kalmanGain, i, kg)
+        array.set(stateEstimate, i, array.get(predictedStateEstimate, i) + kg * (pricesource - array.get(predictedStateEstimate, i)))
+        array.set(errorCovariance, i, (1 - kg) * array.get(predictedErrorCovariance, i))
+    
+    array.get(stateEstimate, 0)
+
+f_init(pricesource)
+kalmanFilteredPrice = f_kalman(pricesource, measurementNoise)
+
+// Hull Moving Average Function with Kalman instead of Weighted Moving Average
+THMA(_src, _length) =>  
+    f_kalman(
+         f_kalman(
+             _src,
+             _length / 3
+             ) * 3 - f_kalman(
+                 _src, 
+                 _length / 2
+                 ) - f_kalman(
+                     _src, 
+                     _length
+                     ), _length)
+
+// Return
+kalmanHMA = THMA(pricesource, measurementNoise)
+
+float scoreS = 0.0
+for i = 1 to 45 by 1
+    scoreS += (kalmanHMA > kalmanHMA[i] ? 1 : -1)
+
+// Conditions + state
+longCond  = scoreS > thresL
+shortCond = ta.crossunder(scoreS, thresS)
+
+var int signal = 1
+var color coloring = na
+
+if longCond and not shortCond
+    signal := 1
+    coloring := longcol
+else if shortCond
+    signal := -1
+    coloring := shortcol
+else
+    coloring := nz(coloring[1], chart.fg_color)
+
+// Plots
+plot(scoreS, "Kalman Hull Trend Score", coloring, lineW)
+plot(kalmanHMA, "Kalman Hull", coloring, 3, force_overlay = true, display = showkh?display.all:display.none)
+
+if barstate.islast and show_refs
+    line.new(x1=last_bar_index, x2=bar_index - 1, y1=thresL, y2=thresL, color=chart.fg_color.transp(50), style=line.style_dashed, extend=extend.right)
+    line.new(x1=last_bar_index, x2=bar_index - 1, y1=thresS, y2=thresS, color=chart.fg_color.transp(50), style=line.style_dashed, extend=extend.right)
+
+// Candles + background
+plotcandle(open, high, low, close, "Trend Candles",
+     coloring, coloring, true, bordercolor=coloring,
+     display=paintCandles ? display.all : display.none, force_overlay=true)
+
+bgcolor(bgCol ? coloring.transp(80) : na, force_overlay=true)
+
+// Signals
+plotshape(signal == 1 and signal[1] == -1, "Long Signal", shape.triangleup, location.belowbar, longcol, 0, "𝕃", longcol, true, size.small,
+     display=showls ? display.all : display.none, force_overlay=true)
+
+plotshape(signal == -1 and signal[1] == 1, "Short Signal", shape.triangledown, location.abovebar, shortcol, 0, "𝕊", shortcol, true, size.small,
+     display=showls ? display.all : display.none, force_overlay=true)
+
+alertcondition(signal == 1 and signal[1] == -1, title="KHull Trend Score Long", message="KHull Trend Score Long - {{ticker}} - {{interval}}")
+alertcondition(signal == -1 and signal[1] == 1, title="KHull Trend Score Short",message="KHull Trend Score Short - {{ticker}} - {{interval}}")
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////

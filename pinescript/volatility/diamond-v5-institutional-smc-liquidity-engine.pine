@@ -1,0 +1,727 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  Diamond V7.01: Institutional Execution Model [DiamondQuantX Algo]  ║
+// ║  Engine: Leg-Based PD Array | Best-Candidate Sweep | FVG Logic   ║
+// ║  Status: 100% FIXED & COMPILE READY (Line Breaks Resolved)       ║
+// ╚══════════════════════════════════════════════════════════════════╝
+indicator("Diamond V70.1 : Institutional Execution Model", overlay=true, max_bars_back=500)
+
+// ════════════════════════════════════════════════════════════════════
+// 1. AUTO MARKET DETECTION
+// ════════════════════════════════════════════════════════════════════
+sym        = syminfo.ticker
+is_gold    = str.contains(sym, "XAU") or str.contains(sym, "GOLD") or str.contains(sym, "GC")
+is_idx_nq  = str.contains(sym, "NQ")  or str.contains(sym, "MNQ") or str.contains(sym, "US100")
+is_idx_sp  = str.contains(sym, "SPX") or str.contains(sym, "SP500") or str.contains(sym, "ES")
+is_idx_dj  = str.contains(sym, "DJ")  or str.contains(sym, "YM")
+is_idx_eu  = str.contains(sym, "DAX") or str.contains(sym, "GER") or str.contains(sym, "UK100")
+is_indices = is_idx_nq or is_idx_sp or is_idx_dj or is_idx_eu
+
+// ════════════════════════════════════════════════════════════════════
+// 2. INPUTS
+// ════════════════════════════════════════════════════════════════════
+grp_mkt     = "Market Context"
+grp_struct  = "Institutional Structure (Leg-Based)"
+grp_exec    = "Execution Engine"
+grp_flt     = "Alpha Filters"
+grp_tg      = "Telegram Bridge"
+grp_vis     = "Visuals"
+
+// Market
+market_override = input.string("Auto",  "Market Type",       options=["Auto","Forex","Gold","Indices"], group=grp_mkt)
+htf_period      = input.timeframe("240","HTF Bias",          group=grp_mkt)
+htf_aggressive  = input.bool(false,     "Aggressive Bias",   group=grp_mkt, tooltip="If true, uses current HTF bar (Repaint Risk). Keep false for automation.")
+
+// Structure
+show_structure  = input.bool(true,  "Show Structure Map",        group=grp_struct)
+swing_left      = input.int(5,      "Structure Left Bars",       minval=2, group=grp_struct)
+swing_right     = input.int(3,      "Structure Right Bars",      minval=1, group=grp_struct)
+bos_confirm     = input.string("Body Close", "BOS Validation", options=["Body Close","Wick"], group=grp_struct)
+use_pd_filter   = input.bool(true,  "Institutional PD Filter",   group=grp_struct, tooltip="Restricts Buy to Discount and Sell to Premium of the current dealing range.")
+ema_len         = input.int(50,     "Trend Baseline (HTF Bias)", minval=10, group=grp_struct)
+slope_bars      = input.int(5,      "Momentum Lookback",         minval=1,  group=grp_struct)
+min_slope_atr   = input.float(0.1,  "Min Momentum (ATR)",        step=0.05, group=grp_struct)
+
+// Execution
+sweep_lookback  = input.int(3,    "Liquidity Pool Depth",     minval=1, maxval=10, group=grp_exec, tooltip="Scans this many previous swings for the BEST liquidity pool.")
+cluster_tol     = input.float(0.1,"Cluster Tolerance (ATR)",  step=0.05, group=grp_exec)
+atr_len         = input.int(14,   "ATR Volatility",           minval=1,  group=grp_exec)
+body_filter     = input.bool(true, "Wick-Only Sweep",          group=grp_exec)
+use_fvg         = input.bool(true, "FVG Confluence",           group=grp_exec)
+fvg_min_size    = input.float(0.05,"Min FVG Size (ATR)",       step=0.01, group=grp_exec)
+confirm_win     = input.int(5,    "Confirmation Window",      minval=1, group=grp_exec)
+disp_body_in    = input.float(0.6,"Displacement Strength",    step=0.05, group=grp_exec)
+sl_buffer       = input.float(0.5,"SL Buffer (ATR)",           step=0.1,  group=grp_exec)
+tp_rr           = input.float(2.0,"Reward/Risk Ratio",         step=0.5,  group=grp_exec)
+reentry_filt    = input.int(5,    "Re-entry Block (Bars)",     minval=0,  group=grp_exec)
+
+// Filters
+use_vol         = input.bool(true, "Volume Injection",         group=grp_flt)
+vol_len         = input.int(20,    "Volume MA",                minval=5,  group=grp_flt)
+use_rsi         = input.bool(true, "RSI Momentum Div",         group=grp_flt)
+rsi_lb          = input.int(14,    "RSI Period",               minval=3,  group=grp_flt)
+use_session     = input.bool(true, "Session Timing",           group=grp_flt)
+min_score       = input.int(5,     "Min Alpha Score",          minval=0, maxval=15, group=grp_flt)
+
+// Telegram
+tg_token        = input.string("", "Bot Token",  group=grp_tg)
+tg_id           = input.string("", "Chat ID",    group=grp_tg)
+tg_mode         = input.string("JSON (Bridge)", "Format", options=["JSON (Bridge)","Plain Text"], group=grp_tg, tooltip="Use JSON for the Google Apps Script Bridge we built.")
+tg_test         = input.bool(false, "🚨 Test Alert", group=grp_tg)
+
+// Visuals
+theme           = input.string("Institutional", "Theme",       options=["Institutional","Classic"], group=grp_vis)
+minimal_mode    = input.bool(false, "Minimal Mode",            group=grp_vis)
+show_dashboard  = input.bool(true,  "Show Console",            group=grp_vis)
+dash_pos_inp    = input.string("Top Right", "Console Pos",   options=["Top Right","Bottom Right","Top Left"], group=grp_vis)
+dash_size       = input.string("Normal",    "Console Size", options=["Small","Normal","Large"], group=grp_vis)
+show_ema        = input.bool(true,  "Show Trendline",          group=grp_vis)
+show_sl         = input.bool(true,  "Show Execution Lines",    group=grp_vis)
+show_tp         = input.bool(true,  "Show Targets",            group=grp_vis)
+show_fvg_box    = input.bool(true,  "Show Imbalance Box",      group=grp_vis)
+
+// ════════════════════════════════════════════════════════════════════
+// 3. ADAPTIVE PARAMETERS
+// ════════════════════════════════════════════════════════════════════
+bool mrkt_gold    = market_override == "Gold"    or (market_override == "Auto" and is_gold)
+bool mrkt_indices = market_override == "Indices" or (market_override == "Auto" and is_indices)
+bool mrkt_forex   = market_override == "Forex"   or (market_override == "Auto" and not mrkt_gold and not mrkt_indices)
+
+market_name = mrkt_gold ? "GOLD" : mrkt_indices ? "INDEX" : "FOREX"
+
+float sweep_tol_val   = mrkt_gold ? 0.8  : mrkt_indices ? 1.0  : 0.5
+float wick_ratio_val  = mrkt_gold ? 0.12 : mrkt_indices ? 0.10 : 0.15
+float disp_body_val   = mrkt_gold ? 0.65 : mrkt_indices ? 0.70 : disp_body_in
+float vol_mult_val    = mrkt_gold ? 1.3  : mrkt_indices ? 1.4  : 1.2
+int   confirm_win_val = mrkt_gold ? 6    : mrkt_indices ? 4    : confirm_win
+
+c_bull = theme == "Institutional" ? color.rgb(0, 160, 160) : color.lime
+c_bear = theme == "Institutional" ? color.rgb(180, 30, 30) : color.red
+c_neut = color.gray
+c_text = color.white
+c_hdr  = mrkt_gold ? color.rgb(120, 80, 0) : mrkt_indices ? color.rgb(20, 60, 120) : color.rgb(20, 80, 60)
+
+// ════════════════════════════════════════════════════════════════════
+// 4. CORE UTILITIES
+// ════════════════════════════════════════════════════════════════════
+f_safe_div(float n, float d, float v) => d == 0.0 ? v : n / d
+
+atr     = ta.atr(atr_len)
+vol_avg = ta.sma(volume, vol_len)
+ema_val = ta.ema(close, ema_len)
+rsi_val = ta.rsi(close, rsi_lb)
+
+f_killzone() =>
+    in_ldn = not na(time("", "0200-0500", "America/New_York"))
+    in_ny  = not na(time("", "0800-1100", "America/New_York"))
+    in_pre = not na(time("", "0700-0930", "America/New_York"))
+    bool res = false
+    if mrkt_indices
+        res := in_ny or in_pre
+    else
+        res := in_ny or in_ldn
+    res
+
+f_sess_name() =>
+    in_ldn = not na(time("", "0200-0500", "America/New_York"))
+    in_ny  = not na(time("", "0800-1100", "America/New_York"))
+    in_pre = not na(time("", "0700-0930", "America/New_York"))
+    string s = "Off-Hours"
+    if in_ldn
+        s := "London"
+    else if in_ny
+        s := "New York"
+    else if in_pre
+        s := "Pre-Market"
+    s
+
+f_day_qual() =>
+    int d = dayofweek(time)
+    bool res = false
+    if mrkt_indices
+        res := d >= dayofweek.monday and d <= dayofweek.thursday
+    else
+        res := d >= dayofweek.tuesday and d <= dayofweek.thursday
+    res
+
+// ════════════════════════════════════════════════════════════════════
+// 5. HTF TREND (NO REPAINT)
+// ════════════════════════════════════════════════════════════════════
+f_htf_trend() =>
+    int   shift  = htf_aggressive ? 0 : 1
+    lkd          = htf_aggressive ? barmerge.lookahead_on : barmerge.lookahead_off
+    float src    = close[shift]
+    htf_c   = request.security(syminfo.tickerid, htf_period, src,                              lookahead=lkd, gaps=barmerge.gaps_off)
+    htf_e   = request.security(syminfo.tickerid, htf_period, ta.ema(src, ema_len),             lookahead=lkd, gaps=barmerge.gaps_off)
+    htf_ep  = request.security(syminfo.tickerid, htf_period, ta.ema(src, ema_len)[slope_bars], lookahead=lkd, gaps=barmerge.gaps_off)
+    htf_atr = request.security(syminfo.tickerid, htf_period, ta.atr(14)[shift],                lookahead=lkd, gaps=barmerge.gaps_off)
+    float slope = f_safe_div(htf_e - htf_ep, htf_atr, 0.0)
+    int dir = 0
+    if htf_c > htf_e and slope > min_slope_atr
+        dir := 1
+    else if htf_c < htf_e and slope < -min_slope_atr
+        dir := -1
+    dir
+
+// ════════════════════════════════════════════════════════════════════
+// 6. FVG DETECTION
+// ════════════════════════════════════════════════════════════════════
+f_get_fvg(bool is_bull, int offset) =>
+    float top    = na
+    float bot    = na
+    bool  ok     = false
+    float min_g = atr * fvg_min_size
+    
+    float h_curr = high[offset]
+    float l_curr = low[offset]
+    float h_prev2 = high[offset + 2]
+    float l_prev2 = low[offset + 2]
+    float c_curr = close[offset]
+    float o_curr = open[offset]
+
+    if is_bull
+        float gap = l_curr - h_prev2
+        if gap > min_g and c_curr > o_curr
+            ok  := true
+            top := l_curr
+            bot := h_prev2
+    else
+        float gap = l_prev2 - h_curr
+        if gap > min_g and c_curr < o_curr
+            ok  := true
+            top := l_prev2
+            bot := h_curr
+    [ok, top, bot]
+
+// ════════════════════════════════════════════════════════════════════
+// 7. STRUCTURE ENGINE
+// ════════════════════════════════════════════════════════════════════
+var float[] sw_h_p = array.new_float(0)
+var int[]   sw_h_i = array.new_int(0)
+var float[] sw_l_p = array.new_float(0)
+var int[]   sw_l_i = array.new_int(0)
+
+ph = ta.pivothigh(swing_left, swing_right)
+pl = ta.pivotlow(swing_left, swing_right)
+
+if not na(ph)
+    array.unshift(sw_h_p, ph), array.unshift(sw_h_i, bar_index[swing_right])
+    if array.size(sw_h_p) > 10 
+        array.pop(sw_h_p), array.pop(sw_h_i)
+
+if not na(pl)
+    array.unshift(sw_l_p, pl), array.unshift(sw_l_i, bar_index[swing_right])
+    if array.size(sw_l_p) > 10 
+        array.pop(sw_l_p), array.pop(sw_l_i)
+
+var int   struct_state  = 0
+var float prot_lvl      = na
+var float targ_lvl      = na
+var float rng_high      = na
+var float rng_low       = na
+
+// FIX: Pure Price Action Init (No EMA Wait)
+if struct_state == 0 and array.size(sw_h_p) > 0 and array.size(sw_l_p) > 0
+    float last_h = array.get(sw_h_p, 0)
+    float last_l = array.get(sw_l_p, 0)
+    if close > last_h
+        struct_state := 1
+        prot_lvl := last_l
+        targ_lvl := high
+        rng_high := high
+        rng_low := last_l
+    else if close < last_l
+        struct_state := -1
+        prot_lvl := last_h
+        targ_lvl := low
+        rng_high := last_h
+        rng_low := low
+    else
+        struct_state := close > open ? 1 : -1
+        prot_lvl := struct_state==1 ? last_l : last_h
+        targ_lvl := struct_state==1 ? last_h : last_l
+        rng_high := last_h
+        rng_low := last_l
+
+bool is_break_up = bos_confirm == "Body Close" ? close > targ_lvl : high > targ_lvl
+bool is_break_dn = bos_confirm == "Body Close" ? close < targ_lvl : low  < targ_lvl
+bool is_choch_up = bos_confirm == "Body Close" ? close > prot_lvl : high > prot_lvl
+bool is_choch_dn = bos_confirm == "Body Close" ? close < prot_lvl : low  < prot_lvl
+
+string evt_txt = ""
+
+if struct_state == 1
+    if not na(targ_lvl) and is_break_up
+        prot_lvl := array.size(sw_l_p) > 0 ? array.get(sw_l_p, 0) : prot_lvl
+        targ_lvl := na
+        rng_low  := prot_lvl 
+        rng_high := high
+        evt_txt  := "BOS"
+    else if not na(prot_lvl) and is_choch_dn
+        struct_state := -1
+        targ_lvl     := prot_lvl
+        prot_lvl     := array.size(sw_h_p) > 0 ? array.get(sw_h_p, 0) : high
+        rng_high     := prot_lvl
+        rng_low      := low
+        evt_txt      := "CHoCH"
+else if struct_state == -1
+    if not na(targ_lvl) and is_break_dn
+        prot_lvl := array.size(sw_h_p) > 0 ? array.get(sw_h_p, 0) : prot_lvl
+        targ_lvl := na
+        rng_high := prot_lvl
+        rng_low  := low
+        evt_txt  := "BOS"
+    else if not na(prot_lvl) and is_choch_up
+        struct_state := 1
+        targ_lvl     := prot_lvl
+        prot_lvl     := array.size(sw_l_p) > 0 ? array.get(sw_l_p, 0) : low
+        rng_low      := prot_lvl
+        rng_high     := high
+        evt_txt      := "CHoCH"
+
+// Target Maintenance
+if struct_state == 1 and not na(ph)
+    if ph > (na(targ_lvl) ? 0.0 : targ_lvl)
+        targ_lvl := ph
+if struct_state == -1 and not na(pl)
+    if pl < (na(targ_lvl) ? 1.0e6 : targ_lvl)
+        targ_lvl := pl
+
+// Range Tracking logic
+if struct_state == 1
+    rng_high := math.max(rng_high, high)
+    if not na(prot_lvl) and prot_lvl < rng_high
+        rng_low := math.max(rng_low, prot_lvl)
+else
+    rng_low := math.min(rng_low, low)
+    if not na(prot_lvl) and prot_lvl > rng_low
+        rng_high := math.min(rng_high, prot_lvl)
+
+float pd_mid = (not na(rng_high) and not na(rng_low) and rng_high > rng_low)
+     ? (rng_high + rng_low) * 0.5
+     : (high + low) * 0.5
+
+var label[] struct_lbls = array.new_label(0)
+if show_structure and evt_txt != ""
+    color lbl_c = evt_txt == "CHoCH" ? color.yellow : (struct_state == 1 ? c_bull : c_bear)
+    float lbl_y = evt_txt == "BOS"   ? (struct_state == 1 ? high : low) : (struct_state == 1 ? low : high)
+    label lbl   = label.new(bar_index, lbl_y, evt_txt, color=lbl_c, style=label.style_none, textcolor=lbl_c, size=size.tiny)
+    array.push(struct_lbls, lbl)
+    if array.size(struct_lbls) > 30
+        label.delete(array.shift(struct_lbls))
+
+// ════════════════════════════════════════════════════════════════════
+// 8. BEST-CANDIDATE SWEEP ENGINE (INSTITUTIONAL)
+// ════════════════════════════════════════════════════════════════════
+int htf_dir      = f_htf_trend()
+int active_trend = (struct_state == htf_dir and struct_state != 0) ? struct_state : 0
+
+var bool is_sweep = false
+var int  sweep_q  = 0
+
+// Memory Arrays
+var int[]   mem_bar        = array.new_int(0)
+var int[]   mem_trend      = array.new_int(0)
+var float[] mem_level      = array.new_float(0)
+var float[] mem_extreme    = array.new_float(0)
+var int[]   mem_score      = array.new_int(0)
+
+is_sweep := false
+sweep_q  := 0
+
+if active_trend != 0
+    float[] arr_p = active_trend == 1 ? sw_l_p : sw_h_p
+    int[]   arr_i = active_trend == 1 ? sw_l_i : sw_h_i
+    int     count = math.min(array.size(arr_p), sweep_lookback)
+    float   c_rng = math.max(0.00001, high - low)
+
+    if count > 0
+        // FIX: Find the BEST sweep, not just the first one
+        int   best_idx   = -1
+        int   best_score = -1
+        float best_lvl   = na
+        float best_depth = 1000000.0 // For tie-breaking (closer is better)
+        
+        for i = 0 to count - 1
+            float target    = array.get(arr_p, i)
+            int   pivot_idx = array.get(arr_i, i)
+            
+            bool penetrated = active_trend == 1
+                  ? (low < target and close > target)
+                  : (high > target and close < target)
+            float depth = math.abs(target - (active_trend == 1 ? low : high))
+
+            if penetrated and depth <= (atr * sweep_tol_val)
+                float wick    = active_trend == 1
+                      ? (math.min(open, close) - low)
+                      : (high - math.max(open, close))
+                float w_ratio = wick / c_rng
+                bool body_ok  = not body_filter or
+                      (active_trend == 1
+                       ? math.min(open, close) >= target
+                       : math.max(open, close) <= target)
+
+                if w_ratio >= wick_ratio_val and body_ok
+                    int q = 0
+                    
+                    // Scoring logic
+                    bool vol_ok = use_vol and volume > vol_avg * vol_mult_val
+                    q += vol_ok ? (mrkt_indices ? 3 : 2) : 0
+                    q += (use_session and f_killzone()) ? 2 : 0
+                    q += f_day_qual() ? 1 : 0
+
+                    int cl_cnt = 0
+                    for j = 0 to count - 1
+                        if j != i 
+                            if math.abs(target - array.get(arr_p, j)) <= (atr * cluster_tol)
+                                cl_cnt += 1
+                    q += cl_cnt >= 1 ? 3 : 0 
+
+                    bool is_disc_now = active_trend == 1 ? close < pd_mid : close > pd_mid
+                    bool pd_ok       = not use_pd_filter or is_disc_now
+                    q += pd_ok ? 2 : -3
+
+                    if use_rsi
+                        int bars_back = bar_index - pivot_idx
+                        if bars_back > 0 and bars_back < 300
+                            float pivot_rsi = rsi_val[bars_back]
+                            if not na(pivot_rsi)
+                                if active_trend == 1
+                                    q += (low < target and rsi_val > pivot_rsi) ? 2 : 0
+                                else
+                                    q += (high > target and rsi_val < pivot_rsi) ? 2 : 0
+                    
+                    // FIX: Tie-breaker logic (Higher score OR same score with closer depth)
+                    if q > best_score or (q == best_score and depth < best_depth)
+                        best_score := q
+                        best_idx   := i
+                        best_lvl   := target
+                        best_depth := depth
+        
+        // Register the Winner
+        if best_idx != -1
+            sweep_q  := best_score
+            is_sweep := true
+            
+            if array.size(mem_bar) > 20
+                array.shift(mem_bar), array.shift(mem_trend), array.shift(mem_level), array.shift(mem_extreme), array.shift(mem_score)
+
+            array.push(mem_bar,        bar_index)
+            array.push(mem_trend,      active_trend)
+            array.push(mem_level,      best_lvl)
+            array.push(mem_extreme,    active_trend == 1 ? low : high)
+            array.push(mem_score,      best_score)
+
+// ════════════════════════════════════════════════════════════════════
+// 9. EXECUTION ENGINE (Risk Guard & FVG Lookback)
+// ════════════════════════════════════════════════════════════════════
+var bool   entry_sig    = false
+var int    entry_dir    = 0
+var float  entry_sl     = na
+var float  entry_tp     = na
+var int    final_q      = 0
+var float  fvg_top      = na
+var float  fvg_bot      = na
+var int    last_entry_bar = 0
+
+var string last_sig_txt = "Scanning..."
+var color  last_sig_col = color.gray
+var int    sig_count    = 0
+
+entry_sig := false
+int[] to_rem = array.new_int(0)
+
+if array.size(mem_bar) > 0 and barstate.isconfirmed
+    for i = 0 to array.size(mem_bar) - 1
+        int   idx = array.get(mem_bar,   i)
+        int   trd = array.get(mem_trend, i)
+        int   scr = array.get(mem_score, i)
+        float ext = array.get(mem_extreme, i)
+        int   age = bar_index - idx
+
+        if age > confirm_win_val
+            array.push(to_rem, i)
+        else if age > 0 and (bar_index - last_entry_bar > reentry_filt)
+            bool  is_b      = trd == 1
+            bool  candle_ok = is_b ? close > open : close < open
+            float body      = math.abs(close - open)
+            bool  disp_ok   = body >= (atr * disp_body_val)
+
+            // FIX: Check FVG on current bar OR previous bar
+            [fvg_curr, ft0, fb0] = f_get_fvg(is_b, 0)
+            [fvg_prev, ft1, fb1] = f_get_fvg(is_b, 1)
+            
+            bool fvg_found = fvg_curr or fvg_prev
+            bool fvg_ok = not use_fvg or fvg_found
+
+            if candle_ok and disp_ok and fvg_ok
+                int v_bonus = (use_vol and volume > vol_avg * vol_mult_val) ? 1 : 0
+                int tot     = scr + 2 + v_bonus + (fvg_found ? 2 : 0)
+
+                if tot >= min_score
+                    // FIX: Risk Compression Guard
+                    float raw_sl    = ext + (is_b ? -1.0 : 1.0) * (atr * sl_buffer)
+                    float min_dist  = atr * 0.1
+                    float raw_dist  = math.abs(close - raw_sl)
+                    float safe_dist = math.max(raw_dist, min_dist)
+                    
+                    float safe_sl   = is_b ? (close - safe_dist) : (close + safe_dist)
+                    float final_sl  = (is_b ? raw_sl < close : raw_sl > close) ? raw_sl : safe_sl
+                    
+                    float risk_final = math.abs(close - final_sl)
+                    float calc_tp   = close + (is_b ? 1.0 : -1.0) * (risk_final * tp_rr)
+
+                    entry_sig    := true
+                    entry_dir    := trd
+                    entry_sl     := final_sl
+                    entry_tp     := calc_tp
+                    final_q      := tot
+                    if fvg_curr 
+                        fvg_top := ft0
+                        fvg_bot := fb0
+                    else
+                        fvg_top := ft1
+                        fvg_bot := fb1
+                    
+                    sig_count      += 1
+                    last_entry_bar := bar_index
+                    last_sig_txt   := (trd == 1 ? "LONG" : "SHORT") + " [" + str.tostring(tot) + "pts]"
+                    last_sig_col   := trd == 1 ? color.teal : color.red
+                    
+                    array.push(to_rem, i)
+                    break
+
+if array.size(to_rem) > 0
+    array.sort(to_rem, order.descending)
+    for i = 0 to array.size(to_rem) - 1
+        int ri = array.get(to_rem, i)
+        array.remove(mem_bar,     ri)
+        array.remove(mem_trend,   ri)
+        array.remove(mem_score,   ri)
+        array.remove(mem_level,   ri)
+        array.remove(mem_extreme, ri)
+
+// ════════════════════════════════════════════════════════════════════
+// 10. VISUALIZATION & TELEGRAM
+// ════════════════════════════════════════════════════════════════════
+plot(show_ema ? ema_val : na, "EMA", color=active_trend == 1 ? c_bull : active_trend == -1 ? c_bear : c_neut, linewidth=2)
+
+plotshape(not minimal_mode and is_sweep and active_trend == 1,  "Sweep Up",   shape.diamond, location.belowbar, color=color.orange, size=size.tiny)
+plotshape(not minimal_mode and is_sweep and active_trend == -1, "Sweep Down", shape.diamond, location.abovebar, color=color.orange, size=size.tiny)
+
+plotshape(entry_sig and entry_dir == 1 and not minimal_mode, "Buy Full",  shape.labelup,   location.belowbar, color=c_bull, textcolor=c_text, text="BUY",  size=size.small)
+plotshape(entry_sig and entry_dir == 1 and minimal_mode,     "Buy Min",   shape.labelup,   location.belowbar, color=c_bull, textcolor=c_text, text="L",    size=size.tiny)
+
+plotshape(entry_sig and entry_dir == -1 and not minimal_mode, "Sell Full", shape.labeldown, location.abovebar, color=c_bear, textcolor=c_text, text="SELL", size=size.small)
+plotshape(entry_sig and entry_dir == -1 and minimal_mode,     "Sell Min",  shape.labeldown, location.abovebar, color=c_bear, textcolor=c_text, text="S",    size=size.tiny)
+
+var label[] entry_lbls = array.new_label(0)
+if not minimal_mode and entry_sig
+    float lbl_y = entry_dir == 1 ? low - (atr * 1.5) : high + (atr * 1.5)
+    label lbl   = label.new(
+         bar_index, lbl_y,
+         str.tostring(final_q) + "pts  RR " + str.tostring(tp_rr, "#.#"),
+         color     = entry_dir == 1 ? c_bull : c_bear,
+         textcolor = c_text,
+         style     = entry_dir == 1 ? label.style_label_up : label.style_label_down,
+         size      = size.tiny)
+    array.push(entry_lbls, lbl)
+    if array.size(entry_lbls) > 20
+        label.delete(array.shift(entry_lbls))
+
+var line[] sl_pool  = array.new_line(0)
+var line[] tp_pool  = array.new_line(0)
+var box[]  fvg_pool = array.new_box(0)
+
+if show_sl and entry_sig
+    line sl_l = line.new(bar_index, entry_sl, bar_index + 20, entry_sl,
+         color=color.new(color.red, 20), style=line.style_dotted, width=2)
+    array.push(sl_pool, sl_l)
+    if array.size(sl_pool) > 5
+        line.delete(array.shift(sl_pool))
+
+if show_tp and entry_sig
+    line tp_l = line.new(bar_index, entry_tp, bar_index + 20, entry_tp,
+         color=color.new(color.green, 20), style=line.style_dotted, width=2)
+    array.push(tp_pool, tp_l)
+    if array.size(tp_pool) > 5
+        line.delete(array.shift(tp_pool))
+
+if show_fvg_box and entry_sig and not na(fvg_top)
+    color box_c = entry_dir == 1 ? c_bull : c_bear
+    box bx = box.new(bar_index - 2, fvg_bot, bar_index, fvg_top,
+         border_color=na, bgcolor=color.new(box_c, 80))
+    array.push(fvg_pool, bx)
+    if array.size(fvg_pool) > 5
+        box.delete(array.shift(fvg_pool))
+
+bgcolor(entry_sig ? color.new(entry_dir == 1 ? c_bull : c_bear, 92) : na)
+
+// Structure Lines
+var line l_prot = na
+var line l_targ = na
+var label lbl_prot = na
+var label lbl_targ = na
+
+if show_structure and not minimal_mode
+    if not na(prot_lvl)
+        color prot_col = struct_state == 1 ? c_bull : c_bear
+        if na(l_prot)
+            l_prot := line.new(bar_index - 10, prot_lvl, bar_index + 5, prot_lvl,
+                  width=1, color=prot_col)
+        else
+            line.set_xy1(l_prot, bar_index - 10, prot_lvl)
+            line.set_xy2(l_prot, bar_index + 5,  prot_lvl)
+            line.set_color(l_prot, prot_col)
+        
+        if barstate.islast
+            if not na(lbl_prot)
+                label.delete(lbl_prot)
+            lbl_prot := label.new(bar_index + 5, prot_lvl,
+                  "Strong " + (struct_state == 1 ? "Low" : "High"),
+                  color=color.new(c_neut, 100), textcolor=prot_col,
+                  style=label.style_label_left, size=size.tiny)
+    
+    if not na(targ_lvl)
+        if na(l_targ)
+            l_targ := line.new(bar_index - 10, targ_lvl, bar_index + 5, targ_lvl,
+                  style=line.style_dotted, color=color.gray)
+        else
+            line.set_xy1(l_targ, bar_index - 10, targ_lvl)
+            line.set_xy2(l_targ, bar_index + 5,  targ_lvl)
+        
+        if barstate.islast
+            if not na(lbl_targ)
+                label.delete(lbl_targ)
+            lbl_targ := label.new(bar_index + 5, targ_lvl,
+                  "Target: Weak " + (struct_state == 1 ? "High" : "Low"),
+                  color=color.new(c_neut, 100), textcolor=color.gray,
+                  style=label.style_label_left, size=size.tiny)
+
+// TELEGRAM ALERT ENGINE
+plot(entry_sig ? entry_sl : na, "SL", display=display.none)
+plot(entry_sig ? entry_tp : na, "TP", display=display.none)
+
+if entry_sig
+    string sig_type  = entry_dir == 1 ? "🚀 BUY (LONG)"  : "🔻 SELL (SHORT)"
+    string trend_txt = htf_dir == 1   ? "BULLISH 🐂"     : htf_dir == -1 ? "BEARISH 🐻" : "RANGE ⚖️"
+    bool   dsc       = struct_state == 1 ? close < pd_mid : close > pd_mid
+    string prc_txt   = dsc ? "DISCOUNT ✅" : "PREMIUM ⚠️"
+    
+    float  r_val  = math.abs(close - entry_sl)
+    string r_unit = mrkt_forex ? " Pips" : mrkt_gold ? " $" : " pts"
+    float  r_disp = mrkt_forex ? (r_val / syminfo.mintick / 10) : r_val
+    
+    // Fix: Single-line JSON string for robustness
+    string json_msg = '{"token":"' + tg_token + '", "chat_id":"' + tg_id + '", "parse_mode":"Markdown", "text":"💎 *Diamond V7 Signal*\\n━━━━━━━━━━━━━━━\\n📍 *Symbol:* ' + syminfo.ticker + ' (' + timeframe.period + 'm)\\n🔔 *Type:* ' + sig_type + '\\n📈 *Trend:* ' + trend_txt + '\\n💰 *Zone:* ' + prc_txt + '\\n━━━━━━━━━━━━━━━\\n💵 *Entry:* ' + str.tostring(close) + '\\n🛡️ *SL:* ' + str.tostring(entry_sl) + ' (' + str.tostring(r_disp, "#.1") + r_unit + ')\\n🎯 *TP:* ' + str.tostring(entry_tp) + '\\n📊 *RR:* 1:' + str.tostring(tp_rr, "#.#") + '\\n━━━━━━━━━━━━━━━\\n⭐ *Score:* ' + str.tostring(final_q) + '/15\\n📢 @DiamondQuantX"}'
+    
+    if tg_mode == "JSON (Bridge)"
+        alert(json_msg, alert.freq_once_per_bar_close)
+    else
+        string plain_msg = "💎 Diamond V7 Signal\nSymbol: " + syminfo.ticker + "\nType: " + sig_type + "\nEntry: " + str.tostring(close) + "\nSL: " + str.tostring(entry_sl) + "\nTP: " + str.tostring(entry_tp) + "\nScore: " + str.tostring(final_q) + "/15"
+        alert(plain_msg, alert.freq_once_per_bar_close)
+
+// TEST ALERT LOGIC
+var bool test_done = false
+if tg_test and not test_done
+    string time_str = not na(timenow) ? str.format("{0,date,HH:mm:ss}", timenow) : "N/A"
+    string t_json = '{"token":"' + tg_token + '", "chat_id":"' + tg_id + '", "parse_mode":"Markdown", "text":"🟢 *TEST SUCCESSFUL*\\nDiamond V7 Engine Active ✅\\n📍 Symbol: ' + syminfo.ticker + '\\n⏰ Time: ' + time_str + '"}'
+    if tg_mode == "JSON (Bridge)"
+        alert(t_json, alert.freq_once_per_bar_close)
+    else
+        alert("✅ TEST OK — Diamond V7 Engine Active", alert.freq_once_per_bar_close)
+    test_done := true
+if not tg_test
+    test_done := false
+
+// ════════════════════════════════════════════════════════════════════
+// 11. DASHBOARD (FULL)
+// ════════════════════════════════════════════════════════════════════
+string dash_pos_str = dash_pos_inp
+string dash_p = position.top_right
+// Fix: Use if-else for safe position assignment
+if dash_pos_str == "Bottom Right"
+    dash_p := position.bottom_right
+else if dash_pos_str == "Top Left"
+    dash_p := position.top_left
+
+var table hud = table.new(dash_p, 2, 12,
+     bgcolor      = color.new(color.black, 35),
+     frame_color = color.gray,
+     frame_width = 1,
+     border_width= 1)
+
+if show_dashboard and barstate.islast
+    string sz   = dash_size == "Small" ? size.small : dash_size == "Large" ? size.large : size.normal
+    color c_hdr = mrkt_gold ? color.rgb(180, 140, 0) : mrkt_indices ? color.rgb(40, 80, 140) : color.rgb(30, 90, 70)
+
+    // Row 0 — Header
+    table.cell(hud, 0, 0, "DIAMOND V7",  text_color=color.yellow, bgcolor=c_hdr, text_size=sz)
+    table.cell(hud, 1, 0, market_name,   text_color=color.yellow, bgcolor=c_hdr, text_size=sz)
+
+    // Row 1 — HTF Trend
+    string htf_txt = htf_dir == 1 ? "BULL" : htf_dir == -1 ? "BEAR" : "RANGE"
+    color  htf_bg  = htf_dir == 1 ? c_bull : htf_dir == -1 ? c_bear : c_neut
+    table.cell(hud, 0, 1, "HTF Trend", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 1, htf_txt,      bgcolor=htf_bg, text_color=color.white, text_size=sz)
+
+    // Row 2 — LTF Structure
+    string str_txt = struct_state == 1 ? "BULLISH" : struct_state == -1 ? "BEARISH" : "NEUTRAL"
+    color  str_bg  = struct_state == 1 ? c_bull    : struct_state == -1 ? c_bear    : c_neut
+    table.cell(hud, 0, 2, "Structure", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 2, str_txt,      bgcolor=str_bg, text_color=color.white, text_size=sz)
+
+    // Row 3 — Alignment
+    string aln_txt = active_trend != 0 ? "ALIGNED" : "CONFLICT"
+    color  aln_bg  = active_trend != 0 ? color.green : color.maroon
+    table.cell(hud, 0, 3, "Alignment", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 3, aln_txt,      bgcolor=aln_bg, text_color=color.white, text_size=sz)
+
+    // Row 4 — Price Zone
+    bool   is_d   = struct_state == 1 ? close < pd_mid : close > pd_mid
+    string prc    = is_d ? "DISCOUNT" : "PREMIUM"
+    color  prc_bg = is_d ? color.green : color.orange
+    table.cell(hud, 0, 4, "Pricing", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 4, prc,          bgcolor=prc_bg, text_color=color.white, text_size=sz)
+
+    // Row 5 — Session
+    bool kz = f_killzone()
+    table.cell(hud, 0, 5, "Session",      text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 5, f_sess_name(),  bgcolor=kz ? color.green : c_neut, text_color=color.white, text_size=sz)
+
+    // Row 6 — Day Quality
+    bool   day_qual = f_day_qual()
+    string day_txt  = day_qual ? "High Prob" : "Caution"
+    color  day_bg   = day_qual ? color.green  : color.orange
+    table.cell(hud, 0, 6, "Day Quality", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 6, day_txt,        bgcolor=day_bg, text_color=color.white, text_size=sz)
+
+    // Row 7 — ATR
+    string a_u = mrkt_forex ? " pip" : mrkt_gold ? " $" : " pts"
+    float  a_n = mrkt_forex ? math.round(atr / syminfo.mintick / 10) : math.round(atr * 100) / 100
+    table.cell(hud, 0, 7, "ATR (14)",           text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 7, str.tostring(a_n) + a_u,      bgcolor=color.new(color.blue, 60), text_color=color.white, text_size=sz)
+
+    // Row 8 — Adaptive params
+    string p_info = "SWP:" + str.tostring(sweep_tol_val, "#.1") + " WIN:" + str.tostring(confirm_win_val) + " DSP:" + str.tostring(disp_body_val, "#.2")
+    table.cell(hud, 0, 8, "Params", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 8, p_info,   bgcolor=color.new(color.purple, 60), text_color=color.white, text_size=sz)
+
+    // Row 9 — Last Signal
+    table.cell(hud, 0, 9, "Last Signal", text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 9, last_sig_txt,  bgcolor=color.new(last_sig_col, 40), text_color=color.white, text_size=sz)
+
+    // Row 10 — RR
+    table.cell(hud, 0, 10, "Target RR",                          text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 10, "1 : " + str.tostring(tp_rr, "#.#"),      bgcolor=color.new(color.purple, 50), text_color=color.white, text_size=sz)
+
+    // Row 11 — Signal count
+    table.cell(hud, 0, 11, "Signals",                             text_color=color.white, text_size=sz)
+    table.cell(hud, 1, 11, str.tostring(sig_count),               bgcolor=color.new(color.gray, 50), text_color=color.white, text_size=sz)
+
+// ════════════════════════════════════════════════════════════════════
+// 16. ALERT CONDITIONS
+// ════════════════════════════════════════════════════════════════════
+alertcondition(entry_sig and entry_dir ==  1, "BUY Signal",  "Diamond V7 - LONG Entry")
+alertcondition(entry_sig and entry_dir == -1, "SELL Signal", "Diamond V7 - SHORT Entry")
+alertcondition(is_sweep,                      "Sweep Alert", "Liquidity Sweep Detected")

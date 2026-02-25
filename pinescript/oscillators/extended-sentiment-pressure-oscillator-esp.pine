@@ -1,0 +1,206 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © PJooris1408
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ESP — Extended Sentiment Pressure Oscillator (Multi-Source / Multi-Normalization / Multi-Smoothing)
+// Educational / research-oriented oscillator that compares Uptrend vs Downtrend pressure using selectable normalization modes.
+//
+// Inspired by / credits for the core concept to: “Average Sentiment Oscillator” © KivancOzbilgic.
+//
+// MAIN FEATURES
+// • Multi-source selection
+// • 6 normalization modes
+// • 6 smoothing types
+// • Expanded Mode toggle: legacy 0..100 vs centered -50..+50 with reference hline(s)
+// • Optional switchable visuals: Delta, Bias, and signal helper flags
+// • ESP Sensitivity Regulation
+//
+// SUMMARY
+// A multi-mode trend-bias “sentiment pressure & accumulation” oscillator measuring UP vs DOWN pressure in both bar-range and window-range context.
+//
+// SOME USE CASES
+// • Sentiment confirmation
+// • Momentum bias & regime detection
+// • Complementary to other trend tools or indicators like EMA Cross, VWAP, SUPERTREND, ... and/or market analysis
+//
+// DISCLAIMER
+// This indicator is for educational and analytical purposes only.
+// It does NOT provide financial advice or trading recommendations.
+// Past performance is not indicative of future results. 
+// The only guarantee in Trading is the risk of substantial financial loss. 
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator('Extended Sentiment Pressure Oscillator (ESP)', shorttitle = 'ESP', overlay = false)
+
+// ===== UI =====
+g1 = 'Core Settings'
+esp_src_close = input.source(close, 'ESP Source (default: close)', tooltip = 'Replaces CLOSE in the formulas only. High/Low/Open remain chart OHLC for robustness. You may select external sources here.', group = g1)
+esp_length = input.int(4, 'Period (default: 4)', minval = 1, maxval = 5000, tooltip = 'Lookback window for Window_Range, ATR and Smoothing Length. Higher = smoother/slower, lower = faster/noisier.', group = g1)
+esp_normalization = input.string('Bar_Range', 'ESP normalization mode (default: Bar_Range)', options = ['Mix', 'Bar_Range', 'Window_Range', 'Hybrid', 'TR', 'ATR'], tooltip = 'Normalization selector: Bar_Range, Window_Range, Mix=avg(Bar_Range,Window_Range). \nHybrid=(Bar_Range,Window_Range), True Range (TR) and Average True Range (ATR).', group = g1)
+esp_ma_type = input.string('SMA', 'Smoothing MA (default: SMA)', options = ['SMA', 'EMA', 'HMA', 'SMMA', 'WMA', 'VWMA'], tooltip = 'Smoothing applied to raw Up/Down pressure series.', group = g1)
+esp_sensitivity = input.float(1, title = 'ESP Sensitivity (default: 1; range: 0.1-1.5)', minval = 0.10, maxval = 1.5, step = 0.05, tooltip = 'Sensitivity around the midpoint.\n1.0 = neutral.\n<1.0 = smoother/flatter.\n>1.0 = more reactive (amplifies distance from 50 / from 0 in Expanded mode).', group = g1)
+
+g2 = 'Extra Plots'
+esp_plot_avg = input.bool(true, 'Show Avg Line', tooltip = 'Avg = (Up + Down) / 2 (in the active scale).', group = g2)
+esp_plot_delta = input.bool(true, 'Show Net Pressure', tooltip = 'Shows net pressure between Uptrend and Downtrend.\n\nDefault mode: Net Pressure = Up(0..100) - Down(0..100).\nExpanded mode: same value, centered around 0 for readability.\n\nTip: Combine with the Bias Histogram for strength/acceleration.', group = g2)
+esp_bias_deadzone = input.float(0.5, 'Net pressure Bias neutral zone ±', minval = 0.0, step = 0.1, tooltip = 'Small zone around 0 where color becomes neutral to avoid flicker.', group = g2)
+esp_focus_np = input.bool(false, 'Dim Up & Down Lines for Net Pressure focus', tooltip = 'Dims Up/Down lines so Net Pressure becomes the main readable signal. Helpful in ATR/TR modes.', group = g2)
+
+g3 = 'Expanded Mode'
+esp_expanded_mode = input.bool(true, 'Expanded mode (centered view)', tooltip = 'ON: centered view around 0 (easier to read bullish vs bearish pressure).\nOFF: legacy 0..100 view.', group = g3)
+esp_plot_hist = input.bool(true, 'Show Bias Histogram (Expanded only)', tooltip = 'Histogram of centered bias (Expanded mode only).', group = g3)
+esp_plot_flags = input.bool(true, 'Show UP / DOWN Flags (Expanded only)', tooltip = 'UP/DOWN flags derived from Zero Cross (centered bias) or Momentum Shift (Expanded mode only).', group = g3)
+
+g4 = 'Signal Mode'
+esp_signal_mode = input.string('ZeroCross', 'Signal mode (default: ZeroCross)', options = ['ZeroCross', 'MomentumShift'], tooltip = 'ZeroCross: signals on crossing 0.\nMomentumShift: signals when Net Pressure rises/falls for N consecutive bars (can trigger before 0-cross).', group = g4)
+esp_confirm_bars = input.int(3, 'Momentum confirmation bars (default: 3; Range: 1-5)', minval = 1, maxval = 5, tooltip = 'Indicates how many consecutive rising/falling Net Pressure bars are required for MomentumShift signals.\nHigher = stricter / later, but fewer false starts.', group = g4)
+esp_min_slope = input.float(2, 'Min slope threshold (default: 2)', minval = 0.0, step = 0.5, tooltip = 'Optional: requires a minimum absolute change in Net Pressure per bar. Increase to filter weak shifts.', group = g4)
+
+// ===== Helpers (V3.7 selector style) =====
+esp_safe_div(esp_num, esp_norm) =>
+    esp_norm == 0.0 ? 0.0 : esp_num * 50.0 / esp_norm
+
+esp_smooth(esp_src, esp_len, esp_type) =>
+    switch esp_type
+        'SMA' => ta.sma(esp_src, esp_len)
+        'EMA' => ta.ema(esp_src, esp_len)
+        'HMA' => ta.hma(esp_src, esp_len)
+        'SMMA' => ta.rma(esp_src, esp_len)
+        'WMA' => ta.wma(esp_src, esp_len)
+        => ta.vwma(esp_src, esp_len)
+
+// ===== Base OHLC (High/Low/Open remain true price references) =====
+float esp_h = high
+float esp_l = low
+float esp_o = open
+float esp_c = esp_src_close
+
+// ===== Window Range stats =====
+float esp_window_lo = ta.lowest(esp_l, esp_length)
+float esp_window_hi = ta.highest(esp_h, esp_length)
+float esp_window_op = esp_o[esp_length - 1]
+
+// ===== Normalization (clamped) =====
+float esp_norm_bar_range = esp_h - esp_l == 0.0 ? 1.0 : esp_h - esp_l
+float esp_norm_window_range = esp_window_hi - esp_window_lo == 0.0 ? 1.0 : esp_window_hi - esp_window_lo
+float esp_tr = ta.tr(true)
+float esp_atr = ta.atr(esp_length)
+float esp_norm_tr = esp_tr == 0.0 ? syminfo.mintick : esp_tr
+float esp_norm_atr = esp_atr == 0.0 ? syminfo.mintick : esp_atr
+
+// ===== Numerators (up/down) =====
+float esp_num_up_bar_range = esp_c + esp_h - (esp_l + esp_o)
+float esp_num_dn_bar_range = esp_h + esp_o - (esp_c + esp_l)
+float esp_num_up_window_range = esp_c + esp_window_hi - (esp_window_lo + esp_window_op)
+float esp_num_dn_window_range = esp_window_hi + esp_window_op - (esp_c + esp_window_lo)
+
+// ===== Scaled variants (raw domain ~0..100-ish before smoothing) =====
+float esp_up_bar_range = esp_safe_div(esp_num_up_bar_range, esp_norm_bar_range)
+float esp_dn_bar_range = esp_safe_div(esp_num_dn_bar_range, esp_norm_bar_range)
+float esp_up_window_range = esp_safe_div(esp_num_up_window_range, esp_norm_window_range)
+float esp_dn_window_range = esp_safe_div(esp_num_dn_window_range, esp_norm_window_range)
+float esp_up_hybrid = esp_safe_div(esp_num_up_bar_range, esp_norm_window_range)
+float esp_dn_hybrid = esp_safe_div(esp_num_dn_bar_range, esp_norm_window_range)
+float esp_up_tr = esp_safe_div(esp_num_up_bar_range, esp_norm_tr)
+float esp_dn_tr = esp_safe_div(esp_num_dn_bar_range, esp_norm_tr)
+float esp_up_atr = esp_safe_div(esp_num_up_bar_range, esp_norm_atr)
+float esp_dn_atr = esp_safe_div(esp_num_dn_bar_range, esp_norm_atr)
+float esp_up_mix = (esp_up_bar_range + esp_up_window_range) * 0.5
+float esp_dn_mix = (esp_dn_bar_range + esp_dn_window_range) * 0.5
+
+// ===== Raw selector =====
+esp_raw_up = switch esp_normalization
+    'Mix' => esp_up_mix
+    'Bar_Range' => esp_up_bar_range
+    'Window_Range' => esp_up_window_range
+    'Hybrid' => esp_up_hybrid
+    'TR' => esp_up_tr
+    => esp_up_atr // default = ATR
+
+esp_raw_dn = switch esp_normalization
+    'Mix' => esp_dn_mix
+    'Bar_Range' => esp_dn_bar_range
+    'Window_Range' => esp_dn_window_range
+    'Hybrid' => esp_dn_hybrid
+    'TR' => esp_dn_tr
+    => esp_dn_atr // default = ATR
+
+// ===== Smoothing =====
+float esp_up_s = esp_smooth(esp_raw_up, esp_length, esp_ma_type)
+float esp_dn_s = esp_smooth(esp_raw_dn, esp_length, esp_ma_type)
+
+// ===== Baseline clamp to 0..100 (stable meaning) =====
+float esp_up_0100_base = math.max(0.0, math.min(100.0, esp_up_s))
+float esp_dn_0100_base = math.max(0.0, math.min(100.0, esp_dn_s))
+
+// ===== Sensitivity around midpoint (50) without breaking the scale =====
+float esp_up_0100 = math.max(0.0, math.min(100.0, 50.0 + (esp_up_0100_base - 50.0) * esp_sensitivity))
+float esp_dn_0100 = math.max(0.0, math.min(100.0, 50.0 + (esp_dn_0100_base - 50.0) * esp_sensitivity))
+
+// ===== Expanded Mode: centered -50..+50 =====
+float esp_up_center = esp_up_0100 - 50.0
+float esp_dn_center = -(esp_dn_0100 - 50.0)
+
+// ===== Final plot series =====
+float esp_plot_up = esp_expanded_mode ? esp_up_center : esp_up_0100
+float esp_plot_dn = esp_expanded_mode ? esp_dn_center : esp_dn_0100
+
+// ===== Net pressure (Bias) and Delta =====
+// Centered: Bias == Up(0..100) - Down(0..100) == Delta.
+// Plot Bias in Expanded mode because it is centered and matches the 0-line concept.
+float esp_delta_value = esp_up_0100 - esp_dn_0100
+float esp_bias_value = esp_up_center + esp_dn_center
+float esp_avg_value = (esp_plot_up + esp_plot_dn) * 0.5
+
+// ==== Slope Confirm logic
+float esp_np = esp_bias_value
+bool esp_rise_ok = true
+bool esp_fall_ok = true
+for esp_i = 0 to 4 by 1
+    esp_rise_ok := esp_rise_ok and (esp_i < esp_confirm_bars - 1 ? esp_np[esp_i] > esp_np[esp_i + 1] : true)
+    esp_fall_ok := esp_fall_ok and (esp_i < esp_confirm_bars - 1 ? esp_np[esp_i] < esp_np[esp_i + 1] : true)
+float esp_slope_1 = esp_np - esp_np[1]
+bool esp_slope_ok_up = esp_slope_1 >= esp_min_slope
+bool esp_slope_ok_dn = -esp_slope_1 >= esp_min_slope
+bool esp_up_confirm = esp_confirm_bars == 1 ? esp_slope_1 > 0 : esp_rise_ok
+bool esp_dn_confirm = esp_confirm_bars == 1 ? esp_slope_1 < 0 : esp_fall_ok
+bool esp_upshift = esp_signal_mode == 'ZeroCross' ? ta.crossover(esp_np, 0.0) : esp_up_confirm and esp_slope_ok_up
+bool esp_downshift = esp_signal_mode == 'ZeroCross' ? ta.crossunder(esp_np, 0.0) : esp_dn_confirm and esp_slope_ok_dn
+
+// Plot series for "Show Up-Down Delta":
+// Expanded ON  => show Bias (centered around 0, best readability)
+// Expanded OFF => show Delta (same numeric value, but conceptually "difference" in 0..100 domain)
+float esp_delta_plot = esp_expanded_mode ? esp_bias_value : esp_delta_value
+
+// ===== Hlines =====
+hline(esp_expanded_mode ? na : 50.0, title = 'Default mode reference (50)', color = color.new(color.gray, 20), linestyle = hline.style_dotted, linewidth = 1)
+hline(esp_plot_delta or esp_expanded_mode ? 0.0 : na, title = 'Expanded mode reference (0)', color = color.new(color.gray, 20), linestyle = hline.style_dotted, linewidth = 1)
+
+// ===== Adaptive colors (Expanded only) =====
+esp_col_up = esp_expanded_mode ? esp_plot_up >= 0 ? color.new(color.green, 0) : color.new(color.red, 0) : color.new(color.green, 0)
+esp_col_dn = esp_expanded_mode ? esp_plot_dn >= 0 ? color.new(color.fuchsia, 0) : color.new(color.red, 0) : color.new(color.fuchsia, 0)
+
+// ===== Plots =====
+p_up = plot(esp_plot_up, color = esp_focus_np ? color.new(esp_col_up, 70) : esp_col_up, linewidth = esp_focus_np ? 1 : 2, title = "Uptrend")
+p_dn = plot(esp_plot_dn, color = esp_focus_np ? color.new(esp_col_dn, 70) : esp_col_dn, linewidth = esp_focus_np ? 1 : 2, title = "Downtrend")
+fill(p_up, p_dn, color = color.new(color.gray, 85), title = "Up/Down Spread Fill")
+
+// ===== Adaptive color for Net Pressure (Bias/Delta) – 5-state (green/fuchsia/orange/red/grey) =====
+float esp_np_plot = esp_delta_plot
+bool esp_np_is_pos = esp_np_plot >= esp_bias_deadzone
+bool esp_np_is_neg = esp_np_plot <= -esp_bias_deadzone
+esp_np_color = esp_np_is_neg ? esp_up_confirm ? color.new(color.orange, 0) : color.new(color.red, 0) : esp_np_is_pos ? esp_dn_confirm ? color.new(color.fuchsia, 0) : color.new(color.green, 0) : color.new(color.gray, 0)
+
+// plot(esp_plot_delta ? esp_delta_plot : na, color = esp_np_color, linewidth = 2, title = "Net Pressure")
+plot(esp_plot_delta ? esp_delta_plot : na, color = esp_np_color, linewidth = 3, title = 'Net Pressure')
+plot(esp_plot_avg ? esp_avg_value : na, color = color.new(color.gray, 0), linewidth = 1, title = 'Avg (Up+Down)/2')
+plot(esp_plot_hist and esp_expanded_mode ? esp_bias_value : na, style = plot.style_histogram, color = esp_bias_value >= 0 ? color.new(color.green, 35) : color.new(color.red, 35), title = 'Bias Histogram (Expanded)')
+
+// ==== Plot shapes ====
+plotshape(esp_plot_flags and esp_expanded_mode and esp_upshift, title = 'UPSHIFT', style = shape.triangleup, location = location.bottom, color = color.new(color.green, 0), size = size.tiny, text = 'UP')
+plotshape(esp_plot_flags and esp_expanded_mode and esp_downshift, title = 'DOWNSHIFT', style = shape.triangledown, location = location.top, color = color.new(color.red, 0), size = size.tiny, text = 'DN')
+
+//
+// ==== EOF CODE ====
+//

@@ -1,0 +1,575 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © hapharmonic
+
+//@version=6
+indicator("Market Cap Landscape 3D", overlay = true, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 100, calc_bars_count = 300, scale = scale.none)
+
+// ───────────────────────────────────── Inputs ─────────────────────────────────────
+const string GRP_VIEW   = "Camera & Projection"
+const string GRP_GRID   = "Grid / Surface"
+const string GRP_PEAKS  = "Peaks / Mountains"
+const string GRP_FLAG   = "Flags (3D)"
+const string GRP_SER    = "Data Series"
+const string GRP_PAL    = "Color Palette"
+const string GRP_BADGE  = "Emblem / Badge Controls"
+const string GRP_CRYPTO = "Crypto Data"
+
+// Grid
+int   gridX        = input.int(32, "Grid X resolution", group = GRP_GRID, minval = 8, maxval = 64, step = 2, tooltip = "Controls the number of nodes along the X-axis (width) of the 3D surface.")
+int   gridY        = input.int(24, "Grid Y resolution", group = GRP_GRID, minval = 8, maxval = 48, step = 2, tooltip = "Controls the number of nodes along the Y-axis (depth) of the 3D surface.")
+bool  showFill     = input.bool(true, "Fill surface strips (gradient)", group = GRP_GRID, tooltip = "Toggles the visibility of the colored gradient fills between the grid lines.")
+bool  showWire     = input.bool(true, "Show wireframe lines", group = GRP_GRID, tooltip = "Toggles the visibility of the grid lines that form the surface wireframe.")
+bool  showMarkers  = input.bool(true, "Show nodes (markers)", group = GRP_GRID, tooltip = "Toggles the visibility of the small dots at each grid intersection point (node).")
+
+// Camera
+float yawDeg       = input.float(45, "Yaw (°)",   group = GRP_VIEW, minval = 0, maxval = 90, step = 1, tooltip = "Rotates the camera view horizontally around the center of the landscape.")
+float pitchDeg     = input.float(38, "Pitch (°)", group = GRP_VIEW, minval = 15, maxval = 75, step = 1, tooltip = "Tilts the camera view vertically. Higher values provide a more top-down view.")
+float scaleX       = input.float(4.4, "Scale X (width)",  group = GRP_VIEW, minval = 0.1, step = 0.1, tooltip = "Stretches or compresses the landscape horizontally.")
+float scaleY       = input.float(9.0, "Scale Y (depth)",  group = GRP_VIEW, minval = 0.1, step = 0.1, tooltip = "Stretches or compresses the landscape in depth (front to back).")
+float scaleZ       = input.float(0.55,"Scale Z (height)", group = GRP_VIEW, minval = 0.1, step = 0.05, tooltip = "Amplifies or reduces the height of the peaks and valleys.")
+
+// Peaks (hatching)
+bool  showPeakVolumeFill = input.bool(true, "Fill peaks volume (vertical lines)", group = GRP_PEAKS, tooltip = "Draws vertical lines from the peak threshold up to the surface, giving a sense of volume.")
+bool  showPeakSurfaceFill= input.bool(true, "Fill peaks surface (cross-hatch)", group = GRP_PEAKS, tooltip = "Draws a cross-hatch pattern on the surface of peaks that are above the threshold.")
+float peakThreshold    = input.float(25, "Peak height threshold", group = GRP_PEAKS, minval = 0, tooltip = "The minimum Z-height a point must have to be considered part of a 'peak' for filling.")
+color peakFillColor    = input.color(color.new(#FFFFFF, 75), "Peak fill color", group = GRP_PEAKS, tooltip = "Sets the color and transparency of the peak fill lines.")
+int   hatchStep        = input.int(3, "Peak fill density (step)", minval = 2, maxval = 6, step = 1, group = GRP_PEAKS, tooltip = "Controls the density of the fill lines. Smaller numbers mean denser lines.")
+
+// Flags (3D)
+bool  showFlagInput= input.bool(true, "Show Flag on Summit", group = GRP_FLAG, tooltip = "Toggles the visibility of the flag and emblem on the highest peak.")
+float flagPoleH    = input.float(350.0, "Flag height (Z units)", group = GRP_FLAG, minval = 1, step = 0.5, tooltip = "Sets the height of the flagpole placed on the highest summit.")
+float flagW        = input.float(13.1, "Flag width",  group = GRP_FLAG, minval = 0.5, step = 0.1, tooltip = "Controls the width of the flag.")
+float flagH        = input.float(39.1, "Flag height", group = GRP_FLAG, minval = 0.4, step = 0.1, tooltip = "Controls the height of the flag.")
+float flagYawOff   = input.float(0,   "Flag yaw (left/right, °)", group = GRP_FLAG, minval = -180, maxval = 180, tooltip = "Rotates the flag horizontally relative to the camera's yaw.")
+float flagPitchOff = input.float(10,  "Flag tilt (up/down, °)",   group = GRP_FLAG, minval = -45,  maxval = 45, tooltip = "Tilts the flag vertically.")
+color poleColor    = input.color(color.new(color.white, 15), "Pole color", group = GRP_FLAG, tooltip = "Sets the color of the flagpole.")
+
+// Series
+bool  showSeries1  = input.bool(true, "Show ridge series", group = GRP_SER, tooltip = "Toggles the visibility of the glowing line that follows a central ridge on the landscape.")
+bool  showSeries2  = input.bool(true, "Show leaderboard pole", group = GRP_SER, tooltip = "Toggles the visibility of the pole in the back-right corner used for the crypto leaderboard.")
+
+// Palettes & marker size
+enum PaletteOpt
+    RAINBOW
+    FIRE
+    ICE
+    FOREST
+    NEON_DREAM
+    SUNSET_WAVE
+    CYBERPUNK
+    EMERALD_SEA
+    PLASMA_HEAT
+    SPRING_PASTEL
+    VIVID_NIGHT
+    SOLAR_FLARE
+    OCEANIC
+PaletteOpt paletteChoice = input.enum(PaletteOpt.SUNSET_WAVE, "Base Gradient Palette", group = GRP_PAL, tooltip = "Selects the color gradient used for the main 3D surface.")
+
+enum MarkerSz
+    TINY
+    SMALL
+    NORMAL
+MarkerSz markerSz = input.enum(MarkerSz.TINY, "Marker size", group = GRP_GRID, tooltip = "Controls the size of the dots at each grid intersection point.")
+
+// Emblem / Badge
+float badgeRotDeg  = input.float(31,  "Emblem global rotation (°)", group = GRP_BADGE, minval = -180, maxval = 180, tooltip = "Rotates the entire emblem assembly on the flag.")
+color badgeBgColor = input.color(color.black, "Background circle color", group = GRP_BADGE, tooltip = "Sets the color of the circular background of the emblem.")
+float badgeBgScale = input.float(1.65, "Background circle radius scale", group = GRP_BADGE, minval = 0.5, maxval = 2.0, step = 0.05, tooltip = "Adjusts the size of the circular background relative to the emblem elements.")
+
+// T-like element
+float tRotDeg      = input.float(-30,  "T rotation (°)", group = GRP_BADGE, inline = "tR", minval = -180, maxval = 180, tooltip = "Rotates the 'T' shape within the emblem.")
+bool  tFlipH       = input.bool(false, "Flip H", group = GRP_BADGE, inline = "tR", tooltip = "Flips the 'T' shape horizontally.")
+bool  tFlipV       = input.bool(false, "Flip V", group = GRP_BADGE, inline = "tR", tooltip = "Flips the 'T' shape vertically.")
+float tOffU        = input.float(0.05, "T offset U", group = GRP_BADGE, inline = "tO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the 'T' shape horizontally within the emblem.")
+float tOffV        = input.float(0.82,"V",          group = GRP_BADGE, inline = "tO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the 'T' shape vertically within the emblem.")
+float tScale       = input.float(1.05,"T scale",    group = GRP_BADGE, inline = "tS", minval = 0.2, maxval = 2.0, step = 0.05, tooltip = "Adjusts the size of the 'T' shape.")
+color tColor       = input.color(color.white, "T color", group = GRP_BADGE, tooltip = "Sets the color of the 'T' shape.")
+
+// Dot element
+float dotOrbitDeg  = input.float(0,  "Dot orbit angle (°)", group = GRP_BADGE, inline = "dR", minval = -180, maxval = 180, tooltip = "Rotates the dot's position around a central point.")
+bool  dotFlipH     = input.bool(false, "Flip H", group = GRP_BADGE, inline = "dR", tooltip = "Flips the dot's offset horizontally.")
+bool  dotFlipV     = input.bool(false, "Flip V", group = GRP_BADGE, inline = "dR", tooltip = "Flips the dot's offset vertically.")
+float dotOffU      = input.float(-0.46, "Dot offset U", group = GRP_BADGE, inline = "dO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the dot horizontally.")
+float dotOffV      = input.float(0.05,   "V",             group = GRP_BADGE, inline = "dO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the dot vertically.")
+float dotScale     = input.float(1.1,  "Dot scale",     group = GRP_BADGE, inline = "dS", minval = 0.2, maxval = 2.0, step = 0.05, tooltip = "Adjusts the size of the dot.")
+color dotColor     = input.color(color.white, "Dot color", group = GRP_BADGE, tooltip = "Sets the color of the dot.")
+
+// Slash element
+float slashRotDeg  = input.float(-138,  "Slash rotation (°)", group = GRP_BADGE, inline = "sR", minval = -180, maxval = 180, tooltip = "Rotates the slash shape.")
+bool  slashFlipH   = input.bool(false,  "Flip H", group = GRP_BADGE, inline = "sR", tooltip = "Flips the slash shape horizontally.")
+bool  slashFlipV   = input.bool(false,  "Flip V", group = GRP_BADGE, inline = "sR", tooltip = "Flips the slash shape vertically.")
+float slashOffU    = input.float(0.09, "Slash offset U", group = GRP_BADGE, inline = "sO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the slash horizontally.")
+float slashOffV    = input.float(0.16, "V",               group = GRP_BADGE, inline = "sO", minval = -2.0, maxval = 2.0, step = 0.05, tooltip = "Shifts the slash vertically.")
+float slashScale   = input.float(1.4, "Slash scale",     group = GRP_BADGE, inline = "sS", minval = 0.2, maxval = 2.0, step = 0.05, tooltip = "Adjusts the size of the slash.")
+color slashColor   = input.color(color.white, "Slash color", group = GRP_BADGE, tooltip = "Sets the color of the slash.")
+
+// Crypto data input
+string symbolsText = input.text_area("BTC,ETH,BNB,XRP,ADA,SOL,DOGE,TRX,TON,DOT", "Symbols (comma-separated)", group = GRP_CRYPTO, tooltip = "Enter a comma-separated list of crypto symbols (e.g., BTC,ETH,SOL). Maximum of 40 unique symbols.")
+bool showCapsOnMountain = input.bool(false, "Show Market Cap on Mountain", group = GRP_CRYPTO, tooltip = "If checked, displays the market cap next to the symbol on the mountain. If unchecked, a colored circle appears behind the symbol instead.")
+
+// ─────────────────────────────── Utilities & Colors ───────────────────────────────
+color COLOR_GRID = color.new(color.white, 82)
+
+f_palette(PaletteOpt opt) =>
+    switch opt
+        PaletteOpt.FIRE         => array.from(#000000, #FF5722, #FFC107, #FFFFFF)
+        PaletteOpt.ICE          => array.from(#0D47A1, #42A5F5, #B3E5FC, #E1F5FE)
+        PaletteOpt.FOREST       => array.from(#1B5E20, #4CAF50, #AED581, #FFF59D)
+        PaletteOpt.NEON_DREAM   => array.from(#ff00ff, #00ffff, #ffff00, #ff00ff)
+        PaletteOpt.SUNSET_WAVE  => array.from(#F9C80E, #F86624, #EA3546, #662E9B, #43BCCD)
+        PaletteOpt.CYBERPUNK    => array.from(#f5f500, #ff00ff, #00ffff, #0077ff)
+        PaletteOpt.EMERALD_SEA  => array.from(#004d40, #009688, #4db6ac, #b2dfdb)
+        PaletteOpt.PLASMA_HEAT  => array.from(#0d0887, #6a00a8, #b12a90, #e16462, #fca636)
+        PaletteOpt.SPRING_PASTEL=> array.from(#fde4cf, #ffcfd2, #fbf8cc, #b9fbc0, #98f5e1)
+        PaletteOpt.VIVID_NIGHT  => array.from(#4a00e0, #8e2de2, #f80759, #fc4a1a)
+        PaletteOpt.SOLAR_FLARE  => array.from(#F22E2E, #FF7B00, #FFC700, #FFF89A)
+        PaletteOpt.OCEANIC      => array.from(#003f5c, #2f4b7c, #665191, #a05195, #d45087, #f95d6a, #ff7c43, #ffa600)
+        => array.from(#2962FF, #7B1FA2, #E91E63, #FF9800, #F44336) // Default
+
+array<color> palette = f_palette(paletteChoice)
+
+f_colorAt(float t) =>
+    float u = math.max(0, math.min(1, t))
+    float s = u * (palette.size() - 1)
+    int i1 = int(math.floor(s))
+    int i2 = int(math.ceil(s))
+    color.from_gradient(s - i1, 0, 1, palette.get(i1), palette.get(i2))
+
+f_labelSize(MarkerSz s) =>
+    switch s
+        MarkerSz.SMALL  => size.small
+        MarkerSz.NORMAL => size.normal
+        => size.tiny
+
+// Expanded array of 40 unique, bright colors.
+var array<color> brightColors = array.from(
+     color.rgb(255, 23, 68), color.rgb(236, 64, 122), color.rgb(240, 98, 146), color.rgb(255, 82, 82),
+     color.rgb(255, 110, 64), color.rgb(255, 167, 38), color.rgb(255, 202, 40), color.rgb(255, 238, 88),
+     color.rgb(178, 255, 89), color.rgb(100, 221, 23), color.rgb(0, 200, 83), color.rgb(105, 240, 174),
+     color.rgb(29, 233, 182), color.rgb(0, 188, 212), color.rgb(0, 229, 255), color.rgb(64, 196, 255),
+     color.rgb(41, 121, 255), color.rgb(48, 79, 254), color.rgb(83, 109, 254), color.rgb(121, 134, 203),
+     color.rgb(103, 58, 183), color.rgb(126, 87, 194), color.rgb(171, 71, 188), color.rgb(213, 0, 249),
+     color.rgb(197, 17, 98), color.rgb(255, 28, 108), color.rgb(255, 64, 129), color.rgb(255, 128, 171),
+     color.rgb(255, 20, 147), color.rgb(0, 255, 127), color.rgb(255, 215, 0), color.rgb(138, 43, 226),
+     color.rgb(255, 0, 255), color.rgb(65, 105, 225), color.rgb(50, 205, 50), color.rgb(255, 165, 0),
+     color.rgb(255, 99, 71), color.rgb(30, 144, 255), color.rgb(154, 205, 50), color.rgb(218, 112, 214)
+ )
+
+f_fmtCap(float v) =>
+    float av = math.abs(v)
+    string suffix = av >= 1e12 ? "T" : av >= 1e9 ? "B" : av >= 1e6 ? "M" : ""
+    float divisor = av >= 1e12 ? 1e12 : av >= 1e9 ? 1e9 : av >= 1e6 ? 1e6 : 1.0
+    suffix == "" ? str.tostring(v, "#.##") : str.tostring(v / divisor, "#.##") + suffix
+
+// ─────────────────────────────────── UDTs ─────────────────────────────────────────
+type Point3D
+    float x
+    float y
+    float z
+
+type DataSeries
+    array<Point3D> points
+    color seriesColor
+
+type Camera
+    int anchorX
+    float anchorY
+    float cYaw
+    float sYaw
+    float sPit
+    float cPit
+    float sx
+    float sy
+    float sz
+
+type CryptoData
+    string symbol
+    float cap
+    color labelColor
+
+// ───────────────────────────────── Methods ────────────────────────────────────────
+method project(Camera this, Point3D p) =>
+    float xr = p.x * this.cYaw - p.y * this.sYaw
+    float yr = p.x * this.sYaw + p.y * this.cYaw
+    float sxp = xr * this.sx
+    float syp = yr * this.sPit * this.sy - p.z * this.cPit * this.sz
+    chart.point.from_index(this.anchorX + int(sxp), this.anchorY - syp)
+
+method toPolyline(DataSeries this, Camera cam) =>
+    array<chart.point> poly = array.new<chart.point>()
+    for p in this.points
+        poly.push(cam.project(p))
+    poly
+
+// ───────────────────────── Surface & Series Builders ──────────────────────────────
+f_buildSurface(int gx, int gy) =>
+    matrix<Point3D> M = matrix.new<Point3D>(gy, gx)
+    array<Point3D> peaks = array.from(
+         Point3D.new(18, 12, 151.1), Point3D.new(20, 13, 151.3), Point3D.new(15, 15, 135.8),
+         Point3D.new(14, 16, 135.0), Point3D.new(16, 17, 133.0), Point3D.new(10, 8, 53.8),
+         Point3D.new(12, 6, 51.1), Point3D.new(22, 5, 33.0), Point3D.new(25, 18, 15.8),
+         Point3D.new(8, 4, 15.8)
+     )
+    for y = 0 to gy - 1
+        float cy = math.cos(y / 6.) * 3
+        for x = 0 to gx - 1
+            float base = math.sin(x / 4.) * 5 + cy
+            float add  = 0.0
+            for pk in peaks
+                float dx = float(x) - pk.x
+                float dy = float(y) - pk.y
+                add += pk.z * math.exp(-(dx*dx + dy*dy) / (2 * 3.2 * 3.2))
+            M.set(y, x, Point3D.new(float(x), float(y), base + add))
+    M
+
+f_ridgeSeries(matrix<Point3D> surf) =>
+    int rows = matrix.rows(surf), cols = matrix.columns(surf)
+    DataSeries s1 = DataSeries.new(array.new<Point3D>(), color.new(f_colorAt(0.8), 5))
+    if showSeries1
+        for x = 4 to cols - 5
+            int y = 12 + int(math.sin(x / 2.8) * 2)
+            y := math.max(0, math.min(rows - 1, y))
+            Point3D p = surf.get(y, x)
+            s1.points.push(Point3D.new(p.x, p.y, p.z + 2))
+    s1
+
+// Dynamic leaderboard pole height
+f_buildLabelPole(matrix<Point3D> surf, int numItems) =>
+    DataSeries pole = DataSeries.new(array.new<Point3D>(), color.new(f_colorAt(0.5), 10))
+    if showSeries2
+        int poleX = gridX - 1, poleY = 0
+        Point3D basePoint = surf.get(poleY, poleX)
+        float poleHeight = 100.0 + numItems * 25.0
+        pole.points.push(basePoint)
+        pole.points.push(Point3D.new(basePoint.x, basePoint.y, basePoint.z + poleHeight))
+    pole
+
+// ───────────────────────────── 3D Basis & Badge Builders ──────────────────────────
+f_basis(float yawOff, float pitchOff) =>
+    float phi = (yawDeg + yawOff) * math.pi / 180
+    float pit = pitchOff * math.pi / 180
+    float ux = math.cos(phi), float uy = math.sin(phi), float uz = 0.0
+    float nx = -uy, float ny = ux
+    float vx = nx * math.sin(pit), float vy = ny * math.sin(pit), float vz = math.cos(pit)
+    [ux, uy, uz, vx, vy, vz]
+
+f_to3D(Point3D A, array<float> basis, float u, float v) =>
+    Point3D.new(A.x + basis.get(0) * u + basis.get(3) * v, A.y + basis.get(1) * u + basis.get(4) * v, A.z + basis.get(2) * u + basis.get(5) * v)
+
+f_polyCircle(Camera cam, Point3D A, array<float> basis, float u0, float v0, float r, int n) =>
+    array<chart.point> poly = array.new<chart.point>()
+    for i = 0 to n - 1
+        float t = 2.0 * math.pi * i / n
+        poly.push(cam.project(f_to3D(A, basis, u0 + r * math.cos(t), v0 + r * math.sin(t))))
+    poly
+
+f_polyRotRect(Camera cam, Point3D A, array<float> basis, float u0, float v0, float hw, float hh, float angRad) =>
+    float ca = math.cos(angRad), float sa = math.sin(angRad)
+    array<chart.point> poly = array.new<chart.point>()
+    poly.push(cam.project(f_to3D(A, basis, u0 + (-hw * ca - -hh * sa), v0 + (-hw * sa + -hh * ca))))
+    poly.push(cam.project(f_to3D(A, basis, u0 + ( hw * ca - -hh * sa), v0 + ( hw * sa + -hh * ca))))
+    poly.push(cam.project(f_to3D(A, basis, u0 + ( hw * ca -  hh * sa), v0 + ( hw * sa +  hh * ca))))
+    poly.push(cam.project(f_to3D(A, basis, u0 + (-hw * ca -  hh * sa), v0 + (-hw * sa +  hh * ca))))
+    poly
+
+f_localTransform(float u0, float v0, float uc, float vc, float rotDeg, bool flipH, bool flipV) =>
+    float dx = (u0 - uc) * (flipH ? -1.0 : 1.0), float dy = (v0 - vc) * (flipV ? -1.0 : 1.0)
+    float th = rotDeg * math.pi / 180, float ca = math.cos(th), float sa = math.sin(th)
+    [uc + dx * ca - dy * sa, vc + dx * sa + dy * ca]
+
+f_buildBadgePolys(Camera cam, Point3D A, array<float> basis, float w, float h) =>
+    float uC = w * 0.5, float vC = h * 0.5
+    float R = math.min(w, h) * 0.35
+
+    array<chart.point> bg = f_polyCircle(cam, A, basis, uC, vC, R * badgeBgScale, 28)
+
+    float tTh = R * 0.28 * tScale, float tH = R * 0.90 * tScale
+    [uBarC, vBarC] = f_localTransform(uC - R * 0.43 + tOffU * R, vC + tOffV * R, uC, vC, badgeRotDeg + tRotDeg, tFlipH, tFlipV)
+    float tAng = (badgeRotDeg + tRotDeg) * math.pi / 180
+    array<chart.point> tBar  = f_polyRotRect(cam, A, basis, uBarC, vBarC, tTh * 0.5, tH * 0.5, tAng)
+
+    float headW = R * 0.70 * tScale, float headH = tTh
+    [uHeadC, vHeadC] = f_localTransform((uC - R * 0.43) + (tTh * 0.5 + headW * 0.5) + tOffU * R, vC - (tH * 0.5 - headH * 0.5) + tOffV * R, uC, vC, badgeRotDeg + tRotDeg, tFlipH, tFlipV)
+    array<chart.point> tHead = f_polyRotRect(cam, A, basis, uHeadC, vHeadC, headW * 0.5, headH * 0.5, tAng)
+
+    float orb = (dotOrbitDeg + badgeRotDeg) * math.pi / 180
+    [uDot, vDot] = f_localTransform(uC + (-R * 0.18) * -math.sin(orb) + dotOffU * R, vC + (-R * 0.18) * math.cos(orb) + dotOffV * R, uC, vC, 0.0, dotFlipH, dotFlipV)
+    array<chart.point> dot = f_polyCircle(cam, A, basis, uDot, vDot, R * 0.20 * dotScale, 24)
+
+    [uSlash, vSlash] = f_localTransform(uC + R * 0.43 + slashOffU * R, vC + R * 0.05 + slashOffV * R, uC, vC, badgeRotDeg + slashRotDeg, slashFlipH, slashFlipV)
+    float slashAng = (-35.0 + badgeRotDeg + slashRotDeg) * math.pi / 180
+    array<chart.point> slash = f_polyRotRect(cam, A, basis, uSlash, vSlash, R * 0.95 * slashScale * 0.5, R * 0.26 * slashScale * 0.5, slashAng)
+
+    [bg, tBar, tHead, dot, slash]
+
+// Flag + pole geometry projected
+f_flagGeom(Camera cam, Point3D base, float w, float h, float poleH, float yawOff, float pitchOff) =>
+    [ux, uy, uz, vx, vy, vz] = f_basis(yawOff, pitchOff)
+    Point3D poleB = base, Point3D poleT = Point3D.new(base.x, base.y, base.z + poleH)
+    Point3D A = poleT
+    array<float> basis = array.from(ux, uy, uz, vx, vy, vz)
+    Point3D B = f_to3D(A, basis, w, 0), Point3D C = f_to3D(B, basis, 0, h), Point3D D = f_to3D(A, basis, 0, h)
+    [cam.project(A), cam.project(B), cam.project(C), cam.project(D), cam.project(poleB), cam.project(poleT), basis, A]
+
+// Node marker
+f_node(chart.point cp, color c) =>
+    label.new(cp.index, cp.price, "●", style = label.style_none, color = c, textcolor = c, size = f_labelSize(markerSz))
+
+// ───────────── Crypto: Fetch & sort (unique, case-insensitive) ────────────────────
+f_getSortedCryptoData(string txt) =>
+    string[] toks = str.split(txt, ",")
+    map<string, bool> uniqueSymbols = map.new<string, bool>()
+    for tok in toks
+        string base = str.upper(str.trim(tok))
+        if base != ""
+            uniqueSymbols.put(base, true)
+    string[] syms = uniqueSymbols.keys()
+    float[]  caps = array.new_float(syms.size())
+    for i = 0 to syms.size() - 1
+        caps.set(i, request.security("CRYPTOCAP:" + syms.get(i), timeframe.period, close))
+    array<CryptoData> sortedData = array.new<CryptoData>()
+    if caps.size() > 0
+        array<int> orderIdx = caps.sort_indices(order.descending)
+        for i = 0 to orderIdx.size() - 1
+            int si = orderIdx.get(i)
+            string sym = syms.get(si)
+            float capVal = caps.get(si)
+            color lblColor = brightColors.get(i % brightColors.size())
+            sortedData.push(CryptoData.new(sym, capVal, lblColor))
+    sortedData
+
+// ───────────── Optimized placement preserving original distribution ───────────────
+// Build candidate grid (subsampled) once.
+f_buildCandidates(matrix<Point3D> surf, Camera cam, int step) =>
+    array<Point3D> c3d = array.new<Point3D>()
+    array<chart.point> c2d = array.new<chart.point>()
+    for y = 0 to matrix.rows(surf) - 1 by step
+        for x = 0 to matrix.columns(surf) - 1 by step
+            Point3D p3 = surf.get(y, x)
+            chart.point p2 = cam.project(p3)
+            c3d.push(p3), c2d.push(p2)
+    [c3d, c2d]
+
+// Assign nearest non-colliding candidate to each target (single pass).
+f_assignToTargets(array<chart.point> targets, array<Point3D> c3d, array<chart.point> c2d, float minDist, array<chart.point> seedSelected) =>
+    array<Point3D> out3d = array.new<Point3D>()
+    array<chart.point> selected2d = array.copy(seedSelected)
+    array<bool> used = array.new<bool>(c2d.size(), false)
+
+    for tIdx = 0 to targets.size() - 1
+        chart.point tgt = targets.get(tIdx)
+        int bestIdx = -1
+        float bestD  = 1e9
+
+        for attempt = 0 to 3
+            float req = minDist * math.pow(0.85, attempt)
+            bestIdx := -1, bestD := 1e9
+
+            for i = 0 to c2d.size() - 1
+                if used.get(i)
+                    continue
+                chart.point cand = c2d.get(i)
+                float dT = math.sqrt(math.pow(cand.index - tgt.index, 2) + math.pow(cand.price - tgt.price, 2))
+                if dT < bestD
+                    bool collide = false
+                    for s in selected2d
+                        float ds = math.sqrt(math.pow(cand.index - s.index, 2) + math.pow(cand.price - s.price, 2))
+                        if ds < req
+                            collide := true
+                            break
+                    if not collide
+                        bestD := dT, bestIdx := i
+            if bestIdx != -1
+                used.set(bestIdx, true)
+                out3d.push(c3d.get(bestIdx))
+                selected2d.push(c2d.get(bestIdx))
+                break
+        if bestIdx == -1
+            int nb = -1
+            float bd = 1e9
+            for i = 0 to c2d.size() - 1
+                if used.get(i)
+                    continue
+                chart.point cand = c2d.get(i)
+                float dT = math.sqrt(math.pow(cand.index - tgt.index, 2) + math.pow(cand.price - tgt.price, 2))
+                if dT < bd
+                    bd := dT, nb := i
+            if nb != -1
+                used.set(nb, true)
+                out3d.push(c3d.get(nb))
+                selected2d.push(c2d.get(nb))
+    out3d
+
+// Robustly clear all drawing objects.
+f_flushDrawings() =>
+    for l in line.all
+        l.delete()
+    for p in polyline.all
+        p.delete()
+    for lb in label.all
+        lb.delete()
+
+// ─────────────────────────────────── Main ─────────────────────────────────────────
+if barstate.islast
+    f_flushDrawings()
+
+    // These buffers are now local to the `islast` block.
+    array<chart.point> stripBuf = array.new<chart.point>()
+    array<chart.point> lineBuf  = array.new<chart.point>()
+    array<chart.point> fpoly    = array.new<chart.point>()
+
+    Camera cam = Camera.new(bar_index - int((gridX * scaleX) / 4), high + ta.tr * 6, math.cos(yawDeg * math.pi / 180),
+         math.sin(yawDeg * math.pi / 180), math.sin(pitchDeg * math.pi / 180), math.cos(pitchDeg * math.pi / 180), scaleX, scaleY, scaleZ)
+
+    matrix<Point3D> surface = f_buildSurface(gridX, gridY)
+    int rows = matrix.rows(surface), cols = matrix.columns(surface)
+
+    array<CryptoData> sortedCrypto = f_getSortedCryptoData(symbolsText)
+    int nSyms = sortedCrypto.size()
+
+    // Surface rendering
+    if showFill
+        for y = 0 to rows - 2
+            stripBuf.clear()
+            for x = 0 to cols - 1
+                stripBuf.push(cam.project(surface.get(y, x)))
+            for x = cols - 1 to 0
+                stripBuf.push(cam.project(surface.get(y + 1, x)))
+            polyline.new(stripBuf, closed = true, line_color = #00000000, fill_color = color.new(f_colorAt((y + 0.5) / (rows - 1)), 78))
+    if showWire
+        for y = 0 to rows - 1
+            lineBuf.clear()
+            for x = 0 to cols - 1
+                lineBuf.push(cam.project(surface.get(y, x)))
+            polyline.new(lineBuf, line_color = COLOR_GRID)
+        for x = 0 to cols - 1
+            lineBuf.clear()
+            for y = 0 to rows - 1
+                lineBuf.push(cam.project(surface.get(y, x)))
+            polyline.new(lineBuf, line_color = COLOR_GRID)
+    if showMarkers
+        int mstep = int(math.max(1, math.ceil(math.sqrt(cols * rows / 380.))))
+        for y = 0 to rows - 1
+            for x = 0 to cols - 1
+                if (x % mstep == 0 and y % mstep == 0) or x == 0 or x == cols - 1 or y == 0 or y == rows - 1
+                    chart.point cp = cam.project(surface.get(y, x))
+                    color cnode = color.new(f_colorAt(y / (rows - 1.0)), 40)
+                    f_node(cp, cnode)
+                    f_node(cp, color.new(color.white, 70))
+
+    if showPeakVolumeFill
+        for y = 0 to rows - 1 by hatchStep
+            for x = 0 to cols - 1 by hatchStep
+                Point3D pc = surface.get(y, x)
+                if pc.z > peakThreshold
+                    line.new(cam.project(Point3D.new(pc.x, pc.y, peakThreshold)), cam.project(pc), color = peakFillColor, width = 1)
+    if showPeakSurfaceFill
+        for y = 0 to rows - 1 by hatchStep
+            for x = 0 to cols - 2
+                Point3D p1 = surface.get(y, x), Point3D p2 = surface.get(y, x + 1)
+                if p1.z > peakThreshold and p2.z > peakThreshold
+                    line.new(cam.project(p1), cam.project(p2), color = peakFillColor)
+        for x = 0 to cols - 1 by hatchStep
+            for y = 0 to rows - 2
+                Point3D p1 = surface.get(y, x), Point3D p2 = surface.get(y + 1, x)
+                if p1.z > peakThreshold and p2.z > peakThreshold
+                    line.new(cam.project(p1), cam.project(p2), color = peakFillColor)
+
+    DataSeries ridge = f_ridgeSeries(surface)
+    polyline.new(ridge.toPolyline(cam), line_color = ridge.seriesColor, line_width = 2)
+
+    // Highest summit
+    float zAbs = -1e9, int ixAbs = 0, int iyAbs = 0
+    for yy = 0 to rows - 1
+        for xx = 0 to cols - 1
+            Point3D pt = surface.get(yy, xx)
+            if pt.z > zAbs
+                zAbs := pt.z, ixAbs := xx, iyAbs := yy
+    Point3D top = surface.get(iyAbs, ixAbs)
+    
+    // Always calculate flag geometry for `basis` vector
+    [pa, pb, pc, pd, pPoleB, pPoleT, basis, A] = f_flagGeom(cam, Point3D.new(top.x, top.y, top.z), flagW, flagH, flagPoleH, flagYawOff, flagPitchOff)
+
+    // Conditionally draw flag
+    if showFlagInput
+        fpoly.clear(), fpoly.push(pa), fpoly.push(pb), fpoly.push(pc), fpoly.push(pd)
+        polyline.new(fpoly, closed = true, line_color = color.new(color.black, 50), fill_color = color.white)
+        line.new(pPoleB, pPoleT, color = poleColor, width = 2)
+
+        [bg, tBar, tHead, dot, slash] = f_buildBadgePolys(cam, A, basis, flagW, flagH)
+        polyline.new(bg,    closed = true, line_color = #00000000, fill_color = badgeBgColor)
+        polyline.new(tBar,  closed = true, line_color = #00000000, fill_color = tColor)
+        polyline.new(tHead, closed = true, line_color = #00000000, fill_color = tColor)
+        polyline.new(dot,   closed = true, line_color = #00000000, fill_color = dotColor)
+        polyline.new(slash, closed = true, line_color = #00000000, fill_color = slashColor)
+
+    // Leaderboard pole (dynamic height)
+    DataSeries leaderboardPole = f_buildLabelPole(surface, nSyms)
+    polyline.new(leaderboardPole.toPolyline(cam), line_color = leaderboardPole.seriesColor, line_width = 2)
+
+    // ────────────────────────────── Crypto Market Caps ─────────────────────────────
+    if nSyms > 0
+        chart.point summitScreenPoint = cam.project(Point3D.new(top.x, top.y, top.z + flagPoleH))
+        chart.point baseScreenPoint   = cam.project(Point3D.new(top.x, top.y, 0))
+        float yScreenMax = summitScreenPoint.price, float yScreenMin = baseScreenPoint.price
+
+        int candStep = int(math.max(1, math.ceil(math.sqrt(rows * cols / 300.0))))
+        [c3d, c2d] = f_buildCandidates(surface, cam, candStep)
+
+        array<chart.point> targets = array.new<chart.point>()
+        float phi = 2.0 * math.pi * 2.618
+        for i = 1 to nSyms - 1
+            float rankRatio = (nSyms - float(i) - 1) / math.max(float(nSyms - 2), 1.0)
+            float tY = yScreenMin + (yScreenMax - yScreenMin) * (0.1 + 0.8 * rankRatio)
+            float radius = (1.0 - rankRatio) * 100.0 + 20.0
+            float ang = phi * i
+            float tX = float(summitScreenPoint.index) + radius * math.cos(ang)
+            array.push(targets, chart.point.from_index(int(tX), tY))
+
+        array<chart.point> seedSelected = array.new<chart.point>()
+        Point3D midPole = Point3D.new(top.x, top.y, top.z + flagPoleH * 0.5)
+        Point3D rank1_3D = f_to3D(midPole, basis, flagW * 0.1, 0)
+        chart.point rank1_2D = cam.project(rank1_3D)
+        seedSelected.push(rank1_2D)
+
+        float minScreenDist = math.max(12.0, 26.0 - nSyms / 2.0)
+        array<Point3D> assigned = f_assignToTargets(targets, c3d, c2d, minScreenDist, seedSelected)
+
+        CryptoData c0 = sortedCrypto.get(0)
+        string txt0 = showCapsOnMountain ? str.format("{0}: {1}", c0.symbol, f_fmtCap(c0.cap)) : c0.symbol
+        if not showCapsOnMountain
+            label.new(rank1_2D.index, rank1_2D.price, "", style=label.style_circle, color=color.new(c0.labelColor, 50), textcolor=#00000000, size=size.normal)
+        label.new(rank1_2D.index, rank1_2D.price, txt0, style=label.style_text_outline, color=color.white, textcolor=c0.labelColor, size=size.normal)
+
+        for i = 1 to nSyms - 1
+            if i - 1 >= assigned.size()
+                break
+            CryptoData cd = sortedCrypto.get(i)
+            string txt = showCapsOnMountain ? str.format("{0}: {1}", cd.symbol, f_fmtCap(cd.cap)) : cd.symbol
+            chart.point cp = cam.project(assigned.get(i - 1))
+            if not showCapsOnMountain
+                label.new(cp.index, cp.price, "", style=label.style_circle, color=color.new(cd.labelColor, 50), textcolor=#00000000, size=size.normal)
+            label.new(cp.index, cp.price, txt, style=label.style_text_outline, color=color.white, textcolor=cd.labelColor, size=size.normal)
+
+        Point3D poleStart = leaderboardPole.points.get(0), Point3D poleEnd = leaderboardPole.points.get(1)
+        float poleLabelOffset = 3.0, float topMargin = 0.98, float bottomMargin = 0.08
+
+        for i = 0 to nSyms - 1
+            CryptoData crypto = sortedCrypto.get(i)
+            float t = bottomMargin
+            if nSyms > 1
+                float normalizedRank = (nSyms - 1.0 - i) / (nSyms - 1.0)
+                t := bottomMargin + normalizedRank * (topMargin - bottomMargin)
+
+            float labelX = poleStart.x + t * (poleEnd.x - poleStart.x)
+            float labelY = poleStart.y + t * (poleEnd.y - poleStart.y)
+            float labelZ = poleStart.z + t * (poleEnd.z - poleStart.z)
+            Point3D labelPointOnPole3D = Point3D.new(labelX, labelY, labelZ)
+
+            chart.point pointOnPole2D = cam.project(labelPointOnPole3D)
+            chart.point textAnchorPoint = chart.point.from_index(pointOnPole2D.index + int(poleLabelOffset), pointOnPole2D.price)
+
+            line.new(pointOnPole2D, textAnchorPoint, color=crypto.labelColor, width=1, style=line.style_dotted)
+
+            string poleLabelText = showCapsOnMountain ? crypto.symbol : str.format("{0}: {1}", crypto.symbol, f_fmtCap(crypto.cap))
+            label.new(textAnchorPoint.index, textAnchorPoint.price, poleLabelText, style=label.style_label_left, color=#00000000, textcolor=crypto.labelColor, size=size.normal)

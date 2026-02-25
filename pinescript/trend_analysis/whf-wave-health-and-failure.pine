@@ -1,0 +1,765 @@
+//@version=5
+indicator("WHF - Wave Health and Failure", shorttitle="WHF-NA", overlay=true, max_bars_back=500, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+// ════════════════════════════════════════════════════════════════════════╗
+//         ⚡  WHF — Neural Adaptive Wave Health & Failure Engine ⚡      ║
+//             CORE THESIS: Assume failure until proven healthy.           ║
+//           Failed moves are first-class signals, not noise to ignore.    ║
+// ════════════════════════════════════════════════════════════════════════╝
+// LIBRARY IMPORTS                                                         ║
+// ════════════════════════════════════════════════════════════════════════╝
+import DskyzInvestments/DafeRLMLLib/1 as ml
+import DskyzInvestments/DafeSPALib/1 as spa
+import DskyzInvestments/DafeMLSPABridge/1 as bridge
+import DskyzInvestments/WickPressureLib/1 as wpk
+import DskyzInvestments/DafePatternsLib/1 as pattern
+import DskyzInvestments/DafeVisLib/1 as viz
+import DskyzInvestments/DafeDashboardLib/1 as dafe
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ INPUT GROUPS                                                               ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+string G_CORE     = "═══ ⚡ WHF CORE SETTINGS ═══"
+string G_HEALTH   = "═══ 💊 WAVE HEALTH PARAMETERS ═══"
+string G_ML       = "═══ 🧠 ML ENGINE SETTINGS ═══"
+string G_SPA      = "═══ 🎯 SPA / THOMPSON SETTINGS ═══"
+string G_WPK      = "═══ ⚛️ WICK PHYSICS SETTINGS ═══"
+string G_PATTERN  = "═══ 🔬 PATTERN DETECTION ═══"
+string G_SIGNAL   = "═══ 📡 SIGNAL FILTERS ═══"
+string G_VISUAL   = "═══ 🎨 VISUAL SETTINGS ═══"
+string G_DASH     = "═══ 📊 DASHBOARD ═══"
+string G_AI       = "═══ 🤖 AI ASSISTANT ═══"
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ TOOLTIP DEFINITIONS                                                        ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var string TT_CORE    = "⚙️ CORE SETTINGS\n\n• Lookback: The window of bars analyzed to determine current wave health.\n• Smoothing: Reduces jitter in the health score.\n• Thresholds: Defines the cutoff for a 'Healthy' trend (>70) vs a 'Failed' trend (<40)."
+var string TT_HEALTH  = "💊 HEALTH COMPONENTS (The 3 Pillars)\n\n• REQ (Relative Efficiency Quotient): How much price moved vs volume used.\n• PC (Participation Consistency): Does volume sustain or drop off?\n• SE (Structural Extension): Penalizes choppy/overlapping price action.\n\n• Churn: Detects high volume with low price movement (hidden resistance)."
+var string TT_ML      = "🧠 MACHINE LEARNING ENGINE\n\n• Features: Number of market data points fed into the neural net.\n• Hidden Neurons: The 'brain capacity' of the net.\n• Learning Rate: How fast the AI adapts to new data (Lower = More stable, Higher = Faster adaptation).\n• Warmup: Bars required before ML starts signaling."
+var string TT_SPA     = "🎯 SUCCESS PROPENSITY ANALYSIS\n\nUses 'Thompson Sampling' to allocate trust to different sub-strategies.\n\n• Arms: Number of internal strategies competing.\n• Decay: Memory factor. How fast it forgets old data.\n• Trauma: How severely the system penalizes a loss (Higher = more risk averse).\n• Epsilon: Exploration rate (trying new things vs sticking to what works)."
+var string TT_WPK     = "⚛️ WICK PRESSURE KERNEL\n\nAnalyzes the internal auction of each candle.\n\n• Regime Lookback: Context for volatility.\n• Anomaly: Z-Score required to flag a wick as 'Unusual' behavior.\n• Cluster: Identifies zones where multiple anomalies align."
+var string TT_SIG     = "📡 SIGNAL FILTERS\n\n• Min Confidence: The combined probability threshold (AI + Health + WPK) required to trigger a trade signal.\n• Show Healthy: Trends with high efficiency.\n• Show Failed: 'Fade' signals where a trend collapsed (often high probability reversals)."
+var string TT_VIS     = "🎨 VISUALS\n\n• Neural Zigzag: Draws the wave structure colored by health.\n• Zones: Highlights areas of structural failure or strength.\n• Trail: A dynamic stop-loss line based on wave health."
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ INPUTS                                                                     ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+int    i_lookback       = input.int(100, "Health Lookback", minval=5, maxval=150, group=G_CORE, tooltip=TT_CORE)
+int    i_smoothing      = input.int(3, "Score Smoothing", minval=1, maxval=10, group=G_CORE, tooltip=TT_CORE)
+float  i_healthyThresh  = input.float(70.0, "Healthy Threshold", minval=50, maxval=90, group=G_CORE, tooltip="Above this = Strong Trend")
+float  i_failedThresh   = input.float(40.0, "Failed Threshold", minval=10, maxval=50, group=G_CORE, tooltip="Below this = Broken Trend (Reversal Risk)")
+float  i_reqWeight      = input.float(0.35, "REQ Weight (Efficiency)", minval=0.1, maxval=0.6, step=0.05, group=G_HEALTH, tooltip="Importance of Price Distance vs Volume Used.")
+float  i_pcWeight       = input.float(0.40, "PC Weight (Consistency)", minval=0.1, maxval=0.6, step=0.05, group=G_HEALTH, tooltip="Importance of sustained volume participation.")
+float  i_seWeight       = input.float(0.25, "SE Weight (Structure)", minval=0.1, maxval=0.6, step=0.05, group=G_HEALTH, tooltip="Importance of clean candle geometry (penalizes overlapping).")
+int    i_participWindow = input.int(14, "Participation Window", minval=5, maxval=50, group=G_HEALTH)
+float  i_churnThresh    = input.float(1.5, "Churn Threshold", minval=0.5, maxval=5.0, step=0.1, group=G_HEALTH, tooltip="Penalizes health when Volume is high but Price Range is low (fighting).")
+int    i_failedFFMax    = input.int(5, "Failed Follow-Through Max", minval=1, maxval=15, group=G_HEALTH, tooltip="Allowed number of bars that fail to make a new extreme before health degrades.")
+bool   i_mlEnabled      = input.bool(true, "Enable ML Engine", group=G_ML, tooltip=TT_ML)
+int    i_mlFeatures     = input.int(12, "Feature Count", minval=6, maxval=16, group=G_ML, tooltip="Number of market inputs used (RSI, ATR, Trend, Health, etc).")
+int    i_mlHidden       = input.int(24, "Hidden Neurons", minval=8, maxval=48, group=G_ML, tooltip="Complexity of the neural network.")
+int    i_mlActions      = input.int(5, "Action Count", minval=3, maxval=7, group=G_ML, tooltip="Long, Short, Neutral, Strong Long, Strong Short.")
+float  i_mlLR           = input.float(0.001, "Learning Rate", minval=0.0001, maxval=0.01, step=0.0001, group=G_ML, tooltip="Speed of adaptation. Lower is more stable, Higher catches regime changes faster.")
+int    i_mlWarmup       = input.int(50, "ML Warmup Bars", minval=20, maxval=200, group=G_ML, tooltip="Bars to process before generating signals.")
+bool   i_spaEnabled     = input.bool(true, "Enable SPA Engine", group=G_SPA, tooltip=TT_SPA)
+int    i_spaArms        = input.int(4, "Strategy Arms", minval=2, maxval=8, group=G_SPA, tooltip="Number of internal strategies competing for dominance.")
+float  i_spaDecay       = input.float(0.995, "Memory Decay", minval=0.98, maxval=0.999, step=0.001, group=G_SPA, tooltip="How fast the system forgets past performance. 0.999 = Long memory.")
+float  i_spaTrauma      = input.float(2.0, "Trauma Factor", minval=1.2, maxval=4.0, step=0.1, group=G_SPA, tooltip="Penalty multiplier for losses. High trauma makes the system very cautious after a loss.")
+float  i_spaEpsilon     = input.float(0.15, "Exploration Rate", minval=0.01, maxval=0.5, step=0.01, group=G_SPA, tooltip="% chance the system tries a non-dominant strategy to see if market conditions changed.")
+bool   i_wpkEnabled     = input.bool(true, "Enable Wick Physics", group=G_WPK, tooltip=TT_WPK)
+int    i_wpkRegimeLB    = input.int(100, "Regime Lookback", minval=50, maxval=300, group=G_WPK)
+bool   i_wpkLearning    = input.bool(true, "Thompson Sampling ML", group=G_WPK, tooltip="Allows WPK to learn which candle shapes predict movement best.")
+float  i_wpkMinAnomaly  = input.float(1.5, "Min Anomaly (Z-Score)", minval=0.5, maxval=5.0, step=0.1, group=G_WPK, tooltip="Statistical threshold to mark a wick as significant.")
+int    i_wpkClusterLB   = input.int(50, "Cluster Lookback", minval=20, maxval=200, group=G_WPK)
+bool   i_patEnabled     = input.bool(true, "Enable Neural Patterns", group=G_PATTERN, tooltip="Detects classic chart patterns enhanced by ML confirmation.")
+float  i_minConfidence  = input.float(0.5, "Min Confidence (0-1)", minval=0.2, maxval=0.9, step=0.05, group=G_SIGNAL, tooltip=TT_SIG)
+bool   i_showHealthy    = input.bool(true, "Show Healthy Signals", group=G_SIGNAL, tooltip="Trend continuation entries.")
+bool   i_showFailed     = input.bool(true, "Show Failed Signals", group=G_SIGNAL, tooltip="Trend Reversal/Fade entries.")
+bool   i_showFragile    = input.bool(true, "Show Fragile Warnings", group=G_SIGNAL, tooltip="Warning icons when trend health deteriorates.")
+bool   i_showPatterns   = input.bool(true, "Show Pattern Signals", group=G_SIGNAL)
+string i_themeName      = input.string("DAFE Signature", "Theme", options=["Matrix", "Cyber", "Neon", "Gold", "Ice", "Blood", "DAFE Signature"], group=G_VISUAL)
+bool   i_showZigzag     = input.bool(true, "Show Neural Zigzag", group=G_VISUAL, tooltip="Draws the health-coded wave structure.")
+int    i_zigDepth       = input.int(10, "Zigzag Depth", minval=2, group=G_VISUAL)
+bool   i_showZones      = input.bool(true, "Show Health Zones", group=G_VISUAL, tooltip="Background highlights for healthy/failed regimes.")
+bool   i_showTrail      = input.bool(true, "Show Health Trail", group=G_VISUAL, tooltip="Trailing stop line derived from wave health.")
+bool   i_candleColor    = input.bool(true, "Health Candle Coloring", group=G_VISUAL)
+bool   i_showWatermark  = input.bool(true, "Show DAFE Watermark", group=G_VISUAL)
+bool   i_showDashboard  = input.bool(true, "Show Dashboard", group=G_DASH)
+string i_dashPos        = input.string("TopRight", "Dashboard Position", options=["TopRight", "TopLeft", "BottomRight", "BottomLeft"], group=G_DASH)
+bool   i_showExtended   = input.bool(true, "Show Extended Metrics", group=G_DASH)
+bool   i_showValidation = input.bool(true, "Show Library Validation", group=G_DASH, tooltip="Debug panel showing connection status of internal libraries.")
+bool   i_showAI         = input.bool(false, "Enable AI Assistant", group=G_AI, tooltip="Displays the conversational analysis panel.")
+string i_gender         = input.string("Droid", "Gender", options=["Male", "Female", "Droid"], group=G_AI)
+string i_aiPosition     = input.string("TopRight", "AI Position", options=["TopRight", "TopLeft", "BottomRight", "BottomLeft"], group=G_AI)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 1: THEME & GLOBALS                                                 ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var viz.Theme theme = viz.get_theme(i_themeName)
+color col_healthy   = theme.bull
+color col_fragile   = color.new(#ffaa00, 0)
+color col_failed    = theme.bear
+color col_neutral   = theme.neu
+color col_bg        = theme.bg
+color col_accent    = theme.a
+color col_primary   = theme.p
+color col_secondary = theme.s
+color col_text      = theme.txt_hi
+color col_dim       = theme.txt_lo
+float ta_linreg_0 = ta.linreg(close, 20, 0)
+float ta_linreg_1 = ta.linreg(close, 20, 1)
+float trendSlope  = ta_linreg_0 - ta_linreg_1
+float ta_atr      = ta.atr(14)
+float synthVix    = ta_atr / close * 100.0
+float ta_rsi      = ta.rsi(close, 14)
+float ta_ema8     = ta.ema(close, 8)
+float ta_ema21    = ta.ema(close, 21)
+float ta_ema50    = ta.ema(close, 50)
+float chartHigh   = ta.highest(high, 300)
+float chartLow    = ta.lowest(low, 300)
+float chartRange  = chartHigh - chartLow
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 2: ML ENGINE INITIALIZATION                                        ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var mlEngine = ml.init(0, i_mlFeatures, i_mlActions, i_mlLR)
+bool mlActive = i_mlEnabled
+if barstate.isfirst and mlActive
+    for i = 0 to 3
+        sock = ml.DataSocket.new()
+        sock.id := switch i
+            0 => "rsi"
+            1 => "atr_norm"
+            2 => "trend"
+            => "whf_health"
+        sock.value := 0.5
+        sock.normalized := 0.5
+        sock.weight := 1.0
+        array.push(mlEngine.sockets, sock)
+    mlEngine.num_sockets := 4
+var bool mlSocketsConnected = false
+var int  mlSocketCount      = 0
+var int  mlActionsSelected  = 0
+var float mlLastReward      = 0.0
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 3: SPA ENGINE INITIALIZATION                                      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+var armNames = array.from("Health-Cont", "Failure-Fade", "Fragile-Scalp", "WPK-Confluence")
+var spaEngine = spa.init(i_spaArms, armNames, 10000.0, 0, i_spaDecay, i_spaTrauma, i_spaEpsilon)
+bool spaActive = i_spaEnabled
+if barstate.isfirst and spaActive
+    for i = 0 to 6
+        sSock = spa.DataSocket.new()
+        sSock.id := switch i
+            0 => "whf_health"
+            1 => "whf_req"
+            2 => "whf_pc"
+            3 => "whf_se"
+            4 => "wpk_anomaly"
+            5 => "wpk_delta"
+            => "cluster_bias"
+        sSock.value := 0.0
+        sSock.normalized := 0.5
+        sSock.weight := 1.0
+        array.push(spaEngine.sockets, sSock)
+    spaEngine.num_sockets := 7
+var bool spaSocketsConnected = false
+var int  spaSocketCount      = 0
+var int  spaSelectCount      = 0
+var float spaLastEquity      = 10000.0
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 4: BRIDGE & WPK INITIALIZATION                                     ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var bridgeState = bridge.init_bridge(i_spaArms, i_mlActions, i_minConfidence, i_mlWarmup)
+bool bridgeActive = i_mlEnabled and i_spaEnabled
+var wpkAgents = wpk.create_learning_agents()
+bool wpkLearningActive = i_wpkEnabled and i_wpkLearning
+var bool bridgeReconciled   = false
+var bool wpkRegimeDetected  = false
+var bool wpkWickAnalyzed    = false
+var bool wpkClustersScanned = false
+var int  patternCount       = 0
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 5: CORE WHF COMPUTATION                                            ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+float netMove       = math.abs(close - close[i_lookback])
+float sumMoves      = 0.0
+float sumVolume     = 0.0
+for i = 0 to i_lookback - 1
+    sumMoves  += math.abs(close[i] - close[i + 1])
+    sumVolume += volume[i]
+float efficiency    = sumMoves > 0 ? netMove / sumMoves : 0.0
+float avgRange      = ta_atr
+float priceProgress = avgRange > 0 ? netMove / avgRange : 0.0
+float avgVol        = ta.sma(volume, i_lookback)
+float energyCost    = avgVol > 0 ? (sumVolume / i_lookback) / avgVol : 1.0
+float energyNorm    = energyCost > 0 ? math.min(1.0, priceProgress / energyCost) : 0.0
+float recentMom     = math.abs(close - close[math.floor(i_lookback / 3)])
+float earlyMom      = math.abs(close[math.floor(i_lookback / 3)] - close[i_lookback])
+float decayRatio    = earlyMom > 0 ? recentMom / earlyMom : 1.0
+float decayScore    = math.min(1.0, decayRatio)
+float reqScore      = ((efficiency * 0.40) + (energyNorm * 0.30) + (decayScore * 0.30)) * 100
+float currentDelta    = wpk.est_candle_delta(0)
+float deltaRatioVal   = wpk.delta_ratio(currentDelta, i_participWindow)
+float priceDir        = close > close[1] ? 1.0 : close < close[1] ? -1.0 : 0.0
+float deltaDir        = currentDelta > 0 ? 1.0 : currentDelta < 0 ? -1.0 : 0.0
+float alignSum        = 0.0
+for i = 0 to i_participWindow - 1
+    float pDir = close[i] > close[i + 1] ? 1.0 : close[i] < close[i + 1] ? -1.0 : 0.0
+    float dEst = wpk.est_candle_delta(i)
+    float dDir = dEst > 0 ? 1.0 : dEst < 0 ? -1.0 : 0.0
+    alignSum  += pDir * dDir
+float correlScore     = math.max(0.0, math.min(1.0, (alignSum / i_participWindow + 1.0) / 2.0))
+float buyVolume       = close > open ? volume : 0.0
+float sellVolume      = close < open ? volume : 0.0
+float buyPressure     = ta.sma(buyVolume, i_participWindow)
+float sellPressure    = ta.sma(sellVolume, i_participWindow)
+float totalPressure   = buyPressure + sellPressure
+float absorptionDom   = totalPressure > 0 ? math.max(buyPressure, sellPressure) / totalPressure : 0.5
+int halfWindow        = math.max(1, i_participWindow / 2)
+float earlyVol        = math.sum(volume[halfWindow], halfWindow)
+float lateVol         = math.sum(volume, halfWindow)
+float participRatio   = earlyVol > 0 ? lateVol / earlyVol : 1.0
+float dropOffScore    = math.min(1.0, participRatio > 0.8 ? 1.0 : participRatio / 0.8)
+float pcScore         = ((correlScore * 0.35) + (absorptionDom * 0.35) + (dropOffScore * 0.30)) * 100
+float priceStdDev     = ta.stdev(close, i_lookback)
+float churnIndex      = avgRange > 0 ? priceStdDev / avgRange : 0.0
+float churnScore      = churnIndex < i_churnThresh ? 1.0 : i_churnThresh / churnIndex
+int compressionCount  = 0
+for i = 0 to math.min(i_lookback - 2, 48)
+    float re_i   = avgRange > 0 ? (high[i] - low[i]) / avgRange : 1.0
+    float re_i1  = avgRange > 0 ? (high[i + 1] - low[i + 1]) / avgRange : 1.0
+    if re_i < 0.8 and re_i1 > 1.2
+        compressionCount += 1
+float compressionPen  = 1.0 - math.min(1.0, compressionCount / math.max(1.0, float(i_lookback) / 5.0))
+int failedFF          = 0
+for i = 1 to math.min(i_lookback - 1, 48)
+    float moveI    = math.abs(close[i] - close[i + 1])
+    float moveNext = math.abs(close[i - 1] - close[i])
+    if moveI > avgRange * 0.7 and moveNext < avgRange * 0.3
+        failedFF += 1
+float followThruScore = 1.0 - math.min(1.0, failedFF / float(i_failedFFMax))
+float seScore         = ((churnScore * 0.40) + (compressionPen * 0.30) + (followThruScore * 0.30)) * 100
+float totalWeight     = i_reqWeight + i_pcWeight + i_seWeight
+float wREQ            = i_reqWeight / totalWeight
+float wPC             = i_pcWeight  / totalWeight
+float wSE             = i_seWeight  / totalWeight
+float rawHealth       = (reqScore * wREQ) + (pcScore * wPC) + (seScore * wSE)
+float waveHealth      = ta.sma(rawHealth, i_smoothing)
+waveHealth           := math.max(0.0, math.min(100.0, waveHealth))
+string waveState      = waveHealth >= i_healthyThresh ? "HEALTHY" : waveHealth >= i_failedThresh ? "FRAGILE" : "FAILED"
+color  stateColor     = waveState == "HEALTHY" ? col_healthy : waveState == "FRAGILE" ? col_fragile : col_failed
+int healthDirection   = currentDelta > 0 and correlScore > 0.6 ? 1 : currentDelta < 0 and correlScore > 0.6 ? -1 : 0
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 6: WPK INTEGRATION                                                 ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var wpkRegime   = wpk.detect_regime(i_wpkRegimeLB)
+if bar_index > 0
+    wpkRegime   := wpk.detect_regime(i_wpkRegimeLB)
+    wpkRegimeDetected := true
+var wickData    = wpk.analyze_wick(0, wpkRegime, wpkAgents)
+if bar_index > 0
+    wickData    := wpk.analyze_wick(0, wpkRegime, wpkAgents)
+    wpkWickAnalyzed := true
+float wickProb  = wpk.get_probability(wickData, wpkRegime)
+var clusters = wpk.scan_clusters(i_wpkClusterLB, 0.5, i_wpkMinAnomaly)
+if i_wpkEnabled
+    clusters := wpk.scan_clusters(i_wpkClusterLB, 0.5, i_wpkMinAnomaly)
+    wpkClustersScanned := true
+float clusterBias   = not na(clusters) ? wpk.get_cluster_bias(clusters, close) : 0.0
+bool  nearCluster   = not na(clusters) ? wpk.is_near_cluster(clusters, close, 0.3) : false
+float wickModifier  = 0.0
+if i_wpkEnabled and not na(wickData)
+    if wickData.anomaly_score > 2.0
+        if wickData.is_trapped
+            wickModifier := -15.0
+        else if wickData.context == "trend_continuation"
+            wickModifier := +10.0
+        else if wickData.context == "reversal"
+            wickModifier := -10.0
+float wpkAdjustedHealth = math.max(0.0, math.min(100.0, waveHealth + wickModifier))
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 7: PATTERN SCANNING                                                ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var pattern.PatternResult patResult = pattern.PatternResult.new("", "", "", 0.0, 0.0, 0.0, 0.0, 0.0, false, 1.0)
+if i_patEnabled and bar_index > i_mlWarmup
+    patResult := pattern.scan_pattern_universe()
+    if patResult.is_active
+        patternCount += 1
+float patternBoost = 0.0
+if i_patEnabled and not na(patResult) and patResult.is_active
+    bool patternBullish   = patResult.direction == "Bull"
+    bool patternBearish   = patResult.direction == "Bear"
+    bool healthBullish    = waveState == "HEALTHY" and healthDirection == 1
+    bool healthBearish    = waveState == "FAILED" and healthDirection == -1
+    bool failFade         = waveState == "FAILED" and ((healthDirection == 1 and patternBearish) or (healthDirection == -1 and patternBullish))
+    if (healthBullish and patternBullish) or (healthBearish and patternBearish) or failFade
+        patternBoost := patResult.net_confidence / 100.0 * 0.15
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 8: ML SOCKET UPDATE & CYCLE                                        ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+int    mlDirection    = 0
+float  mlConfidence   = 0.0
+string mlRegimeName   = "Unknown"
+if mlActive and not na(mlEngine) and bar_index >= i_mlWarmup
+    state = ml.build_state(mlEngine)
+    mlEngine := ml.connect_socket(mlEngine, "rsi", nz(ta_rsi, 50), "oscillator", 1.0, 0.0, 100.0)
+    mlEngine := ml.connect_socket(mlEngine, "atr_norm", nz(ta_atr/close*100, 1.0), "custom", 0.8, 0.0, 5.0)
+    mlEngine := ml.connect_socket(mlEngine, "trend", nz(trendSlope, 0), "custom", 1.0, -10.0, 10.0)
+    mlEngine := ml.connect_socket(mlEngine, "whf_health", nz(waveHealth, 50), "score", 1.5, 0.0, 100.0)
+    mlSocketsConnected := true
+    mlSocketCount := array.size(mlEngine.sockets)
+if mlActive and not na(mlEngine) and bar_index >= 2
+    state = ml.build_state(mlEngine)
+    [actObj, eng] = ml.select_action(mlEngine, state)
+    mlEngine     := eng
+    int actIdx = actObj.action
+    mlConfidence := actObj.confidence
+    mlActionsSelected += 1
+    if i_mlActions == 3
+        mlDirection := actIdx == 0 ? 1 : actIdx == 2 ? -1 : 0
+    else
+        mlDirection := actIdx <= 1 ? 1 : actIdx >= 3 ? -1 : 0
+    mlRegimeName := waveState
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 9: SPA STRATEGY SELECTION                                          ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+int    spaSelected    = 0
+float  spaConfidence  = 0.0
+string spaArmName     = "N/A"
+var signals = array.from(0, 0, 0, 0)
+if spaActive and not na(spaEngine) and bar_index >= 1
+    spaEngine := spa.connect_socket(spaEngine, "whf_health", waveHealth, "score", 1.5, 0.0, 100.0)
+    spaEngine := spa.connect_socket(spaEngine, "whf_req", reqScore, "score", 1.0, 0.0, 100.0)
+    spaEngine := spa.connect_socket(spaEngine, "whf_pc", pcScore, "score", 1.0, 0.0, 100.0)
+    spaEngine := spa.connect_socket(spaEngine, "whf_se", seScore, "score", 1.0, 0.0, 100.0)
+    if i_wpkEnabled and not na(wickData)
+        spaEngine := spa.connect_socket(spaEngine, "wpk_anomaly", wickData.anomaly_score, "custom", 0.8, 0.0, 5.0)
+        spaEngine := spa.connect_socket(spaEngine, "wpk_delta", wickData.est_delta, "custom", 0.8, -1000.0, 1000.0)
+    spaEngine := spa.connect_socket(spaEngine, "cluster_bias", clusterBias, "oscillator", 0.6, -10.0, 10.0)
+    spaSocketsConnected := true
+    spaSocketCount := array.size(spaEngine.sockets)
+    int sig0 = waveState == "HEALTHY" ? healthDirection : 0
+    int sig1 = waveState == "FAILED" ? -healthDirection : 0
+    int sig2 = 0
+    if waveState == "FRAGILE" and wickProb > 65 and not na(wickData)
+        sig2 := wickData.net_pressure > 0 ? 1 : wickData.net_pressure < 0 ? -1 : 0
+    int sig3 = 0
+    if i_wpkEnabled and not na(wickData)
+        if waveState == "HEALTHY" and wickData.anomaly_score > 1.5 and wickData.context == "trend_continuation"
+            sig3 := healthDirection
+        else if waveState == "FAILED" and wickData.is_trapped
+            sig3 := -healthDirection
+    signals := array.from(sig0, sig1, sig2, sig3)
+    spaEngine := spa.feed_signals(spaEngine, signals, close)
+    spaEngine := spa.detect_drift(spaEngine, close, volume, ta_atr, trendSlope)
+    spaEngine := spa.apply_trauma_cycle(spaEngine)
+    [selected, conf, eng2] = spa.select(spaEngine)
+    spaEngine    := eng2
+    spaSelected  := selected
+    spaConfidence := conf
+    spaArmName   := spa.get_name(spaEngine, selected)
+    spaSelectCount += 1
+    spaLastEquity := spa.get_equity(spaEngine, spaSelected)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 10: BRIDGE RECONCILIATION                                          ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+float finalConfidence = 0.0
+int   finalDirection  = 0
+float riskScore       = 0.5
+float positionSize    = 0.0
+bool  shouldTrade     = false
+string reasoning      = ""
+if bridgeActive and not na(bridgeState) and not na(mlEngine) and not na(spaEngine)
+    int mlRegimeId = waveState == "HEALTHY" ? 1 : waveState == "FAILED" ? 2 : 0
+    float mlRegimeConf = mlConfidence
+    int spaRegimeId = 0 
+    float spaRegimeConf = spaConfidence
+    bool spaShocked = false
+    int spaSinceShock = 99
+    float hurstVal = 0.5
+    float effVal   = 0.5
+    bridgeState := bridge.reconcile_regime(bridgeState, mlRegimeId, mlRegimeName, mlRegimeConf,
+         spaRegimeId, spaRegimeConf, spaShocked, spaSinceShock, synthVix, hurstVal, effVal)
+    bridgeReconciled := true
+    float armEquity = spa.get_equity(spaEngine, spaSelected)
+    float prevEquity = armEquity
+    float armDD = 0.0 
+    bridgeState := bridge.compute_reward(bridgeState, spaSelected, armEquity, prevEquity, 
+         armDD, close, close[1], synthVix)
+    float agreement = correlScore
+    float tailRisk  = 0.0
+    float maxDD     = 0.0 
+    riskScore := bridge.compute_risk(bridgeState, mlConfidence, spaConfidence, synthVix,
+         hurstVal, tailRisk, maxDD, agreement)
+    int armSignal = 0
+    if spaSelected < array.size(signals)
+        armSignal := array.get(signals, spaSelected)
+    float kellySize = spa.kelly_size(spaEngine, spaSelected, 0.25)
+    bridgeState := bridge.make_decision(bridgeState, 0, mlConfidence, spaSelected, spaArmName,
+         armSignal, spaConfidence, riskScore, kellySize)
+    finalDirection  := bridgeState.decision.direction
+    finalConfidence := bridgeState.decision.confidence + patternBoost
+    positionSize    := bridgeState.decision.position_size
+    shouldTrade     := bridgeState.decision.should_trade
+    reasoning       := bridgeState.decision.reasoning
+else
+    finalDirection  := healthDirection
+    finalConfidence := waveHealth / 100.0
+    shouldTrade     := waveHealth > i_healthyThresh or waveHealth < i_failedThresh
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 11: SIGNAL GENERATION                                              ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+bool healthyEntry   = waveState == "HEALTHY" and waveState[1] != "HEALTHY"
+bool failedEntry    = waveState == "FAILED"  and waveState[1] != "FAILED"
+bool fragileWarning = waveState == "FRAGILE" and waveState[1] == "HEALTHY"
+bool highConfidence = finalConfidence >= i_minConfidence
+bool warmEnough     = bar_index > i_mlWarmup
+bool sigHealthyLong  = healthyEntry and healthDirection ==  1 and highConfidence and warmEnough and i_showHealthy
+bool sigHealthyShort = healthyEntry and healthDirection == -1 and highConfidence and warmEnough and i_showHealthy
+bool sigFailedLong   = failedEntry  and healthDirection == -1 and highConfidence and warmEnough and i_showFailed
+bool sigFailedShort  = failedEntry  and healthDirection ==  1 and highConfidence and warmEnough and i_showFailed
+bool sigFragile      = fragileWarning and warmEnough and i_showFragile
+bool patternSignal   = i_patEnabled and not na(patResult) and patResult.is_active and patResult.net_confidence > 50 and i_showPatterns
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 12: VISUAL RENDERING — SIGNALS ON BARS                             ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+_cd = viz.diagnose_candle(0)
+_cAlpha = viz.adaptive_alpha(waveHealth / 100.0, 60)
+color candleBody = _cd.is_doji ? col_neutral : _cd.is_marubozu ? (_cd.bias == "bull" ? col_healthy : col_failed) : _cd.is_hammer and healthDirection >= 0 ? col_healthy : _cd.is_shooter and healthDirection <= 0 ? col_failed : _cd.bias == "bull" ? color.new(col_healthy, _cAlpha) : color.new(col_failed, _cAlpha)
+barcolor(i_candleColor ? candleBody : na)
+float sigOffset = ta_atr * 1.5
+if sigHealthyLong and barstate.isconfirmed
+    label.new(bar_index, low - sigOffset, "⚡ HEALTHY\nLONG", 
+         color=color.new(col_healthy, 5), textcolor=color.white, 
+         size=size.small, style=label.style_label_up, 
+         textalign=text.align_center)
+    label.new(bar_index, low - sigOffset * 1.8, str.tostring(finalConfidence * 100, "#.#") + "%", 
+         color=color.new(col_bg, 20), textcolor=col_healthy, 
+         size=size.tiny, style=label.style_label_up)
+    line.new(bar_index, low, bar_index, low - sigOffset * 0.5, 
+         color=color.new(col_healthy, 30), width=3)
+if sigHealthyShort and barstate.isconfirmed
+    label.new(bar_index, high + sigOffset, "⚡ HEALTHY\nSHORT", 
+         color=color.new(col_healthy, 5), textcolor=color.white, 
+         size=size.small, style=label.style_label_down, 
+         textalign=text.align_center)
+    label.new(bar_index, high + sigOffset * 1.8, str.tostring(finalConfidence * 100, "#.#") + "%", 
+         color=color.new(col_bg, 20), textcolor=col_healthy, 
+         size=size.tiny, style=label.style_label_down)
+    line.new(bar_index, high, bar_index, high + sigOffset * 0.5, 
+         color=color.new(col_healthy, 30), width=3)
+if sigFailedLong and barstate.isconfirmed
+    label.new(bar_index, low - sigOffset, "🔴 FADE\nLONG", 
+         color=color.new(col_failed, 5), textcolor=color.white, 
+         size=size.small, style=label.style_label_up, 
+         textalign=text.align_center)
+    label.new(bar_index, low - sigOffset * 1.8, str.tostring(finalConfidence * 100, "#.#") + "%", 
+         color=color.new(col_bg, 20), textcolor=col_failed, 
+         size=size.tiny, style=label.style_label_up)
+    line.new(bar_index, low, bar_index, low - sigOffset * 0.5, 
+         color=color.new(col_failed, 30), width=3)
+if sigFailedShort and barstate.isconfirmed
+    label.new(bar_index, high + sigOffset, "🔴 FADE\nSHORT", 
+         color=color.new(col_failed, 5), textcolor=color.white, 
+         size=size.small, style=label.style_label_down, 
+         textalign=text.align_center)
+    label.new(bar_index, high + sigOffset * 1.8, str.tostring(finalConfidence * 100, "#.#") + "%", 
+         color=color.new(col_bg, 20), textcolor=col_failed, 
+         size=size.tiny, style=label.style_label_down)
+    line.new(bar_index, high, bar_index, high + sigOffset * 0.5, 
+         color=color.new(col_failed, 30), width=3)
+if sigFragile and barstate.isconfirmed
+    label.new(bar_index, high + sigOffset * 0.8, "⚠", 
+         color=color.new(col_fragile, 10), textcolor=color.white, 
+         size=size.tiny, style=label.style_label_down)
+// ═══════════════════════════════════════════════════════════════════════════╗
+// PATTERN DOTS                                                               ║
+// ═══════════════════════════════════════════════════════════════════════════╝
+if patternSignal and barstate.isconfirmed and not na(patResult)
+    bool patBull = patResult.direction == "Bull"
+    float patY = patBull ? low - ta_atr * 0.3 : high + ta_atr * 0.3
+    float confNorm = math.max(0.0, math.min(1.0, patResult.net_confidence / 100.0))
+    int dotAlpha = math.round(40 - confNorm * 35)
+    color dotCol = patBull ? color.new(col_primary, dotAlpha) : color.new(col_secondary, dotAlpha)
+    label.new(bar_index, patY, "●", 
+         color=color.new(color.black, 100), textcolor=dotCol, size=size.tiny, 
+         style=patBull ? label.style_label_up : label.style_label_down,
+         tooltip=patResult.name + " | " + patResult.direction + " | " + str.tostring(patResult.net_confidence, "#.#") + "% confidence")
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 13: HEALTH ZONE VISUALIZATION                                      ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+color zoneBg = waveState == "HEALTHY" ? color.new(col_healthy, 94) : waveState == "FAILED" ? color.new(col_failed, 94) : na
+bgcolor(i_showZones ? zoneBg : na)
+float trailY = chartLow - chartRange * 0.02
+float healthPct = waveHealth / 100.0
+float trailHeight = chartRange * 0.04 * healthPct
+color trailCol = viz.gradient_color(waveHealth, col_failed, col_healthy)
+plot(i_showTrail ? trailY + trailHeight : na, "Health Trail", trailCol, 3, plot.style_line, display=display.pane)
+float emaUpper = math.max(ta_ema8, ta_ema21)
+float emaLower = math.min(ta_ema8, ta_ema21)
+color emaFill = ta_ema8 > ta_ema21 ? color.new(col_healthy, 88) : color.new(col_failed, 88)
+p_ema8  = plot(ta_ema8, "EMA 8", color.new(col_accent, 60), 1)
+p_ema21 = plot(ta_ema21, "EMA 21", color.new(col_dim, 60), 1)
+fill(p_ema8, p_ema21, emaFill)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 14: COMPREHENSIVE DASHBOARD                                        ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+if i_showDashboard and barstate.islast
+    dashPosVal = i_dashPos == "TopRight" ? position.top_right : i_dashPos == "TopLeft" ? position.top_left : i_dashPos == "BottomRight" ? position.bottom_right : position.bottom_left
+    int totalRows = 14
+    if i_showExtended
+        totalRows += 8
+    if i_showValidation
+        totalRows += 10
+    var table dash = table.new(dashPosVal, 3, totalRows, bgcolor=color.new(col_bg, 5), border_width=1, border_color=color.new(col_accent, 70))
+    int row = 0
+    table.cell(dash, 0, row, "  ⚡ DAFE WHF  ", text_color=col_accent, text_size=size.small, bgcolor=color.new(col_accent, 85), text_font_family=font.family_monospace)
+    table.cell(dash, 1, row, "  Neural Adaptive  ", text_color=col_dim, text_size=size.tiny, bgcolor=color.new(col_accent, 85), text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, "  " + i_themeName + "  ", text_color=col_primary, text_size=size.tiny, bgcolor=color.new(col_accent, 85), text_font_family=font.family_monospace)
+    row += 1
+    string healthBar = viz.draw_bar(waveHealth, 10)
+    table.cell(dash, 0, row, " ▐ Health", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+    table.cell(dash, 1, row, " " + str.tostring(wpkAdjustedHealth, "#.#") + " " + healthBar, text_color=stateColor, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, " " + waveState + " ", text_color=stateColor, text_size=size.tiny, bgcolor=color.new(stateColor, 85), text_font_family=font.family_monospace)
+    row += 1
+    string reqBar = viz.draw_bar(reqScore, 8)
+    table.cell(dash, 0, row, "   REQ", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+    table.cell(dash, 1, row, " " + str.tostring(reqScore, "#.#") + " " + reqBar, text_color=reqScore > 60 ? col_healthy : reqScore > 40 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, " " + str.tostring(wREQ * 100, "#") + "% wt", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    row += 1
+    string pcBar = viz.draw_bar(pcScore, 8)
+    table.cell(dash, 0, row, "   PC", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+    table.cell(dash, 1, row, " " + str.tostring(pcScore, "#.#") + " " + pcBar, text_color=pcScore > 60 ? col_healthy : pcScore > 40 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, " " + str.tostring(wPC * 100, "#") + "% wt", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    row += 1
+    string seBar = viz.draw_bar(seScore, 8)
+    table.cell(dash, 0, row, "   SE", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+    table.cell(dash, 1, row, " " + str.tostring(seScore, "#.#") + " " + seBar, text_color=seScore > 60 ? col_healthy : seScore > 40 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, " " + str.tostring(wSE * 100, "#") + "% wt", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+    row += 1
+    table.cell(dash, 0, row, " ▐ Direction", text_color=col_accent, text_size=size.tiny, bgcolor=color.new(col_accent, 92), text_font_family=font.family_monospace, text_halign=text.align_left)
+    string fDir = finalDirection > 0 ? "▲ LONG" : finalDirection < 0 ? "▼ SHORT" : "─ FLAT"
+    color fDirCol = finalDirection > 0 ? col_healthy : finalDirection < 0 ? col_failed : col_neutral
+    table.cell(dash, 1, row, " " + fDir, text_color=fDirCol, text_size=size.tiny, bgcolor=color.new(col_accent, 92), text_font_family=font.family_monospace)
+    table.cell(dash, 2, row, " " + str.tostring(finalConfidence * 100, "#.#") + "% conf", text_color=fDirCol, text_size=size.tiny, bgcolor=color.new(col_accent, 92), text_font_family=font.family_monospace)
+    row += 1
+    if mlActive
+        string mDir = mlDirection > 0 ? "▲" : mlDirection < 0 ? "▼" : "─"
+        table.cell(dash, 0, row, " 🧠 ML", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + mDir + " " + str.tostring(mlConfidence * 100, "#") + "% " + mlRegimeName, text_color=mlDirection > 0 ? col_healthy : mlDirection < 0 ? col_failed : col_neutral, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " " + str.tostring(mlSocketCount) + " socks", text_color=mlSocketsConnected ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    if spaActive
+        table.cell(dash, 0, row, " 🎯 SPA", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " Arm: " + spaArmName, text_color=col_primary, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " " + str.tostring(spaConfidence * 100, "#") + "% " + str.tostring(spaSocketCount) + " socks", text_color=spaSocketsConnected ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    if i_wpkEnabled
+        string wpkCtx = not na(wickData) ? wickData.context : "N/A"
+        float wpkAnom = not na(wickData) ? wickData.anomaly_score : 0.0
+        table.cell(dash, 0, row, " ⚛️ WPK", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + wpkCtx + " A:" + str.tostring(wpkAnom, "#.##"), text_color=wpkAnom > 2.0 ? col_accent : col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Pr:" + str.tostring(wickProb, "#") + "% Cl:" + str.tostring(clusterBias, "#.#"), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    if bridgeActive
+        table.cell(dash, 0, row, " 🔗 Bridge", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " Risk:" + str.tostring(riskScore * 100, "#") + "% Size:" + str.tostring(positionSize, "#.##"), text_color=riskScore < 0.3 ? col_healthy : riskScore < 0.6 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, shouldTrade ? " ✅ TRADE" : " ⛔ NO TRADE", text_color=shouldTrade ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    if i_patEnabled
+        string patName = not na(patResult) and patResult.is_active ? patResult.name : "None"
+        string patDir  = not na(patResult) and patResult.is_active ? patResult.direction : "─"
+        float  patConf = not na(patResult) and patResult.is_active ? patResult.net_confidence : 0.0
+        table.cell(dash, 0, row, " 🔬 Pattern", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + patName, text_color=patDir == "Bull" ? col_healthy : patDir == "Bear" ? col_failed : col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " " + patDir + " " + str.tostring(patConf, "#") + "%", text_color=patDir == "Bull" ? col_healthy : patDir == "Bear" ? col_failed : col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    // ═══════════════════════════════════════════════════════════════════════╗
+    // EXTENDED METRICS                                                       ║
+    // ═══════════════════════════════════════════════════════════════════════╝
+    if i_showExtended
+        table.cell(dash, 0, row, "─── Extended ───", text_color=color.new(col_accent, 40), text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 1, row, "", bgcolor=col_bg)
+        table.cell(dash, 2, row, "", bgcolor=col_bg)
+        row += 1
+        table.cell(dash, 0, row, "  Delta", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + str.tostring(currentDelta, "#.#"), text_color=currentDelta > 0 ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Ratio:" + str.tostring(deltaRatioVal, "#.##"), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  Efficiency", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + str.tostring(efficiency * 100, "#.#") + "%", text_color=efficiency > 0.5 ? col_healthy : efficiency > 0.3 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Energy:" + str.tostring(energyNorm * 100, "#") + "%", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  δ-Correl", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + str.tostring(correlScore * 100, "#.#") + "%", text_color=correlScore > 0.6 ? col_healthy : correlScore > 0.4 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Absorb:" + str.tostring(absorptionDom * 100, "#") + "%", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  Structure", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " Churn:" + str.tostring(churnIndex, "#.##"), text_color=churnIndex < i_churnThresh ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " FF:" + str.tostring(failedFF) + "/" + str.tostring(i_failedFFMax), text_color=failedFF < 2 ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  RSI/Trend", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " RSI:" + str.tostring(ta_rsi, "#.#"), text_color=ta_rsi > 70 ? col_failed : ta_rsi < 30 ? col_healthy : col_neutral, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Slope:" + str.tostring(trendSlope, "#.##"), text_color=trendSlope > 0 ? col_healthy : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  Vol/ATR", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " VIX:" + str.tostring(synthVix, "#.##"), text_color=synthVix > 2.0 ? col_failed : synthVix > 1.0 ? col_fragile : col_healthy, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " ATR:" + str.tostring(ta_atr, "#.##"), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, "  Arm Sigs", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        string armSigs = ""
+        for i = 0 to math.min(3, array.size(signals) - 1)
+            int s = array.get(signals, i)
+            armSigs += (s > 0 ? "▲" : s < 0 ? "▼" : "─") + " "
+        table.cell(dash, 1, row, " " + armSigs, text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Sel:" + str.tostring(spaSelected), text_color=col_primary, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+    // ═══════════════════════════════════════════════════════════════════════╗
+    // LIBRARY VALIDATION PANEL                                               ║
+    // ═══════════════════════════════════════════════════════════════════════╝
+    if i_showValidation
+        table.cell(dash, 0, row, "─── Lib Status ───", text_color=color.new(col_accent, 40), text_size=size.tiny, bgcolor=color.new(col_accent, 95), text_font_family=font.family_monospace)
+        table.cell(dash, 1, row, "", bgcolor=color.new(col_accent, 95))
+        table.cell(dash, 2, row, "", bgcolor=color.new(col_accent, 95))
+        row += 1
+        bool mlOk = mlActive and mlSocketsConnected and mlSocketCount >= 4
+        table.cell(dash, 0, row, " DafeRLMLLib", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, mlOk ? " ✅ ACTIVE" : mlActive ? " ⚡ WARMUP" : " ⛔ OFF", text_color=mlOk ? col_healthy : mlActive ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " S:" + str.tostring(mlSocketCount) + " A:" + str.tostring(mlActionsSelected), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        bool spaOk = spaActive and spaSocketsConnected and spaSocketCount >= 7
+        table.cell(dash, 0, row, " DafeSPALib", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, spaOk ? " ✅ ACTIVE" : spaActive ? " ⚡ INIT" : " ⛔ OFF", text_color=spaOk ? col_healthy : spaActive ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " S:" + str.tostring(spaSocketCount) + " Sel:" + str.tostring(spaSelectCount), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, " MLSPABridge", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, bridgeReconciled ? " ✅ RECONCILED" : bridgeActive ? " ⚡ STANDBY" : " ⛔ OFF", text_color=bridgeReconciled ? col_healthy : bridgeActive ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Risk:" + str.tostring(riskScore * 100, "#") + "%", text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, " WickPressLib", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        bool wpkOk = wpkRegimeDetected and wpkWickAnalyzed
+        table.cell(dash, 1, row, wpkOk ? " ✅ PHYSICS" : i_wpkEnabled ? " ⚡ INIT" : " ⛔ OFF", text_color=wpkOk ? col_healthy : i_wpkEnabled ? col_fragile : col_failed, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " Reg:" + (wpkRegimeDetected ? "✓" : "✗") + " Wck:" + (wpkWickAnalyzed ? "✓" : "✗") + " Cl:" + (wpkClustersScanned ? "✓" : "✗"), text_color=col_dim, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace)
+        row += 1
+        table.cell(dash, 0, row, " DafePattLib", text_color=col_text, text_size=size.tiny, bgcolor=col_bg, text_font_family=font.family_monospace, text_halign=text.align_left)
+        bool patOk = i_patEnabled and patternCount > 0
+        viz.fill_status(dash, row, " DafePattLib", patOk, i_patEnabled, "Found:" + str.tostring(patternCount), theme)
+        row += 1
+        viz.fill_status(dash, row, " DafeVisLib", true, true, i_themeName + " " + viz.draw_bar(100, 5), theme)
+        row += 1
+        viz.fill_status(dash, row, " DafeDashLib", i_showAI, i_showAI, i_gender, theme)
+        row += 1
+        int totalSockets = mlSocketCount + spaSocketCount
+        int activeLibs = (mlOk ? 1 : 0) + (spaOk ? 1 : 0) + (bridgeReconciled ? 1 : 0) + (wpkOk ? 1 : 0) + (patOk ? 1 : 0) + 1 + (i_showAI ? 1 : 0)
+        table.cell(dash, 0, row, " ═ TOTAL", text_color=col_accent, text_size=size.tiny, bgcolor=color.new(col_accent, 90), text_font_family=font.family_monospace, text_halign=text.align_left)
+        table.cell(dash, 1, row, " " + str.tostring(activeLibs) + "/7 libs " + viz.draw_stars(activeLibs / 7.0), text_color=activeLibs >= 6 ? col_healthy : activeLibs >= 4 ? col_fragile : col_failed, text_size=size.tiny, bgcolor=color.new(col_accent, 90), text_font_family=font.family_monospace)
+        table.cell(dash, 2, row, " " + str.tostring(totalSockets) + " sockets", text_color=totalSockets > 8 ? col_healthy : col_fragile, text_size=size.tiny, bgcolor=color.new(col_accent, 90), text_font_family=font.family_monospace)
+        row += 1
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 15: TRADE ASSISTANT                                                ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+if i_showAI
+    var array<dafe.MetricPlugin> aiMetrics = array.new<dafe.MetricPlugin>()
+    if barstate.isfirst
+        array.push(aiMetrics, dafe.metric_bounded("Health", 50.0, 70.0, 30.0, 2.0))
+        array.push(aiMetrics, dafe.metric_bounded("REQ", 50.0, 70.0, 30.0, 1.0))
+        array.push(aiMetrics, dafe.metric_bounded("PC", 50.0, 70.0, 30.0, 1.0))
+        array.push(aiMetrics, dafe.metric_bounded("SE", 50.0, 70.0, 30.0, 1.0))
+    if array.size(aiMetrics) >= 4
+        dafe.update_metric(array.get(aiMetrics, 0), wpkAdjustedHealth)
+        dafe.update_metric(array.get(aiMetrics, 1), reqScore)
+        dafe.update_metric(array.get(aiMetrics, 2), pcScore)
+        dafe.update_metric(array.get(aiMetrics, 3), seScore)
+    dafe.DafeConfig aiCfg = dafe.full_config(i_gender, i_themeName, "Normal", i_aiPosition, true, true, true, true, 4000)
+    dafe.render(aiMetrics, aiCfg)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 16: DAFE BRANDING WATERMARK                                        ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var table wmMain  = table.new(position.bottom_center, 3, 1, bgcolor=color.new(color.black, 100), border_width=0)
+var table wmGlow1 = table.new(position.bottom_center, 3, 1, bgcolor=color.new(color.black, 100), border_width=0)
+var table wmGlow2 = table.new(position.bottom_center, 3, 1, bgcolor=color.new(color.black, 100), border_width=0)
+var int wmFrame = 0
+var float wmAlpha = 80.0
+if i_showWatermark and barstate.isconfirmed
+    wmFrame := (wmFrame + 1) % 100
+    wmAlpha := 70.0 + math.sin(wmFrame * 0.1) * 20.0
+    table.clear(wmMain, 0, 0)
+    table.clear(wmGlow1, 0, 0)
+    table.clear(wmGlow2, 0, 0)
+    color wmColorBase = waveState == "HEALTHY" ? col_healthy : waveState == "FAILED" ? col_failed : col_primary
+    table.cell(wmGlow2, 0, 0, "⚡", text_color=color.new(wmColorBase, math.round(wmAlpha) + 20), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmGlow2, 1, 0, "Dskyz (DAFE) Trading Systems", text_color=color.new(wmColorBase, math.round(wmAlpha) + 20), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmGlow2, 2, 0, "⚡", text_color=color.new(wmColorBase, math.round(wmAlpha) + 20), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmGlow1, 0, 0, "⚡", text_color=color.new(col_secondary, math.round(wmAlpha)), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmGlow1, 1, 0, "Dskyz (DAFE) Trading Systems", text_color=color.new(col_secondary, math.round(wmAlpha)), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmGlow1, 2, 0, "⚡", text_color=color.new(col_secondary, math.round(wmAlpha)), text_size=size.normal, text_halign=text.align_center)
+    string wmText = "Dskyz (DAFE) Trading Systems"
+    table.cell(wmMain, 0, 0, wmFrame % 20 < 10 ? "⚡" : "✦", text_color=color.new(col_accent, 20), text_size=size.normal, text_halign=text.align_center)
+    table.cell(wmMain, 1, 0, wmText, text_color=color.new(col_accent, 20), text_size=size.normal, text_font_family=font.family_monospace, text_halign=text.align_center)
+    table.cell(wmMain, 2, 0, wmFrame % 20 < 10 ? "⚡" : "✦", text_color=color.new(col_accent, 20), text_size=size.normal, text_halign=text.align_center)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 17: DATA WINDOW EXPORTS                                            ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+plot(waveHealth, "Wave Health", color.new(color.blue, 100), display=display.data_window)
+plot(reqScore, "REQ Score", color.new(color.aqua, 100), display=display.data_window)
+plot(pcScore, "PC Score", color.new(color.yellow, 100), display=display.data_window)
+plot(seScore, "SE Score", color.new(color.purple, 100), display=display.data_window)
+plot(wpkAdjustedHealth, "WPK Adjusted", color.new(color.orange, 100), display=display.data_window)
+plot(finalConfidence * 100, "Confidence %", color.new(color.lime, 100), display=display.data_window)
+plot(finalDirection, "Direction", color.new(color.white, 100), display=display.data_window)
+plot(currentDelta, "Delta", color.new(color.teal, 100), display=display.data_window)
+plot(efficiency * 100, "Efficiency %", color.new(color.gray, 100), display=display.data_window)
+plot(riskScore * 100, "Risk %", color.new(color.red, 100), display=display.data_window)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 19: REVOLUTIONARY WAVE TRACKER                                     ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+var line lastZigLine    = na
+var line currentZigLine = na
+var line currentZigGlow = na
+var box  failureBox     = na
+var int  dir            = 0
+var float lastPiv       = close
+var int  lastPivIdx     = bar_index
+float ph = ta.pivothigh(i_zigDepth, i_zigDepth)
+float pl = ta.pivotlow(i_zigDepth, i_zigDepth)
+if not na(ph) or not na(pl)
+    int  newDir = not na(ph) ? -1 : 1
+    float newPiv = not na(ph) ? ph : pl
+    int  newIdx = bar_index - i_zigDepth
+    if newDir != dir
+        [coreCol, glowCol] = viz.get_neon(newDir == 1 ? col_failed : col_healthy, 50) 
+        line.new(lastPivIdx, lastPiv, newIdx, newPiv, color=coreCol, width=2)
+        dir := newDir
+        lastPiv := newPiv
+        lastPivIdx := newIdx
+if i_showZigzag and barstate.islast
+    line.delete(currentZigLine)
+    line.delete(currentZigGlow)
+    box.delete(failureBox)
+    color waveCol = waveState == "HEALTHY" ? col_healthy : waveState == "FRAGILE" ? col_fragile : col_failed
+    int waveWidth = waveState == "HEALTHY" ? 2 : 4
+    [wCore, wGlow] = viz.get_neon(waveCol, 40)
+    currentZigGlow := line.new(lastPivIdx, lastPiv, bar_index, close, color=wGlow, width=waveWidth + 4)
+    currentZigLine := line.new(lastPivIdx, lastPiv, bar_index, close, color=wCore, width=waveWidth, style=line.style_solid)
+    if waveState != "HEALTHY"
+        float boxTop = math.max(lastPiv, high)
+        float boxBot = math.min(lastPiv, low)
+        float midP   = (boxTop + boxBot) / 2
+        int boxAlpha = viz.adaptive_alpha(1.0 - (waveHealth/100.0), 70)
+        color boxFill = color.new(waveCol, boxAlpha)
+        color boxBorder = waveCol
+        failureBox := box.new(lastPivIdx, boxTop, bar_index + 3, boxBot, 
+             border_color=boxBorder, 
+             border_width=1, 
+             bgcolor=boxFill)
+        string statusTxt = waveState == "FRAGILE" ? "⚠️ FRAGILE WAVE" : "🔴 CONFIRMED FAILURE"
+        color txtCol = viz.smart_text(boxFill) 
+        box.set_text(failureBox, statusTxt)
+        box.set_text_color(failureBox, txtCol)
+        box.set_text_size(failureBox, size.tiny)
+        box.set_text_halign(failureBox, text.align_center)
+        box.set_text_valign(failureBox, text.align_center)
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║ SECTION 18: ALERTS                                                         ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+alertcondition(sigHealthyLong, "WHF Healthy Long", "⚡ DAFE WHF — HEALTHY Long Entry")
+alertcondition(sigHealthyShort, "WHF Healthy Short", "⚡ DAFE WHF — HEALTHY Short Entry")
+alertcondition(sigFailedLong, "WHF Failed→Long", "🔴 DAFE WHF — FAILED Fade Long")
+alertcondition(sigFailedShort, "WHF Failed→Short", "🔴 DAFE WHF — FAILED Fade Short")
+alertcondition(sigFragile, "WHF Fragile Warning", "⚠️ DAFE WHF — FRAGILE Warning")
+alertcondition(patternSignal, "WHF Pattern Confluence", "🔬 DAFE WHF — Pattern Detected")
+alertcondition(shouldTrade, "WHF Trade Signal", "📡 DAFE WHF — Bridge Trade Signal")

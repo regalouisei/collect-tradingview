@@ -1,0 +1,130 @@
+//@version=6
+//By henrique Centieiro
+//Update log:
+//18/07/2025: Fixed EVaR Value display in the information table to show meaningful percentages. Line 105: Changed table display from str.tostring(evar_value, "#.####") to str.tostring(normalized_evar * 100, "#.##") + "%"
+indicator("EVaR Indicator and Position Sizing", overlay=false, max_labels_count=1)
+
+// ===== INPUT PARAMETERS =====
+var g_params = "EVAR Parameters"
+lookback = input.int(100, "Lookback Period", minval=10, maxval=500, group=g_params)
+alpha = input.float(0.05, "Confidence Level (α)", minval=0.01, maxval=0.99, group=g_params)
+q_param = input.float(1.5, "Q Parameter (Tsallis)", minval=1.1, maxval=2.5, group=g_params)
+
+var g_position = "Position Sizing"
+max_position = input.float(100, "Maximum Position Size (%)", minval=1, maxval=100, group=g_position)
+account_size = input.float(10000, "Account Size ($)", minval=100, group=g_position)
+risk_percent = input.float(2, "Risk Per Trade (%)", minval=0.1, maxval=10, group=g_position)
+
+var g_visual = "Visualization"
+show_tables = input.bool(true, "Show Position Info Table", group=g_visual)
+color_bars = input.bool(false, "Color Price Bars by Risk", group=g_visual)
+
+// ===== EVAR CALCULATION =====
+// Calculate returns
+returns = ta.change(close) / close[1]
+
+// Function to calculate simplified Entropic Value at Risk
+simplified_evar() =>
+    // Calculate moment generating function approximation
+    sum_mgf = 0.0
+    for i = 0 to lookback-1
+        // Using q-exponential from Tsallis statistics for non-Gaussian distributions
+        q_exp = math.pow(1 + (q_param - 1) * returns[i], 1 / (q_param - 1))
+        sum_mgf := sum_mgf + q_exp
+    
+    mgf_value = sum_mgf / lookback
+    
+    // Calculate EVAR (simplified version)
+    evar = math.log(mgf_value / alpha) / (2 - q_param)
+    
+    // Ensure we return a positive value
+    math.abs(evar)
+
+// Get EVAR value
+evar_value = simplified_evar()
+
+// Calculate volatility for comparison
+volatility = ta.stdev(returns, lookback)
+
+// Calculate EVAR to volatility ratio
+evar_vol_ratio = evar_value / volatility
+
+// Normalize the EVAR for better visualization (between 0 and 1)
+max_evar = ta.highest(evar_value, 250)
+min_evar = ta.lowest(evar_value, 250)
+evar_range = max_evar - min_evar
+normalized_evar = evar_range > 0 ? (evar_value - min_evar) / evar_range : 0.5
+
+// ===== POSITION SIZING CALCULATION =====
+// Calculate position size adjustment factor (As EVAR increases, position size decreases)
+position_adjustment = math.max(0.1, 1 - normalized_evar)
+
+// Calculate recommended position size
+recommended_position_size = max_position * position_adjustment
+
+// Calculate dollar position size
+dollar_position = (account_size * recommended_position_size / 100)
+
+// Calculate position in shares
+shares_to_buy = math.floor(dollar_position / close)
+
+// Calculate risk-based stop loss distance
+risk_amount = account_size * (risk_percent / 100)
+max_stop_distance_percent = (risk_amount / dollar_position) * 100
+stop_price = close * (1 - max_stop_distance_percent / 100)
+
+// Calculate theoretical max drawdown (worst case scenario)
+theoretical_max_drawdown = (risk_percent / 100) * recommended_position_size / max_position
+
+// ===== VISUALIZATION =====
+// Define risk levels for color coding with more vibrant colors
+risk_level = normalized_evar > 0.7 ? "High" : normalized_evar > 0.5 ? "Medium" : "Low"
+risk_color = normalized_evar > 0.7 ? #FF1744 : normalized_evar > 0.5 ? #FF9100 : #00C853  // Vibrant red, orange, green
+
+// Color candles by risk if enabled
+barcolor(color_bars ? risk_color : na)
+
+// ===== PLOTTING PANELS =====
+// Panel 1: EVAR Risk Level with more vibrant colors
+plot(normalized_evar, "Normalized EVAR", risk_color, 3)  // Increased line width
+hline(0.5, "Medium Risk", #757575, hline.style_dashed)  // Darker gray
+hline(0.7, "High Risk", #FF1744, hline.style_dashed)    // Vibrant red
+hline(0.3, "Low Risk", #00C853, hline.style_dashed)     // Vibrant green
+bgcolor(color.new(risk_color, 85))  // Reduced transparency for sharper background
+
+// ===== INFORMATION TABLES =====
+if barstate.islast and show_tables
+    // Create position sizing information table with sharper colors
+    var table position_table = table.new(position=position.top_right, columns=2, rows=8, bgcolor=color.new(#212121, 10), border_width=1, border_color=#EEEEEE)
+    
+    // Clear previous data
+    table.clear(position_table, 0, 0, 1, 7)
+    
+    // Table headers - more vibrant blue
+    table.cell(position_table, 0, 0, "EVAR Position Sizing", text_color=#FFFFFF, bgcolor=color.new(#2962FF, 10), text_size=size.normal)
+    table.cell(position_table, 1, 0, "", text_color=#FFFFFF, bgcolor=color.new(#2962FF, 10), text_size=size.normal)
+    
+    // Risk metrics
+    table.cell(position_table, 0, 1, "Risk Level", text_color=#EEEEEE)
+    table.cell(position_table, 1, 1, risk_level, text_color=risk_color, text_size=size.normal)
+    
+    table.cell(position_table, 0, 2, "EVAR Value", text_color=#EEEEEE)
+    table.cell(position_table, 1, 2, str.tostring(normalized_evar * 100, "#.##") + "%", text_color=#FFFFFF)
+    
+    // Position sizing - with more vibrant colors
+    table.cell(position_table, 0, 3, "Position Size", text_color=#EEEEEE)
+    table.cell(position_table, 1, 3, str.tostring(recommended_position_size, "#.##") + "%", text_color=#64B5F6)
+    
+    table.cell(position_table, 0, 4, "Trade Amount", text_color=#EEEEEE)
+    table.cell(position_table, 1, 4, "$" + str.tostring(dollar_position, "#,##0.00"), text_color=#64B5F6)
+    
+    table.cell(position_table, 0, 5, "Shares/Units", text_color=#EEEEEE)
+    table.cell(position_table, 1, 5, str.tostring(shares_to_buy, "#,##0"), text_color=#64B5F6)
+    
+    // Stop loss - vibrant orange
+    table.cell(position_table, 0, 6, "Stop Price", text_color=#EEEEEE)
+    table.cell(position_table, 1, 6, "$" + str.tostring(stop_price, "#,##0.00") + " (" + str.tostring(max_stop_distance_percent, "#.##") + "%)", text_color=#FFAB40)
+    
+    // Max drawdown - vibrant red
+    table.cell(position_table, 0, 7, "Max Drawdown", text_color=#EEEEEE)
+    table.cell(position_table, 1, 7, str.tostring(theoretical_max_drawdown * 100, "#.##") + "%", text_color=#FF5252)

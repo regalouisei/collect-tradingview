@@ -1,0 +1,309 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//@version=6
+indicator("SRD786-Micro Futures Scalping Indicator", shorttitle="SRD786-SCP", overlay=true, format=format.price, precision=5)
+
+// ─────────────────────────────────────────
+// INPUT PARAMETERS
+// ─────────────────────────────────────────
+
+// Trend Settings
+trendLength = input.int(9, "Fast EMA Length", minval=1, group="Trend Settings")
+trendSlowLength = input.int(21, "Slow EMA Length", minval=1, group="Trend Settings")
+trendSource = input.source(close, "Trend Source", group="Trend Settings")
+
+// RSI Settings
+rsiLength = input.int(7, "RSI Length", minval=1, group="Momentum Settings")
+rsiOverbought = input.int(70, "RSI Overbought", minval=1, group="Momentum Settings")
+rsiOversold = input.int(30, "RSI Oversold", minval=1, group="Momentum Settings")
+rsiSource = input.source(close, "RSI Source", group="Momentum Settings")
+
+// Volume Settings
+useVolume = input.bool(true, "Use Volume Filter", group="Volume Settings")
+volumeSmaLength = input.int(20, "Volume SMA Length", minval=1, group="Volume Settings")
+
+// Scalping Settings
+scalpRange = input.int(5, "Scalp Range (Ticks)", minval=1, group="Scalping Settings")
+tickSize = input.float(0.25, "Tick Size", minval=0.0001, step=0.25, group="Scalping Settings")
+
+// Signal Consolidation Settings
+consolidationBars = input.int(3, "Consolidation Bars", minval=1, maxval=10, group="Consolidation Settings")
+
+// Visual Settings
+showLabels = input.bool(true, "Show Signal Labels", group="Visual Settings")
+showBackground = input.bool(true, "Show Trend Background", group="Visual Settings")
+maColorUp = input.color(color.lime, "Uptrend Color", group="Visual Settings")
+maColorDn = input.color(color.red, "Downtrend Color", group="Visual Settings")
+bgColorUp = input.color(color.new(color.green, 90), "Background Uptrend", group="Visual Settings")
+bgColorDn = input.color(color.new(color.red, 90), "Background Downtrend", group="Visual Settings")
+
+// ─────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────
+
+// EMAs for Trend
+fastEMA = ta.ema(trendSource, trendLength)
+slowEMA = ta.ema(trendSource, trendSlowLength)
+
+// RSI Calculation
+rsiValue = ta.rsi(rsiSource, rsiLength)
+
+// Volume Filter
+volumeSma = ta.sma(volume, volumeSmaLength)
+volumeFilter = not useVolume or volume > volumeSma
+
+// Trend Direction
+isUptrend = fastEMA > slowEMA
+isDowntrend = fastEMA < slowEMA
+
+// Support and Resistance (Dynamic)
+atrValue = ta.atr(14)
+supportLevel = low - (atrValue * 0.5)
+resistanceLevel = high + (atrValue * 0.5)
+
+// ─────────────────────────────────────────
+// CROSSOVER/CROSSUNDER VARIABLES
+// ─────────────────────────────────────────
+
+// RSI Oversold Crossover (RSI crosses above oversold level)
+rsiOversoldCross = ta.crossover(rsiValue, rsiOversold)
+
+// RSI Overbought Crossunder (RSI crosses below overbought level)
+rsiOverboughtCross = ta.crossunder(rsiValue, rsiOverbought)
+
+// EMA Crossunder (Fast crosses below Slow - Long Exit)
+fastCrossunderSlow = ta.crossunder(fastEMA, slowEMA)
+
+// EMA Crossover (Fast crosses above Slow - Short Exit)
+fastCrossoverSlow = ta.crossover(fastEMA, slowEMA)
+
+// ─────────────────────────────────────────
+// SCALPING SIGNALS
+// ─────────────────────────────────────────
+
+// Long Signal Conditions
+longCondition = 
+     isUptrend and 
+     rsiOversoldCross and 
+     volumeFilter and 
+     (close - open) >= (tickSize * scalpRange)
+
+// Short Signal Conditions
+shortCondition = 
+     isDowntrend and 
+     rsiOverboughtCross and 
+     volumeFilter and 
+     (open - close) >= (tickSize * scalpRange)
+
+// Exit Signals
+longExit = fastCrossunderSlow
+shortExit = fastCrossoverSlow
+
+// ─────────────────────────────────────────
+// SIGNAL CONSOLIDATION FILTER
+// ─────────────────────────────────────────
+
+// Count bars since last signal
+varip int barsSinceLongSignal = 0
+varip int barsSinceShortSignal = 0
+
+if longCondition
+    barsSinceLongSignal := 0
+else
+    barsSinceLongSignal := na(barsSinceLongSignal) ? 1 : barsSinceLongSignal + 1
+
+if shortCondition
+    barsSinceShortSignal := 0
+else
+    barsSinceShortSignal := na(barsSinceShortSignal) ? 1 : barsSinceShortSignal + 1
+
+// Require at least N bars between signals of same type
+signalConsolidated = barsSinceLongSignal >= consolidationBars and barsSinceShortSignal >= consolidationBars
+
+// Apply signal consolidation to raw conditions
+consolidatedLongCondition = longCondition and signalConsolidated
+consolidatedShortCondition = shortCondition and signalConsolidated
+
+// ─────────────────────────────────────────
+// ENTRY PRICE TRACKING
+// ─────────────────────────────────────────
+
+// Track position state and entry prices
+varip float entryLongPrice = na
+varip float entryShortPrice = na
+varip bool inLongPosition = false
+varip bool inShortPosition = false
+
+// Update long entry price when long condition triggers
+if consolidatedLongCondition and not inLongPosition
+    entryLongPrice := close
+    inLongPosition := true
+    inShortPosition := false
+    entryShortPrice := na
+
+// Update short entry price when short condition triggers
+if consolidatedShortCondition and not inShortPosition
+    entryShortPrice := close
+    inShortPosition := true
+    inLongPosition := false
+    entryLongPrice := na
+
+// Reset on exit signals
+if longExit and inLongPosition
+    inLongPosition := false
+    entryLongPrice := na
+
+if shortExit and inShortPosition
+    inShortPosition := false
+    entryShortPrice := na
+
+// Also reset if opposite signal triggers while in position
+if consolidatedLongCondition and inShortPosition
+    inShortPosition := false
+    entryShortPrice := na
+    entryLongPrice := close
+    inLongPosition := true
+
+if consolidatedShortCondition and inLongPosition
+    inLongPosition := false
+    entryLongPrice := na
+    entryShortPrice := close
+    inShortPosition := true
+
+// Calculate P&L
+float currentPnl = na
+if inLongPosition and not na(entryLongPrice)
+    currentPnl := (close - entryLongPrice) / syminfo.mintick
+else if inShortPosition and not na(entryShortPrice)
+    currentPnl := (entryShortPrice - close) / syminfo.mintick
+
+// Format P&L string
+string pnlString = na(currentPnl) ? "N/A" : (currentPnl > 0 ? "+" : "") + str.tostring(currentPnl, "#")
+color pnlColor = currentPnl > 0 ? color.lime : currentPnl < 0 ? color.red : color.gray
+
+// ─────────────────────────────────────────
+// PLOT TREND LINES
+// ─────────────────────────────────────────
+
+//plot(fastEMA, "Fast EMA", color=isUptrend ? maColorUp : maColorDn, linewidth=2)
+//plot(slowEMA, "Slow EMA", color=isUptrend ? maColorUp : maColorDn, linewidth=2)
+
+// ─────────────────────────────────────────
+// BACKGROUND COLOR
+// ─────────────────────────────────────────
+
+//bgcolor(showBackground ? (isUptrend ? bgColorUp : bgColorDn) : na)
+
+// ─────────────────────────────────────────
+// SIGNAL MARKERS
+// ─────────────────────────────────────────
+
+// Long Entry Arrow
+//plotshape(consolidatedLongCondition and showLabels, title="Long Signal", style=shape.triangleup, 
+ //         location=location.belowbar, color=color.new(color.green, 0), 
+ //         size=size.small, text="LONG", textcolor=color.white)
+
+// Short Entry Arrow
+//plotshape(consolidatedShortCondition and showLabels, title="Short Signal", style=shape.triangledown, 
+  //        location=location.abovebar, color=color.new(color.red, 0), 
+    //      size=size.small, text="SHORT", textcolor=color.white)
+
+// Exit Signals
+//plotshape(longExit and showLabels, title="Long Exit", style=shape.xcross, 
+  //        location=location.abovebar, color=color.yellow, size=size.tiny)
+//plotshape(shortExit and showLabels, title="Short Exit", style=shape.xcross, 
+  //        location=location.belowbar, color=color.yellow, size=size.tiny)
+
+// ─────────────────────────────────────────
+// SUPPORT/RESISTANCE LEVELS
+// ─────────────────────────────────────────
+
+// Dynamic Support Line
+//lineSupport = plot(isUptrend ? supportLevel : na, "Support", color=color.new(color.blue, 50), 
+  //                 style=plot.style_circles, trackprice=true, display=display.data_window)
+
+// Dynamic Resistance Line
+//lineResistance = plot(isDowntrend ? resistanceLevel : na, "Resistance", 
+  //                     color=color.new(color.orange, 50), style=plot.style_circles, 
+    //                   trackprice=true, display=display.data_window)
+
+// ─────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────
+
+//alertcondition(consolidatedLongCondition, title="Long Entry Alert", 
+  //             message="MF Scalper: Long Entry Signal\nPrice: {{close}}\nRSI: {{plot_0}}")
+
+//alertcondition(consolidatedShortCondition, title="Short Entry Alert", 
+//               message="MF Scalper: Short Entry Signal\nPrice: {{close}}\nRSI: {{plot_0}}")
+
+//alertcondition(longExit, title="Long Exit Alert", 
+//               message="MF Scalper: Long Exit Signal\nPrice: {{close}}")
+
+//alertcondition(shortExit, title="Short Exit Alert", 
+//               message="MF Scalper: Short Exit Signal\nPrice: {{close}}")
+
+// ─────────────────────────────────────────
+// STATUS TABLE
+// ─────────────────────────────────────────
+
+var table panel = na
+if barstate.islast
+    panel := table.new(position.bottom_center, 2, 6, bgcolor=color.new(color.white, 80), 
+                       border_width=1, border_color=color.gray)
+    
+    // Table Header
+    table.cell(panel, 0, 0, "MF SCALPER", text_color=color.blue, 
+               text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(panel, 1, 0, syminfo.ticker, text_color=color.blue, 
+               text_size=size.small)
+    
+    // Trend Status
+    trendText = isUptrend ? "▲ BULLISH" : "▼ BEARISH"
+    trendColor = isUptrend ? color.lime : color.red
+    table.cell(panel, 0, 1, "TREND", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 1, trendText, text_color=trendColor, text_size=size.small)
+    
+    // RSI Status
+    rsiText = rsiValue > rsiOverbought ? "OVERBOUGHT" : rsiValue < rsiOversold ? "OVERSOLD" : 
+              rsiValue > 50 ? "BULLISH" : "BEARISH"
+    rsiColor = rsiValue > rsiOverbought ? color.red : rsiValue < rsiOversold ? color.lime : 
+               rsiValue > 50 ? color.green : color.red
+    table.cell(panel, 0, 2, "RSI", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 2, str.tostring(rsiValue, "#.##") + " (" + rsiText + ")", 
+               text_color=rsiColor, text_size=size.small)
+    
+    // Volume Status
+    volStatus = volumeFilter ? "ACTIVE" : "LOW"
+    volColor = volumeFilter ? color.lime : color.gray
+    table.cell(panel, 0, 3, "VOLUME", text_color=color.gray, text_size=size.small)
+    table.cell(panel, 1, 3, volStatus, text_color=volColor, text_size=size.small)
+    
+    // Position Entry Price Row
+//    table.cell(panel, 0, 4, "ENTRY", text_color=color.gray, text_size=size.small)
+  //  if inLongPosition
+    //    table.cell(panel, 1, 4, str.tostring(entryLongPrice, format.mintick), 
+      //             text_color=color.lime, text_size=size.small)
+   // else if inShortPosition
+     //   table.cell(panel, 1, 4, str.tostring(entryShortPrice, format.mintick), 
+       //            text_color=color.red, text_size=size.small)
+   // else
+     //   table.cell(panel, 1, 4, "N/A", text_color=color.gray, text_size=size.small)
+    
+    // Position Type and P&L Row
+    //table.cell(panel, 0, 5, "POSITION", text_color=color.gray, text_size=size.small)
+   // if inLongPosition
+     //   table.cell(panel, 1, 5, "LONG " + pnlString + " pts", text_color=pnlColor, text_size=size.small)
+    //else if inShortPosition
+      //  table.cell(panel, 1, 5, "SHORT " + pnlString + " pts", text_color=pnlColor, text_size=size.small)
+    //else
+      //  table.cell(panel, 1, 5, "FLAT", text_color=color.gray, text_size=size.small)
+
+// ─────────────────────────────────────────
+// RSI PLOT (Separate Pane)
+// ─────────────────────────────────────────
+
+//plot(rsiValue, "RSI", color=color.purple, linewidth=2)
+//hline(rsiOverbought, "Overbought", color=color.red, linestyle=hline.style_dotted)
+//hline(rsiOversold, "Oversold", color=color.lime, linestyle=hline.style_dotted)

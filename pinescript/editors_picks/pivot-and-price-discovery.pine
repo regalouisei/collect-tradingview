@@ -1,0 +1,393 @@
+// A Poulation Sampled linear regression model that provides additional detail about the distribution moments (skew, kurtosis, variance and mean) as well as providing indicators that track when a pivot has enough momentum to trade on as well as expected ranges of future price action based on Std Devs.
+// For the momentum lines -- red indicates that there has been a reducing pivot with momentum, this continues as a grey line for continuation, and will be cancelled when an increasing pivot with momentum is encountered.
+// Forward looking trend triangle captures the +/- stated standard deviation from the latest bar_index over 2 periods.  Movements that trace outside of this can be considered a precursor to an upcoming pivot, 
+//    and by anaylzing skewness and kurtosis, the probability of an upcoming pivot should be better understood.
+// I have really only looked at this for timescales greater than 5 minutes.  Adjust the lookback length accordingly when moving to different timescales:
+//    For example, 1 hr at 10m timescale will be a lookback length of 6 which is too low for accurate analysis, so keep the lookback length appropriate for the timescales being used.
+//    Also realize that trade volume will skew the deviations and regression if you are including data outside of regular trading hours (futures are different, but also experience volume sensitivity -- I may look into accounting for this in future versions.)
+//Added indicators (+) which appear when the price has re-entered the regression channel -  this often is an early indicator of an upcoming pivot (when the two colors disagree), or a weakening of momentum when there is an existing direction.  
+// When both of the indicators are the same color and they break the previous trend, then we can expect the pivot to be concrete if the next timeframe follows.  Please note that this is heavily dependent on the deviation used.  If the deviation is 1, then this will happen often and be meaningless.
+//  if the deviation is 2.571 or greater then exit and re-entry into the channel is a significant event. 
+// © TheGeeBee
+
+//@version=5
+
+indicator('Pivot and Price Discovery', overlay=true, max_bars_back=400, max_lines_count=400,explicit_plot_zorder=true)
+
+src = input(defval=ohlc4, title='Source')
+len = input.int(defval=56, title='Lookback Length', minval=16)
+i_deviation = input.float(defval=2.0, title='Model Deviation', minval=0.1, step=0.1)
+extendit = input(defval=false, title='Extend Lines?')
+showBounds = input(defval=false, title='Show S&R Levels')
+type_SR_Input = input.string("Fibonacci", "S&R Type", options=["Traditional", "Fibonacci", "Woodie", "Classic", "DM", "Camarilla"])
+showbroken = input.bool(defval=false, title='Show when Channel is Broken?', inline='brk')
+momenthistory = input(defval=true,title = 'Show Moment History Table')
+forwardrange = input(defval = true,title= 'Show Future Movement Range?')
+indicatorPeek = input(defval = true,title = 'Show Real-Time Momentum Indicator Status?')
+showCritOnChart = input(defval = false,title = 'Show Critical Skew and Kurtosis Indicators on Chart?')
+multiframeAnalysis = input(defval = false,title = "Analyze Multiple Timeframes")
+brokencol = input.color(defval=color.rgb(255, 156, 102), title='', inline='brk')
+upcol = input.color(defval=color.rgb(90, 200, 90, 60), title='Up/Down Regression Trend Colors', inline='trcols')
+dncol = input.color(defval=color.rgb(255, 82, 82, 60), title='', inline='trcols')
+widt = input(defval=2, title='Line Width')
+bkcolr = input(defval=color.rgb(4,4,4),title="Background Color")
+
+bgcolor(bkcolr,offset=150,editable=true)
+
+// Global Constants
+centerline = 0
+_ZScore_S    = 1.96 //absolute ZScore for small values where length < 50 at 95% confidence
+_ZScore_L    = 3.29 //absolute Zscore for larger values where length > 50 at 95% confidence
+_Skew_RefVal     = 2.0  //skewness reference value for oversized values where length is > 300
+_Kurtosis_RefVal     = 10.0 //Excess Kurtosis reference value for oversized values where length is > 300 (The normal value for kurtosis is 7, and excess kurtosis is 10 (7 + 3))
+//Times used for multiframe analysis
+_src_5 = request.security(syminfo.tickerid,"3",ohlc4)
+_src_10 = request.security(syminfo.tickerid,"7",ohlc4)
+
+// Global Variables
+highbar = ta.highest(src,len) 
+lowbar = ta.lowest(src,len) 
+
+//Use Log Returns instead of Price -> The price itself usually has a lower bound of 0, and it approximately follows a lognormal distribution. Therefore it always has a significant skewness.
+//Correlation of price is always positive because today's price is calculated based on yesterday's price. Using returns our data is detrended and stationary, the moments of returns provide useful information about the shape of the distribution.
+float logReturn = src+ (math.log(src/src[1])) //plus src to make the output more readable for high value tickers
+
+var regression_lines = array.new_line(3)
+var fib_lines = array.new_line(4)
+
+var fib_ratios = array.new_float(0)
+var colors = array.new_color(2)
+var early_pivot = 0
+var bool bound_candle = na
+
+if barstate.isfirst
+    array.unshift(colors, upcol)
+    array.unshift(colors, dncol)
+    array.push(fib_ratios, 0.236)
+    array.push(fib_ratios, 0.382)
+    array.push(fib_ratios, 0.618)
+    array.push(fib_ratios, 0.786)
+
+// Sampled Population Deviation and Regression Function
+get_channel(src, len) =>
+    mid = math.sum(src, len) / len
+    slope = ta.linreg(src, len, 0) - ta.linreg(src, len, 1)
+    intercept = mid - slope * math.floor(len / 2) + (1 - len % 2) / 2 * slope
+    endy = intercept + slope * (len - 1)
+    dev = 0.0
+    for x = 0 to len - 1 by 1
+        dev += math.pow(src[x] - (slope * (len - x) + intercept), 2)
+        dev
+    dev := math.sqrt(dev / len)
+    [intercept, endy, dev, slope]
+
+[_y_low, _y_high, dev, slope] = get_channel(src, len)
+
+n_out_of_Deviation_channel = slope > 0 and close < _y_high - dev * i_deviation ? 0 : slope < 0 and close > _y_high + dev * i_deviation ? 2 : -1
+
+for x = 0 to 2 by 1
+    if not showbroken or n_out_of_Deviation_channel != x or nz(n_out_of_Deviation_channel[1], -1) != -1
+        line.delete(array.get(regression_lines, x))
+    else
+        line.set_color(array.get(regression_lines, x), color=brokencol)
+        line.set_width(array.get(regression_lines, x), width=2)
+        line.set_style(array.get(regression_lines, x), style=line.style_arrow_both)
+        line.set_extend(array.get(regression_lines, x), extend=extend.none)
+
+    array.set(regression_lines, x, line.new(x1=bar_index - (len - 1), y1=_y_low + dev * i_deviation * (x - 1), x2=bar_index, y2=_y_high + dev * i_deviation * (x - 1), color=array.get(colors, math.round(math.max(math.sign(slope), 0))), style=x % 2 == 1 ? line.style_solid : line.style_dashed, width=widt, extend=extendit ? extend.right : extend.none))
+// Display various pivot point (support and resistance) levels
+chartingTimeframe = timeframe.period
+refreshedData = timeframe.change(chartingTimeframe)
+float [] pivotValues = ta.pivot_point_levels(type_SR_Input, refreshedData)
+pivotArray = array.new_line(array.size(pivotValues)) 
+
+if showBounds
+    line pivotLine = na
+    if refreshedData == true 
+        for i = 0 to 6 //use only the pivots from +/- 3 pivot levels
+            if not na(pivotArray[len]) 
+                line.delete(array.get(pivotArray[len/1.5],i))  //Limit the historical levels to keep the chart cleaner
+            array.set(pivotArray,i
+             , line.new(bar_index-1
+             , array.get(pivotValues[1],i)
+             , bar_index
+             , array.get(pivotValues,i)
+             , xloc=xloc.bar_index
+             , color = i==0?color.rgb(255,255,255,60): //Highlight the baseline to which the pivots are attached
+             color.rgb(100,100,100,60)
+             , style = line.style_solid 
+             , width=3))
+
+//Variance Function
+f_var(x, n) => 
+    mean = ta.vwma(x, n)
+    s = array.new_float(0)
+    for i = 0 to n-1 
+        array.push(s,math.pow(x[i]-mean,2)) //second moment deviation from the mean squared
+    sum = array.sum(s)
+    variance = sum/(n-1) //Divide by n - 1 instead of just n for unbiased sample variance
+
+//Kurtosis Function
+f_kurt(x,n)=>
+    mean = ta.vwma(x,n)
+    //Sample Standard Deviation for Sample Kurtosis (utilize custom sample standard deviation function instead of built in stdev) 
+    s1 = array.new_float(0)
+    for i = 0 to n-1 
+        array.push(s1,math.pow(x[i]-mean,2))
+    sum = array.sum(s1)
+    variance = sum/(n-1) //Divide by n - 1 instead of just n for unbiased sample variance
+    std = math.sqrt(variance) //Square root of variance = standard deviation
+    //Kurtosis Calculation
+    s2 = array.new_float(0)
+    for i = 0 to n-1
+        array.push(s2,math.pow(x[i]- mean,4)) //forth moment deviation from the mean to the power of 4
+    sum2 = array.sum(s2)
+    //Unbiased Estimator For Sample Kurtosis
+    a = n*(n+1)*sum2
+    b = (n-1)*(n-2)*(n-3)*math.pow(std,4)    //Forth moment StdDev to the power of 4
+    theKurtosis = (a/b) - (3*math.pow((n-1),2))/ ((n-2)*(n-3))
+ 
+
+//Standard Deviation Function
+f_sd(x, n) => 
+    mean = ta.vwma(x, n)
+    s = array.new_float(0)
+    for i = 0 to n-1 
+        array.push(s,math.pow(x[i]-mean,2))
+    sum = array.sum(s)
+    variance = sum/(n-1) //Divide by n - 1 instead of just n for unbiased sample variance
+    sd = math.sqrt(variance) //Square root of variance = standard deviation
+
+
+//Skewedness Function
+f_skew(x,n)=>
+    //Mean
+    mean = ta.vwma(x,n)
+    //Sample Standard Deviation for Sample Skewness (utilize custom sample standard deviation function instead of built in stdev) 
+    s1 = array.new_float(0)
+    for i = 0 to n-1 
+        array.push(s1,(math.pow(x[i]-mean,2)))
+    sum = array.sum(s1)
+    variance = sum/(n-1) //Divide by n - 1 instead of just n for unbiased sample variance
+    std = math.sqrt(variance) //Square root of variance = standard deviation
+    //Skewness calculation
+    s2 = array.new_float(0)
+    for i = 0 to n-1
+        array.push(s2,math.pow(x[i] - mean,3)) //third moment deviation from the mean to the power of 3
+    sum2 = array.sum(s2)
+    //Unbiased Estimator For Sample Skewness
+    a = sum2*n
+    b = (n-1)*(n-2)*math.pow(std,3) //third momemnt Std Dev to the power of 3
+    skewness = a/b
+
+f_rsquared(series) =>
+    sum_error = array.new_float(len,0.05)
+    sum_total = array.new_float(len,0.05)
+    model = ta.linreg(series, len, 0)
+
+    for i = 0 to len-1
+        array.push (sum_error, math.pow(array.get(sum_error,i) + (series[i] - model[i]), 2))
+        array.push (sum_total, math.pow(array.get(sum_total,i) + (series[i] - math.avg(series[i],array.get(sum_total,i))), 2))
+    s_error = array.sum(sum_error)
+    s_total = array.sum(sum_total)
+    rsqrd = 1 - (s_error / s_total)
+
+//Standard Error of Skewness Function 
+f_standard_error_skew(n) =>
+    math.sqrt((6*n*(n-1))/((n-2)*(n+1)*(n+3)))
+
+//Standard Error of Kurtosis Function
+f_standard_error_kurt(n) =>
+    //Standard Error of Skewness
+    sesk = math.sqrt((6*n*(n-1))/((n-2)*(n+1)*(n+3)))
+    //Stanard Error of Kurtosis
+    2*sesk*math.sqrt((math.pow(n,2)-1) / ((n-3)*(n+5)))
+
+//Skewness Critical Value Function
+f_skew_crit_val() =>
+    len > 300  ? _Skew_RefVal: len > 50 ? _ZScore_L * f_standard_error_skew(len) : _ZScore_S
+ * f_standard_error_skew(len)
+
+//Kurtosis Critical Value Function 
+f_kurtisis_crit_val() =>
+    len > 300  ? _Kurtosis_RefVal: len > 50 ? _ZScore_L * f_standard_error_kurt(len) : _ZScore_S
+ * f_standard_error_kurt(len)
+
+// Ploting Variables
+float tikr_skew = f_skew(src,len)
+float tikr_mean = ta.swma(close)
+float tikr_simple_mean = ta.vwma(src,len)
+float tikr_Rsqr = f_rsquared(src)
+float tikr_var = f_var(src,len)
+float tikr_kurtosis = f_kurt(src,len)
+float skew_cv = f_skew_crit_val()
+float kurt_cv = f_kurtisis_crit_val()
+float stdDev = f_sd(src,len)
+var label _regrssion_slope_indicator = label.new(x=bar_index - (len - 1), y=_y_low, text='S', size=size.large)
+
+_indicator = slope > 0 ? slope > slope[1] ? '⇑' : '⇗' : slope < 0 ? slope < slope[1] ? '⇓' : '⇘' : '⇒'
+_style = slope > 0 ? slope > slope[1] ? label.style_label_up : label.style_label_upper_right : slope < 0 ? slope < slope[1] ? label.style_label_down : label.style_label_lower_right : label.style_label_right
+label.set_style(_regrssion_slope_indicator, _style)
+label.set_text(_regrssion_slope_indicator, _indicator)
+label.set_x(_regrssion_slope_indicator, bar_index - (len - 1))
+label.set_y(_regrssion_slope_indicator, slope > 0 ? _y_low - dev * i_deviation : slope < 0 ? _y_low + dev * i_deviation : _y_low)
+label.set_color(_regrssion_slope_indicator, slope > 0 ? upcol : slope < 0 ? dncol : color.blue)
+
+alertcondition(n_out_of_Deviation_channel, title='Channel Broken', message='Channel Broken')
+
+// Trends, Momentum and Direction
+_slope_is_up = math.sign(slope) != math.sign(slope[1]) and slope > 0
+_slope_is_down = math.sign(slope) != math.sign(slope[1]) and slope < 0
+ta_Williams_R = ta.wpr(len/2)+close+50
+//Examine the range of prices and log return between high and low, range of prices and log returns between high and low plus the time series standard deviations.
+//_direction_stable_under = if ta.barssince (ta.crossover(logReturn,src)) or ta.barssince (ta.crossunder(logReturn,src)) >= 2 and (low <= low[1] or high >= high[1]), then direction_stable is true and we can plot a directional marker
+var int direction_stable_under = na
+var int direction_stable_over = na
+var bool directional_stability = true
+var bool bar_is_up = na
+var bool bar_is_down = na
+var bool channel_reentry = na
+var bool swing_pivot_down = na
+var bool swing_pivot_up = na
+
+bar_is_up := close>open?true:false
+bar_is_down := close<open?true:false
+direction_stable_under := ta.barssince(ta.crossunder(src,logReturn))  //determine how many time periods have passed since the price and log Returns have crossed over
+direction_stable_over := ta.barssince(ta.crossover(src,logReturn))
+// if the price and log return values remain apart then the direction of the chart is stable and will, under most circumstances, indicate the direction will contuinue to the next timeframe -- if they cross, then there is a weak indicator of a pivot occuring
+directional_stability := direction_stable_over>= 2 and direction_stable_under>= 2?true: false
+// a candle is bounded if the previous candle's range encompasses the range of the current candle.  However, if there is a no strong directional trend, and the current candle's low is roughly equal to the previous candle's close (and visa-versa for downward trend), then the trend is in the up direction (allowing) for early reversal notification 
+bound_candle := high[1] >= high and low[1] <= low 
+
+// Indicator Details
+channel_bottom = _y_high - dev * i_deviation
+channel_top = _y_high + dev * i_deviation
+channel_reentry_high = close < channel_top and hl2[1] > channel_top?true:false
+channel_reentry_low = close > channel_bottom and hl2[1]< channel_bottom? true:false
+channel_reentry := channel_reentry_high == true?true:channel_reentry_low ==true? true:false
+micro_trend_falling = ta.falling(src,len/5)
+micro_trend_rising = ta.rising(src,len/5)
+price_high_out_of_channel = ohlc4>_y_high+dev*i_deviation and close<close[1] 
+price_low_out_of_channel = ohlc4<_y_high-dev*i_deviation and close>close[1]
+price_beyond_stddev = ohlc4>ohlc4[1]+(stdDev) or ohlc4<ohlc4[1]-(stdDev)
+kurtosis_risk = tikr_kurtosis >= kurt_cv
+kurtosis_squeeze = tikr_kurtosis <= -kurt_cv
+skew_risk = math.abs(tikr_skew)>= skew_cv
+skew_shift_up = tikr_skew > tikr_skew[1]*1.01 and tikr_skew[2]*1.01 
+skew_shift_down = tikr_skew < tikr_skew[1]/1.01 and tikr_skew[2]/1.01 
+regression_validity_ticker = f_rsquared(src)
+regression_validity_logReturn = f_rsquared(logReturn)
+// when there is a difference between the open and close of candles, it often indicates a swing pivot.
+swing_pivot_down := open<close[1] and high<high[1] and  close[1]>close[2] and bound_candle== false and skew_risk == false and kurtosis_squeeze == false?true:false
+swing_pivot_up := open>close[1] and low>low[1]  and close[1]<close[2] and bound_candle == false and skew_risk == false and kurtosis_squeeze == false?true:false
+
+//Populate the table that displays the current and historical moment values
+var valuesTable = table.new(position = position.top_right, columns = 4, rows = 6, bgcolor = color.rgb(147, 138, 165, 100), border_width = 0)
+if barstate.islast
+    table.cell(table_id = valuesTable, column = 0, row = 0, text = "Skewness is " + str.substring(str.format("{0,number,#.###}",tikr_skew),0,8),bgcolor=tikr_skew >0 and tikr_skew>skew_cv?color.rgb(73, 234, 119, 40):tikr_skew <0 and tikr_skew< -skew_cv?color.rgb(255, 10, 5, 40): color.rgb(187, 187, 187, 40), text_size=size.small)
+    table.cell(table_id = valuesTable, column = 0, row = 1, text = "Crit Val is " + str.substring(str.tostring(skew_cv),0,4),bgcolor = color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 1, row = 0, text = "Ex'S Kurtosis " + str.substring(str.format("{0,number,#.###}",tikr_kurtosis),0,8), bgcolor=tikr_kurtosis >0 and tikr_kurtosis>kurt_cv?color.rgb(73, 234, 119, 40):tikr_kurtosis <0 and tikr_kurtosis< -kurt_cv?color.rgb(225, 10, 5, 40): color.rgb(187, 187, 187, 40),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 1, row = 1, text = "Crit Val is " + str.substring(str.tostring(kurt_cv),0,4),bgcolor = color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 2, row = 0, text = "Std Dev at " + str.tostring(i_deviation)+" sigma is " + str.substring(str.format("{0,number,#.###}",stdDev),0,5), bgcolor=color.rgb(150, 147, 147, 40),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 2, row = 1, text = "Dev Range is " + str.format("{0,number,#}",close + stdDev) + " to " + str.format("{0,number,#}",close - stdDev) ,bgcolor = color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 3, row = 0, text = "R-Squared is  " + str.substring(str.format("{0,number,#.###}",tikr_Rsqr),0,8), bgcolor = color.rgb(187, 187, 187, 40),text_size=size.small)
+    table.cell(table_id = valuesTable, column = 3, row = 1, text = "Mean is " + str.substring(str.format("{0,number,#.###}",tikr_simple_mean),0,8),bgcolor = color.rgb(187, 187, 187, 40),text_size=size.small)
+    if momenthistory 
+        for i = 2 to 5 by 1
+            table.cell(table_id = valuesTable, column = 0, row =i, text = "Skew was "+ str.substring(str.format("{0,number,#.###}",tikr_skew[i-1]),0,8),bgcolor= tikr_skew[i-1]>skew_cv[i-1]?color.rgb(1, 221, 27, 11): tikr_skew[i-1]<-skew_cv[i-1]?color.rgb(255, 63, 137, 30): color.rgb(187, 187, 187, 40), text_size=size.small)
+            table.cell(table_id = valuesTable, column = 1, row =i, text = "X'S Ktrs' was "+ str.substring(str.format("{0,number,#.###}",tikr_kurtosis[i-1]),0,8),bgcolor=tikr_kurtosis[i-1]>kurt_cv[i-1]?color.rgb(1, 221, 27, 11): tikr_kurtosis[i-1]< -kurt_cv[i-1]?color.rgb(255, 63, 137, 30): color.rgb(187, 187, 187, 40), text_size=size.small)
+            table.cell(table_id = valuesTable, column = 2, row =i, text = "StdDist was " + str.substring(str.format("{0,number,#.###}",stdDev[i-1]),0,5),bgcolor=color.rgb(187, 187, 187, 60),text_size=size.small) 
+            table.cell(table_id = valuesTable, column = 3, row =i, text = "Variance was " + str.substring(str.format("{0,number,#.###}",tikr_var[i-1]),0,8),bgcolor=color.rgb(187, 187, 187, 60),text_size=size.small)
+
+
+//Plot Channel, Price and Returns information
+
+p_Returns = plot (logReturn,title="Log Returns",color=logReturn<close?color.rgb(194, 2, 27):logReturn>=close?color.rgb(255, 252, 51):color.rgb(145, 145, 145),linewidth=3)
+p_Ticker_Close = plot (close, title="Ticker close",color=color.rgb(4,4,4),linewidth=1)
+p_Channel_Top = plot(channel_top,title="Top Deviation Channel",color = color.rgb(200,200,100))
+p_Channel_Bottom = plot(channel_bottom,title="Bottom Deviation Channel", color = color.rgb(200,100,200))
+// ------
+// Show indicator boxes when excess kurtosis exceeds critical value
+if showCritOnChart
+    if math.abs(tikr_kurtosis)>kurt_cv //or math.abs(tikr_skew)>skew_cv 
+        myBox = box.new(left=bar_index[1], top=_y_high + dev * i_deviation, right=bar_index, bottom=_y_high- (dev*i_deviation), bgcolor=color.rgb(230,30,30,60),  border_width=1, border_color=tikr_kurtosis>kurt_cv?color.rgb(54, 254, 54,60):color.rgb(254,54,54,60))
+    if math.abs(tikr_skew)>skew_cv //or math.abs(tikr_skew)>skew_cv 
+        myBox = box.new(left=bar_index[1], top=_y_high + (dev * i_deviation)/2, right=bar_index, bottom=_y_high- (dev*i_deviation)/2, bgcolor=color.rgb(77, 230, 30, 60),  border_width=1, border_color=tikr_skew>skew_cv? color.rgb(54, 254, 54,60):color.rgb(254,54,54,60))
+
+
+// plot colored dots on the mean plot line showing if there is momentum in the price action bar to bar timeframe
+p_Channel_Mean = plot(_y_high, title="Channel Mean with Momentum indicators",
+ color=
+ bound_candle == false ?
+ bar_is_down == true and ((tikr_skew < skew_cv*2 and tikr_kurtosis>kurt_cv) or (micro_trend_falling or (close<close[1] and ohlc4<ohlc4[1] and close < (close[1]+open[1])/2 and hl2 < hl2[2]))) ?color.rgb(255,0,0,30): 
+ bar_is_up == true   and ((tikr_skew > skew_cv*2 and tikr_kurtosis>kurt_cv) or (micro_trend_rising  or (close>close[1] and ohlc4>ohlc4[1] and close > (close[1]+open[1])/2 and hl2 > hl2[2]))) ?color.rgb(30,255,79,30):
+ color.rgb(120,120,120,80):
+ color.rgb(120,120,120,80),
+ linewidth=4, style=plot.style_circles)
+
+// Plot indicators for the conditions where a pivot that isn't brownian is probable
+p_Channel_PullBack = plot(channel_top[1]+ dev,"Re-entry pivot", 
+ color =  
+ channel_reentry == true and bound_candle == false or (swing_pivot_down == true or swing_pivot_up == true)?  //ignore pivots where the pivoting candle price range is bound by the previous range
+ channel_reentry_low? color.rgb(30, 255, 79,40):  // Plot slightly different colors for the different type of pivot (for debugging and analysis)
+ swing_pivot_up? color.rgb(30,255,80):
+ channel_reentry_high? color.rgb(255,0,0,40):
+ swing_pivot_down? color.rgb(255,10,20): na:na,
+ linewidth=3, style=plot.style_cross)
+
+//Display Indicator Details by taking a peek at the state of the existing indicators (for debugging and analysis)
+var indicatorPeekTable = table.new(position = position.bottom_right, columns = 1, rows = 10, bgcolor = color.rgb(147, 138, 165, 100), border_width = 0)
+if indicatorPeek
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 0, text = "Trend Rising ",bgcolor =micro_trend_rising?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 1, text = "Trend Falling ",bgcolor =micro_trend_falling?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 2, text = "Price Above Channel ",bgcolor =price_high_out_of_channel?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 3, text = "Price Below Channel ",bgcolor =price_low_out_of_channel?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 4, text = "Price Beyond StdDev ",bgcolor =price_beyond_stddev?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 5, text = "Candle is Bound ",bgcolor =bound_candle?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 6, text = skew_shift_up? "Skew Rising ":skew_shift_down? "Skew Falling ":"Normal ",bgcolor = skew_shift_up or skew_shift_down?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 7, text = kurtosis_risk? "Fat Tails": kurtosis_squeeze?"Short Tails":"Normal ",bgcolor = kurtosis_risk or kurtosis_squeeze? color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 8, text = "Direction Stable ",bgcolor =directional_stability ==true ?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+    table.cell(table_id = indicatorPeekTable, column = 0, row = 9, text = "Regression Valid ",bgcolor =tikr_Rsqr>0.98?color.rgb(10,250,10):color.rgb(150,150,150,50),text_size=size.small)
+
+//if skew is highly positive or negative and excess kurtosis is highly positive and price is outside of expected deviation, a reversion to the mean is expected (with some overshoot to the lower channel if excess kurtosis quickly declines to below critical value) --> (usually this happens around some big news event)
+
+//  Experimental plots
+
+//plot(ta.cmo(hlc3, len), color=color.fuchsia,linewidth=3)
+//plot(ta.cog(hlc3, len))
+//plot(ta.correlation(logReturn, src[5], len)+_y_high+dev,color=ta.correlation(logReturn, src[5], len) <=0.9?color.rgb(255, 153, 0, 100):color.rgb(0,0,0,40))
+//p_Williams_R = plot(ta_Williams_R,color=ta.falling(src,3) and ohlc4 <= (ohlc4[1]+ohlc4[2])/2 ?color.red:ta.rising(src,3) and ohlc4>=(ohlc4[1]+ohlc4[2])/2 ?color.green:color.rgb(120,120,120,100), linewidth=2)
+
+// Plotting expected forward range based on Standard Deviation at current bar_index time
+if forwardrange
+    var line l_UpperGuide = na
+    var line l_LowerGuide = na
+    var linefill lf_Range = na
+    line.delete(l_UpperGuide[(len/2)-1])
+    line.delete(l_LowerGuide[(len/2)-1])
+
+    for i = 1 to len/2 by 1 //Fade the history
+        linefill.set_color(lf_Range[i],color.rgb(150,150,150,80+(i*1.2)))
+        line.set_color(l_UpperGuide[i],color.rgb(100,100,100,80+(i*5)))
+        line.set_color(l_LowerGuide[i],color.rgb(100,100,100,80+(i*5)))
+    //plot the deviation based guidance cone and change its color depending on price direction
+    _x1_bar = bar_index
+    _x2_bar = _x1_bar+2 //hardcoded to 2 intervals
+    __y_lowpoint = close
+    __y_highUpoint = __y_lowpoint + dev*1.65
+    __y_highLpoint = __y_lowpoint - dev*1.65
+    l_UpperGuide := line.new(_x1_bar,__y_lowpoint,_x2_bar,__y_highUpoint,color=color.rgb(29, 128, 90))
+    l_LowerGuide := line.new(_x1_bar,__y_lowpoint,_x2_bar,__y_highLpoint,color=color.rgb(131, 73, 73))
+    lf_Range := linefill.new(l_UpperGuide,l_LowerGuide,color =(src[1])/1<src+(stdDev[1]/4)? color.rgb(50,255,50,50):(src[1])/1>src-(stdDev[1]/4)? color.rgb(255, 0, 0, 70):color.rgb(150,150,150,70)) // highlighting the forward looking price value range
+
+//Fill between various plots
+fill(p_Returns,p_Ticker_Close,color=color.rgb(10,200,255,70)) // showing the variance between price return and log return values
+fill(p_Channel_Top,p_Channel_Bottom,color = color.rgb(105,100,200,70)) // highlighting the regression channel
+
+
+
+//ToDo:  
+// Determine if price is in momentum or if a reversion to the mean is expected by including analysis of kurtosis and skewness to prior movements.  
+// Plot historical top / bottom deviation price values against the historical price to visualize if there is separation or convergance of the price to sigma. (done)
+// Plot expected forward high and low values based on reversion / conversion data.  (currently using standard deviations without taking into account probable upcoming mean reversions)
+// Use Volume Weighted Moving Averages to regulate pivots for extended hours trading and overnight futures (done).

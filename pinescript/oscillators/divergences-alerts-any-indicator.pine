@@ -1,0 +1,176 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © victhoreb
+
+//@version=6
+indicator("Divergences + Alerts (ANY Indicator)", max_lines_count = 500, max_bars_back = 5000)
+
+choose_source = input.bool(false, "Plug External Source (Standart is Candle MFI)", group = "Source", tooltip = "Plug any pre-existing indicator into the chart")
+
+mfi = ta.mfi(hlc3, 14)
+mfi_atr = ta.vwma(math.abs(mfi - mfi[1]), 7) / 2
+
+osc_high = choose_source ? input.source(high, "High", inline = "src", group = "Source") : math.min(mfi + mfi_atr, 100)
+osc_low = choose_source ? input.source(low, "Low", inline = "src", group = "Source") : math.max(mfi - mfi_atr, 0)
+
+osc_close = math.avg(osc_high, osc_low)
+osc_open = osc_close[1] 
+osc_color = osc_close > osc_open ? #2f00ff : #ff0000
+
+plotcandle(osc_open, osc_high, osc_low, osc_close, "Indicator", osc_color, osc_color, bordercolor = chart.fg_color)
+
+hline(100, "100", display = choose_source ? display.none : display.all, editable = choose_source ? false : true)
+hline(50, "50", display = choose_source ? display.none : display.all, editable = choose_source ? false : true)
+hline(0, "0", display = choose_source ? display.none : display.all, editable = choose_source ? false : true)
+
+// Divergence Calculation 
+hh(x0, x1, h_src, ok, atr) => 
+    if ok
+        curr = h_src[bar_index - x0]
+        last = h_src[bar_index - x1]
+        bool hh = true
+        lb = x0 - x1 
+        lb_start = bar_index - x0 
+        for i = lb_start to lb_start + lb - 1
+            hh := hh and h_src[i] <= curr 
+        hh and curr > last + atr
+
+lh(x0, x1, h_src, ok, atr) => 
+    if ok
+        curr = h_src[bar_index - x0]
+        last = h_src[bar_index - x1]
+        bool lh = true
+        lb = x0 - x1 
+        lb_start = bar_index - x0 
+        for i = lb_start to lb_start + lb - 1
+            lh := lh and h_src[i] <= last 
+        lh and curr < last - atr
+
+hl(x0, x1, l_src, ok, atr) => 
+    if ok
+        curr = l_src[bar_index - x0]
+        last = l_src[bar_index - x1]
+        bool hl = true
+        lb = x0 - x1 
+        lb_start = bar_index - x0 
+        for i = lb_start to lb_start + lb - 1
+            hl := hl and l_src[i] >= last
+        hl and curr > last + atr
+
+ll(x0, x1, l_src, ok, atr) => 
+    if ok
+        curr = l_src[bar_index - x0]
+        last = l_src[bar_index - x1]
+        bool ll = true
+        lb = x0 - x1 
+        lb_start = bar_index - x0
+        for i = lb_start to lb_start + lb - 1
+            ll := ll and l_src[i] >= curr
+        ll and curr < last - atr
+
+type pivot_storage 
+    chart.point[] price 
+    chart.point[] osc
+    bool ok = true
+
+type divergence_data
+    pivot_storage bull
+    pivot_storage bear 
+
+var data = divergence_data.new(
+  pivot_storage.new(array.new<chart.point>(2, chart.point.now(high)), array.new<chart.point>(2, chart.point.now(osc_high))), 
+  pivot_storage.new(array.new<chart.point>(2, chart.point.now(low)), array.new<chart.point>(2, chart.point.now(osc_low)))
+  )
+
+lb = input.int(5, "Pivot Detection Lookback", group = "Divergences")
+min_lb = input.int(5, "Minimum Lookback", group = "Divergences")
+max_lb = input.int(30, "Maximum Lookback", group = "Divergences")
+
+filter_atr = input.bool(true, "Filter by ATR", inline = "ATR", group = "Divergences")
+atr_len = input.int(10, "Length", inline = "ATR", group = "Divergences")
+atr_mult = input.float(0.25, "Mulitplier", inline = "ATR", group = "Divergences")
+
+atr = ta.sma(filter_atr ? high - low : 0, atr_len) * atr_mult
+osc_atr = ta.sma(filter_atr ? osc_high - osc_low : 0, atr_len) * atr_mult
+
+in_rng(cond) =>
+    bars = ta.barssince(cond == true)
+    min_lb <= bars and bars <= max_lb
+
+method ok(pivot_storage storage, bool new_pivot, int lb) => 
+    in_rng = in_rng(new_pivot[1])
+    storage.ok := new_pivot ? math.abs((storage.price.get(0).index - storage.price.get(1).index) - (storage.osc.get(0).index - storage.osc.get(1).index)) < lb and in_rng : false
+
+method update(pivot_storage storage, chart.point price, chart.point osc, bool when) => 
+    if when
+        storage.price.pop()
+        storage.osc.pop()
+        storage.price.unshift(price[1])
+        storage.osc.unshift(osc[1])
+
+new_ph = not na(ta.pivothigh(osc_high, lb, lb))
+new_pl =  not na(ta.pivotlow(osc_low, lb, lb))
+
+data.bull.update(
+  chart.point.from_index(bar_index[-ta.highestbars(high, lb)], ta.highest(high, lb)), 
+  chart.point.from_index(bar_index[-ta.highestbars(osc_high, lb)], ta.highest(osc_high, lb)),
+  new_ph)
+
+data.bear.update(
+  chart.point.from_index(bar_index[-ta.lowestbars(low, lb)], ta.lowest(low, lb)), 
+  chart.point.from_index(bar_index[-ta.lowestbars(osc_low, lb)], ta.lowest(osc_low, lb)),
+  new_pl)
+
+data.bull.ok(new_ph, lb)
+data.bear.ok(new_pl, lb)
+
+method buyer_exhaustion(pivot_storage data) => 
+    ok = data.ok
+    price_hh = hh(data.price.get(0).index, data.price.get(1).index, high, ok, atr)
+    osc_lh = lh(data.osc.get(0).index, data.osc.get(1).index, osc_high, ok, osc_atr)
+    price_hh and osc_lh 
+
+method buyer_absorption(pivot_storage data) => 
+    ok = data.ok
+    price_lh = lh(data.price.get(0).index, data.price.get(1).index, high, ok, atr) 
+    osc_hh = hh(data.osc.get(0).index, data.osc.get(1).index, osc_high, ok, osc_atr)
+    price_lh and osc_hh
+
+method seller_exhaustion(pivot_storage data) =>
+    ok = data.ok
+    price_ll = ll(data.price.get(0).index, data.price.get(1).index, low, ok, atr)
+    osc_hl = hl(data.osc.get(0).index, data.osc.get(1).index, osc_low, ok, osc_atr)
+    price_ll and osc_hl
+
+method seller_absorption(pivot_storage data) => 
+    ok = data.ok
+    price_hl = lh(data.price.get(0).index, data.price.get(1).index, low, ok, atr) 
+    osc_ll = hh(data.osc.get(0).index, data.osc.get(1).index, osc_low, ok, osc_atr)
+    price_hl and osc_ll
+
+buyer_absorption = buyer_absorption(data.bull)
+buyer_exhaustion = buyer_exhaustion(data.bull)
+seller_absorption = seller_absorption(data.bear)
+seller_exhaustion = seller_exhaustion(data.bear)
+
+bullish_color = input.color(#2f00ff, "+", inline = "color", group = "Divergences")
+bearish_color = input.color(#ff0000, "-", inline = "color", group = "Divergences")
+
+exhaustion = input.bool(true, "Exhaustion", group = "Divergences")
+absorption = input.bool(true, "Absorption", group = "Divergences")
+
+if (buyer_exhaustion and exhaustion) or (buyer_absorption and absorption)
+    line.new(data.bull.price.get(0), data.bull.price.get(1), xloc.bar_index, extend.none, bearish_color, line.style_solid, 2, true)
+    line.new(data.bull.osc.get(0), data.bull.osc.get(1), xloc.bar_index, extend.none, bearish_color, line.style_solid, 2)
+
+if (seller_exhaustion and exhaustion) or (seller_absorption and absorption)
+    line.new(data.bear.price.get(0), data.bear.price.get(1), xloc.bar_index, extend.none, bullish_color, line.style_solid, 2, true)
+    line.new(data.bear.osc.get(0), data.bear.osc.get(1), xloc.bar_index, extend.none, bullish_color, line.style_solid, 2)
+
+alertcondition(buyer_exhaustion, title = "Buyer Exhaustion",
+               message = "Buyer Exhaustion detected on {{ticker}} - Possible Downward Shift")
+alertcondition(buyer_absorption, title = "Buyer Absorption",
+               message = "Buyer Absorption detected on {{ticker}} - Possible Downward Shift")
+alertcondition(seller_exhaustion, title = "Seller Exhaustion",
+               message = "Seller Exhaustion detected on {{ticker}} - Possible Upward Shift")
+alertcondition(seller_absorption, title = "Seller Absorption",
+               message = "Seller Absorption detected on {{ticker}} - Possible Upward Shift")

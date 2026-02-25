@@ -1,0 +1,3123 @@
+//@version=6
+indicator(
+     title          = "Smart Trader, Episode 05, by Ata Sabanci — Concentric Candles & Aristotelian Cycloids",
+     shorttitle     = "ST-EP05",
+     overlay        = true,
+     max_polylines_count = 100,
+     max_labels_count    = 500,
+     max_lines_count     = 500,
+     max_bars_back       = 5000
+ ) 
+
+//══════════════════════════════════════════════════════════════════════════════
+//  IDEA & THEORETICAL FOUNDATION
+//══════════════════════════════════════════════════════════════════════════════
+//
+//  This indicator fuses two profound mathematical frameworks:
+//
+//  ┌─────────────────────────────────────────────────────────────────────────┐
+//  │  1. VOLATILITY-DIFFUSION NORMALIZATION (σ√t Scaling Law)               │
+//  │                                                                         │
+//  │  A financial chart has two incompatible axes: price (currency) and      │
+//  │  time (bars). Any geometric shape drawn on a raw chart is meaningless  │
+//  │  — it distorts with zoom or rescaling.                                  │
+//  │                                                                         │
+//  │  Under Geometric Brownian Motion: dS/S = μdt + σdW                     │
+//  │  The standard deviation of log-returns scales as: std(Δln P) = σ√Δt   │
+//  │                                                                         │
+//  │  This gives us the non-arbitrary conversion factor:                    │
+//  │    σ_bar = stdev(log-returns, N)                                       │
+//  │    1 bar of time ≡ σ_bar units of log-price                           │
+//  │                                                                         │
+//  │  Normalized coordinates: X = bar_index, Y = ln(Price) / σ_bar         │
+//  │  Both axes now measure the SAME thing. Geometry becomes invariant.     │
+//  ├─────────────────────────────────────────────────────────────────────────┤
+//  │  2. ARISTOTLE'S WHEEL PARADOX & CYCLOID CURVES                        │
+//  │                                                                         │
+//  │  The predecessor-comparison algorithm finds maxima candles (M0, M1).   │
+//  │  Walking backward, each candle larger than its predecessor is          │
+//  │  selected. In the normalized space, each candle's log-range           │
+//  │  becomes a circle diameter. Four prices (O,H,L,C) become four fixed   │
+//  │  points on this circle. As the circle rolls without slipping, each    │
+//  │  point traces a CYCLOID — "the Helen of geometry" (Galileo).          │
+//  │                                                                         │
+//  │  Each maxima candle defines THREE concentric circles:                  │
+//  │    • Outer circle:      diameter = H − L         (full candle range)   │
+//  │    • Upper wick circle: diameter = H − max(O,C)  (upper wick length)  │
+//  │    • Lower wick circle: diameter = min(O,C) − L  (lower wick length)  │
+//  │  All share the same center = geometric midpoint of the candle.        │
+//  │                                                                         │
+//  │  Three X-points are tracked — one at each circle's apex:              │
+//  │    X₁ on outer circle apex  (= High)          → standard cycloid      │
+//  │    X₂ on upper wick circle apex (= Mid+r_up)  → curtate cycloid      │
+//  │    X₃ on lower wick circle apex (= Mid+r_lo)  → curtate cycloid      │
+//  │                                                                         │
+//  │  Two-radius parametric equations (Aristotle's Wheel):                 │
+//  │    x(θ) = R·θ − r·sin(θ+φ₀) + r·sin(φ₀)                             │
+//  │    y(θ) = R   − r·cos(θ+φ₀)                                          │
+//  │  where R = outer rolling radius, r = traced point's circle radius     │
+//  │  Phase: φ₀ = π for all three points (apex start, CW rolling)         │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//
+//  Architecture:
+//    • Single overlay indicator (overlay=true) — all rendering on the
+//      main price chart: cycloid polylines, geometric markers, reference
+//      lines, and the dashboard table.
+//    • Cycloid curves drawn in price space via inverse transform:
+//      price = exp(lnLow + y_normalized × σ_bar)
+//    • Rolling surface (y=0 in normalized space) maps to the candle's
+//      Low price on the chart — geometry is anchored there, not at
+//      price = 0.
+//══════════════════════════════════════════════════════════════════════════════
+
+//──────────────────────────────────────────────────────────────────────────────
+// IMPORT — Lower timeframe volume decomposition for Intrabar engine
+//──────────────────────────────────────────────────────────────────────────────
+import TradingView/ta/10 as tvta
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+
+grpCore = "Core Settings"
+
+iSigmaLen = input.int(20, "σ_bar Lookback Period (Yang-Zhang)",
+     minval = 1, maxval = 2500, group = grpCore,
+     tooltip = "Rolling window for the Yang-Zhang volatility estimator. Uses all four OHLC prices plus overnight gaps to produce the most statistically efficient σ_bar. Larger values → more robust geometric calibration. 500 recommended for accurate axis synchronization. Minimum 20 to ensure statistical validity.")
+
+ 
+
+grpCycloid = "Cycloid Display"
+
+iShowOuter = input.bool(true, "Show Outer Circle Trace (H−L)", group = grpCycloid,
+     tooltip = "Cycloid of X₁ on the outer circle (full candle range). This is the driving wheel — it rolls without slipping. X₁ sits at High (top, φ₀=π), tracing a standard cycloid peaking at 2R.")
+
+iShowUpperPin = input.bool(true, "Show Upper Pin Trace", group = grpCycloid,
+     tooltip = "Cycloid of X₂ on the upper wick circle (diameter = H − max(O,C)). This inner wheel is dragged by the outer — it slips along the baseline (Aristotle's paradox). Traces a curtate cycloid with reduced amplitude.")
+
+iShowLowerPin = input.bool(true, "Show Lower Pin Trace", group = grpCycloid,
+     tooltip = "Cycloid of X₃ on the lower wick circle (diameter = min(O,C) − L). This inner wheel is also dragged. Traces a curtate cycloid with reduced amplitude.")
+
+iShowPeriodMi = input.bool(true, "Show Period Largest Candle", group = grpCycloid,
+     tooltip = "Draw cycloid curves for the single largest candle (by H−L range) within the specified lookback period.\nIf this candle already matches M0 or M1, no duplicate is drawn.\nInherits all rules: color, fill, reference lines, S/R, CVCA, and dashboard.")
+
+iPeriodLen = input.int(20, "Period Lookback Length",
+     minval = 5, maxval = 200, group = grpCycloid,
+     tooltip = "Number of bars to scan backward from the basis candle to find the single largest H−L range candle.\nDefault: 20. Range: 5–200.\nThe resulting candle is appended as an additional maxima (M2) if it differs from M0 and M1.")
+
+iShowRefLines = input.bool(false, "Show Reference Lines", group = grpCycloid,
+     tooltip = "Draw horizontal dashed reference lines from each maxima candle at the apex and nearest trough of each concentric circle, extending to the global cycloid horizon. Labels at line endpoints use global anti-overlap to avoid visual clutter.")
+
+iRefOuterApex = input.bool(true, "  ⊚ Outer Apex Line (2R)", group = grpCycloid,
+     tooltip = "Show the outer circle apex reference line (highest cycloid point, y=2R).\nThis is the primary rolling wheel's peak — the strongest geometric level.\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefOuterTrough = input.bool(true, "  ⊚ Outer Trough Line (0)", group = grpCycloid,
+     tooltip = "Show the outer circle trough reference line (rolling surface, y=0).\nEquals the maxima candle's Low price.\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefUpperPinApex = input.bool(false, "  ▲ Upper Pin Apex Line (R+r_up)", group = grpCycloid,
+     tooltip = "Show the upper wick circle apex reference line (curtate cycloid peak, y=R+r_up).\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefUpperPinTrough = input.bool(false, "  ▲ Upper Pin Trough Line (R−r_up)", group = grpCycloid,
+     tooltip = "Show the upper wick circle trough reference line (curtate cycloid minimum, y=R−r_up).\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefLowerPinApex = input.bool(false, "  ▼ Lower Pin Apex Line (R+r_lo)", group = grpCycloid,
+     tooltip = "Show the lower wick circle apex reference line (curtate cycloid peak, y=R+r_lo).\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefLowerPinTrough = input.bool(false, "  ▼ Lower Pin Trough Line (R−r_lo)", group = grpCycloid,
+     tooltip = "Show the lower wick circle trough reference line (curtate cycloid minimum, y=R−r_lo).\nOnly effective when 'Show Reference Lines' is ON.")
+
+iRefLabelSize = input.int(6, "Reference Label Size (pt)",
+     minval = 4, maxval = 20, group = grpCycloid,
+     tooltip = "Font size in typographic points for reference line endpoint labels.\nDefault: 6. Range: 4–20.\nMapped to nearest label size: ≤6=Tiny, ≤9=Small, ≤12=Normal, ≤16=Large, >16=Huge.")
+
+iRefLineColor = input.color(color.rgb(180, 180, 200), "Reference Line Color", group = grpCycloid,
+     tooltip = "Color for all horizontal cycloid reference lines (apex and trough levels).\nApplied uniformly to all 6 levels per maxima candle.")
+
+iRefLineWidth = input.int(1, "Reference Line Width",
+     minval = 1, maxval = 5, group = grpCycloid,
+     tooltip = "Line thickness for horizontal cycloid reference lines.\nRange: 1–5. Default: 1.")
+
+iRefLineStyle = input.string("Dashed", "Reference Line Style",
+     options = ["Solid", "Dashed", "Dotted"], group = grpCycloid,
+     tooltip = "Line style for horizontal cycloid reference lines.\nSolid: continuous line. Dashed: long dashes. Dotted: short dots.")
+
+iCurveAboveColor = input.color(color.rgb(255, 152, 0), "Curve Color — Above Price", group = grpCycloid,
+     tooltip = "Color for all cycloid curves when the Outer Apex level is above current close.\nApplies uniformly to Outer, Upper Pin, and Lower Pin curves of that maxima.")
+
+iCurveBelowColor = input.color(color.rgb(0, 188, 212), "Curve Color — Below Price", group = grpCycloid,
+     tooltip = "Color for cycloid curve segments below the current close price.\nApplies to all three curve types (Outer, Upper Pin, Lower Pin).")
+
+iCurveOuterWidth = input.int(2, "Outer Curve Line Width",
+     minval = 1, maxval = 10, group = grpCycloid,
+     tooltip = "Line thickness for the outer circle cycloid curve (H−L range).\nThis is the primary rolling wheel trace.\nRange: 1–10. Default: 2.")
+
+iCurvePinWidth = input.int(1, "Pin Curve Line Width",
+     minval = 1, maxval = 10, group = grpCycloid,
+     tooltip = "Line thickness for both upper and lower pin cycloid curves.\nThese are the inner (wick) circle traces.\nRange: 1–10. Default: 1.")
+
+grpFP = "Footprint Volumetrics"
+
+iShowCVCA = input.bool(false, "Show Contact Analysis (CVCA)", group = grpFP,
+     tooltip = "Display the Cycloid-Volume Contact Analysis engine in the dashboard.\nDetects real-time cycloid curve intersections and applies a 7-axis\nprediction matrix: Direction, Curve Type, Zone, Volume Magnitude,\nDelta Character, Absorption, and Confluence.\nOutputs directional probability P(↑), conviction score, and\nbehavior classification for each active contact.\n\n⚠️ REQUIREMENTS:\n• TradingView Premium or Ultimate plan required for tick-level footprint data.\n• Without Premium, CVCA falls back to Volume Engine data (geometry + price action only).\n\n⚠️ INSTRUMENT NOTE:\n• On high-volatility instruments (BTC, NAS100, etc.), increase 'Ticks Per Row' below\n  to prevent histogram overflow errors.\n• On stocks and forex with small tick ranges, default settings work out of the box.\n\nDefault: OFF — enable manually after confirming your plan and instrument compatibility.")
+
+iTicksPerRow = input.int(500000, "Ticks Per Row (Footprint Resolution)", group = grpFP,
+     minval = 1, maxval = 500000,
+     tooltip = "Number of price ticks aggregated into each footprint histogram row.\nControls the granularity of CVCA tick-level volume analysis.\n\n• Low values (1–10): Maximum precision. Best for stocks and forex where\n  single-bar ranges are small (< 500 ticks). Use 1 for BIST stocks.\n• Medium values (50–100): Balanced. Works for most instruments.\n• High values (200–1000): Required for high-volatility instruments like\n  BTC, ETH, NAS100 where a single bar can span thousands of ticks.\n\n⚠️ If you see 'Histogram is too large' error, increase this value.\nOnly active when 'Show Contact Analysis (CVCA)' is ON.\nDefault: 50.")
+
+grpVol = "Volume Engine"
+
+iCalcMethod = input.string("Geometry (Approx)", "Calculation Method",
+     options = ["Geometry (Approx)", "Intrabar (Precise)"], group = grpVol,
+     tooltip = "Volume calculation method for buy/sell decomposition.\n\n• Geometry (Approx): Estimates buy/sell split from OHLC price action using\n  the proportional bar method. This is an approximation — not exact tick data —\n  but works on ALL TradingView plans and ALL instruments without restrictions.\n  Recommended as default for general use.\n\n• Intrabar (Precise): Uses lower timeframe tick data via TradingView's ta\n  library for precise buy/sell decomposition. More accurate, but requires\n  the Intrabar Timeframe setting below.\n  ⚠️ Seconds-based LTF (e.g., 15S) requires Premium+ plan.\n  Use 1-minute LTF on Basic/Plus plans.\n\nDefault: Geometry (Approx) — zero restrictions, universal compatibility.")
+
+iLTF = input.timeframe("1", "Intrabar Timeframe", group = grpVol,
+     tooltip = "Lower timeframe used for precise volume calculation.\nOnly active when 'Intrabar (Precise)' is selected.\n\nDefault: 1 (1-minute) — works on all TradingView plans.\n\n⚠️ Seconds-based timeframes (e.g., 15S, 5S) require TradingView Premium or\nhigher-tier plans. If you see 'seconds-based timeframes' error, keep this\nset to 1 or higher (e.g., 1, 3, 5 for minutes).\n\n• 1-minute: approximate but compatible with all plans.\n• 15S or lower: higher precision, requires Premium+.\n\nNote: Intrabar mode provides more accurate buy/sell decomposition than\nGeometry mode, but the difference is marginal on most instruments.\nGeometry mode is recommended for general use.")
+
+iBasisMode = input.string("Closed Candle", "Calculation Basis",
+     options = ["Current Candle", "Closed Candle"], group = grpVol,
+     tooltip = "Current Candle: uses live bar data for volume metrics and S/R detection.\nClosed Candle: uses only the last confirmed bar. More stable, avoids intrabar noise.")
+
+grpDash = "Dashboard Settings"
+
+iShowDash = input.bool(true, "Show Dashboard on Main Chart", group = grpDash,
+     tooltip = "Project the data dashboard onto the main price chart. Shows all cycloid reference levels, S/R detection, and volume metrics.")
+
+iDashPos = input.string("Top Right", "Dashboard Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpDash,
+     tooltip = "Position of the dashboard on the main chart.")
+
+iDashFont = input.int(12, "Dashboard Font Size (pt)",
+     minval = 6, maxval = 30, group = grpDash,
+     tooltip = "Font size in typographic points for all dashboard table text.\nDefault: 12. Range: 6–30.")
+
+iShowMiPrices = input.bool(false, "Show Mi Reference Prices in Dashboard", group = grpDash,
+     tooltip = "Show the 3 apex/trough price-level rows (Outer, Upper Pin, Lower Pin) for each maxima candle in the dashboard.\nWhen OFF, only the Mi header band and info row (Offset, Length, Mid) are displayed.\nDefault: OFF.")
+
+iLang = input.string("English", "Dashboard Language",
+     options = ["English", "Türkçe", "العربية"], group = grpDash,
+     tooltip = "Select dashboard and tooltip language.\nArabic uses right-to-left alignment.")
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+//──────────────────────────────────────────────────────────────────────────────
+
+const int   HIST_LIMIT = 5000
+const float MIN_SIGMA  = 1e-10
+const float PI         = math.pi
+const float TAU        = 2.0 * PI
+
+var color[] ZONE_COLORS = array.from(
+     color.rgb(41, 98, 255),
+     color.rgb(0, 150, 136),
+     color.rgb(255, 193, 7),
+     color.rgb(255, 87, 34),
+     color.rgb(156, 39, 176),
+     color.rgb(244, 67, 54),
+     color.rgb(0, 188, 212),
+     color.rgb(139, 195, 74),
+     color.rgb(255, 152, 0),
+     color.rgb(233, 30, 99),
+     color.rgb(63, 81, 181),
+     color.rgb(0, 150, 136),
+     color.rgb(205, 220, 57),
+     color.rgb(121, 85, 72),
+     color.rgb(96, 125, 139),
+     color.rgb(255, 235, 59),
+     color.rgb(103, 58, 183),
+     color.rgb(0, 200, 83),
+     color.rgb(255, 61, 0),
+     color.rgb(29, 233, 182)
+ )
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// UDT: Extended Maxima Information
+//──────────────────────────────────────────────────────────────────────────────
+
+type MaximaInfo
+    int     offset
+    float   rawLength
+    float   midPrice
+    float   normDiameter
+    float   normRadius
+    float   circumference
+    float   upperPinDiam
+    float   upperPinRad
+    float   upperPinCirc
+    float   lowerPinDiam
+    float   lowerPinRad
+    float   lowerPinCirc
+    int     centerBarIdx
+    float   centerYNorm
+    float   phaseOuter
+    float   phaseUpper
+    float   phaseLower
+    float   sigmaAtBar
+    float   lnLow
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// UDT: Footprint Extremes per Maxima Candle
+//──────────────────────────────────────────────────────────────────────────────
+
+// Stores all footprint rows for a single bar.
+// Used by CVCA engine to retrieve buy/sell volume at any price level.
+type FPBarData
+    array<float> prices     // Tick-level price for each row
+    array<float> buys       // Buy (ask-side) volume per row
+    array<float> sells      // Sell (bid-side) volume per row
+
+//──────────────────────────────────────────────────────────────────────────────
+// UDT: Cycloid-Volume Contact Event (7-Axis Prediction)
+//──────────────────────────────────────────────────────────────────────────────
+// Stores a single detected intersection between price and a cycloid curve,
+// together with the full 7-axis analysis and prediction output.
+// Academic foundations:
+//   Axis 4–5: Kyle-Obizhaeva square-root impact law (σ√(Q/V))
+//   Axis 5:   Easley-O'Hara PIN/VPIN (delta = informed trading proxy)
+//   Axis 6:   Cont et al. 2014 OFI linear impact (absorption detection)
+//   Axis 7:   MLOFI (Xu et al. 2019, multi-level agreement)
+//──────────────────────────────────────────────────────────────────────────────
+
+type ContactEvent
+    // ── Identity ──
+    int     barIdx              // Bar index where contact detected
+    int     miIdx               // Maxima index (0 = M0, 1 = M1, ...)
+    string  curveName           // Human-readable: "M0·Outer", "M1·UpperPin", etc.
+    float   contactPrice        // Cycloid curve price at contact bar
+    // ── Axis 1: Contact Direction (4 states) ──
+    string  ax1_direction       // DIR_UP, DIR_DN, WICK_UP, WICK_DN
+    // ── Axis 2: Curve Type (3 states) ──
+    string  ax2_curveType       // CRV_OUT, CRV_UP, CRV_LO
+    // ── Axis 3: Curve Zone (3 states) ──
+    string  ax3_zone            // ZONE_APEX, ZONE_TROUGH, ZONE_MID
+    float   ax3_yNorm           // Normalized Y at contact for zone computation
+    // ── Axis 4: Volume Magnitude Ratio (3 states) ──
+    string  ax4_volMag          // VOL_AMP, VOL_PROP, VOL_DEP
+    float   ax4_ratio           // T_curr / T_hist
+    // ── Axis 5: Delta Character (6 states) ──
+    string  ax5_deltaChar       // Δ_CONT_BUY, Δ_CONT_SELL, Δ_FLIP_BUY, Δ_FLIP_SELL, Δ_WEAK_BUY, Δ_WEAK_SELL
+    // ── Axis 6: Absorption Detection (3 states) ──
+    string  ax6_absorption      // ABS_BUY, ABS_SELL, ABS_NONE
+    // ── Axis 7: Multi-Cycloid Confluence (3 states) ──
+    string  ax7_confluence      // CONF_1, CONF_2, CONF_3
+    int     ax7_confCount       // Actual count of nearby curves
+    // ── Prediction Output ──
+    float   probUp              // P(↑) ∈ [0.05, 0.95]
+    float   conviction          // C ∈ [0.0, 1.0]
+    string  behavior            // STRONG_BOUNCE, BREAKOUT, EXHAUSTION, etc.
+    color   behaviorColor       // Visual color for the behavior classification
+    // ── Raw Comparison Data (for dashboard display) ──
+    float   histBuy             // Maxima candle total buy volume
+    float   histSell            // Maxima candle total sell volume
+    float   histDelta           // histBuy - histSell
+    float   histTotal           // histBuy + histSell
+    float   currBuy             // Current candle total buy volume
+    float   currSell            // Current candle total sell volume
+    float   currDelta           // currBuy - currSell
+    float   currTotal           // currBuy + currSell
+    bool    fpValid             // true if both candles have footprint data at contact price row
+    // ── Prediction breakdown (stored for dashboard tooltip) ──
+    float   pBias_dir           // P(↑) adjustment from contact direction
+    float   pBias_delta         // P(↑) adjustment from delta character
+    float   pBias_abs           // P(↑) adjustment from absorption
+    float   pBias_vol           // P(↑) adjustment from volume magnitude
+    float   conv_base           // Conviction base value from curve type
+    float   conv_zone           // Conviction zone multiplier
+    float   conv_vol            // Conviction volume multiplier
+    float   conv_conf           // Conviction confluence multiplier
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// UDT: Multi-Language Text Pack
+//──────────────────────────────────────────────────────────────────────────────
+
+type LangText
+    // Dashboard structure
+    string title
+    string sigma_lbl
+    string lookback_lbl
+    string rev_lbl
+    string line_name_lbl
+    string price_lbl
+    // Line names — apex
+    string outer_apex
+    string upper_pin_apex
+    string lower_pin_apex
+    // Line names — trough
+    string outer_trough
+    string upper_pin_trough
+    string lower_pin_trough
+    // S/R
+    string resistance
+    string support
+    string breakout
+    string broken
+    string testing_res
+    string at_support
+    string mid_range
+    string waiting
+    string no_sr_above
+    string no_sr_below
+    // Volume engine
+    string vol_engine
+    string volumetric
+    string engine_geo
+    string engine_intra
+    string intrabar_ltf
+    string valid_data
+    string bar_unit
+    string global_period
+    string total_vol
+    string buy_vol
+    string sell_vol
+    string delta_vol
+    string basis_current
+    string basis_closed
+    string intrabar_limit
+    string requested_lbl
+    string valid_word
+    string used_word
+    string offset_lbl
+    string length_lbl
+    string mid_lbl
+    // Tooltips
+    string tt_title
+    string tt_sigma
+    string tt_mi_header
+    string tt_outer_apex
+    string tt_upper_pin_apex
+    string tt_lower_pin_apex
+    string tt_outer_trough
+    string tt_upper_pin_trough
+    string tt_lower_pin_trough
+    string tt_price
+    string tt_resistance
+    string tt_support
+    string tt_status
+    string tt_vol_engine
+    string tt_volumetric
+    string tt_offset
+    string tt_length
+    string tt_mid
+    // CVCA (Contact Analysis) tooltip strings
+    string cvca_title
+    string cvca_no_contact
+    string cvca_tt_section
+    string cvca_tt_contact
+    string cvca_tt_prob
+    string cvca_tt_behavior
+    string cvca_tt_axes
+    string cvca_tt_hist
+    string cvca_tt_ratio
+    // CVCA Row 1 — natural language sentence fragments
+    string cvca_sent_prefix         // "Live candle contacted"
+    string cvca_sent_cycloid_at     // "cycloid at"
+    string cvca_sent_closing        // "closing at"
+    string cvca_sent_near_curve     // "Contact is near the curve"
+    string cvca_dir_passed_up       // "Passed Up ↑"
+    string cvca_dir_passed_dn       // "Passed Down ↓"
+    string cvca_dir_stopped         // "Stopped at contact"
+    string cvca_dir_wick_up         // "Wick Bounce ↑"
+    string cvca_dir_wick_dn         // "Wick Reject ↓"
+    string cvca_zone_apex           // "peak (Apex zone)"
+    string cvca_zone_trough         // "bottom (Trough zone)"
+    string cvca_zone_mid            // "midrange (Mid zone)"
+    string cvca_conf_one            // singular confluence
+    string cvca_conf_pre            // "Also"
+    string cvca_conf_post           // "other curves pass through this price level."
+    // Footprint validity — Volume Engine section
+    string fp_status_active         // "Footprint: ✓ Active (tick-level)"
+    string fp_status_no_data        // "Footprint: ⚠ No Data"
+    string fp_status_no_contact   // "Footprint: – No Contact"
+    // CVCA Row 2 — natural language sentence fragments
+    string cvca_r2_signal         // "Signal:"
+    string cvca_r2_prob_up        // "chance of moving up"
+    string cvca_r2_prob_dn        // "chance of moving down"
+    string cvca_r2_conviction     // "conviction"
+    string cvca_r2_dir            // "Direction"
+    string cvca_r2_delta          // "Delta"
+    string cvca_r2_abs            // "Absorption"
+    string cvca_r2_vol            // "Volume"
+    string cvca_r2_curve_at       // "curve at"
+    string cvca_r2_boosts_conf    // "boosts confidence"
+    string cvca_r2_no_fp          // "No footprint — geometry only."
+    string cvca_r2_crv_outer      // "Outer"
+    string cvca_r2_crv_upper      // "Upper Pin"
+    string cvca_r2_crv_lower      // "Lower Pin"
+    string cvca_r2_zone_apex      // "Apex"
+    string cvca_r2_zone_trough    // "Trough"
+    string cvca_r2_zone_mid       // "Mid"
+    // ROW 3 — Volume Ratio + Delta Trend natural language fragments
+    string cvca_r3_vol_prefix     // "Volume is" — sentence opener before ratio
+    string cvca_r3_vol_amp        // "amplified vs history" — VOL_AMP state
+    string cvca_r3_vol_prop       // "proportional to history" — VOL_PROP state
+    string cvca_r3_vol_dep        // "depleted vs history" — VOL_DEP state
+    string cvca_r3_delta_str      // "buying pressure strengthened since the maxima candle"
+    string cvca_r3_delta_str_s    // "selling pressure strengthened since the maxima candle"
+    string cvca_r3_delta_weak     // "buying pressure weakening"
+    string cvca_r3_delta_weak_s   // "selling pressure weakening"
+    string cvca_r3_delta_flip_b   // "delta flipped — buyers took over"
+    string cvca_r3_delta_flip_s   // "delta flipped — sellers took over"
+    string cvca_r3_maxima_lbl     // "Maxima:" — historical candle label for Line 2
+    string cvca_r3_current_lbl    // "Current:" — basis candle label for Line 2
+    string cvca_r3_buy_lbl        // "Buy" — buy volume label
+    string cvca_r3_sell_lbl       // "Sell" — sell volume label
+    string cvca_r3_no_fp_l1       // "No footprint data at this price level — volume comparison unavailable."
+    string cvca_r3_no_fp_l2       // "Prediction uses geometry and price action only."
+    // ── CVCA Tooltip Row 1: Contact Identity ──
+    string tt_r1_hdr              // Tooltip section header for contact identity
+    string tt_r1_curve_lbl        // "Curve:" label
+    string tt_r1_cprice_lbl       // "Contact Price:" label
+    string tt_r1_ctype_lbl        // "Curve Type:" label
+    string tt_r1_ctype_out        // Outer curve description
+    string tt_r1_ctype_up         // Upper pin curve description
+    string tt_r1_ctype_lo         // Lower pin curve description
+    string tt_r1_volsrc           // Volume source explanation line
+    string tt_r1_dir_lbl          // "Direction:" label
+    string tt_r1_dir_block        // 5-line direction state descriptions
+    string tt_r1_zone_lbl         // "Zone:" label
+    string tt_r1_zone_block       // 3-line zone state descriptions
+    string tt_r1_conf_lbl         // "Confluence:" label
+    string tt_r1_conf_unit        // "curves within ±0.3σ"
+    string tt_r1_fp_lbl           // "Footprint:" label
+    string tt_r1_fp_valid         // Short valid status for tooltip
+    string tt_r1_fp_nodata        // Short no-data status for tooltip
+    string tt_r1_fp_active_msg    // All axes active message
+    string tt_r1_fp_none_msg      // Volume axes zeroed message
+    // ── CVCA Tooltip Row 2: Behavior + Prediction ──
+    string tt_r2_hdr              // Tooltip section header for behavior
+    string tt_r2_beh_lbl          // "Behavior:" label
+    string tt_r2_cascade          // Full 9-line priority cascade block
+    string tt_r2_prob_eq          // "P(↑) =" formula label
+    string tt_r2_base50           // "Base 50% +" formula prefix
+    string tt_r2_conv_eq          // "Conviction =" formula label
+    string tt_r2_base_lbl         // "Base" conviction component label
+    string tt_r2_zone_lbl         // "Zone" conviction component label
+    string tt_r2_vol_lbl          // "Vol" conviction component label
+    string tt_r2_conf_lbl         // "Conf" conviction component label
+    // ── CVCA Tooltip Row 3: Volume + Delta ──
+    string tt_r3_hdr              // Tooltip section header for volume
+    string tt_r3_vr_lbl           // "Volume Ratio:" label
+    string tt_r3_vr_block         // 3-line volume ratio descriptions
+    string tt_r3_dt_lbl           // "Delta Trend:" label
+    string tt_r3_dt_block         // 3-line delta trend descriptions
+    string tt_r3_mi_at_cp         // "at contact price:" suffix
+    string tt_r3_basis_at_cp      // "Basis candle at contact price:" label
+    string tt_r3_no_fp_tt         // Full no-footprint fallback for tooltip
+    // ── CVCA Row 2 Line 3: Axis contribution sentence ──
+    string cvca_r2_l3_push_up     // "push up" — bullish axis verb
+    string cvca_r2_l3_push_dn     // "push down" — bearish axis verb
+    string cvca_r2_l3_no_factor   // "No dominant factor." — all axes negligible
+    string cvca_r2_l3_zone_strong // "strong zone confidence" — conv_zone >= 1.3
+    string cvca_r2_l3_zone_mod    // "zone adds confidence" — conv_zone >= 1.05
+    string cvca_r2_l3_and         // "&" — axis name connector
+    string cvca_r2_l3_geo_only    // "Geometry only — no volume data." — no FP fallback
+    // ── CVCA Row 3 Line 1: Volume intensity qualifiers ──
+    string cvca_r3_vol_extreme    // "massively " — ratio > 10
+    string cvca_r3_vol_strong     // "strongly " — ratio > 3
+    // ── CVCA Row 3 Line 3: Human-labeled volume comparison ──
+    string cvca_r3_quiet_here     // "Maxima quiet at this price." — histTotal ≈ 0
+    string cvca_r3_now_lbl        // "Now:" — current candle prefix
+    string cvca_r3_vs             // "vs" — buy vs sell connector
+
+//──────────────────────────────────────────────────────────────────────────────
+// TRANSLATION SYSTEM
+//──────────────────────────────────────────────────────────────────────────────
+
+f_getLangPack(string lang) =>
+    LangText t = LangText.new()
+
+    if lang == "Türkçe"
+        t.title              := "EŞMERKEZLİ MUMLAR — ARİSTOTELES SİKLOİDLERİ"
+        t.sigma_lbl          := "σ_bar"
+        t.lookback_lbl       := "Geriye Bakış"
+        t.rev_lbl            := "Devir"
+        t.line_name_lbl      := "Referans Çizgisi"
+        t.price_lbl          := "Fiyat Seviyesi"
+        t.outer_apex         := "Dış Tepe"
+        t.upper_pin_apex     := "Üst Pin Tepe"
+        t.lower_pin_apex     := "Alt Pin Tepe"
+        t.outer_trough       := "Dış Çukur"
+        t.upper_pin_trough   := "Üst Pin Çukur"
+        t.lower_pin_trough   := "Alt Pin Çukur"
+        t.resistance         := "DİRENÇ"
+        t.support            := "DESTEK"
+        t.breakout           := ">> KIRILIM! (Desteğe Dönüş)"
+        t.broken             := "<< KIRILDI! (Direnç'e Dönüş)"
+        t.testing_res        := "⚠️ DİRENÇ TESTİ"
+        t.at_support         := "⚠️ DESTEK BÖLGESİNDE"
+        t.mid_range          := "~ ORTA ARALIK"
+        t.waiting            := "Bekleniyor..."
+        t.no_sr_above        := "Üstte Referans Yok"
+        t.no_sr_below        := "Altta Referans Yok"
+        t.vol_engine         := "HACİM MOTORU"
+        t.volumetric         := "VOLÜMETRİK"
+        t.engine_geo         := "Geometrik"
+        t.engine_intra       := "Bar İçi"
+        t.intrabar_ltf       := "Bar İçi Alt ZD"
+        t.valid_data         := "Geçerli Veri"
+        t.bar_unit           := "bar"
+        t.global_period      := "Global Periyot"
+        t.total_vol          := "Toplam"
+        t.buy_vol            := "Alış"
+        t.sell_vol           := "Satış"
+        t.delta_vol          := "Delta"
+        t.basis_current      := "Canlı Mum"
+        t.basis_closed       := "Kapanmış Mum"
+        t.intrabar_limit     := "BAR İÇİ VERİ LİMİTİ"
+        t.requested_lbl      := "İstenen"
+        t.valid_word         := "Geçerli"
+        t.used_word          := "Kullanılan"
+        t.offset_lbl         := "Mesafe"
+        t.length_lbl         := "Uzunluk"
+        t.mid_lbl            := "Orta"
+        t.tt_title           := "Aristoteles'in Tekerlek Paradoksu'na dayalı eşmerkezli daire sikloid izleyici.\nMumların normalize edilmiş geometrisi ile fiyat yapısını haritalandırır."
+        t.tt_sigma           := "Yang-Zhang volatilite tahmincisi tarafından hesaplanan σ_bar.\nZaman ve fiyat eksenleri arasındaki köprü: 1 bar = σ_bar birim log-fiyat."
+        t.tt_mi_header       := "Önceki karşılaştırma maxima mumu. Kronolojik önceki mumdan daha büyük menzile sahip.\nDış çemberin çapı bu mumun H−L aralığından türetilir."
+        t.tt_outer_apex      := "Dış çemberin en yüksek noktası (tepe). Standart sikloidin zirve seviyesi.\nNormalize uzayda y = 2R, fiyat = exp(lnLow + 2R × σ)."
+        t.tt_upper_pin_apex  := "Üst pin çemberinin en yüksek noktası. Kısa sikloidin zirve seviyesi.\nNormalize uzayda y = R + r_üst."
+        t.tt_lower_pin_apex  := "Alt pin çemberinin en yüksek noktası. Kısa sikloidin zirve seviyesi.\nNormalize uzayda y = R + r_alt."
+        t.tt_outer_trough    := "Dış çemberin en düşük noktası (çukur). Yuvarlanma yüzeyi.\nNormalize uzayda y = 0, mumun Low fiyatına eşittir."
+        t.tt_upper_pin_trough := "Üst pin çemberinin en düşük noktası.\nNormalize uzayda y = R − r_üst."
+        t.tt_lower_pin_trough := "Alt pin çemberinin en düşük noktası.\nNormalize uzayda y = R − r_alt."
+        t.tt_price           := "Bu referans çizgisinin gerçek fiyat seviyesi.\nTers dönüşüm: fiyat = exp(lnLow + y_norm × σ_bar)."
+        t.tt_resistance      := "Mevcut fiyatın hemen üzerindeki en yakın sikloid referans çizgisi.\nFiyat bu seviyeyi aşmakta zorlanabilir."
+        t.tt_support         := "Mevcut fiyatın hemen altındaki en yakın sikloid referans çizgisi.\nFiyat bu seviyede alış ilgisi bulabilir."
+        t.tt_status          := "Sikloid referans çizgilerine göre fiyatın mevcut konumu.\nKırılma ve çöküş senaryolarını belirlemeye yardımcı olur."
+        t.tt_vol_engine      := "Hacim hesaplama yöntemi ve veri geçerlilik bilgisi.\nGeometrik fiyat hareketini kullanır; Bar İçi daha düşük zaman dilimi verisini kullanır."
+        t.tt_volumetric      := "Seçilen bar için gerçek zamanlı hacim dağılımı.\nAlış-satış baskısını ve net deltayı gösterir."
+        t.tt_offset          := "Maxima mumunun mevcut bardan uzaklığı (0 = canlı bar)."
+        t.tt_length          := "Maxima mumunun ham menzili: High − Low (fiyat birimi)."
+        t.tt_mid             := "Maxima mumunun orta noktası: (High + Low) / 2."
+
+        t.cvca_title         := "EŞMERKEZLİ MUM SİKLOİD-HACİM TEMAS ANALİZİ"
+        t.cvca_no_contact    := "Aktif sikloid eğrisi teması algılanmadı"
+        t.cvca_tt_section    := "Sikloid eğri kesişimleri için 7 eksenli tahmin matrisi.\nEksenler: Yön, Eğri Türü, Bölge, Hacim Büyüklüğü,\nDelta Karakteri, Emilim, Birleşim."
+        t.cvca_tt_contact    := "Sikloid eğri kimliği ve tam temas fiyatı."
+        t.cvca_tt_prob       := "P(↑) yönsel olasılık ve güven puanı."
+        t.cvca_tt_behavior   := "Tüm 7 eksenden davranış sınıflandırması."
+        t.cvca_tt_axes       := "Delta karakteri, hacim büyüklüğü ve emilim durumu."
+        t.cvca_tt_hist       := "Tarihsel ve mevcut hacim karşılaştırması."
+        t.cvca_tt_ratio      := "Hacim çarpan oranları ve delta trend değişimi."
+        // CVCA Row 1 sentence fragments (Turkish)
+        t.cvca_sent_prefix       := "Canlı mum temas etti"
+        t.cvca_sent_cycloid_at   := "sikloid seviyesinde"
+        t.cvca_sent_closing      := "kapanış"
+        t.cvca_sent_near_curve   := "Temas eğrinin yakınında:"
+        t.cvca_dir_passed_up     := "Yukarı Geçti ↑"
+        t.cvca_dir_passed_dn     := "Aşağı Geçti ↓"
+        t.cvca_dir_stopped       := "Temas noktasında durdu"
+        t.cvca_dir_wick_up       := "Fitil Sıçraması ↑"
+        t.cvca_dir_wick_dn       := "Fitil Reddi ↓"
+        t.cvca_zone_apex         := "tepe (Zirve bölgesi)"
+        t.cvca_zone_trough       := "dip (Çukur bölgesi)"
+        t.cvca_zone_mid          := "orta aralık (Orta bölge)"
+        t.cvca_conf_one          := "Ayrıca 1 başka eğri bu fiyat seviyesinden geçiyor."
+        t.cvca_conf_pre          := "Ayrıca"
+        t.cvca_conf_post         := "başka eğri bu fiyat seviyesinden geçiyor."
+        t.fp_status_active       := "Footprint: ✓ Aktif (tik düzeyi)"
+        t.fp_status_no_data      := "Footprint: ⚠ Veri Yok"
+        t.fp_status_no_contact   := "Footprint: – Temas Yok"
+        // CVCA Row 2 sentence fragments (Turkish — beginner-friendly)
+        t.cvca_r2_signal         := "Sinyal:"
+        t.cvca_r2_prob_up        := "yukarı hareket olasılığı"
+        t.cvca_r2_prob_dn        := "aşağı hareket olasılığı"
+        t.cvca_r2_conviction     := "güven"
+        t.cvca_r2_dir            := "Yön"
+        t.cvca_r2_delta          := "Delta"
+        t.cvca_r2_abs            := "Emilim"
+        t.cvca_r2_vol            := "Hacim"
+        t.cvca_r2_curve_at       := "eğrisi"
+        t.cvca_r2_boosts_conf    := "güveni artırıyor"
+        t.cvca_r2_no_fp          := "Footprint yok — sadece geometri."
+        t.cvca_r2_crv_outer      := "Dış"
+        t.cvca_r2_crv_upper      := "Üst Pin"
+        t.cvca_r2_crv_lower      := "Alt Pin"
+        t.cvca_r2_zone_apex      := "Tepe"
+        t.cvca_r2_zone_trough    := "Çukur"
+        t.cvca_r2_zone_mid       := "Orta"
+        // ROW 3 sentence fragments (Turkish — beginner-friendly)
+        t.cvca_r3_vol_prefix     := "Hacim"
+        t.cvca_r3_vol_amp        := "geçmişe göre güçlenmiş"
+        t.cvca_r3_vol_prop       := "geçmişle orantılı"
+        t.cvca_r3_vol_dep        := "geçmişe göre tükenmiş"
+        t.cvca_r3_delta_str      := "alış baskısı maxima mumundan bu yana güçlendi"
+        t.cvca_r3_delta_str_s    := "satış baskısı maxima mumundan bu yana güçlendi"
+        t.cvca_r3_delta_weak     := "alış baskısı zayıflıyor"
+        t.cvca_r3_delta_weak_s   := "satış baskısı zayıflıyor"
+        t.cvca_r3_delta_flip_b   := "delta tersine döndü — alıcılar devraldı"
+        t.cvca_r3_delta_flip_s   := "delta tersine döndü — satıcılar devraldı"
+        t.cvca_r3_maxima_lbl     := "Maxima:"
+        t.cvca_r3_current_lbl    := "Mevcut:"
+        t.cvca_r3_buy_lbl        := "Alış"
+        t.cvca_r3_sell_lbl       := "Satış"
+        t.cvca_r3_no_fp_l1       := "Bu fiyat seviyesinde footprint verisi yok — hacim karşılaştırması yapılamıyor."
+        t.cvca_r3_no_fp_l2       := "Tahmin yalnızca geometri ve fiyat hareketine dayanıyor."
+        // ── CVCA Tooltip Row 1 (Türkçe) ──
+        t.tt_r1_hdr              := "Temas Kimliği · Yön · Bölge · Birleşim"
+        t.tt_r1_curve_lbl        := "Eğri:"
+        t.tt_r1_cprice_lbl       := "Temas Fiyatı:"
+        t.tt_r1_ctype_lbl        := "Eğri Türü:"
+        t.tt_r1_ctype_out        := "Dış (birincil yuvarlanan tekerlek)"
+        t.tt_r1_ctype_up         := "Üst Pin (üst fitil çemberi)"
+        t.tt_r1_ctype_lo         := "Alt Pin (alt fitil çemberi)"
+        t.tt_r1_volsrc           := "Hacim kaynağı: temas fiyatındaki footprint satırı (tik düzeyi)."
+        t.tt_r1_dir_lbl          := "Yön:"
+        t.tt_r1_dir_block        := "• Yukarı Geçti ↑ — gövde CP'yi geçti, üstte kapandı\n• Aşağı Geçti ↓ — gövde CP'yi geçti, altta kapandı\n• Durdu ── — kapanış temas noktasında\n• Fitil Sıçraması ↑ — fitil CP'yi test etti, üstte tutundu\n• Fitil Reddi ↓ — fitil CP'yi test etti, altta reddedildi"
+        t.tt_r1_zone_lbl         := "Bölge:"
+        t.tt_r1_zone_block       := "• Tepe — eğri zirvesinin yakınında (en güçlü geometrik seviye)\n• Çukur — eğri tabanının yakınında (yuvarlanma yüzeyi)\n• Orta — tepe ve çukur arasında"
+        t.tt_r1_conf_lbl         := "Birleşim:"
+        t.tt_r1_conf_unit        := "eğri ±0.3σ aralığında"
+        t.tt_r1_fp_lbl           := "Footprint:"
+        t.tt_r1_fp_valid         := "✓ Geçerli"
+        t.tt_r1_fp_nodata        := "⚠ Veri Yok"
+        t.tt_r1_fp_active_msg    := "Tüm 7 tahmin ekseni tamamen aktif."
+        t.tt_r1_fp_none_msg      := "Hacim eksenleri (4,5,6) tahmine 0 katkı sağlıyor."
+        // ── CVCA Tooltip Row 2 (Türkçe) ──
+        t.tt_r2_hdr              := "Davranış · Olasılık · Güven"
+        t.tt_r2_beh_lbl          := "Davranış:"
+        t.tt_r2_cascade          := "Öncelik sırası:\n1. EMİLİM ↑↓ — ağır karşıt hacim emildi\n2. DELTA TERSİNE ↑↓ — delta işareti maximadan tersine döndü\n3. TÜKENİŞ — tepe bölgesi + azalmış hacim\n4. VAKUM — azalmış hacim, emilim yok\n5. SAVAŞ BÖLGESİ — güçlenmiş hacim, sıfıra yakın delta\n6. KIRILIM/ÇÖKÜŞ — güçlü P(↑) + uyumlu delta\n7. GÜÇLÜ SIÇRAMA/RED — yüksek P + yüksek güven\n8. BİRLEŞİM DUVARI — ≥3 eğri + yüksek güven\n9. ZAYIF SIÇRAMA/RED — geri dönüş"
+        t.tt_r2_prob_eq          := "P(↑) ="
+        t.tt_r2_base50           := "Taban 50% +"
+        t.tt_r2_conv_eq          := "Güven ="
+        t.tt_r2_base_lbl         := "Taban"
+        t.tt_r2_zone_lbl         := "Bölge"
+        t.tt_r2_vol_lbl          := "Hacim"
+        t.tt_r2_conf_lbl         := "Birleşim"
+        // ── CVCA Tooltip Row 3 (Türkçe) ──
+        t.tt_r3_hdr              := "Hacim · Delta Trendi · Footprint:"
+        t.tt_r3_vr_lbl           := "Hacim Oranı:"
+        t.tt_r3_vr_block         := "• Güçlenmiş (>×1.3) — güçlü katılım\n• Orantılı (×0.7–1.3) — normal aktivite\n• Tükenmiş (<×0.7) — zayıf, güvenilmez sinyal"
+        t.tt_r3_dt_lbl           := "Delta Trendi:"
+        t.tt_r3_dt_block         := "• Güçlendi — yön korundu, büyüklük arttı\n• Zayıflıyor — yön korundu, büyüklük azaldı\n• Tersine Döndü — delta işareti tersine döndü (en önemli)"
+        t.tt_r3_mi_at_cp         := "temas fiyatında:"
+        t.tt_r3_basis_at_cp      := "Temel mum temas fiyatında:"
+        t.tt_r3_no_fp_tt         := "Footprint verisi mevcut değil.\nHacim oranı ve delta trendi hesaplanamıyor.\nBu eksenler tahmine 0 katkı sağlıyor."
+        // ── Row 2 Line 3 (Türkçe) ──
+        t.cvca_r2_l3_push_up     := "yukarı itiyor"
+        t.cvca_r2_l3_push_dn     := "aşağı itiyor"
+        t.cvca_r2_l3_no_factor   := "Baskın faktör yok."
+        t.cvca_r2_l3_zone_strong := "bölgeden güçlü güven"
+        t.cvca_r2_l3_zone_mod    := "bölge güveni artırıyor"
+        t.cvca_r2_l3_and         := "ve"
+        t.cvca_r2_l3_geo_only    := "Sadece geometri — hacim verisi yok."
+        // ── Row 3 Line 1 (Türkçe) ──
+        t.cvca_r3_vol_extreme    := "aşırı "
+        t.cvca_r3_vol_strong     := "güçlü "
+        // ── Row 3 Line 3 (Türkçe) ──
+        t.cvca_r3_quiet_here     := "Maxima bu fiyatta sessiz."
+        t.cvca_r3_now_lbl        := "Şimdi:"
+        t.cvca_r3_vs             := "vs"
+
+    else if lang == "العربية"
+        t.title              := "الشموع المتحدة المركز — دوارات أرسطو"
+        t.sigma_lbl          := "σ_bar"
+        t.lookback_lbl       := "فترة المراجعة"
+        t.rev_lbl            := "الدورات"
+        t.line_name_lbl      := "خط المرجع"
+        t.price_lbl          := "مستوى السعر"
+        t.outer_apex         := "قمة الدائرة الخارجية"
+        t.upper_pin_apex     := "قمة الدبوس العلوي"
+        t.lower_pin_apex     := "قمة الدبوس السفلي"
+        t.outer_trough       := "قاع الدائرة الخارجية"
+        t.upper_pin_trough   := "قاع الدبوس العلوي"
+        t.lower_pin_trough   := "قاع الدبوس السفلي"
+        t.resistance         := "المقاومة"
+        t.support            := "الدعم"
+        t.breakout           := ">> اختراق! (التحول إلى دعم)"
+        t.broken             := "<< مكسور! (التحول إلى مقاومة)"
+        t.testing_res        := "⚠️ اختبار المقاومة"
+        t.at_support         := "⚠️ في منطقة الدعم"
+        t.mid_range          := "~ النطاق الأوسط"
+        t.waiting            := "انتظار..."
+        t.no_sr_above        := "لا مرجع أعلى"
+        t.no_sr_below        := "لا مرجع أدنى"
+        t.vol_engine         := "محرك الحجم"
+        t.volumetric         := "الحجمي"
+        t.engine_geo         := "هندسي"
+        t.engine_intra       := "داخل الشمعة"
+        t.intrabar_ltf       := "الإطار الزمني الأدنى"
+        t.valid_data         := "بيانات صالحة"
+        t.bar_unit           := "شمعة"
+        t.global_period      := "الفترة الكلية"
+        t.total_vol          := "المجموع"
+        t.buy_vol            := "شراء"
+        t.sell_vol           := "بيع"
+        t.delta_vol          := "دلتا"
+        t.basis_current      := "الشمعة الحالية"
+        t.basis_closed       := "الشمعة المغلقة"
+        t.intrabar_limit     := "حد بيانات داخل الشمعة"
+        t.requested_lbl      := "مطلوب"
+        t.valid_word         := "صالح"
+        t.used_word          := "مستخدم"
+        t.offset_lbl         := "المسافة"
+        t.length_lbl         := "الطول"
+        t.mid_lbl            := "الوسط"
+        t.tt_title           := "متتبع دوارات الدوائر المتحدة المركز بناءً على مفارقة عجلة أرسطو.\nيرسم خريطة هيكل السعر من خلال الهندسة المنتظمة للشموع."
+        t.tt_sigma           := "σ_bar المحسوب بواسطة مقدر تقلب يانغ-تشانغ.\nالجسر بين محاور الزمن والسعر: 1 شمعة = σ_bar وحدات لوغاريتم السعر."
+        t.tt_mi_header       := "شمعة ماكسيما بمقارنة السابقة. نطاق أكبر من الشمعة السابقة لها زمنياً.\nقطر الدائرة الخارجية مشتق من نطاق H−L لهذه الشمعة."
+        t.tt_outer_apex      := "أعلى نقطة في الدائرة الخارجية (القمة). مستوى ذروة الدوارة القياسية.\nفي الفضاء المنتظم y = 2R، السعر = exp(lnLow + 2R × σ)."
+        t.tt_upper_pin_apex  := "أعلى نقطة في دائرة الدبوس العلوي. ذروة الدوارة المختصرة.\nفي الفضاء المنتظم y = R + r_علوي."
+        t.tt_lower_pin_apex  := "أعلى نقطة في دائرة الدبوس السفلي. ذروة الدوارة المختصرة.\nفي الفضاء المنتظم y = R + r_سفلي."
+        t.tt_outer_trough    := "أدنى نقطة في الدائرة الخارجية (القاع). سطح التدحرج.\nفي الفضاء المنتظم y = 0، يساوي سعر Low للشمعة."
+        t.tt_upper_pin_trough := "أدنى نقطة في دائرة الدبوس العلوي.\nفي الفضاء المنتظم y = R − r_علوي."
+        t.tt_lower_pin_trough := "أدنى نقطة في دائرة الدبوس السفلي.\nفي الفضاء المنتظم y = R − r_سفلي."
+        t.tt_price           := "مستوى السعر الفعلي لخط المرجع.\nالتحويل العكسي: السعر = exp(lnLow + y_norm × σ_bar)."
+        t.tt_resistance      := "أقرب خط مرجع سيكلويدي فوق السعر الحالي مباشرة.\nالسعر قد يواجه صعوبة في تجاوز هذا المستوى."
+        t.tt_support         := "أقرب خط مرجع سيكلويدي تحت السعر الحالي مباشرة.\nالسعر قد يجد اهتمام شراء عند هذا المستوى."
+        t.tt_status          := "موقع السعر الحالي بالنسبة لخطوط المرجع السيكلويدية.\nيساعد في تحديد سيناريوهات الاختراق أو الانهيار."
+        t.tt_vol_engine      := "طريقة حساب الحجم ومعلومات صلاحية البيانات.\nالهندسي يستخدم حركة السعر؛ داخل الشمعة يستخدم بيانات الإطار الزمني الأدنى."
+        t.tt_volumetric      := "تحليل الحجم في الوقت الفعلي للشمعة المحددة.\nيظهر ضغط الشراء مقابل البيع وصافي الدلتا."
+        t.tt_offset          := "مسافة شمعة الماكسيما من الشمعة الحالية (0 = الشمعة الحية)."
+        t.tt_length          := "النطاق الخام لشمعة الماكسيما: High − Low (وحدة السعر)."
+        t.tt_mid             := "نقطة منتصف شمعة الماكسيما: (High + Low) / 2."
+        t.cvca_title         := "تحليل التماس بين الدوّارات والحجم"
+        t.cvca_no_contact    := "لم يتم اكتشاف أي تماس نشط مع منحنيات الدوّارة"
+        t.cvca_tt_section    := "مصفوفة تنبؤ ذات 7 محاور لتقاطعات منحنيات الدوّارة.\nالمحاور: الاتجاه، نوع المنحنى، المنطقة، حجم الحجم،\nطابع الدلتا، الامتصاص، التقارب."
+        t.cvca_tt_contact    := "هوية منحنى الدوّارة وسعر التماس الدقيق."
+        t.cvca_tt_prob       := "احتمال P(↑) الاتجاهي ودرجة الثقة."
+        t.cvca_tt_behavior   := "تصنيف السلوك من جميع المحاور السبعة."
+        t.cvca_tt_axes       := "طابع الدلتا، حجم الحجم، وحالة الامتصاص."
+        t.cvca_tt_hist       := "مقارنة الحجم التاريخي مقابل الحالي."
+        t.cvca_tt_ratio      := "نسب مضاعف الحجم وتغير اتجاه الدلتا."
+        // CVCA Row 1 sentence fragments (Arabic)
+        t.cvca_sent_prefix       := "الشمعة الحية لامست"
+        t.cvca_sent_cycloid_at   := "دوّارة عند"
+        t.cvca_sent_closing      := "إغلاق عند"
+        t.cvca_sent_near_curve   := "التماس بالقرب من المنحنى:"
+        t.cvca_dir_passed_up     := "عبور صعودي ↑"
+        t.cvca_dir_passed_dn     := "عبور هبوطي ↓"
+        t.cvca_dir_stopped       := "توقف عند نقطة التماس"
+        t.cvca_dir_wick_up       := "ارتداد الفتيل ↑"
+        t.cvca_dir_wick_dn       := "رفض الفتيل ↓"
+        t.cvca_zone_apex         := "القمة (منطقة الذروة)"
+        t.cvca_zone_trough       := "القاع (منطقة الحضيض)"
+        t.cvca_zone_mid          := "المنتصف (المنطقة الوسطى)"
+        t.cvca_conf_one          := "أيضاً منحنى آخر يمر عبر مستوى السعر هذا."
+        t.cvca_conf_pre          := "أيضاً"
+        t.cvca_conf_post         := "منحنيات أخرى تمر عبر مستوى السعر هذا."
+        t.fp_status_active       := "البصمة: ✓ نشطة (مستوى التيك)"
+        t.fp_status_no_data      := "البصمة: ⚠ لا بيانات"
+        t.fp_status_no_contact   := "البصمة: – لا تماس"
+        // CVCA Row 2 sentence fragments (Arabic — beginner-friendly)
+        t.cvca_r2_signal         := "إشارة:"
+        t.cvca_r2_prob_up        := "احتمال الصعود"
+        t.cvca_r2_prob_dn        := "احتمال الهبوط"
+        t.cvca_r2_conviction     := "الثقة"
+        t.cvca_r2_dir            := "الاتجاه"
+        t.cvca_r2_delta          := "الدلتا"
+        t.cvca_r2_abs            := "الامتصاص"
+        t.cvca_r2_vol            := "الحجم"
+        t.cvca_r2_curve_at       := "المنحنى عند"
+        t.cvca_r2_boosts_conf    := "يعزز الثقة"
+        t.cvca_r2_no_fp          := "لا بصمة — هندسة فقط."
+        t.cvca_r2_crv_outer      := "الخارجي"
+        t.cvca_r2_crv_upper      := "الدبوس العلوي"
+        t.cvca_r2_crv_lower      := "الدبوس السفلي"
+        t.cvca_r2_zone_apex      := "الذروة"
+        t.cvca_r2_zone_trough    := "الحضيض"
+        t.cvca_r2_zone_mid       := "الوسط"
+        // ROW 3 sentence fragments (Arabic — beginner-friendly)
+        t.cvca_r3_vol_prefix     := "الحجم"
+        t.cvca_r3_vol_amp        := "مضخم مقارنة بالتاريخ"
+        t.cvca_r3_vol_prop       := "متناسب مع التاريخ"
+        t.cvca_r3_vol_dep        := "منخفض مقارنة بالتاريخ"
+        t.cvca_r3_delta_str      := "ضغط الشراء تعزز منذ شمعة الماكسيما"
+        t.cvca_r3_delta_str_s    := "ضغط البيع تعزز منذ شمعة الماكسيما"
+        t.cvca_r3_delta_weak     := "ضغط الشراء يتراجع"
+        t.cvca_r3_delta_weak_s   := "ضغط البيع يتراجع"
+        t.cvca_r3_delta_flip_b   := "الدلتا انعكست — المشترون سيطروا"
+        t.cvca_r3_delta_flip_s   := "الدلتا انعكست — البائعون سيطروا"
+        t.cvca_r3_maxima_lbl     := "الماكسيما:"
+        t.cvca_r3_current_lbl    := "الحالية:"
+        t.cvca_r3_buy_lbl        := "شراء"
+        t.cvca_r3_sell_lbl       := "بيع"
+        t.cvca_r3_no_fp_l1       := "لا توجد بيانات بصمة عند مستوى السعر هذا — مقارنة الحجم غير متاحة."
+        t.cvca_r3_no_fp_l2       := "التنبؤ يعتمد على الهندسة وحركة السعر فقط."
+        // ── CVCA Tooltip Row 1 (العربية) ──
+        t.tt_r1_hdr              := "هوية التماس · الاتجاه · المنطقة · التقارب"
+        t.tt_r1_curve_lbl        := "المنحنى:"
+        t.tt_r1_cprice_lbl       := "سعر التماس:"
+        t.tt_r1_ctype_lbl        := "نوع المنحنى:"
+        t.tt_r1_ctype_out        := "الخارجي (العجلة الرئيسية المتدحرجة)"
+        t.tt_r1_ctype_up         := "الدبوس العلوي (دائرة الفتيل العلوي)"
+        t.tt_r1_ctype_lo         := "الدبوس السفلي (دائرة الفتيل السفلي)"
+        t.tt_r1_volsrc           := "مصدر الحجم: صف البصمة عند سعر التماس (مستوى التيك)."
+        t.tt_r1_dir_lbl          := "الاتجاه:"
+        t.tt_r1_dir_block        := "• عبور صعودي ↑ — الجسم عبر نقطة التماس، أغلق أعلاه\n• عبور هبوطي ↓ — الجسم عبر نقطة التماس، أغلق أدناه\n• توقف ── — الإغلاق عند نقطة التماس\n• ارتداد الفتيل ↑ — الفتيل اختبر نقطة التماس، ثبت أعلاه\n• رفض الفتيل ↓ — الفتيل اختبر نقطة التماس، رُفض أدناه"
+        t.tt_r1_zone_lbl         := "المنطقة:"
+        t.tt_r1_zone_block       := "• الذروة — قرب قمة المنحنى (أقوى مستوى هندسي)\n• الحضيض — قرب قاع المنحنى (سطح التدحرج)\n• الوسط — بين الذروة والحضيض"
+        t.tt_r1_conf_lbl         := "التقارب:"
+        t.tt_r1_conf_unit        := "منحنيات ضمن ±0.3σ"
+        t.tt_r1_fp_lbl           := "البصمة:"
+        t.tt_r1_fp_valid         := "✓ صالح"
+        t.tt_r1_fp_nodata        := "⚠ لا بيانات"
+        t.tt_r1_fp_active_msg    := "جميع محاور التنبؤ السبعة نشطة بالكامل."
+        t.tt_r1_fp_none_msg      := "محاور الحجم (4،5،6) تساهم بـ 0 في التنبؤ."
+        // ── CVCA Tooltip Row 2 (العربية) ──
+        t.tt_r2_hdr              := "السلوك · الاحتمال · الثقة"
+        t.tt_r2_beh_lbl          := "السلوك:"
+        t.tt_r2_cascade          := "ترتيب الأولوية:\n1. امتصاص ↑↓ — حجم معاكس ثقيل تم امتصاصه\n2. انعكاس الدلتا ↑↓ — إشارة الدلتا انعكست من الماكسيما\n3. إنهاك — منطقة الذروة + حجم منخفض\n4. فراغ — حجم منخفض، بدون امتصاص\n5. منطقة معركة — حجم مضخم، دلتا قريبة من الصفر\n6. اختراق/انهيار — P(↑) قوي + دلتا متوافقة\n7. ارتداد/رفض قوي — P عالي + ثقة عالية\n8. جدار تقارب — ≥3 منحنيات + ثقة عالية\n9. ارتداد/رفض ضعيف — احتياطي"
+        t.tt_r2_prob_eq          := "P(↑) ="
+        t.tt_r2_base50           := "الأساس 50% +"
+        t.tt_r2_conv_eq          := "الثقة ="
+        t.tt_r2_base_lbl         := "الأساس"
+        t.tt_r2_zone_lbl         := "المنطقة"
+        t.tt_r2_vol_lbl          := "الحجم"
+        t.tt_r2_conf_lbl         := "التقارب"
+        // ── CVCA Tooltip Row 3 (العربية) ──
+        t.tt_r3_hdr              := "الحجم · اتجاه الدلتا · البصمة عند"
+        t.tt_r3_vr_lbl           := "نسبة الحجم:"
+        t.tt_r3_vr_block         := "• مضخم (>×1.3) — مشاركة قوية\n• متناسب (×0.7–1.3) — نشاط طبيعي\n• منخفض (<×0.7) — ضعيف، إشارة غير موثوقة"
+        t.tt_r3_dt_lbl           := "اتجاه الدلتا:"
+        t.tt_r3_dt_block         := "• تعزز — الاتجاه ثابت، الحجم نما\n• يتراجع — الاتجاه ثابت، الحجم انخفض\n• انعكس — إشارة الدلتا انعكست (الأكثر أهمية)"
+        t.tt_r3_mi_at_cp         := "عند سعر التماس:"
+        t.tt_r3_basis_at_cp      := "الشمعة الأساسية عند سعر التماس:"
+        t.tt_r3_no_fp_tt         := "لا توجد بيانات بصمة متاحة.\nلا يمكن حساب نسبة الحجم واتجاه الدلتا.\nهذه المحاور تساهم بـ 0 في التنبؤ."
+        // ── Row 2 Line 3 (العربية) ──
+        t.cvca_r2_l3_push_up     := "يدفع للأعلى"
+        t.cvca_r2_l3_push_dn     := "يدفع للأسفل"
+        t.cvca_r2_l3_no_factor   := "لا عامل مهيمن."
+        t.cvca_r2_l3_zone_strong := "ثقة قوية من المنطقة"
+        t.cvca_r2_l3_zone_mod    := "المنطقة تضيف ثقة"
+        t.cvca_r2_l3_and         := "و"
+        t.cvca_r2_l3_geo_only    := "هندسة فقط — لا بيانات حجم."
+        // ── Row 3 Line 1 (العربية) ──
+        t.cvca_r3_vol_extreme    := "بشكل هائل "
+        t.cvca_r3_vol_strong     := "بقوة "
+        // ── Row 3 Line 3 (العربية) ──
+        t.cvca_r3_quiet_here     := "الماكسيما هادئة عند هذا السعر."
+        t.cvca_r3_now_lbl        := "الآن:"
+        t.cvca_r3_vs             := "مقابل"
+
+    else // English (default)
+        t.title              := "CONCENTRIC CANDLES — ARISTOTELIAN CYCLOIDS"
+        t.sigma_lbl          := "σ_bar"
+        t.lookback_lbl       := "Lookback"
+        t.rev_lbl            := "Revolutions"
+        t.line_name_lbl      := "Reference Line"
+        t.price_lbl          := "Price Level"
+        t.outer_apex         := "Outer Apex"
+        t.upper_pin_apex     := "Upper Pin Apex"
+        t.lower_pin_apex     := "Lower Pin Apex"
+        t.outer_trough       := "Outer Trough"
+        t.upper_pin_trough   := "Upper Pin Trough"
+        t.lower_pin_trough   := "Lower Pin Trough"
+        t.resistance         := "RESISTANCE"
+        t.support            := "SUPPORT"
+        t.breakout           := ">> BREAKOUT! (Flip to Support)"
+        t.broken             := "<< BROKEN! (Flip to Resistance)"
+        t.testing_res        := "⚠️ TESTING RESISTANCE"
+        t.at_support         := "⚠️ AT SUPPORT AREA"
+        t.mid_range          := "~ MID RANGE"
+        t.waiting            := "Waiting..."
+        t.no_sr_above        := "No Reference Above"
+        t.no_sr_below        := "No Reference Below"
+        t.vol_engine         := "VOLUME ENGINE"
+        t.volumetric         := "VOLUMETRIC"
+        t.engine_geo         := "Geometric"
+        t.engine_intra       := "Intrabar"
+        t.intrabar_ltf       := "Intrabar LTF"
+        t.valid_data         := "Valid Data"
+        t.bar_unit           := "bar"
+        t.global_period      := "Global Period"
+        t.total_vol          := "Total"
+        t.buy_vol            := "Buy"
+        t.sell_vol           := "Sell"
+        t.delta_vol          := "Delta"
+        t.basis_current      := "Current Candle"
+        t.basis_closed       := "Closed Candle"
+        t.intrabar_limit     := "INTRABAR DATA LIMIT"
+        t.requested_lbl      := "Requested"
+        t.valid_word         := "Valid"
+        t.used_word          := "Used"
+        t.offset_lbl         := "Offset"
+        t.length_lbl         := "Length"
+        t.mid_lbl            := "Mid"
+        t.tt_title           := "Concentric circle cycloid tracer based on Aristotle's Wheel Paradox.\nMaps price structure through normalized candle geometry."
+        t.tt_sigma           := "σ_bar computed by the Yang-Zhang volatility estimator.\nThe bridge between time and price axes: 1 bar ≡ σ_bar units of log-price."
+        t.tt_mi_header       := "Predecessor-comparison maxima candle. Larger range than its chronological predecessor.\nThe outer circle's diameter is derived from this candle's H−L range."
+        t.tt_outer_apex      := "Highest point of the outer circle (apex). Standard cycloid peak level.\nIn normalized space y = 2R, price = exp(lnLow + 2R × σ)."
+        t.tt_upper_pin_apex  := "Highest point of the upper pin circle. Curtate cycloid peak level.\nIn normalized space y = R + r_up."
+        t.tt_lower_pin_apex  := "Highest point of the lower pin circle. Curtate cycloid peak level.\nIn normalized space y = R + r_lo."
+        t.tt_outer_trough    := "Lowest point of the outer circle (trough). The rolling surface.\nIn normalized space y = 0, equals the candle's Low price."
+        t.tt_upper_pin_trough := "Lowest point of the upper pin circle.\nIn normalized space y = R − r_up."
+        t.tt_lower_pin_trough := "Lowest point of the lower pin circle.\nIn normalized space y = R − r_lo."
+        t.tt_price           := "Actual price level of this reference line.\nInverse transform: price = exp(lnLow + y_norm × σ_bar)."
+        t.tt_resistance      := "Nearest cycloid reference line immediately above current price.\nPrice may struggle to break past this level."
+        t.tt_support         := "Nearest cycloid reference line immediately below current price.\nPrice may find buying interest at this level."
+        t.tt_status          := "Current price position relative to cycloid reference lines.\nHelps identify breakout or breakdown scenarios."
+        t.tt_vol_engine      := "Volume calculation method and data validity information.\nGeometric uses price action; Intrabar uses lower timeframe data."
+        t.tt_volumetric      := "Real-time volume breakdown for the selected bar.\nShows buying vs selling pressure and net delta."
+        t.tt_offset          := "Distance of the maxima candle from the current bar (0 = live bar)."
+        t.tt_length          := "Raw range of the maxima candle: High − Low (price units)."
+        t.tt_mid             := "Midpoint of the maxima candle: (High + Low) / 2."
+        // CVCA Row 1 sentence fragments (English)
+        t.cvca_sent_prefix       := "Live candle contacted"
+        t.cvca_sent_cycloid_at   := "cycloid at"
+        t.cvca_sent_closing      := "closing at"
+        t.cvca_sent_near_curve   := "Contact is near the curve"
+        t.cvca_dir_passed_up     := "Passed Up ↑"
+        t.cvca_dir_passed_dn     := "Passed Down ↓"
+        t.cvca_dir_stopped       := "Stopped at contact"
+        t.cvca_dir_wick_up       := "Wick Bounce ↑"
+        t.cvca_dir_wick_dn       := "Wick Reject ↓"
+        t.cvca_zone_apex         := "peak (Apex zone)"
+        t.cvca_zone_trough       := "bottom (Trough zone)"
+        t.cvca_zone_mid          := "midrange (Mid zone)"
+        t.cvca_conf_one          := "Also 1 other curve passes through this price level."
+        t.cvca_conf_pre          := "Also"
+        t.cvca_conf_post         := "other curves pass through this price level."
+        t.fp_status_active       := "Footprint: ✓ Active (tick-level)"
+        t.fp_status_no_data      := "Footprint: ⚠ No Data"
+        t.fp_status_no_contact   := "Footprint: – No Contact"
+        // CVCA Row 2 sentence fragments (English — beginner-friendly)
+        t.cvca_r2_signal         := "Signal:"
+        t.cvca_r2_prob_up        := "chance of moving up"
+        t.cvca_r2_prob_dn        := "chance of moving down"
+        t.cvca_r2_conviction     := "conviction"
+        t.cvca_r2_dir            := "Direction"
+        t.cvca_r2_delta          := "Delta"
+        t.cvca_r2_abs            := "Absorption"
+        t.cvca_r2_vol            := "Volume"
+        t.cvca_r2_curve_at       := "curve at"
+        t.cvca_r2_boosts_conf    := "boosts confidence"
+        t.cvca_r2_no_fp          := "No footprint — geometry only."
+        t.cvca_r2_crv_outer      := "Outer"
+        t.cvca_r2_crv_upper      := "Upper Pin"
+        t.cvca_r2_crv_lower      := "Lower Pin"
+        t.cvca_r2_zone_apex      := "Apex"
+        t.cvca_r2_zone_trough    := "Trough"
+        t.cvca_r2_zone_mid       := "Mid"
+        // ROW 3 sentence fragments (English — beginner-friendly)
+        t.cvca_r3_vol_prefix     := "Volume is"
+        t.cvca_r3_vol_amp        := "amplified vs history"
+        t.cvca_r3_vol_prop       := "proportional to history"
+        t.cvca_r3_vol_dep        := "depleted vs history"
+        t.cvca_r3_delta_str      := "buying pressure strengthened since the maxima candle"
+        t.cvca_r3_delta_str_s    := "selling pressure strengthened since the maxima candle"
+        t.cvca_r3_delta_weak     := "buying pressure weakening"
+        t.cvca_r3_delta_weak_s   := "selling pressure weakening"
+        t.cvca_r3_delta_flip_b   := "delta flipped — buyers took over"
+        t.cvca_r3_delta_flip_s   := "delta flipped — sellers took over"
+        t.cvca_r3_maxima_lbl     := "Maxima:"
+        t.cvca_r3_current_lbl    := "Current:"
+        t.cvca_r3_buy_lbl        := "Buy"
+        t.cvca_r3_sell_lbl       := "Sell"
+        t.cvca_r3_no_fp_l1       := "No footprint data at this price level — volume comparison unavailable."
+        t.cvca_r3_no_fp_l2       := "Prediction uses geometry and price action only."
+        // ── CVCA Tooltip Row 1 (English) ──
+        t.tt_r1_hdr              := "Contact Identity · Direction · Zone · Confluence"
+        t.tt_r1_curve_lbl        := "Curve:"
+        t.tt_r1_cprice_lbl       := "Contact Price:"
+        t.tt_r1_ctype_lbl        := "Curve Type:"
+        t.tt_r1_ctype_out        := "Outer (primary rolling wheel)"
+        t.tt_r1_ctype_up         := "Upper Pin (upper wick circle)"
+        t.tt_r1_ctype_lo         := "Lower Pin (lower wick circle)"
+        t.tt_r1_volsrc           := "Volume source: footprint row at contact price (tick-level)."
+        t.tt_r1_dir_lbl          := "Direction:"
+        t.tt_r1_dir_block        := "• Passed Up ↑ — body crossed CP, closed above\n• Passed Down ↓ — body crossed CP, closed below\n• Stopped ── — close ended at contact point\n• Wick Bounce ↑ — wick tested CP, held above\n• Wick Reject ↓ — wick tested CP, rejected below"
+        t.tt_r1_zone_lbl         := "Zone:"
+        t.tt_r1_zone_block       := "• Apex — near curve peak (strongest geometric level)\n• Trough — near curve bottom (rolling surface)\n• Mid — between apex and trough"
+        t.tt_r1_conf_lbl         := "Confluence:"
+        t.tt_r1_conf_unit        := "curves within ±0.3σ"
+        t.tt_r1_fp_lbl           := "Footprint:"
+        t.tt_r1_fp_valid         := "✓ Valid"
+        t.tt_r1_fp_nodata        := "⚠ No Data"
+        t.tt_r1_fp_active_msg    := "All 7 prediction axes fully active."
+        t.tt_r1_fp_none_msg      := "Volume axes (4,5,6) contribute 0 to prediction."
+        // ── CVCA Tooltip Row 2 (English) ──
+        t.tt_r2_hdr              := "Behavior · Probability · Conviction"
+        t.tt_r2_beh_lbl          := "Behavior:"
+        t.tt_r2_cascade          := "Priority cascade:\n1. ABSORPTION ↑↓ — heavy opposing volume absorbed\n2. DELTA FLIP ↑↓ — delta sign reversed from maxima\n3. EXHAUSTION — apex zone + depleted volume\n4. VACUUM — depleted volume, no absorption\n5. BATTLE ZONE — amplified volume, near-zero delta\n6. BREAKOUT/BREAKDOWN — strong P(↑) + matching delta\n7. STRONG BOUNCE/REJECTION — high P + high conviction\n8. CONFLUENCE WALL — ≥3 curves + high conviction\n9. WEAK BOUNCE/REJECTION — fallback"
+        t.tt_r2_prob_eq          := "P(↑) ="
+        t.tt_r2_base50           := "Base 50% +"
+        t.tt_r2_conv_eq          := "Conviction ="
+        t.tt_r2_base_lbl         := "Base"
+        t.tt_r2_zone_lbl         := "Zone"
+        t.tt_r2_vol_lbl          := "Vol"
+        t.tt_r2_conf_lbl         := "Conf"
+        // ── CVCA Tooltip Row 3 (English) ──
+        t.tt_r3_hdr              := "Volume · Delta Trend · Footprint at"
+        t.tt_r3_vr_lbl           := "Volume Ratio:"
+        t.tt_r3_vr_block         := "• Amplified (>×1.3) — strong participation\n• Proportional (×0.7–1.3) — normal activity\n• Depleted (<×0.7) — weak, unreliable signal"
+        t.tt_r3_dt_lbl           := "Delta Trend:"
+        t.tt_r3_dt_block         := "• Strengthened — direction held, magnitude grew\n• Weakening — direction held, magnitude shrank\n• Flipped — delta sign reversed (most significant)"
+        t.tt_r3_mi_at_cp         := "at contact price:"
+        t.tt_r3_basis_at_cp      := "Basis candle at contact price:"
+        t.tt_r3_no_fp_tt         := "No footprint data available.\nVolume ratio and delta trend cannot be computed.\nThese axes contribute 0 to prediction."
+        // ── Row 2 Line 3 (English) ──
+        t.cvca_r2_l3_push_up     := "push up"
+        t.cvca_r2_l3_push_dn     := "push down"
+        t.cvca_r2_l3_no_factor   := "No dominant factor."
+        t.cvca_r2_l3_zone_strong := "strong zone confidence"
+        t.cvca_r2_l3_zone_mod    := "zone adds confidence"
+        t.cvca_r2_l3_and         := "&"
+        t.cvca_r2_l3_geo_only    := "Geometry only — no volume data."
+        // ── Row 3 Line 1 (English) ──
+        t.cvca_r3_vol_extreme    := "massively "
+        t.cvca_r3_vol_strong     := "strongly "
+        // ── Row 3 Line 3 (English) ──
+        t.cvca_r3_quiet_here     := "Maxima quiet at this price."
+        t.cvca_r3_now_lbl        := "Now:"
+        t.cvca_r3_vs             := "vs"
+
+    t
+
+// RTL language check for Arabic text alignment
+f_isRTL(string lang) =>
+    lang == "العربية"
+
+f_textAlign(string lang) =>
+    f_isRTL(lang) ? text.align_right : text.align_left
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// NORMALIZATION ENGINE: Yang-Zhang Volatility Estimator
+//──────────────────────────────────────────────────────────────────────────────
+
+float overnightRet = math.log(open / nz(close[1], open))
+float closeOpenRet = math.log(close / open)
+float lnHO = math.log(high / open)
+float lnHC = math.log(high / close)
+float lnLO = math.log(low  / open)
+float lnLC = math.log(low  / close)
+float rogersSatchellBar = lnHO * lnHC + lnLO * lnLC
+
+float sigmaOvernightSq = ta.variance(overnightRet, iSigmaLen)
+float sigmaCloseOpenSq = ta.variance(closeOpenRet, iSigmaLen)
+float sigmaRSSq        = ta.sma(rogersSatchellBar, iSigmaLen)
+
+float kCoeff = 0.34 / (1.34 + (iSigmaLen + 1.0) / math.max(iSigmaLen - 1.0, 1.0))
+float sigmaYZSq = nz(sigmaOvernightSq) + kCoeff * nz(sigmaCloseOpenSq) + (1.0 - kCoeff) * nz(sigmaRSSq)
+float sigmaBar  = math.sqrt(math.max(sigmaYZSq, 0.0))
+float safeSigma = math.max(nz(sigmaBar, MIN_SIGMA), MIN_SIGMA)
+
+// Pre-computed average true range for CVCA absorption detection (global scope required by ta.sma)
+float avgBarRange = ta.sma(high - low, 20)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// VOLUME ENGINE — Buy/Sell Decomposition (Global Scope)
+//──────────────────────────────────────────────────────────────────────────────
+// Two methods:
+//   Geometric: proportional split from OHLC bar structure
+//   Intrabar:  precise split via lower timeframe tick data (tvta library)
+//──────────────────────────────────────────────────────────────────────────────
+
+[u_intra, d_intra, _vol_unused] = tvta.requestUpAndDownVolume(iLTF)
+
+float volBuy  = 0.0
+float volSell = 0.0
+
+if iCalcMethod == "Intrabar (Precise)"
+    volBuy  := nz(math.abs(u_intra))
+    volSell := nz(math.abs(d_intra))
+else
+    float rangeBar = high - low
+    if rangeBar == 0
+        volBuy  := volume * 0.5
+        volSell := volume * 0.5
+    else
+        volBuy  := volume * ((close - low) / rangeBar)
+        volSell := volume * ((high - close) / rangeBar)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// VOLUME HISTORY: Per-Bar Buy/Sell Persistent Storage
+//──────────────────────────────────────────────────────────────────────────────
+// Stores volume engine output (buy/sell) for every bar as it processes.
+// Enables historical comparison: retrieve any bar's buy/sell volume by
+// bar_index lookup. Works regardless of Premium subscription — uses the
+// same geometric or intrabar decomposition already computed above.
+// Used by CVCA engine to compare maxima candle volume vs contact bar volume.
+//──────────────────────────────────────────────────────────────────────────────
+
+var array<int>   volHistBarIdx = array.new<int>()
+var array<float> volHistBuy    = array.new<float>()
+var array<float> volHistSell   = array.new<float>()
+
+// Evict oldest entries when approaching Pine's per-array element limit.
+// 3 parallel arrays grow by 1 per bar — cap at ~10000 entries (30K total).
+int VOL_HIST_CAP = 10000
+if array.size(volHistBarIdx) >= VOL_HIST_CAP
+    array.shift(volHistBarIdx)
+    array.shift(volHistBuy)
+    array.shift(volHistSell)
+array.push(volHistBarIdx, bar_index)
+array.push(volHistBuy, volBuy)
+array.push(volHistSell, volSell)
+
+// Retrieve buy/sell volume for any historical bar by bar_index.
+// Returns [buyVol, sellVol]. Both are na if bar not found.
+f_lookupBarVol(int targetBarIdx) =>
+    float _bv = na
+    float _sv = na
+    int idx = array.indexof(volHistBarIdx, targetBarIdx)
+    if idx >= 0
+        _bv := array.get(volHistBuy, idx)
+        _sv := array.get(volHistSell, idx)
+    [_bv, _sv]
+
+ 
+//──────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT ENGINE: Per-Bar Row Storage for CVCA
+//──────────────────────────────────────────────────────────────────────────────
+// Requests tick-level footprint data (1 tick = syminfo.mintick) on every bar.
+// Full row-level storage enables CVCA to compare buy/sell volume at exact
+// contact price levels between maxima and basis candles.
+// ⚠️ request.footprint() requires TradingView Premium or Ultimate plan.
+//──────────────────────────────────────────────────────────────────────────────
+
+footprint fpData = request.footprint(iShowCVCA ? iTicksPerRow : 500000, 500)
+
+// ── Full Footprint Row Storage (CVCA Price-Level Volume) ──────────
+// Modern map-based storage: bar_index → FPBarData (all rows).
+// Rolling window evicts oldest bars when total floats approach Pine's limit.
+// Enables CVCA to compare buy/sell at exact contact price level.
+var map<int, FPBarData> fpStore      = map.new<int, FPBarData>()
+var array<int>          fpStoreOrder = array.new<int>()
+var int                 fpStoredElems = 0
+
+if iShowCVCA and not na(fpData)
+    array<volume_row> fpRows = fpData.rows()
+    int fpRowCount = array.size(fpRows)
+    if fpRowCount > 0
+        // ── Full row storage for CVCA price-level comparison ──
+        // Evict oldest bars when approaching Pine's ~100K array element limit.
+        int _newElems = fpRowCount * 3
+        int FP_ELEM_CAP = 85000
+        while fpStoredElems + _newElems > FP_ELEM_CAP and array.size(fpStoreOrder) > 0
+            int _oldBar = array.shift(fpStoreOrder)
+            if map.contains(fpStore, _oldBar)
+                FPBarData _oldData = map.get(fpStore, _oldBar)
+                fpStoredElems -= array.size(_oldData.prices) * 3
+                map.remove(fpStore, _oldBar)
+        // Store current bar's complete footprint
+        FPBarData _newFP = FPBarData.new(
+             array.new<float>(fpRowCount),
+             array.new<float>(fpRowCount),
+             array.new<float>(fpRowCount))
+        for _fr = 0 to fpRowCount - 1
+            volume_row _frow = array.get(fpRows, _fr)
+            array.set(_newFP.prices, _fr, nz(_frow.down_price()))
+            array.set(_newFP.buys,   _fr, nz(_frow.buy_volume()))
+            array.set(_newFP.sells,  _fr, nz(_frow.sell_volume()))
+        map.put(fpStore, bar_index, _newFP)
+        array.push(fpStoreOrder, bar_index)
+        fpStoredElems += _newElems
+
+// Retrieve footprint buy/sell volume at a specific price level for a given bar.
+// Uses map-based full-row storage. Finds the nearest price row to targetPrice.
+// Returns [buy, sell, valid]. If bar not in storage or no rows, valid = false.
+f_lookupFPAtPrice(int targetBarIdx, float targetPrice) =>
+    float _fpBuy  = na
+    float _fpSell = na
+    bool  _fpOk   = false
+    if map.contains(fpStore, targetBarIdx)
+        FPBarData _bd = map.get(fpStore, targetBarIdx)
+        int _cnt = array.size(_bd.prices)
+        if _cnt > 0
+            float _bestDist = 1e18
+            int   _bestJ    = -1
+            for _j = 0 to _cnt - 1
+                float _d = math.abs(array.get(_bd.prices, _j) - targetPrice)
+                if _d < _bestDist
+                    _bestDist := _d
+                    _bestJ    := _j
+            if _bestJ >= 0
+                _fpBuy  := array.get(_bd.buys,  _bestJ)
+                _fpSell := array.get(_bd.sells, _bestJ)
+                _fpOk   := true
+    [_fpBuy, _fpSell, _fpOk]
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+//──────────────────────────────────────────────────────────────────────────────
+
+f_candleLen(int off) =>
+    float result = 0.0
+    if off >= 0 and off < bar_index
+        result := high[off] - low[off]
+    result
+
+f_candleMid(int off) =>
+    float result = close
+    if off >= 0 and off < bar_index
+        result := (high[off] + low[off]) / 2.0
+    result
+
+// Maps integer point size to the nearest label size constant.
+// table.cell() accepts int text_size natively; label.new() requires size.* constants.
+f_intToLabelSize(int pt) =>
+    if pt <= 6
+        size.tiny
+    else if pt <= 9
+        size.small
+    else if pt <= 12
+        size.normal
+    else if pt <= 16
+        size.large
+    else
+        size.huge
+
+// Compute the minimum number of revolutions so the cycloid polyline
+// extends from startBar to at least bar_index (the live bar).
+// Guarantees every curve is eligible for live-bar contact detection.
+f_autoRevolutions(int startBar, float rollR) =>
+    int barsNeeded = math.max(1, bar_index - startBar)
+    float barsPerRev = math.max(1.0, rollR * TAU)
+    int result = math.max(1, int(math.ceil(barsNeeded / barsPerRev)))
+    result
+
+f_lineStyleFromStr(string s) =>
+    switch s
+        "Solid"  => line.style_solid
+        "Dotted" => line.style_dotted
+        => line.style_dashed
+
+f_dashPosition(string s) =>
+    switch s
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_zoneColor(int idx) =>
+    array.get(ZONE_COLORS, idx % array.size(ZONE_COLORS))
+
+// Currency symbol for dashboard display
+f_currSymbol() =>
+    switch syminfo.currency
+        "USD" => "$"
+        "EUR" => "€"
+        "TRY" => "₺"
+        "GBP" => "£"
+        "JPY" => "¥"
+        => syminfo.currency
+
+// Volume formatting with K/M/B suffixes
+f_formatVol(float v) =>
+    string s = ""
+    if v >= 1000000000
+        s := str.format("{0,number,#.##}B", v / 1000000000)
+    else if v >= 1000000
+        s := str.format("{0,number,#.##}M", v / 1000000)
+    else if v >= 1000
+        s := str.format("{0,number,#.##}K", v / 1000)
+    else
+        s := str.format("{0,number,#.##}", v)
+    s
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE LOGIC: Find Concentric Maxima (Predecessor-Comparison Algorithm)
+//──────────────────────────────────────────────────────────────────────────────
+
+// Predecessor-Comparison Maxima Scanner
+// Walks backward from the basis candle (current or closed, per user setting).
+// At each step, compares the candle's range with its immediate predecessor
+// (the candle one step closer to the present). When a candle's range exceeds
+// its predecessor's, it is selected as a maxima. Finds exactly 2 maxima.
+f_findMaxima() =>
+    var array<MaximaInfo> result = array.new<MaximaInfo>()
+    array.clear(result)
+
+    int basisOff = iBasisMode == "Closed Candle" ? 1 : 0
+    int maxScan  = bar_index > 3 ? math.min(bar_index - 2, HIST_LIMIT) : 0
+
+    if maxScan >= basisOff + 2
+        int off        = basisOff + 1
+        int foundCount = 0
+
+        while foundCount < 2 and off <= maxScan
+            float currLen = f_candleLen(off)
+            float prevLen = f_candleLen(off + 1)
+
+            if currLen > prevLen
+                float miHigh  = high[off]
+                float miLow   = low[off]
+                float miOpen  = open[off]
+                float miClose = close[off]
+                float miSigma = safeSigma
+                if off < bar_index
+                    miSigma := math.max(nz(safeSigma[off], safeSigma), MIN_SIGMA)
+
+                float lnH       = math.log(miHigh)
+                float lnL       = math.log(miLow)
+                float lnO       = math.log(miOpen)
+                float lnC       = math.log(miClose)
+                float lnBodyTop = math.max(lnO, lnC)
+                float lnBodyBot = math.min(lnO, lnC)
+
+                float nDiam  = (lnH - lnL) / miSigma
+                float nRad   = nDiam / 2.0
+                float upDiam = (lnH - lnBodyTop) / miSigma
+                float upRad  = upDiam / 2.0
+                float loDiam = (lnBodyBot - lnL) / miSigma
+                float loRad  = loDiam / 2.0
+
+                MaximaInfo mi = MaximaInfo.new(
+                     off, currLen, f_candleMid(off),
+                     nDiam, nRad, PI * nDiam,
+                     upDiam, upRad, PI * upDiam,
+                     loDiam, loRad, PI * loDiam,
+                     bar_index - off, nRad,
+                     PI, PI, PI,
+                     miSigma, lnL)
+                array.push(result, mi)
+                foundCount += 1
+            off += 1
+
+    result
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// CYCLOID MATHEMATICS: Parametric Point Generator (Hybrid Newton-Bisection)
+//──────────────────────────────────────────────────────────────────────────────
+
+f_cycloidX(float theta, float rollR, float traceR, float phi0, float sinPhi0) =>
+    rollR * theta - traceR * math.sin(theta + phi0) + traceR * sinPhi0
+
+f_cycloidPoints(int startIdx, float rollR, float traceR, float phi0, int nRev, float baseLnLow, float sigma) =>
+    array<chart.point> pts = array.new<chart.point>()
+    int totalBars = math.round(rollR * TAU * nRev)
+    // Clamp: curve must never extend beyond the live bar
+    totalBars := math.min(totalBars, math.max(0, bar_index - startIdx))
+
+    if totalBars > 0
+        float sinPhi0   = math.sin(phi0)
+        float thetaEnd  = TAU * nRev
+        float prevTheta = 0.0
+        float derivThreshold = (rollR + traceR) * 0.01
+
+        for b = 0 to totalBars
+            float target = b * 1.0
+            float thetaLo = prevTheta
+            float thetaHi = math.min(prevTheta + PI, thetaEnd)
+            float xHi = f_cycloidX(thetaHi, rollR, traceR, phi0, sinPhi0)
+            if xHi < target
+                thetaHi := thetaEnd
+            float theta = math.max(thetaLo, math.min(thetaHi, target / rollR))
+
+            for _iter = 0 to 9
+                float sinThPhi = math.sin(theta + phi0)
+                float cosThPhi = math.cos(theta + phi0)
+                float xCurrent = rollR * theta - traceR * sinThPhi + traceR * sinPhi0
+                float residual = xCurrent - target
+                if residual < 0.0
+                    thetaLo := math.max(thetaLo, theta)
+                else
+                    thetaHi := math.min(thetaHi, theta)
+                if math.abs(residual) < 0.01
+                    break
+                float xPrime = rollR - traceR * cosThPhi
+                float thetaNext = na
+                if math.abs(xPrime) > derivThreshold
+                    float newtonTheta = theta - residual / xPrime
+                    if newtonTheta > thetaLo and newtonTheta < thetaHi
+                        thetaNext := newtonTheta
+                if na(thetaNext)
+                    thetaNext := (thetaLo + thetaHi) / 2.0
+                theta := thetaNext
+
+            prevTheta := theta
+            float yNorm = rollR - traceR * math.cos(theta + phi0)
+            float yPrice = math.exp(baseLnLow + yNorm * sigma)
+            array.push(pts, chart.point.from_index(startIdx + b, yPrice))
+
+    pts
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// STATE: Persistent variables
+//──────────────────────────────────────────────────────────────────────────────
+
+var array<MaximaInfo> maxima       = array.new<MaximaInfo>()
+var table             dashTable    = na
+var array<polyline>   polyLines   = array.new<polyline>()
+var array<label>      traceLabels = array.new<label>()
+var array<line>       refLines    = array.new<line>()
+
+// ── CVCA Engine: persistent state ──
+// No nested arrays — Pine v6 constraint. Curve prices are extracted
+// and consumed locally inside barstate.islast (same execution scope).
+var array<ContactEvent> cvcaContacts = array.new<ContactEvent>()
+
+// ── Cross-block shared state (Pine scope-size limit workaround) ──
+// The barstate.islast block is split into multiple scopes.
+// These globals carry computed values between scopes.
+var float  gSrResPrice = na
+var string gSrResName  = ""
+var float  gSrSupPrice = na
+var string gSrSupName  = ""
+var int    gDashRow    = 0
+
+ 
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// PRE-COMPUTE: Every bar for Pine consistency
+//──────────────────────────────────────────────────────────────────────────────
+
+array<MaximaInfo> computedMaxima = f_findMaxima()
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// MAIN EXECUTION — last bar only
+//──────────────────────────────────────────────────────────────────────────────
+
+if barstate.islast
+
+    //──────────────────────────────────────────────────────────────────
+    // Cleanup previous drawing objects
+    //──────────────────────────────────────────────────────────────────
+    if array.size(polyLines) > 0
+        for i = 0 to array.size(polyLines) - 1
+            polyline.delete(array.get(polyLines, i))
+    array.clear(polyLines)
+
+    if array.size(traceLabels) > 0
+        for i = 0 to array.size(traceLabels) - 1
+            label.delete(array.get(traceLabels, i))
+    array.clear(traceLabels)
+
+    if array.size(refLines) > 0
+        for i = 0 to array.size(refLines) - 1
+            line.delete(array.get(refLines, i))
+    array.clear(refLines)
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 1: Load computed maxima (predecessor-comparison scan)
+    //──────────────────────────────────────────────────────────────────
+    array.clear(maxima)
+    int cmCount = array.size(computedMaxima)
+    if cmCount > 0
+        for i = 0 to cmCount - 1
+            array.push(maxima, array.get(computedMaxima, i))
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 1b: Period-Based Largest Candle (appended as additional Mi)
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  Scans last iPeriodLen bars for the single largest H−L     │
+    // │  range candle. If that candle's bar_index matches any      │
+    // │  existing Mi (M0 or M1), it is skipped to avoid duplicate. │
+    // │  Otherwise, a full MaximaInfo is built and appended to the │
+    // │  maxima array. All downstream loops (curves, fill, ref     │
+    // │  lines, S/R, CVCA, dashboard, footprint) automatically    │
+    // │  process it — no separate code paths needed.               │
+    // └─────────────────────────────────────────────────────────────┘
+    //──────────────────────────────────────────────────────────────────
+    if iShowPeriodMi
+        int periodBasisOff = iBasisMode == "Closed Candle" ? 1 : 0
+        int scanEnd = math.min(periodBasisOff + iPeriodLen - 1, bar_index - 2)
+        if scanEnd >= periodBasisOff
+            float bestRange = 0.0
+            int   bestOff   = -1
+            for off = periodBasisOff to scanEnd
+                float r = f_candleLen(off)
+                if r > bestRange
+                    bestRange := r
+                    bestOff   := off
+            if bestOff >= 0
+                int candidateBarIdx = bar_index - bestOff
+                bool isDuplicate = false
+                int existingCount = array.size(maxima)
+                if existingCount > 0
+                    for k = 0 to existingCount - 1
+                        if array.get(maxima, k).centerBarIdx == candidateBarIdx
+                            isDuplicate := true
+                            break
+                if not isDuplicate
+                    float miHigh  = high[bestOff]
+                    float miLow   = low[bestOff]
+                    float miOpen  = open[bestOff]
+                    float miClose = close[bestOff]
+                    float miSigma = safeSigma
+                    if bestOff < bar_index
+                        miSigma := math.max(nz(safeSigma[bestOff], safeSigma), MIN_SIGMA)
+                    float lnH       = math.log(miHigh)
+                    float lnL       = math.log(miLow)
+                    float lnO       = math.log(miOpen)
+                    float lnC       = math.log(miClose)
+                    float lnBodyTop = math.max(lnO, lnC)
+                    float lnBodyBot = math.min(lnO, lnC)
+                    float nDiam  = (lnH - lnL) / miSigma
+                    float nRad   = nDiam / 2.0
+                    float upDiam = (lnH - lnBodyTop) / miSigma
+                    float upRad  = upDiam / 2.0
+                    float loDiam = (lnBodyBot - lnL) / miSigma
+                    float loRad  = loDiam / 2.0
+                    MaximaInfo pm = MaximaInfo.new(
+                         bestOff, bestRange, f_candleMid(bestOff),
+                         nDiam, nRad, PI * nDiam,
+                         upDiam, upRad, PI * upDiam,
+                         loDiam, loRad, PI * loDiam,
+                         candidateBarIdx, nRad,
+                         PI, PI, PI,
+                         miSigma, lnL)
+                    array.push(maxima, pm)
+
+    int mCount = array.size(maxima)
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 2: Draw cycloid traces (UNCHANGED)
+    //──────────────────────────────────────────────────────────────────
+    // Color per Mi: Outer Apex price vs current close determines above/below
+    float curveRefPrice = iBasisMode == "Closed Candle" ? nz(close[1], close) : close
+
+    if mCount > 0
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+            int startBar = mi.centerBarIdx
+
+            // Outer Apex price = exp(lnLow + 2R × σ) — highest point of outer cycloid
+            float priceApexOut = math.exp(mi.lnLow + 2.0 * mi.normRadius * mi.sigmaAtBar)
+            color curveCol = priceApexOut > curveRefPrice ? iCurveAboveColor : iCurveBelowColor
+
+            // Dynamic revolutions: extend curve to at least the live bar
+            int nRev = f_autoRevolutions(startBar, mi.normRadius)
+
+            if iShowOuter
+                array<chart.point> ptsOut = f_cycloidPoints(
+                     startBar, mi.normRadius, mi.normRadius, mi.phaseOuter,
+                     nRev, mi.lnLow, mi.sigmaAtBar)
+                int nOut = array.size(ptsOut)
+
+                // ── Bowl fill: cycloid curve closed at apex ──
+                // Outer cycloid starts at apex (2R), dips to trough (Low), returns to apex.
+                // closed=true connects last apex point back to first apex → horizontal cap.
+                // Interior = concave bowl. Fill uses curve color at 90% transparency.
+                // ── Bowl fill — invisible cap, curved fill boundary ──
+                polyline plFill = polyline.new(ptsOut,
+                     curved = false, closed = true, xloc = xloc.bar_index,
+                     line_color = color(na), fill_color = color.new(curveCol, 90))
+                array.push(polyLines, plFill)
+
+                // ── Outer curve — visible line, no fill ──
+                polyline plOut = polyline.new(ptsOut,
+                     curved = true, closed = false, xloc = xloc.bar_index,
+                     line_color = curveCol, line_style = line.style_solid, line_width = iCurveOuterWidth)
+                array.push(polyLines, plOut)
+
+            if iShowUpperPin and mi.upperPinRad > 1e-15
+                array<chart.point> ptsUp = f_cycloidPoints(
+                     startBar, mi.normRadius, mi.upperPinRad, mi.phaseUpper,
+                     nRev, mi.lnLow, mi.sigmaAtBar)
+                polyline plUp = polyline.new(ptsUp,
+                     curved = true, closed = false, xloc = xloc.bar_index,
+                     line_color = curveCol, line_style = line.style_solid, line_width = iCurvePinWidth)
+                array.push(polyLines, plUp)
+
+            if iShowLowerPin and mi.lowerPinRad > 1e-15
+                array<chart.point> ptsLo = f_cycloidPoints(
+                     startBar, mi.normRadius, mi.lowerPinRad, mi.phaseLower,
+                     nRev, mi.lnLow, mi.sigmaAtBar)
+                polyline plLo = polyline.new(ptsLo,
+                     curved = true, closed = false, xloc = xloc.bar_index,
+                     line_color = curveCol, line_style = line.style_dashed, line_width = iCurvePinWidth)
+                array.push(polyLines, plLo)
+
+     
+
+        //══════════════════════════════════════════════════════════════════════════════
+// BLOCK B: CVCA Contact Detection Engine + Geometric Markers
+//══════════════════════════════════════════════════════════════════════════════
+if barstate.islast
+    int mCount = array.size(maxima)
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 2-CVCA: Cycloid Price Extraction + Contact Detection Engine
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  Extracts cycloid curve Y-prices at current bar offset,    │
+    // │  detects proximity contacts, and computes 7-axis           │
+    // │  prediction for each contact.                               │
+    // │  No nested arrays — all processing local to this block.    │
+    // │  Academic: Kyle σ√(Q/V), Easley-O'Hara PIN, Cont OFI     │
+    // └─────────────────────────────────────────────────────────────┘
+    //──────────────────────────────────────────────────────────────────
+                         
+
+    array.clear(cvcaContacts)
+
+    if iShowCVCA and mCount > 0
+
+        float contactTol = safeSigma * close * 0.3
+
+        int basisOff_cvca = iBasisMode == "Closed Candle" ? 1 : 0
+        float cvca_close     = close[basisOff_cvca]
+        float cvca_close1    = close[basisOff_cvca + 1]
+        float cvca_high      = high[basisOff_cvca]
+        float cvca_low       = low[basisOff_cvca]
+        float cvca_open      = open[basisOff_cvca]
+        float cvca_range     = cvca_high - cvca_low
+        int   cvca_basisBar  = bar_index - basisOff_cvca
+
+        // ── Pre-scan: collect ALL curve prices at current bar for confluence (Axis 7) ──
+        // Flat array of scalar prices — one entry per Mi×curve combo at current bar offset.
+        array<float> allCurvePricesAtBar = array.new<float>()
+
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+            int startBar  = mi.centerBarIdx
+            int nRevCvca  = f_autoRevolutions(startBar, mi.normRadius)
+            int curOffset = bar_index - basisOff_cvca - startBar
+
+            // Extract single price at curOffset for each curve type
+            if curOffset >= 0
+                // Outer
+                array<chart.point> ptsO = f_cycloidPoints(
+                     startBar, mi.normRadius, mi.normRadius, mi.phaseOuter,
+                     nRevCvca, mi.lnLow, mi.sigmaAtBar)
+                if curOffset < array.size(ptsO)
+                    array.push(allCurvePricesAtBar, array.get(ptsO, curOffset).price)
+
+                // Upper pin
+                if mi.upperPinRad > 1e-15
+                    array<chart.point> ptsU = f_cycloidPoints(
+                         startBar, mi.normRadius, mi.upperPinRad, mi.phaseUpper,
+                         nRevCvca, mi.lnLow, mi.sigmaAtBar)
+                    if curOffset < array.size(ptsU)
+                        array.push(allCurvePricesAtBar, array.get(ptsU, curOffset).price)
+
+                // Lower pin
+                if mi.lowerPinRad > 1e-15
+                    array<chart.point> ptsL = f_cycloidPoints(
+                         startBar, mi.normRadius, mi.lowerPinRad, mi.phaseLower,
+                         nRevCvca, mi.lnLow, mi.sigmaAtBar)
+                    if curOffset < array.size(ptsL)
+                        array.push(allCurvePricesAtBar, array.get(ptsL, curOffset).price)
+
+        // ── Main detection loop: for each Mi × curve, extract + detect + classify ──
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+            int startBar  = mi.centerBarIdx
+            int nRevMi    = f_autoRevolutions(startBar, mi.normRadius)
+            int curOffset  = bar_index - basisOff_cvca - startBar
+            int prevOffset = curOffset - 1
+
+            if curOffset < 0
+                continue
+
+            // Process each of the 3 curve types
+            array<float>  traceRadii = array.from(mi.normRadius, mi.upperPinRad, mi.lowerPinRad)
+            array<float>  phases     = array.from(mi.phaseOuter, mi.phaseUpper, mi.phaseLower)
+            array<string> curveCodes = array.from("CRV_OUT", "CRV_UP", "CRV_LO")
+            array<string> curveNames = array.from(
+                 "M" + str.tostring(i) + "·Outer",
+                 "M" + str.tostring(i) + "·UpperPin",
+                 "M" + str.tostring(i) + "·LowerPin")
+
+            for c = 0 to 2
+                float traceR = array.get(traceRadii, c)
+                if traceR < 1e-15
+                    continue
+
+                // Generate full cycloid points for this curve
+                array<chart.point> pts = f_cycloidPoints(
+                     startBar, mi.normRadius, traceR, array.get(phases, c),
+                     nRevMi, mi.lnLow, mi.sigmaAtBar)
+                int nPts = array.size(pts)
+
+                // ── Live-bar-only contact detection ──
+                // Always tests the actual live bar (bar_index, offset 0)
+                // regardless of iBasisMode. Contact is detected when the
+                // live bar's close is within ±contactTol of the curve, or
+                // when the live bar's wick pierces the curve.
+                // Note: cvca_close / cvca_high etc. (computed above with
+                // basisOff_cvca) are reserved for future basis-aware CVCA;
+                // current detection uses raw live-bar OHLC below.
+                bool  contactFound = false
+                float cyPrice = na
+                float cyPricePrev = na
+                int   contactBarIdx_scan = bar_index
+                float cClose  = close
+                float cClose1 = close[1]
+                float cHigh   = high
+                float cLow    = low
+                float cOpen   = open
+                float cRange  = high - low
+
+                int liveCurOffset = bar_index - startBar
+                if liveCurOffset >= 0 and liveCurOffset < nPts
+                    float liveCyP  = array.get(pts, liveCurOffset).price
+                    float liveDist = math.abs(close - liveCyP)
+                    bool  liveWick = high >= liveCyP and low <= liveCyP
+                    if liveDist < contactTol or liveWick
+                        cyPrice  := liveCyP
+                        int prevOff = liveCurOffset - 1
+                        cyPricePrev := prevOff >= 0 and prevOff < nPts ? array.get(pts, prevOff).price : na
+                        contactFound := true
+
+                if not contactFound
+                    continue
+
+                // ═══════════════════════════════════════════════════
+                // CONTACT DETECTED — Footprint Lookup + 7 Axes
+                // ═══════════════════════════════════════════════════
+
+                // ── Footprint at contact price: basis candle + maxima candle ──
+                [_fpCBuy, _fpCSell, _fpCOk] = f_lookupFPAtPrice(contactBarIdx_scan, cyPrice)
+                [_fpHBuy, _fpHSell, _fpHOk] = f_lookupFPAtPrice(mi.centerBarIdx, cyPrice)
+                bool _fpBoth = _fpCOk and _fpHOk
+
+                float fpCBuy  = _fpCOk ? nz(_fpCBuy) : 0.0
+                float fpCSell = _fpCOk ? nz(_fpCSell) : 0.0
+                float fpCTot  = fpCBuy + fpCSell
+                float fpCDel  = fpCBuy - fpCSell
+
+                float hBuy  = _fpHOk ? nz(_fpHBuy) : 0.0
+                float hSell = _fpHOk ? nz(_fpHSell) : 0.0
+                float hTot  = hBuy + hSell
+                float hDel  = hBuy - hSell
+
+                ContactEvent ce = ContactEvent.new()
+                ce.barIdx       := contactBarIdx_scan
+                ce.miIdx        := i
+                ce.curveName    := array.get(curveNames, c)
+                ce.contactPrice := cyPrice
+                ce.fpValid      := _fpBoth
+
+                // Raw comparison data (now footprint row-level, not whole candle)
+                ce.histBuy   := hBuy
+                ce.histSell  := hSell
+                ce.histDelta := hDel
+                ce.histTotal := hTot
+                ce.currBuy   := fpCBuy
+                ce.currSell  := fpCSell
+                ce.currDelta := fpCDel
+                ce.currTotal := fpCTot
+
+                // ── AXIS 1: Contact Direction (geometry — no volume) ──
+                // 5-state classification: candle O/H/L/C vs contact point (CP).
+                //   STOPPED        — close ≈ CP (within tight tolerance)
+                //   PASSED_UP      — body crossed CP upward (open < CP, close > CP)
+                //   PASSED_DN      — body crossed CP downward (open > CP, close < CP)
+                //   WICK_BOUNCE_UP — lower wick tested CP, close stayed above
+                //   WICK_REJECT_DN — upper wick tested CP, close stayed below
+                float stopTol = contactTol * 0.33
+                if math.abs(cClose - cyPrice) < stopTol
+                    ce.ax1_direction := "STOPPED"
+                else if cOpen < cyPrice and cClose > cyPrice
+                    ce.ax1_direction := "PASSED_UP"
+                else if cOpen > cyPrice and cClose < cyPrice
+                    ce.ax1_direction := "PASSED_DN"
+                else if cLow <= cyPrice and cClose > cyPrice
+                    ce.ax1_direction := "WICK_BOUNCE_UP"
+                else if cHigh >= cyPrice and cClose < cyPrice
+                    ce.ax1_direction := "WICK_REJECT_DN"
+                else
+                    ce.ax1_direction := "STOPPED"
+
+                // ── AXIS 2: Curve Type (geometry — no volume) ──
+                ce.ax2_curveType := array.get(curveCodes, c)
+
+                // ── AXIS 3: Curve Zone (geometry — no volume) ──
+                float yN = (math.log(cyPrice) - mi.lnLow) / mi.sigmaAtBar
+                ce.ax3_yNorm := yN
+                float R_  = mi.normRadius
+                float apexThresh  = R_ + 0.7 * traceR
+                float troughThresh = R_ - 0.7 * traceR
+                if yN >= apexThresh
+                    ce.ax3_zone := "ZONE_APEX"
+                else if yN <= troughThresh
+                    ce.ax3_zone := "ZONE_TROUGH"
+                else
+                    ce.ax3_zone := "ZONE_MID"
+
+                // ── AXIS 4: Volume Magnitude Ratio (requires footprint) ──
+                if _fpBoth
+                    ce.ax4_ratio := hTot > 0 ? fpCTot / hTot : 0.0
+                    if ce.ax4_ratio > 1.3
+                        ce.ax4_volMag := "VOL_AMP"
+                    else if ce.ax4_ratio >= 0.7
+                        ce.ax4_volMag := "VOL_PROP"
+                    else
+                        ce.ax4_volMag := "VOL_DEP"
+                else
+                    ce.ax4_ratio  := na
+                    ce.ax4_volMag := "VOL_NA"
+
+                // ── AXIS 5: Delta Character (requires footprint) ──
+                // Classifies how the buy/sell imbalance changed between maxima and current candle.
+                // Zero-delta edge cases handled explicitly to avoid misclassification:
+                //   currDelta == 0 → weakened from any prior state (no directional bias remains)
+                //   histDelta == 0 → direction emerged from neutral → classified as flip
+                if _fpBoth
+                    if fpCDel == 0
+                        // Current delta exactly balanced — weakened from prior direction
+                        ce.ax5_deltaChar := hDel > 0 ? "Δ_WEAK_BUY" : hDel < 0 ? "Δ_WEAK_SELL" : "Δ_WEAK_BUY"
+                    else if hDel == 0
+                        // Historical was neutral, current has direction — flip
+                        ce.ax5_deltaChar := fpCDel > 0 ? "Δ_FLIP_BUY" : "Δ_FLIP_SELL"
+                    else if hDel > 0 and fpCDel > 0
+                        ce.ax5_deltaChar := fpCDel >= hDel ? "Δ_CONT_BUY" : "Δ_WEAK_BUY"
+                    else if hDel < 0 and fpCDel < 0
+                        ce.ax5_deltaChar := math.abs(fpCDel) >= math.abs(hDel) ? "Δ_CONT_SELL" : "Δ_WEAK_SELL"
+                    else if fpCDel > 0
+                        ce.ax5_deltaChar := "Δ_FLIP_BUY"
+                    else
+                        ce.ax5_deltaChar := "Δ_FLIP_SELL"
+                else
+                    ce.ax5_deltaChar := "Δ_NA"
+
+                // ── AXIS 6: Absorption Detection (requires footprint) ──
+                if _fpBoth
+                    float rangeRatio = cRange / math.max(avgBarRange, syminfo.mintick)
+                    bool smallRange = rangeRatio < 0.7
+                    if fpCSell > hSell * 1.2 and cClose >= cOpen and smallRange
+                        ce.ax6_absorption := "ABS_BUY"
+                    else if fpCBuy > hBuy * 1.2 and cClose <= cOpen and smallRange
+                        ce.ax6_absorption := "ABS_SELL"
+                    else
+                        ce.ax6_absorption := "ABS_NONE"
+                else
+                    ce.ax6_absorption := "ABS_NONE"
+
+                // ── AXIS 7: Confluence (geometry — no volume) ──
+                int confN = 0
+                int nAllCurves = array.size(allCurvePricesAtBar)
+                if nAllCurves > 0
+                    for q = 0 to nAllCurves - 1
+                        float otherP = array.get(allCurvePricesAtBar, q)
+                        if math.abs(otherP - cyPrice) < contactTol
+                            confN += 1
+                ce.ax7_confCount := confN
+                if confN >= 3
+                    ce.ax7_confluence := "CONF_3"
+                else if confN >= 2
+                    ce.ax7_confluence := "CONF_2"
+                else
+                    ce.ax7_confluence := "CONF_1"
+
+                // ═══════════════════════════════════════════════════
+                // PREDICTION ENGINE: Smooth Continuous Scoring v2
+                // ─────────────────────────────────────────────────
+                // Every axis produces a CONTINUOUS value — no cliff
+                // edges, no wasted information. Raw magnitudes flow
+                // through logistic-sigmoid soft-clamps:
+                //   softClamp(x, A, k) = A·(2/(1+e^{-kx}) − 1)
+                // Volume axes contribute 0 when footprint unavailable.
+                //
+                // Academic: Kyle σ√(Q/V), Easley-O'Hara PIN/VPIN,
+                //           Cont et al. OFI, Xu et al. MLOFI
+                // ═══════════════════════════════════════════════════
+
+                float pUp = 0.5
+                float _safeRng = math.max(cRange, syminfo.mintick)
+
+                // ── SMOOTH AXIS 1: Direction Bias ──────────────────
+                // Signed normalized penetration: how far close sits
+                // from the contact point, scaled by contact tolerance.
+                // Wick engagement: depth of wick probe relative to
+                // candle range — rewards deeper wick tests.
+                // Combined via logistic soft-clamp → (−0.18, +0.18).
+                float _penNorm = (cClose - cyPrice) / math.max(contactTol, syminfo.mintick)
+                float _wickEng = 0.0
+                if cLow < cyPrice and cClose >= cyPrice
+                    _wickEng := (cyPrice - cLow) / _safeRng
+                else if cHigh > cyPrice and cClose <= cyPrice
+                    _wickEng := -(cHigh - cyPrice) / _safeRng
+                float _dirRaw = _penNorm * 0.7 + _wickEng * 0.5
+                float dirBias = 0.18 * (2.0 / (1.0 + math.exp(-2.5 * _dirRaw)) - 1.0)
+                pUp += dirBias
+
+                // ── SMOOTH AXIS 5→P: Delta Bias ───────────────────
+                // Normalizes both historical and current deltas by
+                // their respective totals for scale independence.
+                // Delta shift = how much the bias moved (captures
+                // flips AND magnitude changes in one continuous
+                // variable). Combined via logistic → (−0.22, +0.22).
+                // Zero contribution without footprint data.
+                float deltaSig = 0.0
+                if _fpBoth
+                    float _hDelN = hTot > 0 ? hDel / hTot : 0.0
+                    float _cDelN = fpCTot > 0 ? fpCDel / fpCTot : 0.0
+                    float _dShift = _cDelN - _hDelN
+                    float _dRaw = _cDelN * 0.6 + _dShift * 0.4
+                    deltaSig := 0.22 * (2.0 / (1.0 + math.exp(-3.0 * _dRaw)) - 1.0)
+                pUp += deltaSig
+
+                // ── SMOOTH AXIS 6→P: Absorption Bias ──────────────
+                // Three continuous factors multiplied together:
+                //   (a) Range compression: sigmoid of (0.7 − rangeRatio)
+                //       → peaks when bar is narrow relative to average.
+                //   (b) Volume surplus: how much current sell (buy)
+                //       exceeds historical sell (buy) at this price.
+                //   (c) Body direction: (close−open)/range ∈ [−1,+1].
+                // Buy absorption = heavy selling absorbed, price held.
+                // Sell absorption = heavy buying absorbed, price fell.
+                // Net absorption via logistic → (−0.15, +0.15).
+                float absSig = 0.0
+                if _fpBoth
+                    float _rRat = cRange / math.max(avgBarRange, syminfo.mintick)
+                    float _rComp = math.max(0.0, 2.0 / (1.0 + math.exp(5.0 * (_rRat - 0.7))) - 1.0)
+                    float _sellSurp = hSell > 0 ? math.max(0.0, fpCSell / hSell - 1.0) : 0.0
+                    float _buySurp  = hBuy  > 0 ? math.max(0.0, fpCBuy  / hBuy  - 1.0) : 0.0
+                    float _bodyDir  = (cClose - cOpen) / _safeRng
+                    float _absBuy   = _sellSurp * math.max(0.0,  _bodyDir) * _rComp
+                    float _absSell  = _buySurp  * math.max(0.0, -_bodyDir) * _rComp
+                    float _absRaw   = _absBuy - _absSell
+                    absSig := 0.15 * (2.0 / (1.0 + math.exp(-3.0 * _absRaw)) - 1.0)
+                pUp += absSig
+
+                // ── SMOOTH AXIS 4→P: Volume Magnitude Bias ────────
+                // Log-ratio of total volumes (current/historical):
+                //   ratio=1 → 0, ratio=2 → +0.69, ratio=0.5 → −0.69.
+                // Mapped through sigmoid to volume strength ∈ (−1,+1).
+                // Aligned with direction: amplified confirming volume
+                // adds to P(↑) when bullish, subtracts when bearish.
+                // Zero contribution without footprint data.
+                float volConf = 0.0
+                if _fpBoth
+                    float _vRat  = hTot > 0 ? fpCTot / hTot : 1.0
+                    float _logVR = math.log(math.max(_vRat, 0.01))
+                    float _vStr  = 2.0 / (1.0 + math.exp(-2.0 * _logVR)) - 1.0
+                    float _dSign = dirBias >= 0.0 ? 1.0 : -1.0
+                    volConf := 0.10 * _vStr * _dSign
+                pUp += volConf
+
+                ce.probUp := math.max(0.05, math.min(0.95, pUp))
+
+                // Store prediction breakdown for dashboard tooltip
+                ce.pBias_dir   := dirBias
+                ce.pBias_delta := deltaSig
+                ce.pBias_abs   := absSig
+                ce.pBias_vol   := volConf
+
+                // ── SMOOTH CONVICTION SCORE ────────────────────────
+                // Product of 4 continuous multipliers, each smoothly
+                // responsive to its input — no bin boundaries.
+                //
+                // Base: outer circle = 0.40 (primary rolling wheel);
+                //       pin circles = 0.25 + 0.15·(r/R), rewarding
+                //       larger pin circles proportionally.
+                //
+                // Zone: contacts near curve extremes (apex OR trough)
+                //       are geometrically more significant. Smooth
+                //       sigmoid of |y_rel|, with slight apex premium.
+                //       Range: [1.0, ~1.5].
+                //
+                // Volume: exponential of smooth log-ratio.
+                //       ratio=0.5→~0.67, ratio=1→1.0, ratio=2→~1.49.
+                //       Defaults to 1.0 without footprint.
+                //
+                // Confluence: smooth ramp from curve count.
+                //       1→1.0, 2→~1.46, 3→~1.88, 4+→~2.0.
+                float cBase = ce.ax2_curveType == "CRV_OUT" ? 0.40 :
+                     0.25 + 0.15 * (traceR / math.max(mi.normRadius, 1e-10))
+                float _yRel = (yN - R_) / math.max(traceR, 1e-10)
+                float _absYRel = math.abs(_yRel)
+                float _extremity = math.max(0.0, 2.0 / (1.0 + math.exp(-4.0 * (_absYRel - 0.3))) - 1.0)
+                float _apexBonus = math.max(0.0, _yRel) * 0.1
+                float cZone = 1.0 + (0.4 + _apexBonus) * _extremity
+                float cVol = 1.0
+                if _fpBoth
+                    float _vRatC = hTot > 0 ? fpCTot / hTot : 1.0
+                    float _logVC = math.log(math.max(_vRatC, 0.01))
+                    cVol := math.exp(0.4 * (2.0 / (1.0 + math.exp(-2.0 * _logVC)) - 1.0))
+                float _confNorm = (ce.ax7_confCount - 1.0) / 2.0
+                float cConf = 1.0 + 1.0 * math.max(0.0, 2.0 / (1.0 + math.exp(-3.0 * _confNorm)) - 1.0)
+
+                ce.conviction := math.max(0.0, math.min(1.0, cBase * cZone * cVol * cConf))
+
+                // Store conviction breakdown for dashboard tooltip
+                ce.conv_base := cBase
+                ce.conv_zone := cZone
+                ce.conv_vol  := cVol
+                ce.conv_conf := cConf
+
+                // ── SMOOTH BEHAVIOR CLASSIFICATION ─────────────────
+                // Weighted scoring system: each behavior pattern
+                // computes a continuous score ∈ [0, ∞). Highest
+                // score wins. No hard thresholds — every input
+                // contributes proportionally. A score of 0.29 vs
+                // 0.30 produces a tiny score difference, not a
+                // cliff-edge label flip.
+                //
+                // 9 behavior patterns compete simultaneously.
+                // Fallback (WEAK BOUNCE/REJECTION) activates only
+                // when all specific patterns score below 0.10.
+                bool bullish = ce.probUp > 0.5
+                string beh = "NEUTRAL"
+                color bCol = color.gray
+                float _bestBS = 0.0
+
+                // Pattern 1: ABSORPTION — volume surplus × range
+                // compression × conviction (requires footprint)
+                if _fpBoth
+                    float _absIntensity = math.abs(absSig) / 0.15
+                    float _ampFactor = math.max(0.0, 2.0 / (1.0 + math.exp(-2.0 * math.log(math.max(hTot > 0 ? fpCTot / hTot : 1.0, 0.01)))) - 1.0)
+                    float _sc1 = _absIntensity * _ampFactor * ce.conviction * 1.2
+                    if _sc1 > _bestBS
+                        _bestBS := _sc1
+                        beh  := absSig > 0 ? "ABSORPTION ↑" : "ABSORPTION ↓"
+                        bCol := absSig > 0 ? color.rgb(0, 230, 118) : color.rgb(255, 82, 82)
+
+                // Pattern 2: DELTA FLIP — sign reversal magnitude
+                // (requires footprint, uses normalized deltas)
+                if _fpBoth
+                    float _hDN2 = hTot > 0 ? hDel / hTot : 0.0
+                    float _cDN2 = fpCTot > 0 ? fpCDel / fpCTot : 0.0
+                    float _flipSig = _hDN2 * _cDN2
+                    if _flipSig < -0.0025
+                        float _flipMag = math.abs(_cDN2 - _hDN2) / 2.0
+                        float _sc2 = _flipMag * 1.1
+                        if _sc2 > _bestBS
+                            _bestBS := _sc2
+                            beh  := _cDN2 > 0 ? "DELTA FLIP ↑" : "DELTA FLIP ↓"
+                            bCol := _cDN2 > 0 ? color.rgb(0, 230, 118) : color.rgb(255, 82, 82)
+
+                // Pattern 3: EXHAUSTION — apex proximity × volume
+                // depletion (requires footprint)
+                if _fpBoth
+                    float _apexProx = math.max(0.0, _yRel)
+                    float _depletion = math.max(0.0, 1.0 - (hTot > 0 ? fpCTot / hTot : 1.0))
+                    float _sc3 = _apexProx * _depletion * 1.0
+                    if _sc3 > _bestBS
+                        _bestBS := _sc3
+                        beh  := "EXHAUSTION"
+                        bCol := color.rgb(255, 152, 0)
+
+                // Pattern 4: VACUUM — depletion × no absorption
+                // (requires footprint)
+                if _fpBoth
+                    float _deplVac = math.max(0.0, 1.0 - (hTot > 0 ? fpCTot / hTot : 1.0))
+                    float _noAbs = 1.0 - math.abs(absSig) / 0.15
+                    float _sc4 = _deplVac * math.max(0.0, _noAbs) * 0.8
+                    if _sc4 > _bestBS
+                        _bestBS := _sc4
+                        beh  := "VACUUM"
+                        bCol := color.rgb(120, 120, 140)
+
+                // Pattern 5: BATTLE ZONE — volume amplification ×
+                // near-zero delta (requires footprint)
+                if _fpBoth
+                    float _ampBZ = math.max(0.0, (hTot > 0 ? fpCTot / hTot : 1.0) - 1.0)
+                    float _zeroDel = 1.0 - math.min(1.0, math.abs(fpCDel) / math.max(fpCTot * 0.15, syminfo.mintick))
+                    float _sc5 = _ampBZ * math.max(0.0, _zeroDel) * 0.9
+                    if _sc5 > _bestBS
+                        _bestBS := _sc5
+                        beh  := "BATTLE ZONE"
+                        bCol := color.rgb(255, 235, 59)
+
+                // Pattern 6: STRONG BOUNCE ↑ / BREAKOUT ↑ — bullish
+                // probability strength × conviction (always active)
+                float _bullStr = math.max(0.0, (ce.probUp - 0.5) * 2.0)
+                float _sc6 = _bullStr * ce.conviction * 0.85
+                if _sc6 > _bestBS
+                    _bestBS := _sc6
+                    if ce.ax1_direction == "PASSED_DN" and _fpBoth and fpCDel < 0
+                        beh  := "BREAKOUT ↑"
+                        bCol := color.rgb(0, 230, 118)
+                    else
+                        beh  := "STRONG BOUNCE ↑"
+                        bCol := color.rgb(0, 200, 83)
+
+                // Pattern 7: REJECTION ↓ / BREAKDOWN ↓ — bearish
+                // probability strength × conviction (always active)
+                float _bearStr = math.max(0.0, (0.5 - ce.probUp) * 2.0)
+                float _sc7 = _bearStr * ce.conviction * 0.85
+                if _sc7 > _bestBS
+                    _bestBS := _sc7
+                    if ce.ax1_direction == "PASSED_UP" and _fpBoth and fpCDel > 0
+                        beh  := "BREAKDOWN ↓"
+                        bCol := color.rgb(255, 82, 82)
+                    else
+                        beh  := "REJECTION ↓"
+                        bCol := color.rgb(244, 67, 54)
+
+                // Pattern 8: CONFLUENCE WALL — curve density ×
+                // conviction (always active, geometry-driven)
+                float _confStr = math.max(0.0, (ce.ax7_confCount - 1.5) / 2.0)
+                float _sc8 = _confStr * ce.conviction * 0.9
+                if _sc8 > _bestBS
+                    _bestBS := _sc8
+                    beh  := bullish ? "CONFLUENCE WALL ↑" : "CONFLUENCE WALL ↓"
+                    bCol := bullish ? color.rgb(0, 230, 118) : color.rgb(255, 82, 82)
+
+                // Pattern 9: WEAK BOUNCE / REJECTION — fallback
+                // when no specific pattern exceeds score threshold
+                if _bestBS < 0.10
+                    beh  := bullish ? "WEAK BOUNCE ↑" : "WEAK REJECTION ↓"
+                    bCol := bullish ? color.rgb(100, 180, 100) : color.rgb(180, 100, 100)
+
+                ce.behavior      := beh
+                ce.behaviorColor := bCol
+
+                array.push(cvcaContacts, ce)
+
+        // Sort contacts by conviction descending
+        int nContacts = array.size(cvcaContacts)
+        if nContacts > 1
+            for ii = 1 to nContacts - 1
+                ContactEvent key = array.get(cvcaContacts, ii)
+                float keyVal = key.conviction
+                int jj = ii - 1
+                while jj >= 0
+                    if array.get(cvcaContacts, jj).conviction < keyVal
+                        array.set(cvcaContacts, jj + 1, array.get(cvcaContacts, jj))
+                        jj -= 1
+                    else
+                        break
+                array.set(cvcaContacts, jj + 1, key)
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 2a: Geometric Markers on Maxima Candles (UNCHANGED)
+    //──────────────────────────────────────────────────────────────────
+    if mCount > 0
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+            color baseCol = f_zoneColor(i)
+            int candleBar = mi.centerBarIdx
+            float miH = high[mi.offset]
+            float miL = low[mi.offset]
+            float miMid = (miH + miL) / 2.0
+            float upperApex = math.exp(mi.lnLow + (mi.normRadius + mi.upperPinRad) * mi.sigmaAtBar)
+            float lowerApex = math.exp(mi.lnLow + (mi.normRadius + mi.lowerPinRad) * mi.sigmaAtBar)
+
+            label lblMid = label.new(candleBar, miMid, "⊙",
+                 color = color(na), textcolor = color.white,
+                 style = label.style_label_center, size = size.small)
+            array.push(traceLabels, lblMid)
+            label lblTop = label.new(candleBar, upperApex, "✕",
+                 color = color(na), textcolor = color.yellow,
+                 style = label.style_label_center, size = size.small)
+            array.push(traceLabels, lblTop)
+            label lblBot = label.new(candleBar, lowerApex, "✕",
+                 color = color(na), textcolor = color.yellow,
+                 style = label.style_label_center, size = size.small)
+            array.push(traceLabels, lblBot)
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK C: Reference Lines + S/R Detection + Volume Metrics
+//══════════════════════════════════════════════════════════════════════════════
+if barstate.islast
+    int mCount = array.size(maxima)
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 2b: Reference Lines — Apex + Nearest Trough per Mi
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  For each Mi, draws horizontal reference lines at:         │
+    // │                                                             │
+    // │  APEX LINES (3 per Mi — always drawn):                     │
+    // │    exp(lnL + 2R·σ)       → "Mi·Out↑"    (outer apex=2R)   │
+    // │    exp(lnL + (R+rUp)·σ)  → "Mi·UpPin↑"  (upper pin apex)  │
+    // │    exp(lnL + (R+rLo)·σ)  → "Mi·LoPin↑"  (lower pin apex)  │
+    // │                                                             │
+    // │  TROUGH LINES (1 per Mi — nearest to current price):       │
+    // │    exp(lnL + 0·σ)        → "Mi·Out↓"    (outer trough=0)  │
+    // │    exp(lnL + (R-rUp)·σ)  → "Mi·UpPin↓"  (upper pin min)   │
+    // │    exp(lnL + (R-rLo)·σ)  → "Mi·LoPin↓"  (lower pin min)   │
+    // │  Only the single trough nearest to close is drawn.         │
+    // │                                                             │
+    // │  All lines extend to globalEndBar (shared right edge).     │
+    // │  Anti-overlap: horizontal label slide algorithm.            │
+    // └─────────────────────────────────────────────────────────────┘
+    //──────────────────────────────────────────────────────────────────
+
+    // ── Persistent arrays for S/R scanning (all 12 theoretical levels) ──
+    array<float>  srPrices = array.new<float>()
+    array<string> srNames  = array.new<string>()
+
+    if iShowRefLines and mCount > 0
+
+        string refLblSize = f_intToLabelSize(iRefLabelSize)
+
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+
+            float R    = mi.normRadius
+            float rUp  = mi.upperPinRad
+            float rLo  = mi.lowerPinRad
+            float sig  = mi.sigmaAtBar
+            float lnL  = mi.lnLow
+
+            // ── 3 Apex prices ──
+            float priceApexOut = math.exp(lnL + (R + R)   * sig)
+            float priceApexUp  = math.exp(lnL + (R + rUp) * sig)
+            float priceApexLo  = math.exp(lnL + (R + rLo) * sig)
+
+            // ── 3 Trough prices ──
+            float priceTroughOut = math.exp(lnL + 0.0 * sig)
+            float priceTroughUp  = math.exp(lnL + (R - rUp) * sig)
+            float priceTroughLo  = math.exp(lnL + (R - rLo) * sig)
+
+            // ── Collect ALL 6 levels for S/R scanning ──
+            array.push(srPrices, priceApexOut)
+            array.push(srNames, "M" + str.tostring(i) + "·Out↑")
+            array.push(srPrices, priceApexUp)
+            array.push(srNames, "M" + str.tostring(i) + "·UpPin↑")
+            array.push(srPrices, priceApexLo)
+            array.push(srNames, "M" + str.tostring(i) + "·LoPin↑")
+            array.push(srPrices, priceTroughOut)
+            array.push(srNames, "M" + str.tostring(i) + "·Out↓")
+            array.push(srPrices, priceTroughUp)
+            array.push(srNames, "M" + str.tostring(i) + "·UpPin↓")
+            array.push(srPrices, priceTroughLo)
+            array.push(srNames, "M" + str.tostring(i) + "·LoPin↓")
+
+            // Curves extend dynamically to at least bar_index
+            int lineEnd = bar_index
+            string refStyle = f_lineStyleFromStr(iRefLineStyle)
+            color refLblBg = color.new(iRefLineColor, 85)
+
+            // ── Draw reference lines: each type gated by its individual toggle ──
+            // Labels display price only for clean visual presentation.
+            // S/R detection uses srPrices[] independently — all 6 levels are
+            // always populated regardless of line visibility.
+
+            // Outer Apex (y = 2R)
+            if iRefOuterApex
+                line lnAO = line.new(mi.centerBarIdx, priceApexOut, lineEnd, priceApexOut,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnAO)
+                label lblAO = label.new(lineEnd, priceApexOut,
+                     str.tostring(priceApexOut, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblAO)
+
+            // Upper Pin Apex (y = R + r_up)
+            if iRefUpperPinApex
+                line lnAU = line.new(mi.centerBarIdx, priceApexUp, lineEnd, priceApexUp,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnAU)
+                label lblAU = label.new(lineEnd, priceApexUp,
+                     str.tostring(priceApexUp, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblAU)
+
+            // Lower Pin Apex (y = R + r_lo)
+            if iRefLowerPinApex
+                line lnAL = line.new(mi.centerBarIdx, priceApexLo, lineEnd, priceApexLo,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnAL)
+                label lblAL = label.new(lineEnd, priceApexLo,
+                     str.tostring(priceApexLo, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblAL)
+
+            // ── Trough lines ──
+
+            // Outer Trough (y = 0)
+            if iRefOuterTrough
+                line lnTO = line.new(mi.centerBarIdx, priceTroughOut, lineEnd, priceTroughOut,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnTO)
+                label lblTO = label.new(lineEnd, priceTroughOut,
+                     str.tostring(priceTroughOut, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblTO)
+
+            // Upper Pin Trough (y = R − r_up)
+            if iRefUpperPinTrough
+                line lnTU = line.new(mi.centerBarIdx, priceTroughUp, lineEnd, priceTroughUp,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnTU)
+                label lblTU = label.new(lineEnd, priceTroughUp,
+                     str.tostring(priceTroughUp, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblTU)
+
+            // Lower Pin Trough (y = R − r_lo)
+            if iRefLowerPinTrough
+                line lnTL = line.new(mi.centerBarIdx, priceTroughLo, lineEnd, priceTroughLo,
+                     color = iRefLineColor, style = refStyle, width = iRefLineWidth)
+                array.push(refLines, lnTL)
+                label lblTL = label.new(lineEnd, priceTroughLo,
+                     str.tostring(priceTroughLo, format.mintick),
+                     color = refLblBg, textcolor = iRefLineColor,
+                     style = label.style_label_left, size = refLblSize)
+                array.push(traceLabels, lblTL)
+
+         
+
+    // ── Also populate srPrices when refLines are off (S/R still needs them) ──
+    if not iShowRefLines and mCount > 0
+        for i = 0 to mCount - 1
+            MaximaInfo mi = array.get(maxima, i)
+            float R = mi.normRadius
+            float rUp = mi.upperPinRad
+            float rLo = mi.lowerPinRad
+            float sig = mi.sigmaAtBar
+            float lnL = mi.lnLow
+            array.push(srPrices, math.exp(lnL + (R + R)   * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·Out↑")
+            array.push(srPrices, math.exp(lnL + (R + rUp) * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·UpPin↑")
+            array.push(srPrices, math.exp(lnL + (R + rLo) * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·LoPin↑")
+            array.push(srPrices, math.exp(lnL + 0.0 * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·Out↓")
+            array.push(srPrices, math.exp(lnL + (R - rUp) * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·UpPin↓")
+            array.push(srPrices, math.exp(lnL + (R - rLo) * sig))
+            array.push(srNames, "M" + str.tostring(i) + "·LoPin↓")
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 2c: S/R Detection from ALL Cycloid Reference Levels
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  Scans all 6 theoretical levels per Mi (3 apex + 3 trough) │
+    // │  across all selected Mi's (up to 12 levels total).         │
+    // │  Finds the single nearest level ABOVE and BELOW the basis  │
+    // │  close price. These become Resistance and Support.          │
+    // └─────────────────────────────────────────────────────────────┘
+    //──────────────────────────────────────────────────────────────────
+
+    float basisCloseForSR = iBasisMode == "Closed Candle" ? nz(close[1], close) : close
+
+    float   srResPrice = na
+    string  srResName  = ""
+    float   srSupPrice = na
+    string  srSupName  = ""
+
+    int nSR = array.size(srPrices)
+    if nSR > 0
+        float minDistAbove = 1e18
+        float minDistBelow = 1e18
+        for s = 0 to nSR - 1
+            float p = array.get(srPrices, s)
+            float d = p - basisCloseForSR
+            if d > 0 and d < minDistAbove
+                minDistAbove := d
+                srResPrice   := p
+                srResName    := array.get(srNames, s)
+            if d < 0 and math.abs(d) < minDistBelow
+                minDistBelow := math.abs(d)
+                srSupPrice   := p
+                srSupName    := array.get(srNames, s)
+
+    // ── Store S/R results into globals for dashboard scope ──
+    gSrResPrice := srResPrice
+    gSrResName  := srResName
+    gSrSupPrice := srSupPrice
+    gSrSupName  := srSupName
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK D: Dashboard — Part 1 (Header, Mi Blocks, S/R, CVCA)
+//══════════════════════════════════════════════════════════════════════════════
+if barstate.islast
+    int mCount = array.size(maxima)
+
+    // Restore S/R results from global state
+    float   srResPrice = gSrResPrice
+    string  srResName  = gSrResName
+    float   srSupPrice = gSrSupPrice
+    string  srSupName  = gSrSupName
+
+    // Recompute basis close for S/R status (cross-scope, originally in BLOCK C)
+    float basisCloseForSR = iBasisMode == "Closed Candle" ? nz(close[1], close) : close
+
+    //──────────────────────────────────────────────────────────────────
+    // Step 3: Dashboard — Complete Rebuild
+    // ┌──────────────────────────────────────────────────────────────┐
+    // │  ⊚  CONCENTRIC CANDLES — ARISTOTELIAN CYCLOIDS  ⊚          │
+    // │  σ_bar = ... │ Lookback = ... │ Rev = ...                   │
+    // ├──────────────────────────────────────────────────────────────┤
+    // │  ▓▓▓  M0  ▓▓▓                                              │
+    // │  Offset: ..   Length: ..   Mid: ..                           │
+    // │  ⊚ Outer Apex      │ price  │ ⊚ Outer Trough     │ price   │
+    // │  ▲ Upper Pin Apex  │ price  │ ▲ Upper Pin Trough │ price   │
+    // │  ▼ Lower Pin Apex  │ price  │ ▼ Lower Pin Trough │ price   │
+    // ├──────────────────────────────────────────────────────────────┤
+    // │  [R] RESISTANCE: line_name = price                          │
+    // │  ⚠️  STATUS                                                 │
+    // │  [S] SUPPORT: line_name = price                             │
+    // ├─────────────────────┬────────────────────────────────────────┤
+    // │  VOLUME ENGINE      │  Basis • VOLUMETRIC                   │
+    // │  Engine: ...        │  ◆ Total: ...                         │
+    // │  LTF: ...           │  ▲ Buy: ...                           │
+    // │  Valid: ...         │  ▼ Sell: ...                           │
+    // │  Period: ...        │  Δ Delta: ...                          │
+    // └─────────────────────┴────────────────────────────────────────┘
+    //──────────────────────────────────────────────────────────────────
+    if iShowDash
+        if not na(dashTable)
+            table.delete(dashTable)
+
+        LangText L = f_getLangPack(iLang)
+        string tAlign = f_textAlign(iLang)
+        int fs = iDashFont
+        string curSym = f_currSymbol()
+
+        // Row calculation: title(1) + sigma(1) + per Mi: header(1) + info(1) + lines(3) = 5
+        // + S/R section(3) + volume section(2) + optional warning(1)
+        int cvcaRows = iShowCVCA ? 4 : 0
+        int miRowsPer = iShowMiPrices ? 5 : 2
+        int totalRows = 2 + mCount * miRowsPer + 3 + cvcaRows + 2 + 1
+        int totalCols = 6
+
+        dashTable := table.new(f_dashPosition(iDashPos), totalCols, totalRows,
+             bgcolor      = color.new(color.rgb(10, 10, 20), 15),
+             frame_color  = color.new(color.rgb(80, 80, 120), 40),
+             frame_width  = 2,
+             border_color = color.new(color.rgb(60, 60, 90), 60),
+             border_width = 1)
+
+        int row = 0
+
+        // ── Title Row ────────────────────────────────────────
+        table.cell(dashTable, 0, row,
+             "⊚  " + L.title + "  ⊚",
+             text_color  = color.rgb(220, 220, 255),
+             bgcolor     = color.new(color.rgb(30, 30, 60), 20),
+             text_size   = fs,
+             text_halign = text.align_center,
+             tooltip     = L.tt_title)
+        table.merge_cells(dashTable, 0, row, 5, row)
+        row += 1
+
+        // ── σ_bar Information Row ────────────────────────────
+        string sigInfo = L.sigma_lbl + " = " + str.tostring(safeSigma, "#.######") +
+             "  │  " + L.lookback_lbl + " = " + str.tostring(iSigmaLen) + " " + L.bar_unit
+        table.cell(dashTable, 0, row, sigInfo,
+             text_color  = color.rgb(180, 180, 210),
+             bgcolor     = color.new(color.rgb(20, 20, 40), 25),
+             text_size   = fs,
+             text_halign = text.align_center,
+             tooltip     = L.tt_sigma)
+        table.merge_cells(dashTable, 0, row, 5, row)
+        row += 1
+
+        // ── Per-Mi Data Blocks ──────────────────────────────
+        if mCount > 0
+            for i = 0 to mCount - 1
+                MaximaInfo mi = array.get(maxima, i)
+                color zCol = f_zoneColor(i)
+
+                float R    = mi.normRadius
+                float rUp  = mi.upperPinRad
+                float rLo  = mi.lowerPinRad
+                float sig  = mi.sigmaAtBar
+                float lnL  = mi.lnLow
+
+                // Compute all 6 price levels for this Mi
+                float pApexOut = math.exp(lnL + (R + R)   * sig)
+                float pApexUp  = math.exp(lnL + (R + rUp) * sig)
+                float pApexLo  = math.exp(lnL + (R + rLo) * sig)
+                float pTroughOut = math.exp(lnL + 0.0 * sig)
+                float pTroughUp  = math.exp(lnL + (R - rUp) * sig)
+                float pTroughLo  = math.exp(lnL + (R - rLo) * sig)
+
+                // Header band
+                table.cell(dashTable, 0, row,
+                     "▓▓▓  M" + str.tostring(i) + "  ▓▓▓",
+                     text_color  = color.white,
+                     bgcolor     = zCol,
+                     text_size   = fs,
+                     text_halign = text.align_center,
+                     tooltip     = L.tt_mi_header)
+                table.merge_cells(dashTable, 0, row, 5, row)
+                row += 1
+
+                // Info row: Offset | Length | Mid
+                color dBgInfo = color.new(color.rgb(15, 15, 30), 20)
+                color lblCol  = color.rgb(140, 140, 170)
+
+                table.cell(dashTable, 0, row, L.offset_lbl,
+                     text_color = lblCol, bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_right, tooltip = L.tt_offset)
+                table.cell(dashTable, 1, row, str.tostring(mi.offset),
+                     text_color = color.white, bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_left, tooltip = L.tt_offset)
+                table.cell(dashTable, 2, row, L.length_lbl,
+                     text_color = lblCol, bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_right, tooltip = L.tt_length)
+                table.cell(dashTable, 3, row, str.tostring(mi.rawLength, format.mintick),
+                     text_color = color.white, bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_left, tooltip = L.tt_length)
+                table.cell(dashTable, 4, row, L.mid_lbl,
+                     text_color = lblCol, bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_right, tooltip = L.tt_mid)
+                table.cell(dashTable, 5, row,
+                     str.tostring(mi.midPrice, format.mintick) + " " + curSym,
+                     text_color = color.rgb(255, 215, 80), bgcolor = dBgInfo, text_size = fs,
+                     text_halign = text.align_left, tooltip = L.tt_mid)
+                row += 1
+
+                // Line rows: 3 rows × (apex left | trough right)
+                // Gated by iShowMiPrices toggle (default OFF)
+                if iShowMiPrices
+                    color dBg1 = color.new(color.rgb(10, 10, 25), 25)
+                    color dBg2 = color.new(color.rgb(20, 10, 10), 25)
+                    color dBg3 = color.new(color.rgb(10, 10, 20), 25)
+                    color numCol = color.rgb(120, 220, 255)
+
+                    // Row: Outer Apex | Outer Trough
+                    table.cell(dashTable, 0, row, "⊚ " + L.outer_apex,
+                         text_color = numCol, bgcolor = dBg1, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_outer_apex)
+                    table.cell(dashTable, 1, row, str.tostring(pApexOut, format.mintick),
+                         text_color = numCol, bgcolor = dBg1, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 2, row, " ",
+                         text_color = lblCol, bgcolor = dBg1, text_size = fs,
+                         text_halign = text.align_center)
+                    table.cell(dashTable, 3, row, "⊚ " + L.outer_trough,
+                         text_color = color.rgb(180, 180, 210), bgcolor = dBg1, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_outer_trough)
+                    table.cell(dashTable, 4, row, str.tostring(pTroughOut, format.mintick),
+                         text_color = color.rgb(180, 180, 210), bgcolor = dBg1, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 5, row, " ",
+                         bgcolor = dBg1, text_size = fs)
+                    row += 1
+
+                    // Row: Upper Pin Apex | Upper Pin Trough
+                    color upCol = color.rgb(255, 130, 130)
+                    table.cell(dashTable, 0, row, "▲ " + L.upper_pin_apex,
+                         text_color = upCol, bgcolor = dBg2, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_upper_pin_apex)
+                    table.cell(dashTable, 1, row, str.tostring(pApexUp, format.mintick),
+                         text_color = upCol, bgcolor = dBg2, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 2, row, " ",
+                         text_color = lblCol, bgcolor = dBg2, text_size = fs,
+                         text_halign = text.align_center)
+                    table.cell(dashTable, 3, row, "▲ " + L.upper_pin_trough,
+                         text_color = color.rgb(200, 150, 150), bgcolor = dBg2, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_upper_pin_trough)
+                    table.cell(dashTable, 4, row, str.tostring(pTroughUp, format.mintick),
+                         text_color = color.rgb(200, 150, 150), bgcolor = dBg2, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 5, row, " ",
+                         bgcolor = dBg2, text_size = fs)
+                    row += 1
+
+                    // Row: Lower Pin Apex | Lower Pin Trough
+                    color loCol = color.rgb(180, 140, 255)
+                    table.cell(dashTable, 0, row, "▼ " + L.lower_pin_apex,
+                         text_color = loCol, bgcolor = dBg3, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_lower_pin_apex)
+                    table.cell(dashTable, 1, row, str.tostring(pApexLo, format.mintick),
+                         text_color = loCol, bgcolor = dBg3, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 2, row, " ",
+                         text_color = lblCol, bgcolor = dBg3, text_size = fs,
+                         text_halign = text.align_center)
+                    table.cell(dashTable, 3, row, "▼ " + L.lower_pin_trough,
+                         text_color = color.rgb(160, 130, 200), bgcolor = dBg3, text_size = fs,
+                         text_halign = tAlign, tooltip = L.tt_lower_pin_trough)
+                    table.cell(dashTable, 4, row, str.tostring(pTroughLo, format.mintick),
+                         text_color = color.rgb(160, 130, 200), bgcolor = dBg3, text_size = fs,
+                         text_halign = text.align_left, tooltip = L.tt_price)
+                    table.cell(dashTable, 5, row, " ",
+                         bgcolor = dBg3, text_size = fs)
+                    row += 1
+
+        // ── S/R Section ─────────────────────────────────────
+        // Resistance
+        string resTxt = L.no_sr_above
+        if not na(srResPrice)
+            resTxt := "[R] " + L.resistance + ": " + srResName + " = " + str.tostring(srResPrice, format.mintick) + " " + curSym
+        table.cell(dashTable, 0, row, resTxt,
+             text_color = color.white, bgcolor = color.new(color.rgb(244, 67, 54), 75),
+             text_size = fs, text_halign = tAlign, tooltip = L.tt_resistance)
+        table.merge_cells(dashTable, 0, row, 5, row)
+        row += 1
+
+        // Status
+        string basisLabel = iBasisMode == "Closed Candle" ? L.basis_closed : L.basis_current
+        string statTxt = L.waiting
+        color  statCol = color.gray
+        if not na(srResPrice) and not na(srSupPrice)
+            float srRange = srResPrice - srSupPrice
+            float fromRes = srResPrice - basisCloseForSR
+            float fromSup = basisCloseForSR - srSupPrice
+            if basisCloseForSR > srResPrice
+                statTxt := L.breakout
+                statCol := color.rgb(0, 230, 118)
+            else if basisCloseForSR < srSupPrice
+                statTxt := L.broken
+                statCol := color.rgb(255, 0, 0)
+            else if srRange > 0 and fromRes / srRange < 0.15
+                statTxt := L.testing_res
+                statCol := color.rgb(255, 205, 3)
+            else if srRange > 0 and fromSup / srRange < 0.15
+                statTxt := L.at_support
+                statCol := color.rgb(0, 230, 118)
+            else
+                statTxt := L.mid_range
+        else if not na(srResPrice)
+            statTxt := L.testing_res
+            statCol := color.rgb(255, 205, 3)
+        else if not na(srSupPrice)
+            statTxt := L.at_support
+            statCol := color.rgb(0, 230, 118)
+
+        table.cell(dashTable, 0, row, statTxt + "  (" + basisLabel + ")",
+             text_color = statCol, bgcolor = color.new(color.rgb(30, 30, 50), 20),
+             text_size = fs, text_halign = tAlign, tooltip = L.tt_status)
+        table.merge_cells(dashTable, 0, row, 5, row)
+        row += 1
+
+        // Support
+        string supTxt = L.no_sr_below
+        if not na(srSupPrice)
+            supTxt := "[S] " + L.support + ": " + srSupName + " = " + str.tostring(srSupPrice, format.mintick) + " " + curSym
+        table.cell(dashTable, 0, row, supTxt,
+             text_color = color.white, bgcolor = color.new(color.rgb(0, 230, 118), 75),
+             text_size = fs, text_halign = tAlign, tooltip = L.tt_support)
+        table.merge_cells(dashTable, 0, row, 5, row)
+        row += 1
+
+        // ── CVCA: Cycloid-Volume Contact Analysis (3-Row Layout) ──
+        if iShowCVCA
+            // Section header
+            table.cell(dashTable, 0, row, "🎯  " + L.cvca_title + "  🎯",
+                 text_color  = color.rgb(255, 220, 100),
+                 bgcolor     = color.new(color.rgb(40, 35, 10), 15),
+                 text_size   = fs,
+                 text_halign = text.align_center,
+                 tooltip     = L.cvca_tt_section)
+            table.merge_cells(dashTable, 0, row, 5, row)
+            row += 1
+
+            int nCvca = array.size(cvcaContacts)
+
+            if nCvca == 0
+                string _noContactTxt = L.cvca_no_contact
+                string _noContactTT  = L.cvca_tt_section
+                table.cell(dashTable, 0, row, _noContactTxt,
+                     text_color  = color.rgb(140, 140, 160),
+                     bgcolor     = color.new(color.rgb(25, 25, 40), 20),
+                     text_size   = fs,
+                     text_halign = text.align_center,
+                     tooltip     = _noContactTT)
+                table.merge_cells(dashTable, 0, row, 5, row)
+                row += 1
+                // Fill remaining reserved rows with blank
+                for _pad = 0 to 1
+                    table.cell(dashTable, 0, row, " ",
+                         bgcolor = color.new(color.rgb(25, 25, 40), 20), text_size = fs)
+                    table.merge_cells(dashTable, 0, row, 5, row)
+                    row += 1
+            else
+                // Display only the highest-conviction contact (index 0, already sorted)
+                ContactEvent ce = array.get(cvcaContacts, 0)
+                color cvcaBg1 = color.new(color.rgb(18, 18, 38), 15)
+                color cvcaBg2 = color.new(color.rgb(15, 15, 32), 20)
+                color cvcaBg3 = color.new(color.rgb(20, 18, 35), 18)
+                color dimCol  = color.rgb(140, 140, 170)
+
+                // ── Pre-compute readable labels (localized) ──
+                string dirTxt = ce.ax1_direction == "PASSED_UP"      ? L.cvca_dir_passed_up :
+                     ce.ax1_direction == "PASSED_DN"      ? L.cvca_dir_passed_dn :
+                     ce.ax1_direction == "STOPPED"         ? L.cvca_dir_stopped :
+                     ce.ax1_direction == "WICK_BOUNCE_UP" ? L.cvca_dir_wick_up : L.cvca_dir_wick_dn
+                string zoneTxt = ce.ax3_zone == "ZONE_APEX" ? L.cvca_r2_zone_apex :
+                     ce.ax3_zone == "ZONE_TROUGH" ? L.cvca_r2_zone_trough : L.cvca_r2_zone_mid
+                string pUpPct  = str.tostring(ce.probUp * 100, "#.#") + "%"
+                string convPct = str.tostring(ce.conviction * 100, "#.#") + "%"
+
+                // ── Volume / Delta descriptors ──
+                string volTxt = ""
+                string deltaTxt = ""
+                string fpStatus = ""
+                if ce.fpValid
+                    volTxt := not na(ce.ax4_ratio) ? "×" + str.tostring(ce.ax4_ratio, "#.##") : "n/a"
+                    // Delta trend: classifies how buy/sell imbalance evolved.
+                    // Zero-delta edge cases handled first to prevent fall-through misclassification.
+                    if ce.currDelta == 0
+                        // Current delta exactly balanced — weakened from any prior state
+                        deltaTxt := "Weakening"
+                    else if ce.histDelta == 0
+                        // Historical was neutral, current has direction — flipped
+                        deltaTxt := "Flipped"
+                    else if (ce.histDelta > 0 and ce.currDelta < 0) or (ce.histDelta < 0 and ce.currDelta > 0)
+                        // Sign reversed between maxima and current
+                        deltaTxt := "Flipped"
+                    else if (ce.histDelta > 0 and ce.currDelta > 0 and ce.currDelta < ce.histDelta) or
+                         (ce.histDelta < 0 and ce.currDelta < 0 and math.abs(ce.currDelta) < math.abs(ce.histDelta))
+                        // Same sign but magnitude decreased
+                        deltaTxt := "Weakening"
+                    else
+                        // Same sign and magnitude held or grew
+                        deltaTxt := "Strengthened"
+                    fpStatus := L.tt_r1_fp_valid
+                else
+                    volTxt   := "n/a"
+                    deltaTxt := "n/a"
+                    fpStatus := L.tt_r1_fp_nodata
+
+                // ═══════════════════════════════════════════════════
+                // ROW 1: Natural Language Contact Sentence
+                // Full-width merge (0–5). Dynamically built from
+                // ContactEvent fields + LangText sentence fragments.
+                // Footprint validity moved to Volume Engine section.
+                // ═══════════════════════════════════════════════════
+
+                color dirCol = ce.ax1_direction == "PASSED_UP" or ce.ax1_direction == "WICK_BOUNCE_UP" ?
+                     color.rgb(0, 230, 118) : ce.ax1_direction == "STOPPED" ?
+                     color.rgb(255, 235, 59) : color.rgb(255, 82, 82)
+
+                // Direction fragment for sentence (localized)
+                string dirSent = ce.ax1_direction == "PASSED_UP"      ? L.cvca_dir_passed_up :
+                     ce.ax1_direction == "PASSED_DN"      ? L.cvca_dir_passed_dn :
+                     ce.ax1_direction == "STOPPED"         ? L.cvca_dir_stopped :
+                     ce.ax1_direction == "WICK_BOUNCE_UP" ? L.cvca_dir_wick_up : L.cvca_dir_wick_dn
+
+                // Zone fragment for sentence (localized)
+                string zoneSent = ce.ax3_zone == "ZONE_APEX"   ? L.cvca_zone_apex :
+                     ce.ax3_zone == "ZONE_TROUGH" ? L.cvca_zone_trough : L.cvca_zone_mid
+
+                // Confluence fragment — omitted for 0 or 1, singular for 2, plural for 3+
+                string confSent = ""
+                if ce.ax7_confCount == 2
+                    confSent := " " + L.cvca_conf_one
+                else if ce.ax7_confCount >= 3
+                    confSent := " " + L.cvca_conf_pre + " " + str.tostring(ce.ax7_confCount - 1) + " " + L.cvca_conf_post
+
+                // Assemble the human-readable sentence in 2 compact lines.
+                // Line 1: contact identity + price + direction + close
+                // Line 2: zone location + confluence (if any)
+                // Line 1: Contact identity — which curve touched and at what price
+                string sentLine1 =
+                     L.cvca_sent_prefix + " " + ce.curveName + " " +
+                     L.cvca_sent_cycloid_at + " " +
+                     str.tostring(ce.contactPrice, format.mintick) + "."
+                // Line 2: What the candle did at that contact — direction + live close
+                string sentLine2 =
+                     dirSent + " — " +
+                     L.cvca_sent_closing + " " +
+                     str.tostring(close, format.mintick) + "."
+                // Line 3: Zone name + compact confluence count (prefix dropped for width balance)
+                string confShort = ce.ax7_confCount > 1 ?
+                     " · ×" + str.tostring(ce.ax7_confCount) + " curves." : "."
+                string sentLine3 = zoneSent + confShort
+                string sentenceTxt = sentLine1 + "\n" + sentLine2 + "\n" + sentLine3
+
+                table.cell(dashTable, 0, row, sentenceTxt,
+                     text_color = dirCol, bgcolor = cvcaBg1, text_size = fs,
+                     text_halign = tAlign,
+                     tooltip = L.tt_r1_hdr + "\n" +
+                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                         L.tt_r1_curve_lbl + " " + ce.curveName + "\n" +
+                         L.tt_r1_cprice_lbl + " " + str.tostring(ce.contactPrice, format.mintick) + "\n" +
+                         L.tt_r1_ctype_lbl + " " + (ce.ax2_curveType == "CRV_OUT" ? L.tt_r1_ctype_out :
+                         ce.ax2_curveType == "CRV_UP" ? L.tt_r1_ctype_up :
+                         L.tt_r1_ctype_lo) + "\n" +
+                         L.tt_r1_volsrc + "\n\n" +
+                         L.tt_r1_dir_lbl + " " + dirTxt + "\n" +
+                         L.tt_r1_dir_block + "\n\n" +
+                         L.tt_r1_zone_lbl + " " + zoneTxt + "\n" +
+                         L.tt_r1_zone_block + "\n\n" +
+                         L.tt_r1_conf_lbl + " ×" + str.tostring(ce.ax7_confCount) + " " + L.tt_r1_conf_unit + "\n" +
+                         L.tt_r1_fp_lbl + " " + fpStatus +
+                         (ce.fpValid ?
+                         "\n" + L.tt_r1_fp_active_msg :
+                         "\n" + L.tt_r1_fp_none_msg))
+                table.merge_cells(dashTable, 0, row, 5, row)
+                row += 1
+
+                // ═══════════════════════════════════════════════════
+                // ROW 2: Natural Language — Behavior + P(↑) + Conviction
+                // Full-width merge (0–5). Dynamic sentence from ce.* fields
+                // + LangText fragments. Beginner-friendly wording.
+                // Tooltip retains full technical breakdown.
+                // ═══════════════════════════════════════════════════
+
+                // Probability direction label (localized)
+                string r2ProbLabel = ce.probUp >= 0.5 ? L.cvca_r2_prob_up : L.cvca_r2_prob_dn
+
+                // Curve type short name (localized)
+                string r2CrvName = ce.ax2_curveType == "CRV_OUT" ? L.cvca_r2_crv_outer :
+                     ce.ax2_curveType == "CRV_UP" ? L.cvca_r2_crv_upper : L.cvca_r2_crv_lower
+
+                // Zone short name (localized)
+                string r2ZoneName = ce.ax3_zone == "ZONE_APEX" ? L.cvca_r2_zone_apex :
+                     ce.ax3_zone == "ZONE_TROUGH" ? L.cvca_r2_zone_trough : L.cvca_r2_zone_mid
+
+                // Line 1: Behavior classification label only
+                string r2Line1 = L.cvca_r2_signal + " " + ce.behavior + "."
+
+                // Line 2: Directional probability + conviction score
+                string r2Line2 = pUpPct + " " + r2ProbLabel +
+                     " — " + convPct + " " + L.cvca_r2_conviction + "."
+
+                // Line 3: Natural language axis contribution + zone confidence
+                // Classifies each P(↑) axis as bullish/bearish factor by name.
+                // Raw percentages preserved in tooltip only.
+                float _sigThresh = 0.02
+                string _bullAxes = ""
+                string _bearAxes = ""
+                int _bullN = 0
+                int _bearN = 0
+                if ce.pBias_dir > _sigThresh
+                    _bullAxes += (_bullN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_dir
+                    _bullN += 1
+                else if ce.pBias_dir < -_sigThresh
+                    _bearAxes += (_bearN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_dir
+                    _bearN += 1
+                if ce.pBias_delta > _sigThresh
+                    _bullAxes += (_bullN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_delta
+                    _bullN += 1
+                else if ce.pBias_delta < -_sigThresh
+                    _bearAxes += (_bearN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_delta
+                    _bearN += 1
+                if ce.pBias_abs > _sigThresh
+                    _bullAxes += (_bullN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_abs
+                    _bullN += 1
+                else if ce.pBias_abs < -_sigThresh
+                    _bearAxes += (_bearN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_abs
+                    _bearN += 1
+                if ce.pBias_vol > _sigThresh
+                    _bullAxes += (_bullN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_vol
+                    _bullN += 1
+                else if ce.pBias_vol < -_sigThresh
+                    _bearAxes += (_bearN > 0 ? " " + L.cvca_r2_l3_and + " " : "") + L.cvca_r2_vol
+                    _bearN += 1
+                string _axesSent = ""
+                if _bullN > 0 and _bearN > 0
+                    _axesSent := _bullAxes + " " + L.cvca_r2_l3_push_up + ".\n" + _bearAxes + " " + L.cvca_r2_l3_push_dn + "."
+                else if _bullN > 0
+                    _axesSent := _bullAxes + " " + L.cvca_r2_l3_push_up + "."
+                else if _bearN > 0
+                    _axesSent := _bearAxes + " " + L.cvca_r2_l3_push_dn + "."
+                else
+                    _axesSent := L.cvca_r2_l3_no_factor
+                // Zone confidence qualifier — placed on its own line to prevent dashboard width bloat
+                string _zoneQ = ""
+                if ce.conv_zone >= 1.3
+                    _zoneQ := r2CrvName + "@" + r2ZoneName + " — " + L.cvca_r2_l3_zone_strong + "."
+                else if ce.conv_zone >= 1.05
+                    _zoneQ := r2CrvName + "@" + r2ZoneName + " — " + L.cvca_r2_l3_zone_mod + "."
+                string _zoneQLine = _zoneQ != "" ? "\n" + _zoneQ : ""
+                string r2Line3 = ce.fpValid ? _axesSent + _zoneQLine : L.cvca_r2_l3_geo_only + _zoneQLine
+
+                table.cell(dashTable, 0, row, r2Line1 + "\n" + r2Line2 + "\n" + r2Line3,
+                     text_color = ce.behaviorColor, bgcolor = cvcaBg2, text_size = fs,
+                     text_halign = tAlign,
+                     tooltip = L.tt_r2_hdr + "\n" +
+                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                         L.tt_r2_beh_lbl + " " + ce.behavior + "\n" +
+                         L.tt_r2_cascade + "\n\n" +
+                         L.tt_r2_prob_eq + " " + pUpPct + "\n" +
+                         L.tt_r2_base50 + " " + L.cvca_r2_dir + "(" +
+                         (ce.pBias_dir >= 0 ? "+" : "") + str.tostring(ce.pBias_dir * 100, "#.#") + "%) + " + L.cvca_r2_delta + "(" +
+                         (ce.pBias_delta >= 0 ? "+" : "") + str.tostring(ce.pBias_delta * 100, "#.#") + "%) + " + L.cvca_r2_abs + "(" +
+                         (ce.pBias_abs >= 0 ? "+" : "") + str.tostring(ce.pBias_abs * 100, "#.#") + "%) + " + L.cvca_r2_vol + "(" +
+                         (ce.pBias_vol >= 0 ? "+" : "") + str.tostring(ce.pBias_vol * 100, "#.#") + "%)\n\n" +
+                         L.tt_r2_conv_eq + " " + convPct + "\n" +
+                         L.tt_r2_base_lbl + " " + str.tostring(ce.conv_base * 100, "#") + "% × " + L.tt_r2_zone_lbl + " " +
+                         str.tostring(ce.conv_zone, "#.##") + " × " + L.tt_r2_vol_lbl + " " +
+                         str.tostring(ce.conv_vol, "#.##") + " × " + L.tt_r2_conf_lbl + " " +
+                         str.tostring(ce.conv_conf, "#.##"))
+                table.merge_cells(dashTable, 0, row, 5, row)
+                row += 1
+
+                // ═══════════════════════════════════════════════════
+                // ROW 3: Volume Ratio + Delta Trend + Footprint Data
+                // Full-width merge (0–5). Natural language sentence
+                // built from ce.* fields + LangText fragments.
+                // Tooltip retains full technical breakdown unchanged.
+                // ═══════════════════════════════════════════════════
+
+                // Volume magnitude color (unchanged logic)
+                color volRatCol = ce.fpValid ?
+                     (ce.ax4_volMag == "VOL_AMP" ? color.rgb(255, 235, 59) :
+                     ce.ax4_volMag == "VOL_DEP" ? color.rgb(120, 120, 140) : dimCol) :
+                     color.rgb(255, 205, 3)
+
+                // Build natural language 2-line sentence for ROW 3
+                string r3Txt = ""
+                if ce.fpValid
+                    // Volume magnitude label (localized)
+                    string r3VolLabel = ce.ax4_volMag == "VOL_AMP" ? L.cvca_r3_vol_amp :
+                         ce.ax4_volMag == "VOL_DEP" ? L.cvca_r3_vol_dep : L.cvca_r3_vol_prop
+
+                    // Delta trend label — split by bullish vs bearish direction (localized)
+                    // Uses currDelta for direction; falls back to histDelta when currDelta == 0
+                    string r3DeltaLabel = ""
+                    if deltaTxt == "Strengthened"
+                        r3DeltaLabel := ce.currDelta >= 0 ? L.cvca_r3_delta_str : L.cvca_r3_delta_str_s
+                    else if deltaTxt == "Weakening"
+                        if ce.currDelta > 0
+                            r3DeltaLabel := L.cvca_r3_delta_weak
+                        else if ce.currDelta < 0
+                            r3DeltaLabel := L.cvca_r3_delta_weak_s
+                        else
+                            // currDelta == 0: weakened to neutral — use histDelta for direction label
+                            r3DeltaLabel := ce.histDelta >= 0 ? L.cvca_r3_delta_weak : L.cvca_r3_delta_weak_s
+                    else if deltaTxt == "Flipped"
+                        r3DeltaLabel := ce.currDelta > 0 ? L.cvca_r3_delta_flip_b : L.cvca_r3_delta_flip_s
+
+                    // Line 1: Volume magnitude in natural language with intensity qualifier
+                    // Raw ×ratio moved to tooltip; cell uses verbal intensity (massively/strongly/∅)
+                    string _volIntensity = not na(ce.ax4_ratio) and ce.ax4_ratio > 10.0 ? L.cvca_r3_vol_extreme :
+                         not na(ce.ax4_ratio) and ce.ax4_ratio > 3.0 ? L.cvca_r3_vol_strong : ""
+                    string r3Line1 = L.cvca_r3_vol_prefix + " " + _volIntensity + r3VolLabel + "."
+
+                    // Line 2: Delta trend direction only
+                    string r3Line2 = r3DeltaLabel + "."
+
+                    // Line 3: Human-labeled volume comparison at contact price
+                    // Maxima quiet → short notice + current breakdown.
+                    // Maxima active → both sides labeled with Buy/Sell tags.
+                    string _histPart = ce.histTotal < 1.0 ?
+                         L.cvca_r3_quiet_here :
+                         L.cvca_r3_maxima_lbl + " " + L.cvca_r3_buy_lbl + " " + f_formatVol(ce.histBuy) +
+                         " " + L.cvca_r3_vs + " " + L.cvca_r3_sell_lbl + " " + f_formatVol(ce.histSell)
+                    string _currPart = L.cvca_r3_now_lbl + " " + L.cvca_r3_buy_lbl + " " +
+                         f_formatVol(ce.currBuy) + " " + L.cvca_r3_vs + " " +
+                         L.cvca_r3_sell_lbl + " " + f_formatVol(ce.currSell) + "."
+                    string r3Line3 = _histPart + "\n" + _currPart
+
+                    r3Txt := r3Line1 + "\n" + r3Line2 + "\n" + r3Line3
+                else
+                    // No footprint — clear fallback explaining geometry-only prediction
+                    // Third line is a blank spacer to maintain consistent 3-line row height
+                    r3Txt := L.cvca_r3_no_fp_l1 + "\n" + L.cvca_r3_no_fp_l2 + "\n" + " "
+
+                table.cell(dashTable, 0, row, r3Txt,
+                     text_color = volRatCol, bgcolor = cvcaBg3, text_size = fs,
+                     text_halign = tAlign,
+                     tooltip = L.tt_r3_hdr + " " + str.tostring(ce.contactPrice, format.mintick) + "\n" +
+                         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+                         (ce.fpValid ?
+                         L.tt_r3_vr_lbl + " " + volTxt + " (" + ce.ax4_volMag + ")\n" +
+                         L.tt_r3_vr_block + "\n\n" +
+                         L.tt_r3_dt_lbl + " " + deltaTxt + "\n" +
+                         L.tt_r3_dt_block + "\n\n" +
+                         "Maxima (M" + str.tostring(ce.miIdx) + ") " + L.tt_r3_mi_at_cp + "\n" +
+                         "  " + L.cvca_r3_buy_lbl + ": " + f_formatVol(ce.histBuy) + "  " + L.cvca_r3_sell_lbl + ": " + f_formatVol(ce.histSell) + "\n" +
+                         "  " + L.delta_vol + ": " + (ce.histDelta >= 0 ? "+" : "") + f_formatVol(math.abs(ce.histDelta)) +
+                         "  " + L.total_vol + ": " + f_formatVol(ce.histTotal) + "\n\n" +
+                         L.tt_r3_basis_at_cp + "\n" +
+                         "  " + L.cvca_r3_buy_lbl + ": " + f_formatVol(ce.currBuy) + "  " + L.cvca_r3_sell_lbl + ": " + f_formatVol(ce.currSell) + "\n" +
+                         "  " + L.delta_vol + ": " + (ce.currDelta >= 0 ? "+" : "") + f_formatVol(math.abs(ce.currDelta)) +
+                         "  " + L.total_vol + ": " + f_formatVol(ce.currTotal) :
+                         L.tt_r3_no_fp_tt))
+                table.merge_cells(dashTable, 0, row, 5, row)
+                row += 1
+
+        // ── Store final row index for BLOCK E continuation ──
+        gDashRow := row
+
+//══════════════════════════════════════════════════════════════════════════════
+// BLOCK E: Dashboard — Part 2 (Volume Engine)
+//══════════════════════════════════════════════════════════════════════════════
+if barstate.islast and iShowDash
+    // Restore shared dashboard state from previous scope
+    int row = gDashRow
+    LangText L = f_getLangPack(iLang)
+    string tAlign = f_textAlign(iLang)
+    int fs = iDashFont
+    string curSym = f_currSymbol()
+    int mCount = array.size(maxima)
+
+    // Recompute volume metrics (lightweight, avoids global overhead)
+    int basisOff = iBasisMode == "Closed Candle" ? 1 : 0
+    int intrabarValid = iSigmaLen
+    if iCalcMethod == "Intrabar (Precise)"
+        int acc = 0
+        for off = basisOff to basisOff + iSigmaLen - 1
+            bool ok = not na(u_intra[off]) and not na(d_intra[off])
+            if ok
+                acc += 1
+            else
+                break
+        intrabarValid := acc
+    int lookbackEff = iCalcMethod == "Intrabar (Precise)" ? math.min(iSigmaLen, intrabarValid) : iSigmaLen
+    float cBuy  = nz(volBuy[basisOff])
+    float cSell = nz(volSell[basisOff])
+    float cTot  = cBuy + cSell
+    float cDel  = cBuy - cSell
+
+    if not na(dashTable)
+        // ── Volume Engine Section ───────────────────────────
+        string engName = iCalcMethod == "Geometry (Approx)" ? L.engine_geo : L.engine_intra
+        string ltfTxt  = iCalcMethod == "Intrabar (Precise)" ? iLTF : "-"
+        string basisTxt = iBasisMode == "Closed Candle" ? L.basis_closed : L.basis_current
+
+        color vHdrBg  = color.new(color.rgb(45, 55, 72), 15)
+        color vRowBg  = color.new(color.rgb(55, 65, 81), 20)
+        color vTxtHdr = color.rgb(247, 250, 252)
+        color vTxtDim = color.rgb(160, 174, 192)
+        color vPos    = color.rgb(59, 130, 246)
+        color vNeg    = color.rgb(244, 63, 94)
+        color vDelCol = cDel >= 0 ? vPos : vNeg
+
+        // Volume header row (split: left = engine, right = volumetric)
+        table.cell(dashTable, 0, row, L.vol_engine,
+             text_color = vTxtHdr, bgcolor = vHdrBg, text_size = fs,
+             text_halign = tAlign, tooltip = L.tt_vol_engine)
+        table.merge_cells(dashTable, 0, row, 2, row)
+        table.cell(dashTable, 3, row, basisTxt + " • " + L.volumetric,
+             text_color = vTxtHdr, bgcolor = vHdrBg, text_size = fs,
+             text_halign = tAlign, tooltip = L.tt_volumetric)
+        table.merge_cells(dashTable, 3, row, 5, row)
+        row += 1
+
+        // Volume data row (split)
+        // Footprint validity status (moved from CVCA Row 1)
+        string fpStatusVE = L.fp_status_no_contact
+        if iShowCVCA
+            int nCvcaVE = array.size(cvcaContacts)
+            if nCvcaVE > 0
+                ContactEvent ceVE = array.get(cvcaContacts, 0)
+                fpStatusVE := ceVE.fpValid ? L.fp_status_active : L.fp_status_no_data
+
+        string leftTxt =
+             L.vol_engine + ": (" + engName + ")\n" +
+             L.intrabar_ltf + ": " + ltfTxt + "\n" +
+             L.valid_data + ": " + str.tostring(intrabarValid) + " " + L.bar_unit + "\n" +
+             L.global_period + ": " + str.tostring(lookbackEff) + " " + L.bar_unit + "\n" +
+             fpStatusVE
+
+        string deltaIcon = cDel >= 0 ? "▲" : "▼"
+        string deltaSign = cDel > 0 ? "+" : cDel < 0 ? "-" : ""
+        string rightTxt =
+             "◆  " + L.total_vol + ":   " + f_formatVol(cTot) + "\n" +
+             "▲  " + L.buy_vol + ":     " + f_formatVol(cBuy) + "\n" +
+             "▼  " + L.sell_vol + ":    " + f_formatVol(cSell) + "\n" +
+             deltaIcon + "  " + L.delta_vol + ":   " + deltaSign + f_formatVol(math.abs(cDel))
+
+        table.cell(dashTable, 0, row, leftTxt,
+             text_color = vTxtDim, bgcolor = vRowBg, text_size = fs,
+             text_halign = tAlign, tooltip = L.tt_vol_engine)
+        table.merge_cells(dashTable, 0, row, 2, row)
+        table.cell(dashTable, 3, row, rightTxt,
+             text_color = vDelCol, bgcolor = vRowBg, text_size = fs,
+             text_halign = tAlign, tooltip = L.tt_volumetric)
+        table.merge_cells(dashTable, 3, row, 5, row)
+        row += 1
+
+
+//══════════════════════════════════════════════════════════════════════════════
+//  GUIDELINES
+//══════════════════════════════════════════════════════════════════════════════
+//  1. Pine Script v6 (//@version=6), fully compliant with latest TradingView
+//     official documentation and API.
+//  2. All comments, tooltips, labels, and dashboard text in English (default).
+//     Multi-language support: English, Türkçe, العربية via LangText UDT.
+//  3. Modular block structure: Inputs → Constants → UDTs → Translation
+//     → Normalization → Volume Engine → Helpers → Core Logic → Cycloid Math
+//     → State → Execution.
+//  4. Modern type system: UDT (MaximaInfo, LangText), typed arrays, chart.point,
+//     polyline, tvta import for intrabar volume decomposition.
+//  5. Performance: all heavy computation gated behind barstate.islast.
+//  6. Indicator is overlay=true — all rendering (cycloid traces, reference
+//     lines, geometric markers, dashboard table) draws directly on the
+//     main price chart. No separate pane or force_overlay is used.
+//  7. Normalization engine uses σ_bar from the σ√t diffusion law — the only
+//     scientifically non-arbitrary bridge between price and time axes.
+//  8. Cycloid math uses exact parametric equations with phase anchoring.
+//  9. Volume engine supports dual mode: Geometric (OHLC proportional split)
+//     and Intrabar (lower timeframe tick decomposition via tvta library).
+// 10. S/R detection scans all cycloid reference levels (apex + trough)
+//     across all selected Mi's to find nearest lines above/below price.
+// 11. Dashboard includes professional tooltips on every cell for each
+//     of the three supported languages.
+//══════════════════════════════════════════════════════════════════════════════

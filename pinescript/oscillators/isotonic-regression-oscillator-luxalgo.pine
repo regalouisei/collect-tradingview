@@ -1,0 +1,174 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Isotonic Regression Oscillator [LuxAlgo]", "LuxAlgo - Isotonic Regression Oscillator", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+
+color GREEN             = #089981
+color RED               = #f23645
+
+string STYLE_GROUP      = "Style"
+string SOLID            = "Solid"
+string DASHED           = "Dashed"
+string DOTTED           = "Dotted"
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+
+float   srcInput        = input.source(close, "Source")
+int     lengthInput     = input.int(20, "Period", minval = 2)
+
+// --- Style ---
+color   bullColorInput  = input.color(GREEN, "Bullish Color" , group = STYLE_GROUP)
+color   bearColorInput  = input.color(RED,   "Bearish Color" , group = STYLE_GROUP)
+int     fitWidthInput   = input.int(2,       "Fit Line Width",  minval = 1,        group = STYLE_GROUP)
+string  fitStyleInput   = input.string(SOLID, "Fit Line Style", options = [SOLID, DASHED, DOTTED], group = STYLE_GROUP)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Methods
+//---------------------------------------------------------------------------------------------------------------------{
+
+// @variable [mse, pools, vals, weights] Tuple containing the results of an isotonic fit.
+type PavaResult
+    float   mse
+    int     pools
+    float[] vals
+    int[]   weights
+
+// @function Performs the Pool Adjacent Violators Algorithm (PAVA) for isotonic regression.
+// @param data Array of source values.
+// @param nonDecreasing Boolean indicating if the fit should be non-decreasing (true) or non-increasing (false).
+// @returns A PavaResult object containing the fit data.
+method pava(float[] data, bool nonDecreasing) =>
+    int n = data.size()
+    
+    // Stacks for pool values and weights
+    float[] poolVals    = array.new_float(0)
+    int[]   poolWeights = array.new_int(0)
+    
+    // Build pools
+    for i = 0 to n - 1
+        float currentVal    = data.get(i)
+        float currentPool   = currentVal
+        int   currentWeight = 1
+        
+        while poolVals.size() > 0
+            float prevPool   = poolVals.last()
+            bool  violation  = nonDecreasing ? prevPool > currentPool : prevPool < currentPool
+            
+            if violation
+                int   prevWeight = poolWeights.pop()
+                float lastPool   = poolVals.pop()
+                
+                // Merge pools: weighted average
+                currentPool   := (lastPool * prevWeight + currentPool * currentWeight) / (prevWeight + currentWeight)
+                currentWeight += prevWeight
+            else
+                break
+        
+        poolVals.push(currentPool)
+        poolWeights.push(currentWeight)
+    
+    // Calculate MSE
+    float totalError = 0.0
+    int   idx        = 0
+    for j = 0 to poolVals.size() - 1
+        float pVal    = poolVals.get(j)
+        int   pWeight = poolWeights.get(j)
+        for k = 1 to pWeight
+            totalError += math.pow(data.get(idx) - pVal, 2)
+            idx += 1
+            
+    PavaResult.new(totalError / n, poolVals.size(), poolVals, poolWeights)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+
+float oscillatorValue = 0.0
+
+var parsedFitStyle = switch fitStyleInput
+    SOLID  => line.style_solid
+    DASHED => line.style_dashed
+    DOTTED => line.style_dotted
+
+if bar_index >= lengthInput
+    float[] data = array.new_float(0)
+    for i = 0 to lengthInput - 1
+        data.push(srcInput[lengthInput - 1 - i])
+
+    // Get fits
+    PavaResult incFit = data.pava(true)
+    PavaResult decFit = data.pava(false)
+
+    // Select best fit (lowest MSE)
+    if incFit.mse < decFit.mse
+        oscillatorValue := ((incFit.pools - 1.0) / (lengthInput - 1.0)) * 100.0
+    else if decFit.mse < incFit.mse
+        oscillatorValue := -((decFit.pools - 1.0) / (lengthInput - 1.0)) * 100.0
+
+    // Display most recent fit on chart
+    if barstate.islast
+        var polyline fitLine = na
+        polyline.delete(fitLine)
+        
+        PavaResult bestFit = incFit.mse < decFit.mse ? incFit : decFit
+        chart.point[] pts  = array.new<chart.point>(0)
+        
+        int startIdx = bar_index - lengthInput + 1
+        int currIdx  = startIdx
+        
+        for i = 0 to bestFit.vals.size() - 1
+            float v = bestFit.vals.get(i)
+            int   w = bestFit.weights.get(i)
+            
+            pts.push(chart.point.from_index(currIdx, v))
+            pts.push(chart.point.from_index(currIdx + w - 1, v))
+            currIdx += w
+            
+        fitLine := polyline.new(pts, 
+             line_color = oscillatorValue >= 0 ? bullColorInput : bearColorInput, 
+             line_width = fitWidthInput, 
+             line_style = parsedFitStyle,
+             force_overlay = true)
+
+// --- Plots ---
+oscPositive = oscillatorValue > 0 ? oscillatorValue : na
+oscNegative = oscillatorValue < 0 ? oscillatorValue : na
+
+// Reference zero plot for fills
+pZero = plot(0, "Zero Line", color = chart.fg_color, style = plot.style_circles, display = display.none)
+
+// Visible plots (Split into two to create a "cut" at zero crossings)
+pPos = plot(oscPositive, "Positive Oscillator", color = bullColorInput, linewidth = 2, style = plot.style_linebr)
+pNeg = plot(oscNegative, "Negative Oscillator", color = bearColorInput, linewidth = 2, style = plot.style_linebr)
+
+// --- Crossover Markers ---
+crossUp   = ta.crossover(oscillatorValue, 0)
+crossDown = ta.crossunder(oscillatorValue, 0)
+
+plot(crossUp ? oscillatorValue : na, "Bullish Cross Dot", color = bullColorInput, style = plot.style_circles, linewidth = 3)
+plot(crossDown ? oscillatorValue : na, "Bearish Cross Dot", color = bearColorInput, style = plot.style_circles, linewidth = 3)
+
+// --- Gradient Fills ---
+fill(pPos, pZero, 100, 0, 
+     top_color    = color.new(bullColorInput, 50), 
+     bottom_color = color.new(bullColorInput, 100), 
+     title        = "Positive Gradient")
+
+fill(pNeg, pZero, 0, -100, 
+     top_color    = color.new(bearColorInput, 100), 
+     bottom_color = color.new(bearColorInput, 50), 
+     title        = "Negative Gradient")
+
+// --- Levels ---
+hline( 50, "Upper Level", color = color.new(chart.fg_color, 80), linestyle = hline.style_dashed)
+hline(  0, "Zero Level",  color = color.new(chart.fg_color, 80), linestyle = hline.style_dotted)
+hline(-50, "Lower Level", color = color.new(chart.fg_color, 80), linestyle = hline.style_dashed)
+
+//---------------------------------------------------------------------------------------------------------------------}

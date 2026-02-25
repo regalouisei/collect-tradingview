@@ -1,0 +1,131 @@
+//@version=6
+indicator("Active Move Counter (Points/Ticks) + Avg Candle (Ticks)", overlay=true, max_labels_count=500)
+
+//==================== Inputs ====================
+lenAvg = input.int(9, "Avg Candle Lookback (bars)", minval=1)
+
+round_output = input.string("Nearest", "Rounding", options=["Floor","Nearest","Ceil"])
+dirMethod = input.string("Close vs Close", "Direction Method", options=["Close vs Close","Candle Body (Close vs Open)"])
+minFlipTicks = input.int(0, "Min Flip Size (ticks) to change direction", minval=0,
+     tooltip="0 = flip immediately when direction changes. Set >0 to ignore tiny flips.")
+
+//==================== Helpers ====================
+tickSize = syminfo.mintick
+
+f_round(x) =>
+    float out = na
+    if round_output == "Floor"
+        out := math.floor(x)
+    else if round_output == "Ceil"
+        out := math.ceil(x)
+    else
+        out := math.round(x)
+    out
+
+//==================== Avg Candle (ticks) ====================
+rng = high - low
+avgRange = ta.sma(rng, lenAvg)
+avgTicksLive = avgRange / tickSize
+
+var float avgTicksConfirmed = na
+if barstate.isconfirmed
+    avgTicksConfirmed := avgTicksLive
+
+avgTicksRounded = f_round(avgTicksConfirmed)
+
+//==================== Direction Detection ====================
+float delta = na
+if dirMethod == "Close vs Close"
+    delta := close - close[1]
+else
+    // Candle body direction (more stable in chop)
+    delta := close - open
+
+deltaTicks = delta / tickSize
+
+// Direction state: 1 up, -1 down
+var int dir = 0
+int newDir = dir
+
+// Determine candidate direction (ignoring tiny flips if minFlipTicks > 0)
+bool upCandidate = deltaTicks > minFlipTicks
+bool dnCandidate = deltaTicks < -minFlipTicks
+
+if upCandidate
+    newDir := 1
+else if dnCandidate
+    newDir := -1
+else
+    newDir := nz(dir, 0)
+
+// Initialize if still zero
+if dir == 0 and newDir == 0
+    // fallback to close vs close if first bars are flat
+    newDir := close > close[1] ? 1 : close < close[1] ? -1 : 0
+
+//==================== Leg Tracking ====================
+// We track leg extremes from the moment direction is established,
+// and reset when direction flips.
+var float legHigh = na
+var float legLow = na
+var int legBars = 0
+
+bool flipped = (newDir != 0 and dir != 0 and newDir != dir)
+
+// On first valid direction or flip, reset leg
+if (dir == 0 and newDir != 0) or flipped
+    legHigh := high
+    legLow := low
+    legBars := 1
+    dir := newDir
+else
+    // Keep updating within the same leg
+    dir := newDir
+    legHigh := na(legHigh) ? high : math.max(legHigh, high)
+    legLow := na(legLow) ? low : math.min(legLow, low)
+    legBars += 1
+
+// Active move size in points/ticks (range traveled during the leg)
+movePoints = (na(legHigh) or na(legLow)) ? na : (legHigh - legLow)
+moveTicks = movePoints / tickSize
+
+// Also show signed “net from leg start extreme” feel:
+// (Optional metric: where we are relative to the opposite extreme)
+float netPoints = na
+if not na(legHigh) and not na(legLow)
+    netPoints := dir == 1 ? (close - legLow) : (legHigh - close)
+netTicks = netPoints / tickSize
+
+// Rounded display
+moveTicksR = f_round(moveTicks)
+netTicksR = f_round(netTicks)
+
+//==================== Visuals ====================
+plot(na) // keeps overlay clean; we use a table readout
+
+//==================== Table ====================
+var table t = table.new(position.top_right, 1, 5, frame_color=color.new(color.white, 100), force_overlay=true)
+
+dirTxt = dir == 1 ? "UP" : dir == -1 ? "DOWN" : "—"
+dirIcon = dir == 1 ? "▲" : dir == -1 ? "▼" : "•"
+
+if barstate.islast
+    table.cell(t, 0, 0, "Active Move", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 1, dirIcon + " " + dirTxt + " | Bars: " + str.tostring(legBars), text_color=color.white, bgcolor=color.black)
+
+    // Total leg travel (high-low)
+    table.cell(t, 0, 2,
+        "Leg Range: " + (na(movePoints) ? "na" : str.tostring(movePoints, "#.##")) + " pts (" +
+        (na(moveTicksR) ? "na" : str.tostring(moveTicksR)) + " ticks)",
+        text_color=color.white, bgcolor=color.black)
+
+    // Where price is currently from opposite extreme (useful “active push” feel)
+    table.cell(t, 0, 3,
+        "Net Push: " + (na(netPoints) ? "na" : str.tostring(netPoints, "#.##")) + " pts (" +
+        (na(netTicksR) ? "na" : str.tostring(netTicksR)) + " ticks)",
+        text_color=color.white, bgcolor=color.black)
+
+    // Avg candle size like your script
+    table.cell(t, 0, 4,
+        "Avg Candle (" + str.tostring(lenAvg) + "): " + (na(avgTicksRounded) ? "na" : str.tostring(avgTicksRounded)) + " ticks",
+        text_color=color.white, bgcolor=color.black)

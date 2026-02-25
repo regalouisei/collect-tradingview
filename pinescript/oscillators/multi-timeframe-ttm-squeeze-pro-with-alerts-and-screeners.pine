@@ -1,0 +1,166 @@
+//@version=5
+indicator('Multi-Timeframe Beardy Squeeze Pro (Final Logic w/ Override)', shorttitle='MTF Squeeze', overlay=false, precision=2)
+
+// === Inputs ===
+length = input.int(20, "TTM Squeeze Length")
+BB_mult = input.float(2.0, "Bollinger Band STD Multiplier")
+KC_mult_high = input.float(1.0, "Keltner Channel #1")
+KC_mult_mid = input.float(1.5, "Keltner Channel #2")
+KC_mult_low = input.float(2.0, "Keltner Channel #3")
+
+lengthEMA6  = input.int(6,  "Fast EMA")
+lengthEMA20 = input.int(20, "Slow EMA")
+
+useChartTF = input.bool(false, "Auto Match Chart Timeframe?")
+selectedTF = input.timeframe("240", "Fixed Squeeze Timeframe (Only if above is false)")
+
+Detect_Sqz_Start = input.bool(true, "Alert: Squeeze Start")
+Detect_Sqz_Fire = input.bool(true, "Alert: Squeeze Fire")
+
+// === Squeeze & Momentum Function ===
+f_squeeze(src, len, bb_mult, kc_mult_high, kc_mult_mid, kc_mult_low) =>
+    BB_basis = ta.sma(src, len)
+    dev = bb_mult * ta.stdev(src, len)
+    BB_upper = BB_basis + dev
+    BB_lower = BB_basis - dev
+
+    KC_basis = ta.sma(src, len)
+    devKC = ta.sma(ta.tr, len)
+    KC_upper_high = KC_basis + devKC * kc_mult_high
+    KC_lower_high = KC_basis - devKC * kc_mult_high
+    KC_upper_mid = KC_basis + devKC * kc_mult_mid
+    KC_lower_mid = KC_basis - devKC * kc_mult_mid
+    KC_upper_low = KC_basis + devKC * kc_mult_low
+    KC_lower_low = KC_basis - devKC * kc_mult_low
+
+    NoSqz = BB_lower < KC_lower_low or BB_upper > KC_upper_low
+    LowSqz = BB_lower >= KC_lower_low or BB_upper <= KC_upper_low
+    MidSqz = BB_lower >= KC_lower_mid or BB_upper <= KC_upper_mid
+    HighSqz = BB_lower >= KC_lower_high or BB_upper <= KC_upper_high
+
+    mom = ta.linreg(src - math.avg(math.avg(ta.highest(high, len), ta.lowest(low, len)), ta.sma(src, len)), len, 0)
+
+    [NoSqz, LowSqz, MidSqz, HighSqz, mom]
+
+// === Timeframe Selection ===
+finalTF = useChartTF ? timeframe.period : selectedTF
+
+[NoSqz_htf, LowSqz_htf, MidSqz_htf, HighSqz_htf, mom_htf] = request.security(syminfo.tickerid, finalTF, f_squeeze(close, length, BB_mult, KC_mult_high, KC_mult_mid, KC_mult_low))
+
+// === Dot State
+dotState = HighSqz_htf ? "high" :
+           MidSqz_htf ? "mid" :
+           LowSqz_htf ? "low" :
+           "fired"
+
+sq_color = dotState == "high" ? color.orange :
+           dotState == "mid" ? color.red :
+           dotState == "low" ? color.black :
+           color.green
+
+// === Momentum Logic
+momentumRising = mom_htf > 0 and mom_htf > mom_htf[1]
+momentumFalling = mom_htf < 0 and mom_htf < mom_htf[1]
+
+// === Dot Conditions
+isGreenDot = dotState == "fired"
+isBlackDot = dotState == "low"
+isRedDot = dotState == "mid"
+wasBlackDot = dotState[1] == "low"
+wasRedDot = dotState[2] == "mid"
+
+// === State Control
+var bool buyFiredInitial = false
+var bool buyFiredReentry = false
+var bool overrideBuyFired = false
+
+// === Reset logic
+newSqueezeCycle = not isBlackDot[1] and isBlackDot
+if newSqueezeCycle
+    buyFiredInitial := false
+    buyFiredReentry := false
+    overrideBuyFired := false
+
+// === Buy #1: First green dot + rising momentum
+baseBuy = isGreenDot and not buyFiredInitial and not overrideBuyFired and momentumRising
+if baseBuy
+    buyFiredInitial := true
+
+// === Buy #2: Green after black + rising momentum
+reentryBuy = isGreenDot and wasBlackDot and not buyFiredReentry and not overrideBuyFired and momentumRising
+if reentryBuy
+    buyFiredReentry := true
+
+// === Buy #3: Red → Black/Green + rising momentum (override)
+overrideBuy = not overrideBuyFired and wasRedDot and (isGreenDot or isBlackDot) and momentumRising
+if overrideBuy
+    overrideBuyFired := true
+    buyFiredInitial := true
+    buyFiredReentry := true
+
+// === Final Signal
+buySignal = baseBuy or reentryBuy or overrideBuy
+sellSignal = (isGreenDot or isBlackDot) and momentumFalling and not buySignal
+
+// === Custom Alert Logic: First Green after >=3 (Black or Red) Dots + Blue Histogram ===
+var int squeezeCount = 0
+squeezeCount := (isBlackDot or isRedDot) ? squeezeCount + 1 : 0
+blueHistogram = mom_htf > mom_htf[1] and mom_htf > 0
+squeezeAlert = isGreenDot and squeezeCount[1] >= 3 and blueHistogram
+
+// === Screener Condition: 3 Red Dots in a Row
+red_dots_consecutive = isRedDot and isRedDot[1] and isRedDot[3]
+
+// ==================================================================
+// === Screener Filter: Only include stocks above the 50-day SMA ====
+sma50 = ta.sma(close, 50)
+above50ma = close > sma50
+
+// === Screener Condition: Orange Dot (High Squeeze)
+isOrangeDot = dotState == "high"
+// ==================================================================
+ema6  = ta.ema(close, lengthEMA6)
+ema20 = ta.ema(close, lengthEMA20)
+
+// Only trigger EMA conditions when dot is in squeeze (mid/high)
+dotFilter = dotState == "high" or dotState == "mid"
+
+emaBuyCross  = ta.crossover(ema6, ema20) and dotFilter
+emaSellCross = ta.crossunder(ema6, ema20) and dotFilter
+
+// =============================================================
+// === Plot EMA Cross Markers (Below Histogram)
+// =============================================================
+plotshape(emaBuyCross,title="Bullish EMA Cross",style=shape.triangleup, location=location.bottom,size=size.tiny, color=color.new(color.green, 0),text="B")
+
+plotshape(emaSellCross,title="Bearish EMA Cross",style=shape.triangledown,location=location.bottom,size=size.tiny,color=color.new(color.red, 0),text="S")
+
+
+// === Alerts
+if Detect_Sqz_Start and NoSqz_htf[1] and not NoSqz_htf
+    alert("Squeeze Started on " + finalTF + " chart", alert.freq_once_per_bar_close)
+
+if Detect_Sqz_Fire and NoSqz_htf and not NoSqz_htf[1]
+    alert("Squeeze Fired on " + finalTF + " chart", alert.freq_once_per_bar_close)
+
+alertcondition(buySignal, title="Buy Alert", message="TTM Squeeze Buy Signal (MTF)")
+alertcondition(sellSignal, title="Sell Alert", message="TTM Squeeze Sell Signal (MTF)")
+alertcondition(squeezeAlert, title="Squeeze Fire After 3+ Squeeze Dots", message="First Green Dot after 3+ Black/Red Dots with Blue Histogram!")
+alertcondition(red_dots_consecutive, title="4 Red Dots in a Row", message="TTM Squeeze: 4 consecutive red dots detected")
+
+// === Screener alerts added for filtering
+alertcondition(above50ma, title="Above 50-day MA", message="Price is trading above the 50DMA")
+alertcondition(isOrangeDot, title="Orange Dot Detected", message="TTM Squeeze: Orange dot detected")
+
+// === Plotting
+momColor = mom_htf > mom_htf[1] ? (mom_htf > 0 ? color.aqua : color.yellow) : (mom_htf < 0 ? color.red : color.yellow)
+plot(mom_htf, title='Momentum', color=momColor, style=plot.style_columns, linewidth=2)
+plot(0, title='Zero Line', color=sq_color, style=plot.style_circles, linewidth=3)
+
+plot(buySignal ? mom_htf : na, title="Buy Marker", style=plot.style_circles, color=color.lime, linewidth=3)
+plot(sellSignal ? mom_htf : na, title="Sell Marker", style=plot.style_circles, color=color.red, linewidth=3)
+plot(squeezeAlert ? mom_htf : na, title="Custom Alert Marker", style=plot.style_circles, color=color.purple, linewidth=4)
+// EMA Crossover Signals
+alertcondition(emaBuyCross,title="EMA 6/20 Bullish Crossover (Squeeze Only)",message="6 EMA crossed ABOVE 20 EMA while in red/orange squeeze")
+
+alertcondition( emaSellCross,title="EMA 6/20 Bearish Crossover (Squeeze Only)",message="6 EMA crossed BELOW 20 EMA while in red/orange squeeze")

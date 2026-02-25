@@ -1,0 +1,277 @@
+//@version=6
+indicator("Order Flow RSI — Price / CVD / OI", shorttitle="Order Flow RSI", overlay=false, max_lines_count=300)
+
+// -------------------- Imports --------------------
+import TradingView/ta/8
+
+// -------------------- INPUT GROUP: Data & Timeframes --------------------
+group_data = "Data / Timeframes"
+anchorPeriod      = input.timeframe("1D", "Anchor period (CVD reset)", group=group_data)
+useCustomLowerTF  = input.bool(false, "Use custom lower timeframe for delta (CVD)", group=group_data)
+lowerTF           = input.timeframe("1", "Lower timeframe (delta)", active=useCustomLowerTF, group=group_data)
+lowerTimeframe    = useCustomLowerTF ? lowerTF : (timeframe.isseconds ? "1S" : (timeframe.isintraday ? "1" : (timeframe.isdaily ? "5" : "60")))
+oi_use_chart_tf   = input.bool(true, "Use chart timeframe for OI (recommended)", group=group_data)
+oi_tf             = input.timeframe("1D", "Custom OI timeframe (if not using chart TF)", active = not oi_use_chart_tf, group=group_data)
+
+// -------------------- INPUT GROUP: CVD --------------------
+group_cvd = "CVD Settings"
+cvd_mode      = input.string("Continuous", "CVD mode (Continuous / Anchored / Rolling)", options=["Continuous","Anchored", "Rolling"], group=group_cvd)
+cvd_roll_len  = input.int(50, "Rolling window length (if Rolling)", minval=1, group=group_cvd)
+
+// -------------------- INPUT GROUP: RSI Lengths --------------------
+group_rsi = "RSI Lengths"
+len_price_rsi = input.int(14, "Price RSI length", minval=1, group=group_rsi)
+len_cvd_rsi   = input.int(14, "CVD RSI length",   minval=1, group=group_rsi)
+len_oi_rsi    = input.int(14, "OI RSI length",    minval=1, group=group_rsi)
+
+// -------------------- INPUT GROUP: Consensus --------------------
+group_consensus = "Consensus"
+show_price_rsi = input.bool(true, "Show Price RSI", group=group_consensus)
+show_cvd_rsi   = input.bool(true, "Show CVD RSI", group=group_consensus)
+show_oi_rsi    = input.bool(true, "Show OI RSI (if available)", group=group_consensus)
+
+// Consensus inclusion toggles (choose which series are used for the mean)
+cons_include_price = input.bool(true, "Include Price in Consensus", group=group_consensus)
+cons_include_cvd   = input.bool(true, "Include CVD in Consensus", group=group_consensus)
+cons_include_oi    = input.bool(true, "Include OI in Consensus", group=group_consensus)
+show_consensus     = input.bool(true, "Show Consensus RSI (mean of selected series)", group=group_consensus)
+
+// -------------------- INPUT GROUP: Signals --------------------
+group_signals = "Signals"
+sig_all_three = input.bool(true, "Signal: All active RSIs beyond OB/OS", group=group_signals)
+sig_price_oi_opposite = input.bool(false, "Signal: Price RSI opposite OI RSI (OB vs OS)", group=group_signals)
+sig_price_cvd_opposite = input.bool(false, "Signal: Price RSI opposite CVD RSI (OB vs OS)", group=group_signals)
+sig_oi_cvd_opposite = input.bool(false, "Signal: OI RSI opposite CVD RSI (OB vs OS)", group=group_signals)
+
+alerts_enabled = input.bool(true, "Enable alerts (for enabled signal types)", group=group_signals)
+alerts_require_all_series = input.bool(true, "Require all 3 series present for 'All' signals (if OI missing, don't alert)", group=group_signals)
+
+// -------------------- INPUT GROUP: Levels & Appearance --------------------
+group_appearance = "Levels & Appearance"
+obLevel = input.float(70, "Overbought level (OB)", minval=1, maxval=99, group=group_appearance)
+midLevel = input.float(50, "Mid level (MID)", minval=0, maxval=100, group=group_appearance)
+osLevel = input.float(30, "Oversold level (OS)", minval=1, maxval=99, group=group_appearance)
+
+// background fill colors (must be inputs; Style tab cannot control bgcolor)
+bg_highlight = input.bool(true, "Highlight area when condition matches (enabled signals)", group=group_appearance)
+bg_color_all_top = input.color(color.new(color.red, 90), "All-3 Top (red)", group=group_appearance)
+bg_color_all_bot = input.color(color.new(color.green, 90), "All-3 Bottom (green)", group=group_appearance)
+// pairwise colors (price↔oi, price↔cvd, oi↔cvd)
+bg_color_price_oi_top = input.color(color.new(color.red, 85), "Price↑ / OI↓ Top (red)", group=group_appearance)
+bg_color_price_oi_bot = input.color(color.new(color.green, 85), "Price↓ / OI↑ Bottom (green)", group=group_appearance)
+bg_color_price_cvd_top = input.color(color.new(color.red, 85), "Price↑ / CVD↓ Top (red)", group=group_appearance)
+bg_color_price_cvd_bot = input.color(color.new(color.green, 85), "Price↓ / CVD↑ Bottom (green)", group=group_appearance)
+bg_color_oi_cvd_top = input.color(color.new(color.red, 85), "OI↑ / CVD↓ Top (red)", group=group_appearance)
+bg_color_oi_cvd_bot = input.color(color.new(color.green, 85), "OI↓ / CVD↑ Bottom (green)", group=group_appearance)
+
+show_oi_warning = input.bool(true, "Show OI-not-available warning label", group=group_appearance)
+
+// -------------------- INPUT GROUP: Fill & Advanced --------------------
+group_adv = "Fill & Advanced"
+fill_between_all = input.bool(true, "Fill between min/max of active RSIs (if multiple active)", group=group_adv)
+
+// -------------------- INPUT GROUP: Smoothing --------------------
+group_smooth = "RSI Smoothing"
+maTypeInput = input.string("None", "Smoothing Type", options = ["None", "SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group=group_smooth)
+maLengthInput = input.int(1, "Smoothing length (1 = no smoothing)", minval=1, group=group_smooth)
+enableMA = maTypeInput != "None" and maLengthInput > 1
+
+// -------------------- CVD core --------------------
+// Use TradingView accurate delta
+[openVol, maxVol, minVol, lastVol] = ta.requestVolumeDelta(lowerTimeframe, anchorPeriod)
+deltaBar = lastVol - openVol
+
+// anchored cumCVD (resets at anchorPeriod)
+tAnchor = time(anchorPeriod)
+isNewAnchor = na(tAnchor[1]) ? true : (tAnchor != tAnchor[1])
+
+var float cumCVD_anchor = 0.0
+if barstate.isfirst or isNewAnchor
+    cumCVD_anchor := nz(deltaBar)
+else
+    cumCVD_anchor := nz(cumCVD_anchor) + nz(deltaBar)
+
+// cumulative total (continuous)
+cvdCum = ta.cum(deltaBar)
+// rolling cumulative
+rollingCVD = cvdCum - nz(cvdCum[cvd_roll_len], 0)
+
+// choose CVD source depending on mode
+srcCVD = cvd_mode == "Continuous" ? cvdCum : (cvd_mode == "Anchored" ? cumCVD_anchor : rollingCVD)
+
+// -------------------- Open Interest retrieval --------------------
+oi_symbol = syminfo.tickerid + "_OI"
+tf_for_oi = oi_use_chart_tf ? timeframe.period : oi_tf
+oi_raw = request.security(oi_symbol, tf_for_oi, close, lookahead = barmerge.lookahead_off)
+
+// carry-forward safe series
+var float oi_series = na
+if not na(oi_raw)
+    oi_series := oi_raw
+else
+    oi_series := nz(oi_series[1], na)
+
+oi_is_available = not na(oi_series)
+oi_input = oi_series
+
+// -------------------- Compute raw RSIs (on chart timeframe) --------------------
+price_rsi_raw = ta.rsi(close, len_price_rsi)
+cvd_rsi_raw   = ta.rsi(srcCVD, len_cvd_rsi)
+oi_rsi_raw    = ta.rsi(oi_input, len_oi_rsi)
+
+// -------------------- Smoothing function (copied/adapted from TradingView RSI script) ----
+ma(source, length, MAtype) =>
+    switch MAtype
+        "SMA"        => ta.sma(source, length)
+        "EMA"        => ta.ema(source, length)
+        "SMMA (RMA)" => ta.rma(source, length)
+        "WMA"        => ta.wma(source, length)
+        "VWMA"       => ta.vwma(source, length)
+        => source  // fallback: return source unchanged
+
+// Apply smoothing if enabled; maLengthInput ==1 means effectively no smoothing for most MA
+price_rsi = enableMA ? ma(price_rsi_raw, maLengthInput, maTypeInput) : price_rsi_raw
+cvd_rsi   = enableMA ? ma(cvd_rsi_raw,   maLengthInput, maTypeInput) : cvd_rsi_raw
+oi_rsi    = enableMA ? ma(oi_rsi_raw,    maLengthInput, maTypeInput) : oi_rsi_raw
+
+oi_rsi_plot = (oi_is_available and show_oi_rsi) ? oi_rsi : na
+
+// -------------------- Consensus RSI using selected includes --------------------
+float sumRSI = 0.0
+int consCount = 0
+if cons_include_price and show_price_rsi
+    sumRSI += price_rsi
+    consCount += 1
+if cons_include_cvd and show_cvd_rsi
+    sumRSI += cvd_rsi
+    consCount += 1
+if cons_include_oi and show_oi_rsi and oi_is_available
+    sumRSI += oi_rsi
+    consCount += 1
+
+consensus_rsi = consCount > 0 ? sumRSI / consCount : na
+consensus_plot = show_consensus and consCount > 0 ? consensus_rsi : na
+
+// -------------------- Horizontal levels --------------------
+hOB = hline(obLevel, "OB", color = color.new(color.red, 20))
+hMID = hline(midLevel, "MID", color = color.new(color.gray, 20))
+hOS = hline(osLevel, "OS", color = color.new(color.green, 20))
+
+// -------------------- Plot RSIs (global scope) --------------------
+// Leave color/width/style to Style tab; provide defaults for clarity
+p_price = plot(show_price_rsi ? price_rsi : na, title="Price RSI", color=color.blue, linewidth=1)
+p_cvd   = plot(show_cvd_rsi   ? cvd_rsi   : na, title="CVD RSI",   color=color.orange, linewidth=1)
+p_oi    = plot(show_oi_rsi    ? oi_rsi_plot:na, title="OI RSI",    color=color.purple, linewidth=1)
+p_cons  = plot(consensus_plot, title="Consensus RSI", color=color.yellow, linewidth=1, style=plot.style_line)
+
+// -------------------- Fill between min and max active RSIs --------------------
+// typed vars for min/max
+var float minRSI = na
+var float maxRSI = na
+minRSI := na
+maxRSI := na
+
+if show_price_rsi
+    minRSI := na(minRSI) ? price_rsi : math.min(minRSI, price_rsi)
+    maxRSI := na(maxRSI) ? price_rsi : math.max(maxRSI, price_rsi)
+if show_cvd_rsi
+    minRSI := na(minRSI) ? cvd_rsi : math.min(minRSI, cvd_rsi)
+    maxRSI := na(maxRSI) ? cvd_rsi : math.max(maxRSI, cvd_rsi)
+if show_oi_rsi and oi_is_available
+    minRSI := na(minRSI) ? oi_rsi : math.min(minRSI, oi_rsi)
+    maxRSI := na(maxRSI) ? oi_rsi : math.max(maxRSI, oi_rsi)
+
+p_min = plot(fill_between_all ? minRSI : na, title="ActiveRSI Min", color=color.new(color.gray, 100), linewidth=1)
+p_max = plot(fill_between_all ? maxRSI : na, title="ActiveRSI Max", color=color.new(color.gray, 100), linewidth=1)
+fill(p_max, p_min, color = fill_between_all ? color.new(color.silver, 92) : na)
+
+// -------------------- Signals / Conditions --------------------
+pActive = show_price_rsi
+cActive = show_cvd_rsi
+oActive = show_oi_rsi and oi_is_available
+
+// All-active signals
+int countActive = 0
+int countAbove = 0
+int countBelow = 0
+if pActive
+    countActive += 1
+    countAbove += price_rsi > obLevel ? 1 : 0
+    countBelow += price_rsi < osLevel ? 1 : 0
+if cActive
+    countActive += 1
+    countAbove += cvd_rsi > obLevel ? 1 : 0
+    countBelow += cvd_rsi < osLevel ? 1 : 0
+if oActive
+    countActive += 1
+    countAbove += oi_rsi > obLevel ? 1 : 0
+    countBelow += oi_rsi < osLevel ? 1 : 0
+
+requiredAll = alerts_require_all_series ? 3 : countActive
+cond_all_above = (countActive >= requiredAll) and (countAbove >= requiredAll)
+cond_all_below = (countActive >= requiredAll) and (countBelow >= requiredAll)
+
+// Pairwise opposite conditions — split into 'top' (red) and 'bot' (green) cases
+// Price vs OI
+cond_price_oi_price_over = pActive and oActive and (price_rsi > obLevel and oi_rsi < osLevel)   // red
+cond_price_oi_price_under = pActive and oActive and (price_rsi < osLevel and oi_rsi > obLevel)  // green
+
+// Price vs CVD
+cond_price_cvd_price_over = pActive and cActive and (price_rsi > obLevel and cvd_rsi < osLevel)  // red
+cond_price_cvd_price_under = pActive and cActive and (price_rsi < osLevel and cvd_rsi > obLevel) // green
+
+// OI vs CVD
+cond_oi_cvd_oi_over = oActive and cActive and (oi_rsi > obLevel and cvd_rsi < osLevel)         // red
+cond_oi_cvd_oi_under = oActive and cActive and (oi_rsi < osLevel and cvd_rsi > obLevel)       // green
+
+// -------------------- Background coloring priority & selection --------------------
+// We'll follow priority: All-3 > Price↔OI > Price↔CVD > OI↔CVD
+var color bg_color_selected = na
+
+if bg_highlight
+    // All-3 top/bottom
+    if sig_all_three and cond_all_above
+        bg_color_selected := bg_color_all_top
+    else if sig_all_three and cond_all_below
+        bg_color_selected := bg_color_all_bot
+    // Price↔OI
+    else if sig_price_oi_opposite and cond_price_oi_price_over
+        bg_color_selected := bg_color_price_oi_top
+    else if sig_price_oi_opposite and cond_price_oi_price_under
+        bg_color_selected := bg_color_price_oi_bot
+    // Price↔CVD
+    else if sig_price_cvd_opposite and cond_price_cvd_price_over
+        bg_color_selected := bg_color_price_cvd_top
+    else if sig_price_cvd_opposite and cond_price_cvd_price_under
+        bg_color_selected := bg_color_price_cvd_bot
+    // OI↔CVD
+    else if sig_oi_cvd_opposite and cond_oi_cvd_oi_over
+        bg_color_selected := bg_color_oi_cvd_top
+    else if sig_oi_cvd_opposite and cond_oi_cvd_oi_under
+        bg_color_selected := bg_color_oi_cvd_bot
+    else
+        bg_color_selected := na
+
+bgcolor(bg_color_selected)
+
+// -------------------- Alerts (global scope) --------------------
+// Gate each alert by alerts_enabled and the corresponding signal toggle
+// All-3
+alertcondition(alerts_enabled and sig_all_three and cond_all_above, title="All RSIs above OB", message="All active RSIs are above the overbought level.")
+alertcondition(alerts_enabled and sig_all_three and cond_all_below, title="All RSIs below OS", message="All active RSIs are below the oversold level.")
+// Price<>OI opposite
+alertcondition(alerts_enabled and sig_price_oi_opposite and (cond_price_oi_price_over or cond_price_oi_price_under), title="Price<>OI opposite", message="Price RSI and OI RSI are on opposite sides of OB/OS levels.")
+// Price<>CVD opposite
+alertcondition(alerts_enabled and sig_price_cvd_opposite and (cond_price_cvd_price_over or cond_price_cvd_price_under), title="Price<>CVD opposite", message="Price RSI and CVD RSI are on opposite sides of OB/OS levels.")
+// OI<>CVD opposite
+alertcondition(alerts_enabled and sig_oi_cvd_opposite and (cond_oi_cvd_oi_over or cond_oi_cvd_oi_under), title="OI<>CVD opposite", message="OI RSI and CVD RSI are on opposite sides of OB/OS levels.")
+
+// -------------------- OI availability label --------------------
+if show_oi_rsi and barstate.islast and not oi_is_available and show_oi_warning
+    label.new(bar_index, na, text = "OI not available for this symbol (or naming differs).", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(color.red,80), textcolor = color.white)
+
+// -------------------- Final notes --------------------
+// - Consensus & Signals are split into separate input groups for clarity.
+// - Smoothing: choose a smoothing MA type and length. If Type = "None" or Length = 1, RSIs are unchanged.
+// - Background coloring follows priority: All-3 > Price↔OI > Price↔CVD > OI↔CVD.
+// - Style: change plot colors, widths and line styles in the Style tab per plot (Price RSI, CVD RSI, OI RSI, Consensus).

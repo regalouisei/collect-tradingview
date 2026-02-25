@@ -1,0 +1,225 @@
+//@version=6
+indicator("MTF RSI Heatmap", overlay=false, max_labels_count=100)
+
+// ── Label text size & background
+labelSize    = input.string("Small", "Label size", options = ["Tiny","Small","Normal"])
+labelBgAlpha = input.int(70, "Label background opacity", 0, 100)
+// map to Pine size enum
+ts = labelSize == "Tiny" ? size.tiny : labelSize == "Small" ? size.small : size.normal
+
+// ── Timeframes (each row)
+tf1 = input.timeframe("5",   "TF 1")
+tf2 = input.timeframe("15",  "TF 2")
+tf3 = input.timeframe("60",  "TF 3")
+tf4 = input.timeframe("240", "TF 4")
+tf5 = input.timeframe("D",   "TF 5")
+tf6 = input.timeframe("W",   "TF 6")
+
+use1 = input.bool(true,  "Show TF 1 row")
+use2 = input.bool(true,  "Show TF 2 row")
+use3 = input.bool(true,  "Show TF 3 row")
+use4 = input.bool(true,  "Show TF 4 row")
+use5 = input.bool(true,  "Show TF 5 row")
+use6 = input.bool(true,  "Show TF 6 row")
+
+// Intrabar behavior (updates rows during bar; will repaint on TF close)
+intrabar = input.bool(false, "Update rows intrabar (will repaint)")
+
+// ── Visual theme
+theme = input.string("Classic", "Color theme", options = ["Classic", "High-Contrast"])
+colBull()    => theme == "Classic" ? color.new(color.lime, 0)  : color.new(color.rgb(0, 200, 0), 0)
+colBear()    => theme == "Classic" ? color.new(color.red, 0)   : color.new(color.rgb(230, 0, 0), 0)
+colNeutral() => theme == "Classic" ? color.new(color.yellow,0) : color.new(color.rgb(210, 185, 0), 0)
+
+// ── RSI parameters
+rsiLen     = input.int(14, "RSI length", 2, 100)
+bullThresh = input.float(55, "Bull threshold", 0, 100)
+bearThresh = input.float(45, "Bear threshold", 0, 100)
+
+// Optional light smoothing for intraday rows (cuts micro-flicker)
+smoothIntra = input.int(0, "RSI EMA smooth (5/15/60/240m, 0=off)", 0, 10)
+
+// ── Impulse detector (intraday TF1..TF4)
+impulseOn        = input.bool(true,  "Impulse override (intraday)")
+impulseBars      = input.int(2,      "Impulse lookback bars", 1, 10)
+impulsePct       = input.float(0.35, "Impulse threshold %", 0.05, 5.0)   // e.g. 0.35% over N bars
+impulseVolConf   = input.bool(true,  "Require volume confirmation")
+impulseVolLen    = input.int(20,     "Volume SMA length", 1, 200)
+impulseVolMult   = input.float(1.20, "Volume multiplier", 1.0, 5.0)
+showImpulseMarks = input.bool(true,  "Show ▲/▼ impulse markers")
+
+// ── HYBRID for D/W (rows 5–6): MA stack instead of RSI
+hybridDW       = input.bool(true, "Hybrid for D/W: use MA stack instead of RSI")
+maType         = input.string("EMA", "MA type (D/W)", options=["EMA","SMA","HMA"])
+lenFast        = input.int(8,  "Fast MA (D/W)", 1, 500)
+lenMid         = input.int(21, "Mid  MA (D/W)", 1, 500)
+lenSlow        = input.int(55, "Slow MA (D/W)", 1, 500)
+priceFilterDW  = input.bool(true, "Require price > fast for bull (and < fast for bear)")
+
+// ── Helpers
+ma(src, len) =>
+    maType == "EMA" ? ta.ema(src, len) : maType == "SMA" ? ta.sma(src, len) : ta.hma(src, len)
+
+getRSI(tf) =>
+    _look = intrabar ? barmerge.lookahead_on : barmerge.lookahead_off
+    request.security(syminfo.tickerid, tf, ta.rsi(close, rsiLen), barmerge.gaps_off, _look)
+
+getROC(tf, bars) =>
+    _look = intrabar ? barmerge.lookahead_on : barmerge.lookahead_off
+    request.security(syminfo.tickerid, tf, (close / close[bars] - 1.0) * 100.0, barmerge.gaps_off, _look)
+
+getVolData(tf, len) =>
+    _look = intrabar ? barmerge.lookahead_on : barmerge.lookahead_off
+    v  = request.security(syminfo.tickerid, tf, volume,              barmerge.gaps_off, _look)
+    sv = request.security(syminfo.tickerid, tf, ta.sma(volume, len), barmerge.gaps_off, _look)
+    [v, sv]
+
+biasFromRSI(r) =>
+    float b = 0
+    if r > bullThresh
+        b := 1
+    else if r < bearThresh
+        b := -1
+    b
+
+rowColor(b) =>
+    b == 1 ? colBull() : b == -1 ? colBear() : colNeutral()
+
+// Return impulse direction for a TF: 1 bull, -1 bear, 0 none
+impulseDir(tf) =>
+    int dir = 0
+    if impulseOn
+        roc = getROC(tf, impulseBars)
+        [v, sv] = getVolData(tf, impulseVolLen)
+        volOK = (not impulseVolConf) or (v > impulseVolMult * sv)
+        if volOK
+            if roc <= -impulsePct
+                dir := -1
+            else if roc >= impulsePct
+                dir := 1
+    dir
+
+// MA-stack bias (for D/W when hybrid is on)
+maStackBias(tf) =>
+    _look = intrabar ? barmerge.lookahead_on : barmerge.lookahead_off
+    c  = request.security(syminfo.tickerid, tf, close,                 barmerge.gaps_off, _look)
+    f  = request.security(syminfo.tickerid, tf, ma(close, lenFast),    barmerge.gaps_off, _look)
+    m  = request.security(syminfo.tickerid, tf, ma(close, lenMid),     barmerge.gaps_off, _look)
+    s  = request.security(syminfo.tickerid, tf, ma(close, lenSlow),    barmerge.gaps_off, _look)
+    bull = (f > m) and (m > s) and ((not priceFilterDW) or (c > f))
+    bear = (f < m) and (m < s) and ((not priceFilterDW) or (c < f))
+    bull ? 1 : bear ? -1 : 0
+
+// ── Base RSI per TF (with optional smoothing on intraday)
+r1 = getRSI(tf1), rs1 = smoothIntra > 0 ? ta.ema(r1, smoothIntra) : r1
+r2 = getRSI(tf2), rs2 = smoothIntra > 0 ? ta.ema(r2, smoothIntra) : r2
+r3 = getRSI(tf3), rs3 = smoothIntra > 0 ? ta.ema(r3, smoothIntra) : r3
+r4 = getRSI(tf4), rs4 = smoothIntra > 0 ? ta.ema(r4, smoothIntra) : r4
+r5 = getRSI(tf5)
+r6 = getRSI(tf6)
+
+// Base biases
+b1_base = biasFromRSI(rs1)
+b2_base = biasFromRSI(rs2)
+b3_base = biasFromRSI(rs3)
+b4_base = biasFromRSI(rs4)
+b5_base = hybridDW ? maStackBias(tf5) : biasFromRSI(r5)
+b6_base = hybridDW ? maStackBias(tf6) : biasFromRSI(r6)
+
+// Apply impulse overrides for intraday rows only
+i1 = impulseDir(tf1), b1 = i1 != 0 ? i1 : b1_base
+i2 = impulseDir(tf2), b2 = i2 != 0 ? i2 : b2_base
+i3 = impulseDir(tf3), b3 = i3 != 0 ? i3 : b3_base
+i4 = impulseDir(tf4), b4 = i4 != 0 ? i4 : b4_base
+// D/W unchanged by impulse
+b5 = b5_base
+b6 = b6_base
+
+// ── Heatmap rows (stacked 1-unit bands)
+plot(use1 ? 1 : na, "TF1", style=plot.style_columns, color=rowColor(b1), histbase=0)
+plot(use2 ? 2 : na, "TF2", style=plot.style_columns, color=rowColor(b2), histbase=1)
+plot(use3 ? 3 : na, "TF3", style=plot.style_columns, color=rowColor(b3), histbase=2)
+plot(use4 ? 4 : na, "TF4", style=plot.style_columns, color=rowColor(b4), histbase=3)
+plot(use5 ? 5 : na, "TF5", style=plot.style_columns, color=rowColor(b5), histbase=4)
+plot(use6 ? 6 : na, "TF6", style=plot.style_columns, color=rowColor(b6), histbase=5)
+
+// ── Impulse markers (absolute location at row mid; intraday only)
+rowY1 = 0.5, rowY2 = 1.5, rowY3 = 2.5, rowY4 = 3.5
+plotshape(showImpulseMarks and use1 and i1 == 1 ? rowY1 : na, title="TF1 Impulse Up",   style=shape.triangleup,   location=location.absolute, color=colBull(), size=size.tiny)
+plotshape(showImpulseMarks and use1 and i1 == -1 ? rowY1 : na, title="TF1 Impulse Down", style=shape.triangledown, location=location.absolute, color=colBear(), size=size.tiny)
+plotshape(showImpulseMarks and use2 and i2 == 1 ? rowY2 : na, title="TF2 Impulse Up",   style=shape.triangleup,   location=location.absolute, color=colBull(), size=size.tiny)
+plotshape(showImpulseMarks and use2 and i2 == -1 ? rowY2 : na, title="TF2 Impulse Down", style=shape.triangledown, location=location.absolute, color=colBear(), size=size.tiny)
+plotshape(showImpulseMarks and use3 and i3 == 1 ? rowY3 : na, title="TF3 Impulse Up",   style=shape.triangleup,   location=location.absolute, color=colBull(), size=size.tiny)
+plotshape(showImpulseMarks and use3 and i3 == -1 ? rowY3 : na, title="TF3 Impulse Down", style=shape.triangledown, location=location.absolute, color=colBear(), size=size.tiny)
+plotshape(showImpulseMarks and use4 and i4 == 1 ? rowY4 : na, title="TF4 Impulse Up",   style=shape.triangleup,   location=location.absolute, color=colBull(), size=size.tiny)
+plotshape(showImpulseMarks and use4 and i4 == -1 ? rowY4 : na, title="TF4 Impulse Down", style=shape.triangledown, location=location.absolute, color=colBear(), size=size.tiny)
+
+// ── Static row separators (constants only)
+gridCol = color.new(color.black, 70)
+hline(0, "", gridCol)
+hline(1, "", gridCol)
+hline(2, "", gridCol)
+hline(3, "", gridCol)
+hline(4, "", gridCol)
+hline(5, "", gridCol)
+hline(6, "", gridCol)
+
+// ── Left legend with compact counter header
+rowsEnabled = (use1 ? 1 : 0) + (use2 ? 1 : 0) + (use3 ? 1 : 0) + (use4 ? 1 : 0) + (use5 ? 1 : 0) + (use6 ? 1 : 0)
+var table legend = na
+if barstate.isfirst
+    legend := table.new(position.top_left, 1, 1 + rowsEnabled, frame_color=color.new(color.black, 100), border_width=0)
+
+// Build list of enabled TFs bottom→top
+tfList = array.new_string()
+if use1
+    array.push(tfList, tf1)
+if use2
+    array.push(tfList, tf2)
+if use3
+    array.push(tfList, tf3)
+if use4
+    array.push(tfList, tf4)
+if use5
+    array.push(tfList, tf5)
+if use6
+    array.push(tfList, tf6)
+
+// Agreement counts (for header + signal)
+rowsBull = (use1 and b1 == 1 ? 1 : 0) + (use2 and b2 == 1 ? 1 : 0) + (use3 and b3 == 1 ? 1 : 0) + (use4 and b4 == 1 ? 1 : 0) + (use5 and b5 == 1 ? 1 : 0) + (use6 and b6 == 1 ? 1 : 0)
+rowsBear = (use1 and b1 == -1 ? 1 : 0) + (use2 and b2 == -1 ? 1 : 0) + (use3 and b3 == -1 ? 1 : 0) + (use4 and b4 == -1 ? 1 : 0) + (use5 and b5 == -1 ? 1 : 0) + (use6 and b6 == -1 ? 1 : 0)
+
+if not na(legend)
+    header = "Bull " + str.tostring(rowsBull) + "/" + str.tostring(rowsEnabled) + " | Bear " + str.tostring(rowsBear) + "/" + str.tostring(rowsEnabled)
+    table.cell(legend, 0, 0, header, text_color=color.white, bgcolor=color.new(color.black, 85), text_halign=text.align_left, text_size=ts)
+    for i = 0 to array.size(tfList) - 1
+        table.cell(legend, 0, 1 + i, array.get(tfList, i), text_color=color.white, bgcolor=color.new(color.black, labelBgAlpha), text_halign=text.align_left, text_size=ts)
+
+// ── N-of-6 agreement signal (plot + alerts)
+confirmCount = input.int(4, "Rows required for signal (N of 6)", 1, 6)
+sigBull = rowsBull >= confirmCount
+sigBear = rowsBear >= confirmCount
+
+signal = sigBull ? 1 : sigBear ? -1 : 0
+sigCol  = signal == 1 ? colBull() : signal == -1 ? colBear() : color.new(color.gray, 80)
+plot(signal != 0 ? 6.3 : na, "Signal", color=sigCol, style=plot.style_columns, histbase=6.2)
+
+// ── IMPULSE-ONLY ALERTS (per TF + roll-ups)
+impUpAny   = (use1 and i1 == 1) or (use2 and i2 == 1) or (use3 and i3 == 1) or (use4 and i4 == 1)
+impDownAny = (use1 and i1 == -1) or (use2 and i2 == -1) or (use3 and i3 == -1) or (use4 and i4 == -1)
+
+alertcondition(impulseOn and use1 and i1 ==  1,  "Impulse UP — TF1", "Impulse UP on TF1 (intraday)")
+alertcondition(impulseOn and use1 and i1 == -1,  "Impulse DOWN — TF1","Impulse DOWN on TF1 (intraday)")
+alertcondition(impulseOn and use2 and i2 ==  1,  "Impulse UP — TF2", "Impulse UP on TF2 (intraday)")
+alertcondition(impulseOn and use2 and i2 == -1,  "Impulse DOWN — TF2","Impulse DOWN on TF2 (intraday)")
+alertcondition(impulseOn and use3 and i3 ==  1,  "Impulse UP — TF3", "Impulse UP on TF3 (intraday)")
+alertcondition(impulseOn and use3 and i3 == -1,  "Impulse DOWN — TF3","Impulse DOWN on TF3 (intraday)")
+alertcondition(impulseOn and use4 and i4 ==  1,  "Impulse UP — TF4", "Impulse UP on TF4 (intraday)")
+alertcondition(impulseOn and use4 and i4 == -1,  "Impulse DOWN — TF4","Impulse DOWN on TF4 (intraday)")
+
+alertcondition(impulseOn and impUpAny,   "Impulse UP — any intraday",   "Impulse UP on at least one intraday row")
+alertcondition(impulseOn and impDownAny, "Impulse DOWN — any intraday", "Impulse DOWN on at least one intraday row")
+
+// ── Existing confirmation alerts
+alertcondition(sigBull, "Bull confirmation", "RSI heatmap — bullish confirmation")
+alertcondition(sigBear, "Bear confirmation", "RSI heatmap — bearish confirmation")

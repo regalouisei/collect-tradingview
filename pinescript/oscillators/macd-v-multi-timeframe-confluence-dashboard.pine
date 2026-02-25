@@ -1,0 +1,225 @@
+//@version=5
+indicator("MACD-V: Custom Confluence Strategy", overlay=true, max_labels_count=500)
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+
+// --- Signal Confluence Settings ---
+grp_conf = "Signal Timeframes (Select active TFs)"
+use1m    = input.bool(false, "Include 1 Minute", group=grp_conf)
+use5m    = input.bool(true,  "Include 5 Minute", group=grp_conf) // Default ON
+use15m   = input.bool(true,  "Include 15 Minute", group=grp_conf) // Default ON
+use1h    = input.bool(true,  "Include 1 Hour",    group=grp_conf) // Default ON
+use4h    = input.bool(false, "Include 4 Hour",    group=grp_conf)
+useD     = input.bool(false, "Include Daily",     group=grp_conf)
+useW     = input.bool(false, "Include Weekly",    group=grp_conf)
+
+// --- MACD-V Settings ---
+grp_sett = "MACD-V Settings"
+lenFast   = input.int(12,  "Fast EMA",  minval=1, group=grp_sett)
+lenSlow   = input.int(26,  "Slow EMA",  minval=1, group=grp_sett)
+lenATR    = input.int(26,  "ATR Normalisation", minval=1, group=grp_sett)
+lenSig    = input.int(4,   "Signal EMA", minval=1, group=grp_sett) 
+obLevel   = input.int(140, "OB/OS Threshold (±)", minval=10, group=grp_sett)
+
+// --- Visual Settings ---
+grp_vis = "Visuals"
+showLocal  = input.bool(false, "Show Local Arrows", group=grp_vis) // Default OFF
+tablePos   = input.string(position.top_right, "Table Position", options=[position.top_right, position.bottom_right, position.top_left, position.bottom_left], group=grp_vis)
+textSize   = input.string(size.normal, "Table Text Size", options=[size.small, size.normal, size.large, size.huge], group=grp_vis)
+
+// ==========================================
+// 2. FUNCTIONS
+// ==========================================
+
+// Function to calculate MACD-V tuple (Value, Signal)
+f_calc_macdv(_lenFast, _lenSlow, _lenATR, _lenSig) =>
+    _emaF = ta.ema(close, _lenFast)
+    _emaS = ta.ema(close, _lenSlow)
+    _atr  = ta.atr(_lenATR)
+    _val  = _atr > 0 ? (_emaF - _emaS) / _atr * 100.0 : 0.0
+    _sig  = ta.ema(_val, _lenSig)
+    [_val, _sig]
+
+// ==========================================
+// 3. MULTI-TIMEFRAME DATA FETCHING
+// ==========================================
+
+// Wrapper to get [Current Value, Signal, Previous Value]
+f_get_data_tuple() =>
+    [v, s] = f_calc_macdv(lenFast, lenSlow, lenATR, lenSig)
+    [v, s, v[1]]
+
+// Request data for all TFs
+[v1, s1, p1]    = request.security(syminfo.tickerid, "1",  f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[v5, s5, p5]    = request.security(syminfo.tickerid, "5",  f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[v15, s15, p15] = request.security(syminfo.tickerid, "15", f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[v60, s60, p60] = request.security(syminfo.tickerid, "60", f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[v240, s240, p240] = request.security(syminfo.tickerid, "240", f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[vD, sD, pD]    = request.security(syminfo.tickerid, "D",  f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[vW, sW, pW]    = request.security(syminfo.tickerid, "W",  f_get_data_tuple(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// ==========================================
+// 4. SIGNALS
+// ==========================================
+
+// --- A. Modified Bull/Bear Logic (CURL ONLY) ---
+// Bull: Curling UP (Current Value > Previous Value)
+// We ignore '_s' (Signal Line) for the Confluence Signal
+f_is_bull(_v, _s, _p) => (_v > _p)
+
+// Bear: Curling DOWN (Current Value < Previous Value)
+f_is_bear(_v, _s, _p) => (_v < _p)
+
+// Calculate individual status
+bull_1 = f_is_bull(v1, s1, p1), bear_1 = f_is_bear(v1, s1, p1)
+bull_5 = f_is_bull(v5, s5, p5), bear_5 = f_is_bear(v5, s5, p5)
+bull_15= f_is_bull(v15, s15, p15), bear_15= f_is_bear(v15, s15, p15)
+bull_60= f_is_bull(v60, s60, p60), bear_60= f_is_bear(v60, s60, p60)
+bull_240= f_is_bull(v240, s240, p240), bear_240= f_is_bear(v240, s240, p240)
+bull_D = f_is_bull(vD, sD, pD), bear_D = f_is_bear(vD, sD, pD)
+bull_W = f_is_bull(vW, sW, pW), bear_W = f_is_bear(vW, sW, pW)
+
+// --- B. DYNAMIC CONFLUENCE LOGIC ---
+// If 'useX' is checked, we require 'bull_X'. If unchecked, we ignore it (return true).
+
+// Buy Logic
+all_buy = (use1m ? bull_1 : true) and 
+          (use5m ? bull_5 : true) and 
+          (use15m ? bull_15 : true) and 
+          (use1h ? bull_60 : true) and 
+          (use4h ? bull_240 : true) and 
+          (useD ? bull_D : true) and 
+          (useW ? bull_W : true)
+
+// Sell Logic
+all_sell = (use1m ? bear_1 : true) and 
+           (use5m ? bear_5 : true) and 
+           (use15m ? bear_15 : true) and 
+           (use1h ? bear_60 : true) and 
+           (use4h ? bear_240 : true) and 
+           (useD ? bear_D : true) and 
+           (useW ? bear_W : true)
+
+// Ensure at least one is selected to prevent "Always True" error if user unchecks all
+nothingSelected = not (use1m or use5m or use15m or use1h or use4h or useD or useW)
+final_buy = nothingSelected ? false : all_buy
+final_sell = nothingSelected ? false : all_sell
+
+// --- C. ALTERNATING SIGNAL LOGIC (State Machine) ---
+// 1 = Buy, -1 = Sell, 0 = None
+var int lastSignal = 0 
+bool validBuy = false
+bool validSell = false
+
+if final_buy
+    if lastSignal != 1
+        validBuy := true
+        lastSignal := 1
+
+if final_sell
+    if lastSignal != -1
+        validSell := true
+        lastSignal := -1
+
+// --- D. Plotting ---
+plotchar(validBuy, title="Confluence Buy", char='+', location=location.belowbar, color=color.lime, size=size.normal, textcolor=color.lime)
+plotchar(validSell, title="Confluence Sell", char='+', location=location.abovebar, color=color.red,  size=size.normal, textcolor=color.red)
+
+// Local Signals (Light Arrows) - Hidden by default unless showLocal is checked
+[mv, mvSig] = f_calc_macdv(lenFast, lenSlow, lenATR, lenSig)
+crossUp   = ta.crossover(mv, mvSig)
+crossDown = ta.crossunder(mv, mvSig)
+plotshape(crossUp and showLocal,   title="Local Buy",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 50), size=size.tiny)
+plotshape(crossDown and showLocal, title="Local Sell", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 50),  size=size.tiny)
+
+// ==========================================
+// 5. TABLE DRAWING
+// ==========================================
+f_bg_color(_val, _ob) =>
+    if _val >= _ob
+        color.new(color.red, 30)
+    else if _val <= -_ob
+        color.new(color.lime, 30)
+    else if _val > 0
+        color.new(color.green, 90)
+    else
+        color.new(color.red, 90)
+
+f_get_curl(_val, _prev) =>
+    isUp = _val >= _prev
+    [isUp ? "↗" : "↘", isUp ? color.lime : color.red]
+
+f_get_ema_status(_val, _sig) =>
+    isAbove = _val >= _sig
+    [isAbove ? "Above" : "Below", isAbove ? color.lime : color.red]
+
+// Helper to highlight active timeframes in Yellow
+f_row_color(isActive) =>
+    isActive ? color.new(color.yellow, 80) : color.new(color.gray, 80)
+
+var tbl = table.new(tablePos, 4, 8, border_width=1, border_color=color.gray)
+
+if barstate.islast
+    headerColor = color.gray
+    table.cell(tbl, 0, 0, "Time",   bgcolor=headerColor, text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 0, "Curl",   bgcolor=headerColor, text_color=color.white, text_size=textSize)
+    table.cell(tbl, 2, 0, "Sig",    bgcolor=headerColor, text_color=color.white, text_size=textSize)
+    table.cell(tbl, 3, 0, "Value",  bgcolor=headerColor, text_color=color.white, text_size=textSize)
+
+    // Row 1: 1 Minute
+    [t1_curl, c1_curl] = f_get_curl(v1, p1)
+    [t1_ema,  c1_ema]  = f_get_ema_status(v1, s1)
+    table.cell(tbl, 0, 1, "1m", bgcolor=f_row_color(use1m), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 1, t1_curl, bgcolor=color.new(color.gray, 90), text_color=c1_curl, text_size=textSize)
+    table.cell(tbl, 2, 1, t1_ema,  bgcolor=color.new(color.gray, 90), text_color=c1_ema,  text_size=textSize)
+    table.cell(tbl, 3, 1, str.tostring(v1, "#.0"), bgcolor=f_bg_color(v1, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 2: 5 Minute
+    [t5_curl, c5_curl] = f_get_curl(v5, p5)
+    [t5_ema,  c5_ema]  = f_get_ema_status(v5, s5)
+    table.cell(tbl, 0, 2, "5m", bgcolor=f_row_color(use5m), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 2, t5_curl, bgcolor=color.new(color.gray, 90), text_color=c5_curl, text_size=textSize)
+    table.cell(tbl, 2, 2, t5_ema,  bgcolor=color.new(color.gray, 90), text_color=c5_ema,  text_size=textSize)
+    table.cell(tbl, 3, 2, str.tostring(v5, "#.0"), bgcolor=f_bg_color(v5, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 3: 15 Minute
+    [t15_curl, c15_curl] = f_get_curl(v15, p15)
+    [t15_ema,  c15_ema]  = f_get_ema_status(v15, s15)
+    table.cell(tbl, 0, 3, "15m", bgcolor=f_row_color(use15m), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 3, t15_curl, bgcolor=color.new(color.gray, 90), text_color=c15_curl, text_size=textSize)
+    table.cell(tbl, 2, 3, t15_ema,  bgcolor=color.new(color.gray, 90), text_color=c15_ema,  text_size=textSize)
+    table.cell(tbl, 3, 3, str.tostring(v15, "#.0"), bgcolor=f_bg_color(v15, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 4: 1 Hour
+    [t60_curl, c60_curl] = f_get_curl(v60, p60)
+    [t60_ema,  c60_ema]  = f_get_ema_status(v60, s60)
+    table.cell(tbl, 0, 4, "1h", bgcolor=f_row_color(use1h), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 4, t60_curl, bgcolor=color.new(color.gray, 90), text_color=c60_curl, text_size=textSize)
+    table.cell(tbl, 2, 4, t60_ema,  bgcolor=color.new(color.gray, 90), text_color=c60_ema,  text_size=textSize)
+    table.cell(tbl, 3, 4, str.tostring(v60, "#.0"), bgcolor=f_bg_color(v60, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 5: 4 Hour
+    [t240_curl, c240_curl] = f_get_curl(v240, p240)
+    [t240_ema,  c240_ema]  = f_get_ema_status(v240, s240)
+    table.cell(tbl, 0, 5, "4h", bgcolor=f_row_color(use4h), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 5, t240_curl, bgcolor=color.new(color.gray, 90), text_color=c240_curl, text_size=textSize)
+    table.cell(tbl, 2, 5, t240_ema,  bgcolor=color.new(color.gray, 90), text_color=c240_ema,  text_size=textSize)
+    table.cell(tbl, 3, 5, str.tostring(v240, "#.0"), bgcolor=f_bg_color(v240, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 6: Daily
+    [tD_curl, cD_curl] = f_get_curl(vD, pD)
+    [tD_ema,  cD_ema]  = f_get_ema_status(vD, sD)
+    table.cell(tbl, 0, 6, "Daily", bgcolor=f_row_color(useD), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 6, tD_curl, bgcolor=color.new(color.gray, 90), text_color=cD_curl, text_size=textSize)
+    table.cell(tbl, 2, 6, tD_ema,  bgcolor=color.new(color.gray, 90), text_color=cD_ema,  text_size=textSize)
+    table.cell(tbl, 3, 6, str.tostring(vD, "#.0"), bgcolor=f_bg_color(vD, obLevel), text_color=color.white, text_size=textSize)
+
+    // Row 7: Weekly
+    [tW_curl, cW_curl] = f_get_curl(vW, pW)
+    [tW_ema,  cW_ema]  = f_get_ema_status(vW, sW)
+    table.cell(tbl, 0, 7, "Wkly", bgcolor=f_row_color(useW), text_color=color.white, text_size=textSize)
+    table.cell(tbl, 1, 7, tW_curl, bgcolor=color.new(color.gray, 90), text_color=cW_curl, text_size=textSize)
+    table.cell(tbl, 2, 7, tW_ema,  bgcolor=color.new(color.gray, 90), text_color=cW_ema,  text_size=textSize)
+    table.cell(tbl, 3, 7, str.tostring(vW, "#.0"), bgcolor=f_bg_color(vW, obLevel), text_color=color.white, text_size=textSize)

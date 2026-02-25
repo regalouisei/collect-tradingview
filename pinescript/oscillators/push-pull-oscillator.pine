@@ -1,0 +1,131 @@
+//@version=6
+indicator("PUsh-Pull Oscillator", overlay=false, max_labels_count=50)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+forecastMaxLen  = input.int(14, "Forecast Bias max length", minval=2, maxval=200)
+residualMaxLen  = input.int(50, "Residual Bias max length", minval=2, maxval=200)
+
+src             = input.source(close, "Price Source")
+smoothLen       = input.int(1, "Smoothing (EMA)", minval=1)
+
+spreadScaleMode = input.string("Raw (-200..200)", "Spread scale",
+     options=["Raw (-200..200)", "Normalized (-100..100)"])
+showComponents  = input.bool(false, "Show component biases")
+
+// Spread transforms (FLIPPED):
+// - Forecast: boost mids      -> power < 1 (default 0.5)
+// - Residual: boost extremes  -> power > 1 (default 2.0)
+usePowForecast  = input.bool(true,  "Forecast: boost mids (pow<1)", group="Spread")
+forecastPow     = input.float(0.5,  "Forecast power", minval=0.05, maxval=5.0, group="Spread")
+
+usePowResidual  = input.bool(true,  "Residual: boost extremes (pow>1)", group="Spread")
+residualPow     = input.float(2.0,  "Residual power", minval=0.05, maxval=5.0, group="Spread")
+
+eps = 1e-10
+int maxAll = math.max(forecastMaxLen, residualMaxLen)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Helpers
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+f_signedPow_rescaled(x, p) =>
+    // x in [-100, +100]
+    // normalize abs(x) -> [0,1], apply pow, rescale back -> [-100,+100]
+    float a = math.abs(x) / 100.0
+    a := math.min(math.max(a, 0.0), 1.0)
+    math.sign(x) * 100.0 * math.pow(a, p)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Compute BOTH biases in one regLen loop (one LR fit per length)
+// Forecast-bias only uses regLen <= forecastMaxLen (and only then updates prevF)
+// Residual-bias only uses regLen <= residualMaxLen
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float posSumF = 0.0
+float totSumF = 0.0
+float prevF   = src
+
+float posSumR = 0.0
+float negSumR = 0.0
+
+for regLen = 2 to maxAll
+    if bar_index >= regLen - 1
+        float sumX  = regLen * (regLen - 1) * 0.5
+        float sumX2 = (regLen - 1) * regLen * (2 * regLen - 1) / 6.0
+
+        float sumY  = 0.0
+        float sumXY = 0.0
+        for i = 0 to regLen - 1
+            float y = src[i]
+            sumY  += y
+            sumXY += i * y
+
+        float denom     = regLen * sumX2 - sumX * sumX
+        float slope     = denom != 0.0 ? (regLen * sumXY - sumX * sumY) / denom : 0.0
+        float intercept = (sumY - slope * sumX) / regLen
+
+        // (1) Forecast-path bias (only for regLen <= forecastMaxLen)
+        if regLen <= forecastMaxLen
+            float forecastPrice = intercept - slope * regLen
+            float d = forecastPrice - prevF
+            posSumF += math.max(d, 0.0)
+            totSumF += math.abs(d)
+            prevF   := forecastPrice
+
+        // (2) Current residual imbalance bias (only for regLen <= residualMaxLen)
+        if regLen <= residualMaxLen
+            float resid    = src - intercept
+            float residPct = 100.0 * resid / (math.abs(src) + eps)
+            if residPct >= 0
+                posSumR += residPct
+            else
+                negSumR += residPct
+
+// Forecast-path Bias % in [-100, +100]
+float biasF     = totSumF > 0.0 ? ((posSumF / totSumF) - 0.5) * 2.0 : 0.0
+float biasF_raw = 100.0 * biasF
+float biasF_pct = smoothLen > 1 ? ta.ema(biasF_raw, smoothLen) : biasF_raw
+
+// Residual-imbalance Bias % in [-100, +100]
+float totR      = posSumR + math.abs(negSumR)
+float biasR     = totR > eps ? ((posSumR / totR) - 0.5) * 2.0 : 0.0
+float biasR_raw = 100.0 * biasR
+float biasR_pct = smoothLen > 1 ? ta.ema(biasR_raw, smoothLen) : biasR_raw
+
+// Apply transforms ONLY for spread calculation (FLIPPED)
+float biasF_forSpread = usePowForecast ? f_signedPow_rescaled(biasF_pct, forecastPow) : biasF_pct
+float biasR_forSpread = usePowResidual ? f_signedPow_rescaled(biasR_pct, residualPow) : biasR_pct
+
+// Spread
+float spread_raw = biasR_forSpread - biasF_forSpread
+bool  isRaw      = spreadScaleMode == "Raw (-200..200)"
+float spread     = isRaw ? spread_raw : spread_raw * 0.5
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Guide lines (global-scope plots; toggle with na)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+guideCol = color.new(color.gray, 75)
+
+plot(0, "0", color=guideCol, linewidth=1)
+
+plot(isRaw ? 100.0 : na,   "+100 (raw)",  color=guideCol, linewidth=1)
+plot(isRaw ? -100.0 : na,  "-100 (raw)",  color=guideCol, linewidth=1)
+plot(isRaw ? 200.0 : na,   "+200 (raw)",  color=guideCol, linewidth=1)
+plot(isRaw ? -200.0 : na,  "-200 (raw)",  color=guideCol, linewidth=1)
+
+plot((not isRaw) ? 50.0 : na,    "+50 (norm)",  color=guideCol, linewidth=1)
+plot((not isRaw) ? -50.0 : na,   "-50 (norm)",  color=guideCol, linewidth=1)
+plot((not isRaw) ? 100.0 : na,   "+100 (norm)", color=guideCol, linewidth=1)
+plot((not isRaw) ? -100.0 : na,  "-100 (norm)", color=guideCol, linewidth=1)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Main plots (global-scope; toggle with na)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(spread, "Spread (Residual − Forecast)", color=spread >= 0 ? color.teal : color.red, linewidth=2)
+
+// Components
+plot(showComponents ? biasF_pct : na, "Forecast Bias % (raw)", color=color.new(color.teal, 60), linewidth=1)
+plot(showComponents and usePowForecast ? biasF_forSpread : na, "Forecast Bias % (pow)", color=color.new(color.blue, 60), linewidth=1)
+
+plot(showComponents ? biasR_pct : na, "Residual Bias % (raw)", color=color.new(color.orange, 60), linewidth=1)
+plot(showComponents and usePowResidual ? biasR_forSpread : na, "Residual Bias % (pow)", color=color.new(color.purple, 60), linewidth=1)

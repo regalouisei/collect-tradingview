@@ -1,0 +1,388 @@
+//@version=6
+indicator("Ehlers Dominant Cycle Stochastic RSI", shorttitle="Ehlers Cycle StochRSI", overlay=false)
+                                        
+// ######:   . ####:     :##:    ######:  
+// #######   #######:     ##     #######  
+// ##   :##  #:.   ##    ####    ##   :## 
+// ##    ##        ##    ####    ##    ## 
+// ##   :##        ##   :#  #:   ##   :## 
+// #######.    #####     #::#    #######: 
+// #######.    #####.   ##  ##   ######   
+// ##   :##        ##   ######   ##   ##. 
+// ##    ##        ##  .######.  ##   ##  
+// ##   :##  #:    ##  :##  ##:  ##   :## 
+// ########  #######:  ###  ###  ##    ##:
+// ######    :#####:   ##:  :##  ##    ##:
+                                        
+
+// ==================== INPUTS ====================
+string cycleGroup = "Cycle Detection"
+src = input.source(close, "Source", group=cycleGroup)
+minPeriod = input.int(8, "Min Period", minval=4, maxval=20, group=cycleGroup)
+maxPeriod = input.int(50, "Max Period", minval=20, maxval=100, group=cycleGroup)
+useSpectralDilation = input.bool(false, "Use Spectral Dilation (Bandpass Pre-filter)", group=cycleGroup)
+bandpassBandwidth = input.float(0.3, "Bandpass Bandwidth", minval=0.1, maxval=0.5, step=0.05, group=cycleGroup, tooltip="Lower = narrower band, more selective")
+confirmationThreshold = input.float(0.2, "Confirmation Tolerance (%)", minval=0.05, maxval=0.5, step=0.05, group=cycleGroup, tooltip="Methods must agree within this % to confirm")
+
+string rsiGroup = "RSI Settings"
+rsiMult = input.float(1.0, "RSI Period Multiplier", minval=0.25, maxval=2.0, step=0.25, group=rsiGroup, tooltip="Scales RSI period relative to detected cycle. Use 0.5 for half-cycle (more responsive), 1.0 for full cycle (smoother)")
+
+string stochGroup = "Stochastic Settings"  
+stochMult = input.float(1.0, "Stoch Period Multiplier", minval=0.25, maxval=2.0, step=0.25, group=stochGroup, tooltip="Scales stochastic lookback relative to detected cycle. Use 0.5 for half-cycle (faster signals), 1.0 for full cycle (fewer false signals)")
+kSmooth = input.int(10, "K Smoothing", minval=1, group=stochGroup)
+dSmooth = input.int(3, "D Smoothing", minval=1, group=stochGroup)
+
+string displayGroup = "Display"
+showCycleInfo = input.bool(false, "Show Cycle Detection Info", group=displayGroup)
+showConfidenceBg = input.bool(false, "Cycle Correlation Confidence", group=displayGroup, tooltip="Background color shows agreement between cycle detection methods: Green = high confidence, Yellow = moderate, Red = low")
+
+// ==================== FUNCTIONS ====================
+
+// Ehlers Super Smoother
+superSmoother(float source, int length) =>
+    float coef = math.pi * math.sqrt(2) / length
+    float a1 = math.exp(-coef)
+    float b1 = 2 * a1 * math.cos(coef * math.sqrt(2))
+    float c2 = b1
+    float c3 = -a1 * a1
+    float c1 = 1 - c2 - c3
+    var float filt = 0.0
+    filt := c1 * (source + nz(source[1])) / 2 + c2 * nz(filt[1]) + c3 * nz(filt[2])
+    filt
+
+// Bandpass Filter (for Spectral Dilation)
+bandpassFilter(float source, int centerPeriod, float bandwidth) =>
+    float delta = bandwidth
+    float beta = math.cos(2 * math.pi / centerPeriod)
+    float gamma = 1 / math.cos(4 * math.pi * delta / centerPeriod)
+    float alpha = gamma - math.sqrt(gamma * gamma - 1)
+    var float bp = 0.0
+    bp := 0.5 * (1 - alpha) * (source - nz(source[2])) + beta * (1 + alpha) * nz(bp[1]) - alpha * nz(bp[2])
+    bp
+
+// Highpass Filter (removes DC component)
+highpassFilter(float source, int length) =>
+    float alphaHP = (0.707 * 2 * math.pi) / length
+    float a = math.exp(-alphaHP)
+    float b = 2 * a * math.cos(alphaHP)
+    float c2 = b
+    float c3 = -a * a
+    float c1 = (1 + c2 - c3) / 4
+    var float hp = 0.0
+    hp := c1 * (source - 2 * nz(source[1]) + nz(source[2])) + c2 * nz(hp[1]) + c3 * nz(hp[2])
+    hp
+
+// ================ HILBERT TRANSFORM ==================
+hilbertCycle(float source) =>
+    // Smoothed price
+    float smooth = (4 * source + 3 * nz(source[1]) + 2 * nz(source[2]) + nz(source[3])) / 10
+    
+    var float detrender = 0.0
+    var float I1 = 0.0
+    var float Q1 = 0.0
+    var float jI = 0.0
+    var float jQ = 0.0
+    var float I2 = 0.0
+    var float Q2 = 0.0
+    var float Re = 0.0
+    var float Im = 0.0
+    var float htPeriod = 0.0
+    var float smoothPeriod = 0.0
+    
+    if bar_index > 5
+        float adaptiveFactor = 0.075 * nz(htPeriod[1]) + 0.54
+        
+        detrender := (0.0962 * smooth + 0.5769 * nz(smooth[2]) - 0.5769 * nz(smooth[4]) - 0.0962 * nz(smooth[6])) * adaptiveFactor
+        
+        Q1 := (0.0962 * detrender + 0.5769 * nz(detrender[2]) - 0.5769 * nz(detrender[4]) - 0.0962 * nz(detrender[6])) * adaptiveFactor
+        I1 := nz(detrender[3])
+        
+        jI := (0.0962 * I1 + 0.5769 * nz(I1[2]) - 0.5769 * nz(I1[4]) - 0.0962 * nz(I1[6])) * adaptiveFactor
+        jQ := (0.0962 * Q1 + 0.5769 * nz(Q1[2]) - 0.5769 * nz(Q1[4]) - 0.0962 * nz(Q1[6])) * adaptiveFactor
+        
+        I2 := I1 - jQ
+        Q2 := Q1 + jI
+        
+        I2 := 0.2 * I2 + 0.8 * nz(I2[1])
+        Q2 := 0.2 * Q2 + 0.8 * nz(Q2[1])
+        
+        Re := I2 * nz(I2[1]) + Q2 * nz(Q2[1])
+        Im := I2 * nz(Q2[1]) - Q2 * nz(I2[1])
+        Re := 0.2 * Re + 0.8 * nz(Re[1])
+        Im := 0.2 * Im + 0.8 * nz(Im[1])
+        
+        if Im != 0 and Re != 0
+            htPeriod := 2 * math.pi / math.atan(Im / Re)
+        
+        // Rate of change limiter
+        if htPeriod > 1.5 * nz(htPeriod[1])
+            htPeriod := 1.5 * nz(htPeriod[1])
+        if htPeriod < 0.67 * nz(htPeriod[1])
+            htPeriod := 0.67 * nz(htPeriod[1])
+        
+        htPeriod := math.max(minPeriod, math.min(maxPeriod, htPeriod))
+        smoothPeriod := 0.33 * htPeriod + 0.67 * nz(smoothPeriod[1])
+    
+    smoothPeriod
+
+// ================= AUTOCORRELATION PERIODOGRAM ==================
+autocorrelationCycle(float source) =>
+    // Highpass filter to remove trend
+    float hp = highpassFilter(source, maxPeriod)
+    
+    // Super smoother to reduce noise
+    float filt = superSmoother(hp, 10)
+    
+    // Store filtered values for correlation
+    var float[] filtBuffer = array.new_float(maxPeriod + 1, 0.0)
+    array.unshift(filtBuffer, filt)
+    if array.size(filtBuffer) > maxPeriod + 1
+        array.pop(filtBuffer)
+    
+    // Pearson correlation for each lag
+    var float[] corr = array.new_float(maxPeriod + 1, 0.0)
+    
+    float avgFilt = 0.0
+    for i = 0 to maxPeriod
+        avgFilt := avgFilt + array.get(filtBuffer, i)
+    avgFilt := avgFilt / (maxPeriod + 1)
+    
+    for lag = minPeriod to maxPeriod
+        float sx = 0.0
+        float sy = 0.0
+        float sxx = 0.0
+        float syy = 0.0
+        float sxy = 0.0
+        int n = maxPeriod - lag
+        
+        for i = 0 to n - 1
+            float x = array.get(filtBuffer, i)
+            float y = array.get(filtBuffer, i + lag)
+            sx := sx + x
+            sy := sy + y
+            sxx := sxx + x * x
+            syy := syy + y * y
+            sxy := sxy + x * y
+        
+        float denom = math.sqrt((n * sxx - sx * sx) * (n * syy - sy * sy))
+        float r = denom != 0 ? (n * sxy - sx * sy) / denom : 0
+        array.set(corr, lag, r)
+    
+    // Find the peak correlation (dominant cycle)
+    float maxCorr = 0.0
+    int dominantPeriod = minPeriod
+    
+    for period = minPeriod to maxPeriod
+        float c = array.get(corr, period)
+        // Weight by period to favor longer cycles (reduces noise)
+        float weightedCorr = c * (1 - 0.5 * (period - minPeriod) / (maxPeriod - minPeriod))
+        if c > maxCorr and c > 0.2  // Minimum correlation threshold
+            maxCorr := c
+            dominantPeriod := period
+    
+    var float smoothACPeriod = 0.0
+    smoothACPeriod := 0.2 * dominantPeriod + 0.8 * nz(smoothACPeriod[1])
+    
+    [smoothACPeriod, maxCorr]
+
+// ==================== DFT ====================
+goertzelCycle(float source) =>
+    // Highpass and smooth
+    float hp = highpassFilter(source, maxPeriod)
+    float filt = superSmoother(hp, 10)
+    
+    // Store values
+    var float[] dataBuffer = array.new_float(maxPeriod * 2, 0.0)
+    array.unshift(dataBuffer, filt)
+    if array.size(dataBuffer) > maxPeriod * 2
+        array.pop(dataBuffer)
+    
+    // Goertzel algorithm for each period
+    var float[] power = array.new_float(maxPeriod + 1, 0.0)
+    
+    int N = math.min(array.size(dataBuffer), maxPeriod * 2)
+    
+    float maxPower = 0.0
+    int dominantPeriod = minPeriod
+    
+    for period = minPeriod to maxPeriod
+        float omega = 2 * math.pi / period
+        float coeff = 2 * math.cos(omega)
+        
+        float s0 = 0.0
+        float s1 = 0.0
+        float s2 = 0.0
+        
+        for i = 0 to N - 1
+            s0 := array.get(dataBuffer, i) + coeff * s1 - s2
+            s2 := s1
+            s1 := s0
+        
+        // Power at this frequency
+        float pwr = s1 * s1 + s2 * s2 - coeff * s1 * s2
+        array.set(power, period, pwr)
+        
+        if pwr > maxPower
+            maxPower := pwr
+            dominantPeriod := period
+    
+    var float smoothDFTPeriod = 0.0
+    smoothDFTPeriod := 0.2 * dominantPeriod + 0.8 * nz(smoothDFTPeriod[1])
+    
+    // Normalize power for confidence measure
+    float confidence = maxPower > 0 ? 1.0 : 0.0
+    
+    [smoothDFTPeriod, confidence]
+
+// ==================== MAIN CYCLE DETECTION WITH CONFIRMATION ====================
+
+// Optionally apply spectral dilation (bandpass pre-filter)
+float centerPeriod = (minPeriod + maxPeriod) / 2
+float processedSrc = useSpectralDilation ? bandpassFilter(src, math.round(centerPeriod), bandpassBandwidth) : src
+
+// Run all three methods
+float hilbertPeriod = hilbertCycle(processedSrc)
+[acPeriod, acConfidence] = autocorrelationCycle(processedSrc)
+[dftPeriod, dftConfidence] = goertzelCycle(processedSrc)
+
+// Multiple Confirmation Logic
+float avgPeriod = (hilbertPeriod + acPeriod + dftPeriod) / 3
+
+// Check agreement between methods
+float hilbertDev = math.abs(hilbertPeriod - avgPeriod) / avgPeriod
+float acDev = math.abs(acPeriod - avgPeriod) / avgPeriod
+float dftDev = math.abs(dftPeriod - avgPeriod) / avgPeriod
+
+// Count how many methods agree within tolerance
+int agreementCount = 0
+if hilbertDev <= confirmationThreshold
+    agreementCount := agreementCount + 1
+if acDev <= confirmationThreshold
+    agreementCount := agreementCount + 1
+if dftDev <= confirmationThreshold
+    agreementCount := agreementCount + 1
+
+// Confidence-weighted period
+var float totalWeight = 0.0
+var float weightedPeriod = 0.0
+totalWeight := 0.0
+weightedPeriod := 0.0
+
+// Hilbert gets base weight, boosted if within tolerance
+float hilbertWeight = hilbertDev <= confirmationThreshold ? 1.0 : 0.5
+weightedPeriod := weightedPeriod + hilbertPeriod * hilbertWeight
+totalWeight := totalWeight + hilbertWeight
+
+// Autocorrelation weighted by its correlation strength
+float acWeight = acConfidence * (acDev <= confirmationThreshold ? 1.5 : 0.75)
+weightedPeriod := weightedPeriod + acPeriod * acWeight
+totalWeight := totalWeight + acWeight
+
+// DFT weighted by agreement
+float dftWeight = dftDev <= confirmationThreshold ? 1.0 : 0.5
+weightedPeriod := weightedPeriod + dftPeriod * dftWeight
+totalWeight := totalWeight + dftWeight
+
+float confirmedPeriod = totalWeight > 0 ? weightedPeriod / totalWeight : avgPeriod
+
+// Final smoothing
+var float finalPeriod = 0.0
+finalPeriod := 0.15 * confirmedPeriod + 0.85 * nz(finalPeriod[1])
+finalPeriod := math.max(minPeriod, math.min(maxPeriod, finalPeriod))
+
+// Confidence score (0-100)
+float cycleConfidence = (agreementCount / 3.0) * 100
+
+// ==================== CYCLE RSI ====================
+int rsiPeriod = math.max(2, math.round(finalPeriod * rsiMult))
+
+float change = src - src[1]
+float gain = math.max(change, 0)
+float loss = math.max(-change, 0)
+
+float alphaRSI = 2.0 / (rsiPeriod + 1)
+var float avgGain = 0.0
+var float avgLoss = 0.0
+
+avgGain := alphaRSI * gain + (1 - alphaRSI) * nz(avgGain[1])
+avgLoss := alphaRSI * loss + (1 - alphaRSI) * nz(avgLoss[1])
+
+float cycleRSI = avgLoss == 0 ? 100 : avgGain == 0 ? 0 : 100 - (100 / (1 + avgGain / avgLoss))
+
+// ==================== STOCHASTIC OF RSI ====================
+int stochPeriod = math.max(5, math.round(finalPeriod * stochMult))
+
+var float highestRSI = na
+var float lowestRSI = na
+
+highestRSI := cycleRSI
+lowestRSI := cycleRSI
+for i = 1 to maxPeriod
+    if i < stochPeriod
+        highestRSI := math.max(highestRSI, nz(cycleRSI[i]))
+        lowestRSI := math.min(lowestRSI, nz(cycleRSI[i]))
+
+float rawK = highestRSI - lowestRSI != 0 ? 100 * (cycleRSI - lowestRSI) / (highestRSI - lowestRSI) : 50
+
+// Smooth K
+float alphaK = 2.0 / (kSmooth + 1)
+var float kLine = na
+kLine := na(kLine[1]) ? rawK : alphaK * rawK + (1 - alphaK) * nz(kLine[1])
+
+// D line
+float alphaD = 2.0 / (dSmooth + 1)
+var float dLine = na
+dLine := na(dLine[1]) ? kLine : alphaD * kLine + (1 - alphaD) * nz(dLine[1])
+
+// ==================== VISUALIZATION ====================
+
+// Confidence-based background
+color bgColor = showConfidenceBg ? (cycleConfidence >= 66 ? color.new(color.green, 90) : cycleConfidence >= 33 ? color.new(color.yellow, 92) : color.new(color.red, 92)) : na
+bgcolor(bgColor)
+
+// Main plots
+plot(kLine, "K", color.blue, 2)
+plot(dLine, "D", color.orange, 2)
+
+hline(80, "Overbought", color.red, linestyle=hline.style_dashed)
+hline(50, "Midline", color.gray, linestyle=hline.style_dotted)
+hline(20, "Oversold", color.green, linestyle=hline.style_dashed)
+
+// ==================== DATA WINDOW & TABLE ====================
+plot(finalPeriod, "Final Cycle Period", display=display.data_window)
+plot(hilbertPeriod, "Hilbert Period", display=display.data_window)
+plot(acPeriod, "Autocorrelation Period", display=display.data_window)
+plot(dftPeriod, "DFT Period", display=display.data_window)
+plot(cycleConfidence, "Cycle Confidence %", display=display.data_window)
+plot(rsiPeriod, "RSI Period", display=display.data_window)
+plot(stochPeriod, "Stoch Period", display=display.data_window)
+plot(cycleRSI, "Raw RSI", display=display.data_window)
+plot(acConfidence * 100, "AC Correlation %", display=display.data_window)
+
+// Info table
+var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_width=1)
+
+if showCycleInfo and barstate.islast
+    table.cell(infoTable, 0, 0, "Cycle Method", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Period", text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Hilbert", text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(math.round(hilbertPeriod, 1)), text_color=hilbertDev <= confirmationThreshold ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Autocorr", text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(math.round(acPeriod, 1)), text_color=acDev <= confirmationThreshold ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 3, "DFT", text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(math.round(dftPeriod, 1)), text_color=dftDev <= confirmationThreshold ? color.lime : color.gray, text_size=size.small)
+    
+    table.cell(infoTable, 0, 4, "CONFIRMED", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(math.round(finalPeriod, 1)), text_color=color.yellow, text_size=size.small)
+    
+    table.cell(infoTable, 0, 5, "Confidence", text_color=color.white, text_size=size.small)
+    color confColor = cycleConfidence >= 66 ? color.lime : cycleConfidence >= 33 ? color.yellow : color.red
+    table.cell(infoTable, 1, 5, str.tostring(math.round(cycleConfidence)) + "%", text_color=confColor, text_size=size.small)
+
+// Alerts
+alertcondition(ta.crossover(kLine, dLine) and kLine < 30, "Bullish Cross in Oversold", "K crossed above D in oversold zone")
+alertcondition(ta.crossunder(kLine, dLine) and kLine > 70, "Bearish Cross in Overbought", "K crossed below D in overbought zone")
+alertcondition(cycleConfidence >= 66, "High Cycle Confidence", "All three cycle detection methods agree")

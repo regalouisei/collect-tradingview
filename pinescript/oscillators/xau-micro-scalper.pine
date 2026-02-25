@@ -1,0 +1,171 @@
+//@version=6
+indicator("XAU Micro Scalper – M5 (OANDA) | Segnali + Robustezza", shorttitle="XAU Sig+Score", overlay=true)
+
+//====================================================
+// FILTRO ORARIO (ORA ITALIANA - Europe/Rome)
+// BLOCCA: 00:30 – 06:30
+//====================================================
+tz = input.string("Europe/Rome", "Timezone filtro")
+blockedSession = "0030-0630"
+inBlocked = not na(time(timeframe.period, blockedSession, tz))
+sessionOk = not inBlocked
+
+//====================================================
+// INPUT SEGNALI
+//====================================================
+useRsiFilter = input.bool(true, "Usa filtro RSI")
+useKDConfirm = input.bool(true, "Conferma K sopra/sotto D")
+
+// RSI
+rsiLen      = input.int(14, "Periodo RSI", minval=1)
+rsiMaxLong  = input.int(50, "RSI max LONG", minval=1, maxval=100)
+rsiMinShort = input.int(50, "RSI min SHORT", minval=1, maxval=100)
+
+// Stocastico
+stochLen = input.int(14, "Stoch Length", minval=1)
+kLen     = input.int(3,  "K Smoothing", minval=1)
+dLen     = input.int(3,  "D Smoothing", minval=1)
+stochOS  = input.int(25, "Oversold", minval=1, maxval=50)
+stochOB  = input.int(75, "Overbought", minval=50, maxval=99)
+
+//====================================================
+// INPUT ROBUSTEZZA (score)
+//====================================================
+showScoreLabel  = input.bool(true, "Mostra etichetta robustezza")
+labelOffsetUsd  = input.float(3.0, "Offset etichetta ($)", step=0.5)
+minScoreToShow  = input.int(0, "Score minimo per etichetta", minval=0, maxval=100)
+
+atrLen      = input.int(14, "ATR length (score)", minval=1)
+atrMinPerc  = input.float(0.03, "ATR% minimo (score)", step=0.01)
+atrMaxPerc  = input.float(0.12, "ATR% massimo (score)", step=0.01)
+
+kMoveMin    = input.float(1.0, "K move min (score)", step=0.5)
+kMoveMax    = input.float(8.0, "K move max (score)", step=0.5)
+
+kdSepMin    = input.float(0.5, "K-D sep min (score)", step=0.1)
+kdSepMax    = input.float(6.0, "K-D sep max (score)", step=0.1)
+
+rsiSlopeMin = input.float(0.1, "RSI slope min (score)", step=0.1)
+rsiSlopeMax = input.float(2.0, "RSI slope max (score)", step=0.1)
+
+// Pesi (somma consigliata ~100)
+wStoch = input.int(35, "Peso Stoch", minval=0, maxval=100)
+wKD    = input.int(25, "Peso K-D",   minval=0, maxval=100)
+wRSI   = input.int(25, "Peso RSI",   minval=0, maxval=100)
+wATR   = input.int(15, "Peso ATR%",  minval=0, maxval=100)
+
+//====================================================
+// FUNZIONI UTILI
+//====================================================
+clamp01(x) => math.max(0.0, math.min(1.0, x))
+
+norm(x, minv, maxv) =>
+    maxv == minv ? 0.0 : clamp01((x - minv) / (maxv - minv))
+
+grade(s) =>
+    string g = "D"
+    if s >= 75
+        g := "A"
+    else if s >= 60
+        g := "B"
+    else if s >= 45
+        g := "C"
+    g
+
+labelColor(s) =>
+    color c = color.new(color.red, 0)
+    if s >= 75
+        c := color.new(color.green, 0)
+    else if s >= 60
+        c := color.new(color.lime, 0)
+    else if s >= 45
+        c := color.new(color.orange, 0)
+    c
+
+//====================================================
+// INDICATORI
+//====================================================
+rsi = ta.rsi(close, rsiLen)
+
+// Stoch v6 (ordine corretto)
+k_raw = ta.stoch(close, high, low, stochLen)
+k     = ta.sma(k_raw, kLen)
+d     = ta.sma(k, dLen)
+
+atr = ta.atr(atrLen)
+atrPerc = (atr / close) * 100.0
+
+//====================================================
+// LOGICA SEGNALI
+//====================================================
+baseLong  = ta.crossover(k, stochOS)
+baseShort = ta.crossunder(k, stochOB)
+
+kdLong  = k > d
+kdShort = k < d
+
+rsiOkLong  = (not useRsiFilter) or ((rsi < rsiMaxLong)  and (rsi > rsi[1]))
+rsiOkShort = (not useRsiFilter) or ((rsi > rsiMinShort) and (rsi < rsi[1]))
+
+longSignal  = sessionOk and baseLong  and (not useKDConfirm or kdLong)  and rsiOkLong
+shortSignal = sessionOk and baseShort and (not useKDConfirm or kdShort) and rsiOkShort
+
+//====================================================
+// SCORE 0–100 (robustezza singolo segnale) modificare per cambiare le fasce
+//====================================================
+kMove      = math.abs(k - k[1])
+kdSep      = math.abs(k - d)
+rsiSlope   = math.abs(rsi - rsi[1])
+
+atrScore       = norm(atrPerc, atrMinPerc, atrMaxPerc)
+kdSepScore     = norm(kdSep,   kdSepMin,   kdSepMax)
+rsiSlopeScore  = norm(rsiSlope, rsiSlopeMin, rsiSlopeMax)
+kMoveScore     = norm(kMove, kMoveMin, kMoveMax)
+
+// Stoch strength: quanto K si allontana dalla soglia nel bar del segnale
+stochStrengthLong  = k - stochOS
+stochStrengthShort = stochOB - k
+
+stochScoreLong  = norm(stochStrengthLong,  0.0, 15.0) * kMoveScore
+stochScoreShort = norm(stochStrengthShort, 0.0, 15.0) * kMoveScore
+
+// RSI contesto
+rsiContextLong  = norm(rsiMaxLong - rsi, 0.0, 20.0)
+rsiContextShort = norm(rsi - rsiMinShort, 0.0, 20.0)
+
+rsiScoreLong  = (rsiSlopeScore * 0.6 + rsiContextLong * 0.4)
+rsiScoreShort = (rsiSlopeScore * 0.6 + rsiContextShort * 0.4)
+
+// KD direzionale (solo se nella direzione giusta)
+kdScoreLong  = kdSepScore * (kdLong  ? 1.0 : 0.0)
+kdScoreShort = kdSepScore * (kdShort ? 1.0 : 0.0)
+
+// Punteggio finale
+scoreLong  = wStoch * stochScoreLong  + wKD * kdScoreLong  + wRSI * rsiScoreLong  + wATR * atrScore
+scoreShort = wStoch * stochScoreShort + wKD * kdScoreShort + wRSI * rsiScoreShort + wATR * atrScore
+
+score = longSignal ? scoreLong : shortSignal ? scoreShort : na
+
+// Testo etichetta su più righe
+labelText =
+     (longSignal ? "LONG" : "SHORT") + "\n" +
+     "Score: " + str.tostring(math.round(score)) + "/100\n" +
+     "Grade: " + grade(score)
+
+//====================================================
+// VISUAL
+//====================================================
+plotshape(longSignal,  title="BUY",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.small, text="L")
+plotshape(shortSignal, title="SELL", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.small, text="S")
+
+if (showScoreLabel and (longSignal or shortSignal) and score >= minScoreToShow)
+    y  = longSignal ? (low - labelOffsetUsd) : (high + labelOffsetUsd)
+    st = longSignal ? label.style_label_up : label.style_label_down
+    bg = labelColor(score)
+    label.new(bar_index, y, labelText, style=st, color=bg, textcolor=color.white, size=size.small)
+
+//====================================================
+// ALERT
+//====================================================
+alertcondition(longSignal,  "BUY Signal",  "Segnale LONG XAUUSD M5 (OANDA)")
+alertcondition(shortSignal, "SELL Signal", "Segnale SHORT XAUUSD M5 (OANDA)")

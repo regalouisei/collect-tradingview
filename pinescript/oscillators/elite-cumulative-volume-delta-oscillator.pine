@@ -1,0 +1,380 @@
+//@version=6
+indicator("Elite CVD Oscillator v2.0", "Elite CVD+", format=format.volume, overlay=false)
+
+// Import TA library
+import TradingView/ta/9 as ta_lib
+
+// === Inputs ===
+// Anchor & Timeframe Settings
+anchorInput = input.timeframe("1D", "Anchor Period (Reset)", 
+     tooltip="Defines the session reset period for CVD calculation (e.g., '1D' for daily reset at midnight exchange time). Common choices: '1D' for regular sessions, '1W' for weekly view, or custom like '4H' for shorter sessions. Adjust based on your trading style – shorter anchors for intraday, longer for swing/position trading. For volatile futures like NQ/ES, use '1D' or '4H'; for forex, match session times.")
+
+useCustomTimeframeInput = input.bool(false, "Use Custom Lower Timeframe", 
+     tooltip="Enable to force delta calculation on a specific lower timeframe regardless of chart TF. Useful for consistency across different chart views (e.g., always use 1-min delta even on higher TFs). Toggle on for precision in fast markets; off for auto-adaptation.")
+
+lowerTimeframeInput = input.timeframe("1", "Lower Timeframe", 
+     tooltip="The resolution for fetching volume delta data when 'Use Custom Lower Timeframe' is enabled. Lower TFs (e.g., '1' or '5') provide more granular delta; higher TFs smooth it out. For futures like ES/NQ, '1' or '3' is common for precision on 1M-15M charts; increase to '15' on daily for less noise.")
+
+// Style Settings
+plotStyle = input.string("Line", "Plot Style", options=["Line", "Histogram"], group="Style", 
+     tooltip="Choose 'Histogram' for column-based visualization (great for spotting delta spikes on intraday TFs like 1M-5M); 'Line' for smoother trends on higher TFs (15M+). Histogram recommended for futures to align with volume flow.")
+
+// Divergences
+showRegularDivergences = input.bool(true, "Show Regular Divergence Labels", group="Divergences", 
+     tooltip="Displays classic bullish/bearish divergences between price and CVD. Strong on higher TFs (15M+); may generate more noise on very low TFs – disable if cluttered. Adjust pivot lengths (hardcoded at 5) if needed for instrument volatility.")
+
+showHiddenDivergences = input.bool(true, "Show Hidden Divergence Labels", group="Divergences", 
+     tooltip="Shows hidden (continuation) divergences. Excellent for trend-following setups. Works across all TFs but shines on 5M–1H where trends are clearer. Toggle off on very low TFs if labels overlap.")
+
+// Dual EMA
+fastEmaLength = input.int(20, "Fast CVD EMA Length", minval=1, group="Dual EMA", 
+     tooltip="Period for the faster EMA on CVD line. Shorter lengths (10–20) react quickly – ideal for scalping/low TFs. Longer (30+) for smoother signals on daily/weekly charts. For high-vol instruments like CL, shorten to 15.")
+
+slowEmaLength = input.int(50, "Slow CVD EMA Length", minval=1, group="Dual EMA", 
+     tooltip="Period for the slower EMA. Use 2–3x the fast length for crossovers. Adjust higher on volatile instruments (e.g., NQ) or lower TFs to avoid lag; lower for steady stocks.")
+
+// Dynamic Coloring
+colorLookback = input.int(10, "Delta Strength Lookback", minval=1, group="Dynamic Coloring", 
+     tooltip="Bars to look back for calculating average delta change. Shorter (5–10) for aggressive coloring on intraday; longer (20+) for stable colors on higher TFs. Match to instrument: short for crypto, long for indices.")
+
+strongThreshold = input.float(1.5, "Strong Delta Multiplier", minval=1.0, step=0.1, group="Dynamic Coloring", 
+     tooltip="Multiplier above average delta change to trigger strong green/red coloring. Lower (1.2–1.5) for sensitive response on quiet instruments; raise (2.0+) for high-volume contracts like ES. Test on backdata for optimal.")
+
+// CVD Extremes
+showExtremes = input.bool(true, "Show Session CVD Extremes", group="CVD Extremes", 
+     tooltip="Draws horizontal lines at session high/low CVD values. Very useful for spotting potential resets or exhaustion across all TFs. Enable on 1D anchor for daily trading.")
+
+extremeZonePercent = input.float(5.0, "Extreme Test Zone (% of range)", minval=0.1, maxval=20.0, group="CVD Extremes", 
+     tooltip="Percentage of session CVD range to highlight as 'test zone' near extremes. Smaller % (2–5) for precise entries; larger for broader context. Adjust lower on low-TF scalping for tight zones.")
+
+// Extreme Delta Bars
+showExtremeBars = input.bool(true, "Highlight Extreme Delta Bars", group="Extreme Delta Bars", 
+     tooltip="Colors CVD line intensely on bars with unusually high single-bar delta. Great for spotting aggressive buying/selling pressure. Enable for all TFs, but tune percentile higher on volatile instruments to reduce false positives.")
+
+extremeBarLookback = input.int(50, "Extreme Bar Lookback", minval=10, group="Extreme Delta Bars", 
+     tooltip="Number of bars to calculate percentile for extreme delta. Longer lookback (100+) for stable thresholds on higher TFs; shorter for adaptive on intraday. For ES, use 100+ on 5M+.")
+
+extremeBarPercentile = input.float(95.0, "Extreme Threshold (Percentile)", minval=80.0, maxval=99.9, step=0.1, group="Extreme Delta Bars", 
+     tooltip="Percentile threshold for extreme bars. 95–98 common; lower for more highlights on volatile instruments like BTC. Raise to 98+ on quiet forex pairs.")
+
+showBarBackground = input.bool(false, "Vertical Background on Extreme Bars", group="Extreme Delta Bars", 
+     tooltip="Adds subtle vertical background on extreme delta bars for quick visual scan. Toggle on for enhanced visibility on histogram mode; off if cluttering. Adjust colors below for contrast with your theme.")
+
+extremeBuyBgColor = input.color(color.new(color.lime, 75), "Extreme Buy Background Color", group="Extreme Delta Bars", 
+     tooltip="Color for positive extreme bar backgrounds. Use bright shades like lime to contrast with standard green zones. Adjust transparency: lower (more opaque) for standout on dark themes, higher for subtlety.")
+
+extremeSellBgColor = input.color(color.new(color.fuchsia, 75), "Extreme Sell Background Color", group="Extreme Delta Bars", 
+     tooltip="Color for negative extreme bar backgrounds. Use contrasting shades like fuchsia to avoid blending with red zones. Tune based on TF: more opaque on 1M for quick spots, transparent on daily.")
+
+// Extreme Delta Bar Alerts
+alertExtremeDelta = input.bool(true, "Alert on Extreme Delta Bars", group="Extreme Delta Bars",
+     tooltip="Triggers alert when a single bar prints delta above the selected percentile threshold")
+
+alertExtremeBuyOnly = input.bool(false, "Extreme Buy Only (ignore sells)", group="Extreme Delta Bars", inline="extreme_alert_filter")
+alertExtremeSellOnly = input.bool(false, "Extreme Sell Only (ignore buys)", group="Extreme Delta Bars", inline="extreme_alert_filter")
+
+// Absorption
+showAbsorption = input.bool(true, "Show Absorption Score", group="Absorption", 
+     tooltip="Highlights potential absorption/reversal when high delta occurs against price move. Enable for reversal hunting on 5M-1H; disable on trends.")
+
+absorptionLookback = input.int(50, "Absorption Lookback", minval=10, group="Absorption", 
+     tooltip="Bars for averaging delta strength. Match to your typical holding period – shorter for scalping, longer for swings. For NQ, use 30-50 on 5M.")
+
+absorptionThreshold = input.int(75, "Absorption Score Threshold (0-100)", minval=50, maxval=100, group="Absorption", 
+     tooltip="Minimum score to trigger highlight/label. Tune lower for more signals, higher for high-probability only. Start at 80 on volatile futures.")
+
+showAbsorptionLabels = input.bool(true, "Show Absorption Labels", group="Absorption", 
+     tooltip="Displays numeric absorption score on qualifying bars. Toggle on for detailed reads; off for clean charts.")
+
+// Data Table
+showDataTable = input.bool(true, "Show Data Table", group="Data Table", 
+     tooltip="Displays a compact real-time table with elite CVD metrics. Toggle off to declutter. Best on 5M+ TFs; use on 1M for scalping.")
+
+tablePosition = input.string("top_right", "Table Position", options=["top_left", "top_right", "bottom_left", "bottom_right"], group="Data Table", 
+     tooltip="Corner placement. Top-right for most layouts; bottom for mobile.")
+
+tableSizeMode = input.string("Normal", "Table Size Mode", 
+     options=["Normal", "Compact", "Single Line"], 
+     group="Data Table",
+     tooltip="Single Line = smallest footprint (one row)\nCompact = 3 key metrics\nNormal = full original table\nUse Single Line for tight Mag 7 multi-chart layouts.")
+
+tableBgColor = input.color(color.new(color.black, 85), "Table Background Color", group="Data Table", 
+     tooltip="Semi-transparent dark for blend. Adjust opacity for your theme.")
+
+// Delta Momentum for Table
+rocLength = input.int(14, "Momentum Lookback", minval=5, group="Data Table", 
+     tooltip="Lookback for Recent Delta Momentum. Shorter (5-10) for scalping on 1M-5M; longer (14-20) for swings on 15M+.")
+
+// Confluence Score Factors
+confEmaBias = input.bool(true, "Include EMA Bias in Confluence", group="Data Table")
+confAbsorption = input.bool(true, "Include Absorption in Confluence", group="Data Table")
+confExtremes = input.bool(true, "Include Extremes Test in Confluence", group="Data Table")
+confRocPositive = input.bool(true, "Include Positive ROC in Confluence", group="Data Table")
+confRecentDiv = input.bool(true, "Include Recent Divergence in Confluence", group="Data Table")
+confDivLookback = input.int(20, "Recent Div Lookback (bars)", minval=10, group="Data Table", 
+     tooltip="Bars to scan for last divergence. Shorter for low TFs; longer for higher.")
+
+// === Timeframe logic ===
+lowerTimeframe = useCustomTimeframeInput ? lowerTimeframeInput :
+     timeframe.isseconds ? "1S" :
+     timeframe.isintraday ? "1" :
+     timeframe.isdaily ? "5" : "60"
+
+// === Delta data (anchored - resets per session) ===
+[openVolume, maxVolume, minVolume, lastVolume] = ta_lib.requestVolumeDelta(lowerTimeframe, anchorInput)
+deltaPerBar = lastVolume - openVolume
+
+// === Session-Resettable CVD ===
+var float sessionCvd = 0.0
+isNewSession = ta.change(time(anchorInput)) != 0
+
+if isNewSession
+    sessionCvd := deltaPerBar
+else
+    sessionCvd := sessionCvd[1] + deltaPerBar
+
+// === Dynamic + Extreme Bar Coloring ===
+cvdChange = ta.change(sessionCvd, colorLookback)
+avgChange = ta.sma(math.abs(cvdChange), colorLookback)
+strengthMultiplier = math.abs(cvdChange) / (avgChange == 0 ? 1 : avgChange)
+
+baseColor = strengthMultiplier >= strongThreshold ? (cvdChange > 0 ? color.new(color.lime, 0) : color.new(color.red, 0)) : color.orange
+
+absDelta = math.abs(deltaPerBar)
+extremeThresh = ta.percentile_linear_interpolation(absDelta, extremeBarLookback, extremeBarPercentile)
+isExtremeBar = showExtremeBars and absDelta >= extremeThresh
+
+finalCvdColor = isExtremeBar ? (deltaPerBar > 0 ? color.new(color.lime, 0) : color.new(color.red, 0)) : baseColor
+
+// Plot CVD with selected style
+plot(sessionCvd, "CVD", color=finalCvdColor, linewidth= plotStyle == "Line" ? 3 : 1, style= plotStyle == "Histogram" ? plot.style_columns : plot.style_line)
+
+// === EMAs ===
+fastEma = ta.ema(sessionCvd, fastEmaLength)
+slowEma = ta.ema(sessionCvd, slowEmaLength)
+
+plot(fastEma, "Fast CVD EMA", color=color.yellow, linewidth=2)
+plot(slowEma, "Slow CVD EMA", color=color.purple, linewidth=2)
+
+// Extreme Bar Background (with distinct colors)
+bgcolor(showBarBackground and isExtremeBar ? (deltaPerBar > 0 ? extremeBuyBgColor : extremeSellBgColor) : na)
+
+// === CVD Session Extremes ===
+var line lineHigh = na
+var line lineLow = na
+var float sessionCvdHigh = na
+var float sessionCvdLow = na
+
+if isNewSession
+    sessionCvdHigh := sessionCvd
+    sessionCvdLow := sessionCvd
+    if not na(lineHigh)
+        line.delete(lineHigh)
+    if not na(lineLow)
+        line.delete(lineLow)
+    lineHigh := na
+    lineLow := na
+else
+    sessionCvdHigh := math.max(sessionCvdHigh[1], sessionCvd)
+    sessionCvdLow := math.min(sessionCvdLow[1], sessionCvd)
+
+if showExtremes
+    if na(lineHigh)
+        lineHigh := line.new(bar_index, sessionCvdHigh, bar_index + 1, sessionCvdHigh, extend=extend.right, color=color.new(color.green, 50), width=2)
+        lineLow := line.new(bar_index, sessionCvdLow, bar_index + 1, sessionCvdLow, extend=extend.right, color=color.new(color.red, 50), width=2)
+    else
+        line.set_y1(lineHigh, sessionCvdHigh)
+        line.set_y2(lineHigh, sessionCvdHigh)
+        line.set_y1(lineLow, sessionCvdLow)
+        line.set_y2(lineLow, sessionCvdLow)
+        line.set_x2(lineHigh, bar_index + 1)
+        line.set_x2(lineLow, bar_index + 1)
+
+// === Extreme Test Zone ===
+cvdRange = sessionCvdHigh - sessionCvdLow
+zoneSize = cvdRange * (extremeZonePercent / 100)
+nearHigh = math.abs(sessionCvd - sessionCvdHigh) <= zoneSize
+nearLow = math.abs(sessionCvd - sessionCvdLow) <= zoneSize
+bgcolor(nearHigh ? color.new(color.green, 90) : nearLow ? color.new(color.red, 90) : na)
+
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dashed)
+extremeThreshold = ta.highest(math.abs(sessionCvd), 20)[1]
+bgcolor(math.abs(sessionCvd) > extremeThreshold ? (sessionCvd > 0 ? color.new(color.teal, 90) : color.new(color.red, 90)) : na)
+
+// === Absorption Score ===
+priceRange = high - low
+closePos = priceRange == 0 ? 0.5 : (close - low) / priceRange
+
+deltaEff = deltaPerBar > 0 ?
+     (closePos < 0.5 ? 1 - closePos * 2 : 0) :
+     (closePos > 0.5 ? closePos * 2 - 1 : 0)
+
+deltaStr = absDelta / ta.sma(absDelta, absorptionLookback)
+absorptionScore = math.min(deltaStr * 100 * deltaEff * 2, 100)
+
+highAbs = showAbsorption and absorptionScore >= absorptionThreshold
+absColor = deltaPerBar > 0 ? color.new(color.blue, 80) : color.new(color.orange, 80)
+
+bgcolor(highAbs ? absColor : na)
+
+if highAbs and showAbsorptionLabels
+    label.new(bar_index, sessionCvd, "Absorb\n" + str.tostring(math.round(absorptionScore)), 
+              color=color.new(deltaPerBar > 0 ? color.blue : color.orange, 70), 
+              style=label.style_label_center, textcolor=color.white, size=size.small)
+
+// === Divergence Detection ===
+priceHighPivot = ta.pivothigh(high, 5, 5)
+priceLowPivot = ta.pivotlow(low, 5, 5)
+cvdHighPivot = ta.pivothigh(sessionCvd, 5, 5)
+cvdLowPivot = ta.pivotlow(sessionCvd, 5, 5)
+
+prevPriceHigh = ta.valuewhen(not na(priceHighPivot), priceHighPivot, 1)
+prevPriceLow = ta.valuewhen(not na(priceLowPivot), priceLowPivot, 1)
+prevCvdHigh = ta.valuewhen(not na(cvdHighPivot), cvdHighPivot, 1)
+prevCvdLow = ta.valuewhen(not na(cvdLowPivot), cvdLowPivot, 1)
+
+// Track recent divergence
+var string recentDivType = na
+var int lastDivBar = na
+
+if showRegularDivergences or showHiddenDivergences
+    bool bullDiv = false
+    bool bearDiv = false
+    
+    // Bullish
+    if showRegularDivergences and not na(priceLowPivot) and not na(cvdLowPivot) and priceLowPivot < prevPriceLow and cvdLowPivot > prevCvdLow
+        bullDiv := true
+    if showHiddenDivergences and not na(priceHighPivot) and not na(cvdHighPivot) and priceHighPivot > prevPriceHigh and cvdHighPivot < prevCvdHigh
+        bullDiv := true
+    
+    // Bearish
+    if showRegularDivergences and not na(priceHighPivot) and not na(cvdHighPivot) and priceHighPivot > prevPriceHigh and cvdHighPivot < prevCvdHigh
+        bearDiv := true
+    if showHiddenDivergences and not na(priceLowPivot) and not na(cvdLowPivot) and priceLowPivot < prevPriceLow and cvdLowPivot > prevCvdLow
+        bearDiv := true
+    
+    if bullDiv or bearDiv
+        recentDivType := bullDiv ? "Bullish" : "Bearish"
+        lastDivBar := bar_index
+
+// Decay recent div
+if not na(lastDivBar) and bar_index - lastDivBar > confDivLookback
+    recentDivType := na
+    lastDivBar := na
+
+// === Data Table ===
+var table eliteTable = na
+
+if showDataTable and barstate.islast
+    // Position
+    pos = tablePosition == "top_left" ? position.top_left :
+          tablePosition == "top_right" ? position.top_right :
+          tablePosition == "bottom_left" ? position.bottom_left : position.bottom_right
+    
+    // Buy/Sell % (always calculate)
+    totalVol = volume
+    buyVol = (totalVol + deltaPerBar) / 2
+    sellVol = totalVol - buyVol
+    buyDeltaPct = totalVol > 0 ? (buyVol / totalVol * 100) : 0
+    sellDeltaPct = 100 - buyDeltaPct
+    
+    // Create table only if missing (no delete on mode change)
+    if na(eliteTable)
+        eliteTable := table.new(pos, columns=2, rows=5, bgcolor=tableBgColor,
+                                border_width=1, border_color=color.new(color.gray,60),
+                                frame_width=1, frame_color=color.new(color.gray,80))
+    
+    // Clear ALL cells every update to prevent ghosts/stale data
+    table.clear(eliteTable, 0, 0, 1, 4)
+    
+    bool isSingle = tableSizeMode == "Single Line"
+    bool isCompact = tableSizeMode == "Compact"
+    headerSize = isSingle ? size.small : size.normal
+    
+    // Header (always write)
+    table.cell(eliteTable, 0, 0, isSingle ? "CVD" : "Elite CVD", text_color=color.white, text_size=headerSize, bgcolor=color.new(color.blue,75))
+    table.cell(eliteTable, 1, 0, "", bgcolor=color.new(color.blue,75))
+    
+    if isSingle
+        deltaMom = sessionCvd - nz(sessionCvd[rocLength])
+        arr = deltaMom > 0 ? " ▲" : " ▼"
+        val = str.tostring(sessionCvd, format.volume) + arr
+        table.cell(eliteTable, 0, 1, "Net CVD", text_color=color.gray, text_size=size.tiny)
+        table.cell(eliteTable, 1, 1, val, text_color=sessionCvd > 0 ? color.lime : color.red, text_size=size.normal)
+    
+    else if isCompact
+        table.cell(eliteTable, 0, 1, "Session CVD", text_color=color.gray, text_size=size.tiny)
+        table.cell(eliteTable, 1, 1, str.tostring(sessionCvd, format.volume), text_color=sessionCvd > 0 ? color.lime : color.red, text_size=size.small)
+        
+        table.cell(eliteTable, 0, 2, "Buy/Sell %", text_color=color.gray, text_size=size.tiny)
+        table.cell(eliteTable, 1, 2, str.tostring(buyDeltaPct, "#.#") + "/" + str.tostring(sellDeltaPct, "#.#"), text_color=deltaPerBar > 0 ? color.lime : color.red, text_size=size.small)
+        
+        deltaMom = sessionCvd - nz(sessionCvd[rocLength])
+        dir = deltaMom > nz(sessionCvd[1] - sessionCvd[rocLength+1]) ? "↑" : "↓"
+        table.cell(eliteTable, 0, 3, "Momentum", text_color=color.gray, text_size=size.tiny)
+        table.cell(eliteTable, 1, 3, str.tostring(deltaMom, "+#.##") + " " + dir, text_color=deltaMom > 0 ? color.lime : color.red, text_size=size.small)
+    
+    else  // Normal
+        table.cell(eliteTable, 0, 1, "Session CVD", text_color=color.white, text_size=size.small)
+        table.cell(eliteTable, 1, 1, str.tostring(sessionCvd, "#.##"), text_color=sessionCvd > 0 ? color.lime : color.red, text_size=size.small)
+        
+        table.cell(eliteTable, 0, 2, "Delta % (Buy/Sell)", text_color=color.white, text_size=size.small)
+        table.cell(eliteTable, 1, 2, str.tostring(buyDeltaPct, "#.#") + "% / " + str.tostring(sellDeltaPct, "#.#") + "%", text_color=deltaPerBar > 0 ? color.lime : color.red, text_size=size.small)
+        
+        rng = sessionCvdHigh - sessionCvdLow
+        pctH = rng != 0 ? math.abs((sessionCvd - sessionCvdHigh) / rng * 100) : 0
+        pctL = rng != 0 ? math.abs((sessionCvd - sessionCvdLow) / rng * 100) : 0
+        table.cell(eliteTable, 0, 3, "To High / Low (%)", text_color=color.white, text_size=size.small)
+        table.cell(eliteTable, 1, 3, str.tostring(pctH, "#.#") + "% / " + str.tostring(pctL, "#.#") + "%", text_color=color.orange, text_size=size.small)
+        
+        deltaMom = sessionCvd - nz(sessionCvd[rocLength])
+        prevMom = sessionCvd[1] - nz(sessionCvd[rocLength+1])
+        dirStr = deltaMom > prevMom ? "Rising" : "Falling"
+        table.cell(eliteTable, 0, 4, "Recent Delta (Momentum)", text_color=color.white, text_size=size.small)
+        table.cell(eliteTable, 1, 4, str.tostring(deltaMom, "#.##") + " (" + dirStr + ")", text_color=deltaMom > 0 ? color.lime : color.red, text_size=size.small)
+
+// Single-line extra transparency
+if tableSizeMode == "Single Line" and not na(eliteTable)
+    table.set_bgcolor(eliteTable, color.new(color.black, 94))
+
+// === Divergence Labels ===
+if showRegularDivergences
+    if not na(priceHighPivot) and not na(cvdHighPivot) and priceHighPivot > prevPriceHigh and cvdHighPivot < prevCvdHigh
+        label.new(bar_index, sessionCvd, "Bear Div", color=color.new(color.red, 70), style=label.style_label_down, textcolor=color.white, size=size.small)
+    if not na(priceLowPivot) and not na(cvdLowPivot) and priceLowPivot < prevPriceLow and cvdLowPivot > prevCvdLow
+        label.new(bar_index, sessionCvd, "Bull Div", color=color.new(color.teal, 70), style=label.style_label_up, textcolor=color.white, size=size.small)
+
+if showHiddenDivergences
+    if not na(priceHighPivot) and not na(cvdHighPivot) and priceHighPivot > prevPriceHigh and cvdHighPivot < prevCvdHigh
+        label.new(bar_index, sessionCvd, "Bull Hid", color=color.new(color.teal, 70), style=label.style_label_up, textcolor=color.white, size=size.small)
+    if not na(priceLowPivot) and not na(cvdLowPivot) and priceLowPivot < prevPriceLow and cvdLowPivot > prevCvdLow
+        label.new(bar_index, sessionCvd, "Bear Hid", color=color.new(color.red, 70), style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// === Alerts ===
+
+// Original alerts
+alertcondition(ta.crossover(sessionCvd, 0), title="CVD Cross Above Zero", message="Cumulative delta turned positive")
+alertcondition(ta.crossunder(sessionCvd, 0), title="CVD Cross Below Zero", message="Cumulative delta turned negative")
+alertcondition(sessionCvd > sessionCvdHigh[1], title="New CVD Session High", message="CVD broke session high")
+alertcondition(sessionCvd < sessionCvdLow[1], title="New CVD Session Low", message="CVD broke session low")
+
+// Extreme Delta Bar Alerts
+extremeBuyAlert  = isExtremeBar and deltaPerBar > 0
+extremeSellAlert = isExtremeBar and deltaPerBar < 0
+
+triggerExtremeBuy  = alertExtremeDelta and extremeBuyAlert  and not alertExtremeSellOnly
+triggerExtremeSell = alertExtremeDelta and extremeSellAlert and not alertExtremeBuyOnly
+triggerAnyExtreme  = triggerExtremeBuy or triggerExtremeSell
+
+alertcondition(triggerExtremeBuy,  title="Extreme BUY Delta Bar",  
+     message="EXTREME BUY DELTA {{ticker}} {{timeframe}} | Delta: {{plot(\"CVD\")}}")
+alertcondition(triggerExtremeSell, title="Extreme SELL Delta Bar", 
+     message="EXTREME SELL DELTA {{ticker}} {{timeframe}} | Delta: {{plot(\"CVD\")}}")
+alertcondition(triggerAnyExtreme,  title="Extreme Delta Bar (Any Direction)", 
+     message="EXTREME DELTA BAR {{ticker}} {{timeframe}} | Delta: {{plot(\"CVD\")}}")
+
+// Safety check
+var float cumVolCheck = 0.
+cumVolCheck += nz(volume)
+if barstate.islast and cumVolCheck == 0
+    runtime.error("No volume data available.")

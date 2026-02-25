@@ -1,0 +1,129 @@
+//@version=6
+indicator("Trend Prediction Meter [PointAlgo]", shorttitle="Trend-Predict Meter", overlay=false, max_labels_count=500)
+
+// === HELPERS ===
+clamp(val, minv, maxv) =>
+    math.max(minv, math.min(maxv, val))
+
+// === INPUTS ===
+group_trend = "Trend / Strength"
+len_rsi_short  = input.int(14, "RSI Short Length", minval=2, group=group_trend)
+len_rsi_mid    = input.int(50, "RSI Mid Length",   minval=5, group=group_trend)
+len_ema_fast   = input.int(21, "Fast EMA",         minval=2, group=group_trend)
+len_ema_slow   = input.int(55, "Slow EMA",         minval=5, group=group_trend)
+len_range      = input.int(100,"Range Lookback",   minval=20,group=group_trend)
+
+group_vol = "Volatility / Targets"
+atr_len   = input.int(14, "ATR Length", minval=5, group=group_vol)
+tp1_mult  = input.float(1.0, "TP1 ATR Mult", minval=0.1, step=0.1, group=group_vol)
+tp2_mult  = input.float(2.0, "TP2 ATR Mult", minval=0.2, step=0.1, group=group_vol)
+
+group_ui  = "UI / Meter"
+show_table = input.bool(true, "Show Prediction Table", group=group_ui)
+show_meter = input.bool(true, "Show Meter Plot",       group=group_ui)
+
+// === CORE CALCULATIONS ===
+// 1) Trend strength via EMAs
+ema_fast = ta.ema(close, len_ema_fast)
+ema_slow = ta.ema(close, len_ema_slow)
+ema_trend_raw = (ema_fast - ema_slow) / close * 500.0
+ema_trend_score = clamp(50.0 + ema_trend_raw, 0.0, 100.0)
+
+// 2) RSI strength (short + mid)
+rsi_short = ta.rsi(close, len_rsi_short)
+rsi_mid   = ta.rsi(close, len_rsi_mid)
+rsi_score = (rsi_short + rsi_mid) * 0.5
+
+// 3) Position in recent range
+range_high = ta.highest(high, len_range)
+range_low  = ta.lowest(low, len_range)
+range_span = range_high - range_low
+pos_score  = range_span > 0 ? (close - range_low) / range_span * 100.0 : 50.0
+pos_score  := clamp(pos_score, 0.0, 100.0)
+
+// 4) Volume factor
+vol_avg    = ta.sma(volume, 20)
+vol_ratio  = vol_avg > 0 ? volume / vol_avg : 1.0
+vol_score  = clamp(vol_ratio * 50.0, 0.0, 100.0)
+
+// === COMBINED BULLISH SCORE (0–100) ===
+w_rsi   = 0.4
+w_trend = 0.35
+w_pos   = 0.2
+w_vol   = 0.05
+bull_score = rsi_score * w_rsi + ema_trend_score * w_trend + pos_score * w_pos + vol_score * w_vol
+bull_score := clamp(bull_score, 0.0, 100.0)
+
+// === CROSSOVER SIGNALS ===
+bull_cross_up = ta.crossover(bull_score, 50)
+bear_cross_dn = ta.crossunder(bull_score, 50)
+
+// === CLASSIFICATION ===
+bias_label = bull_score >= 80 ? "EXTREME BULLISH" : bull_score >= 65 ? "VERY BULLISH" : bull_score >= 55 ? "BULLISH" : bull_score > 45 ? "NEUTRAL" : bull_score > 35 ? "BEARISH" : "VERY BEARISH"
+
+is_bullish = bull_score >= 55
+is_bearish = bull_score <= 45
+
+// === ATR-BASED TARGET LEVELS ===
+atr_val = ta.atr(atr_len)
+
+tp1_up  = close + atr_val * (is_bullish ? tp1_mult : tp1_mult * 0.7)
+tp2_up  = close + atr_val * (is_bullish ? tp2_mult : tp2_mult * 0.7)
+tp1_dn  = close - atr_val * (is_bearish ? tp1_mult : tp1_mult * 0.7)
+tp2_dn  = close - atr_val * (is_bearish ? tp2_mult : tp2_mult * 0.7)
+
+direction_text = is_bullish ? "Upside favoured" : is_bearish ? "Downside favoured" : "Balanced / Range"
+
+// === METER COLOR ===
+meter_color = bull_score >= 65 ? color.lime : bull_score >= 55 ? color.new(color.lime, 40) : bull_score > 45 ? color.yellow : bull_score > 35 ? color.new(color.red, 40) : color.red
+
+// === METER PLOT (MUST BE AT GLOBAL SCOPE) ===
+plot(show_meter ? bull_score : na, "Bullish Meter (0–100)", color=meter_color, linewidth=4)
+hline(0, "0", color=color.new(color.gray, 80))
+hline(50, "50", color=color.new(color.gray, 70), linestyle=hline.style_dashed)
+hline(100, "100", color=color.new(color.gray, 80))
+bgcolor(bull_score >= 65 ? color.new(color.green, 92) : bull_score <= 35 ? color.new(color.red, 92) : na)
+
+// === ARROW SIGNALS ===
+plotshape(bull_cross_up, title="Bull Cross 50↑", location=location.bottom, style=shape.triangleup, size=size.normal, color=color.new(color.lime, 0))
+plotshape(bear_cross_dn, title="Bear Cross 50↓", location=location.top, style=shape.triangledown, size=size.normal, color=color.new(color.red, 0))
+
+// === SIDE TABLE (PREDICTION DASHBOARD) ===
+var table dash = na
+
+if show_table
+    if na(dash)
+        dash := table.new(position.top_right, 2, 8, border_width=1, frame_color=color.new(color.white, 60), bgcolor=color.new(color.black, 0))
+    if barstate.islast
+        table.cell(dash, 0, 0, "Symbol", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 0, syminfo.ticker, text_color=color.aqua)
+        
+        table.cell(dash, 0, 1, "Bias", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 1, bias_label, text_color=is_bullish ? color.lime : is_bearish ? color.red : color.yellow)
+        
+        table.cell(dash, 0, 2, "Bull Score", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 2, str.tostring(bull_score, "#.0") + " / 100", text_color=meter_color)
+        
+        table.cell(dash, 0, 3, "Current Price", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 3, str.tostring(close, format.mintick), text_color=color.orange)
+        
+        table.cell(dash, 0, 4, "Upside Levels", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 4, "TP1: " + str.tostring(tp1_up, format.mintick) + "\nTP2: " + str.tostring(tp2_up, format.mintick), text_color=color.lime)
+        
+        table.cell(dash, 0, 5, "Downside Levels", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 5, "TP1: " + str.tostring(tp1_dn, format.mintick) + "\nTP2: " + str.tostring(tp2_dn, format.mintick), text_color=color.red)
+        
+        table.cell(dash, 0, 6, "ATR (" + str.tostring(atr_len) + ")", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 6, str.tostring(atr_val, format.mintick), text_color=color.fuchsia)
+        
+        table.cell(dash, 0, 7, "Comment", text_color=color.white, bgcolor=color.new(color.gray, 60))
+        table.cell(dash, 1, 7, direction_text, text_color=color.white)
+
+// === ALERTS ===
+long_signal = is_bullish and bull_score >= 65
+short_signal = is_bearish and bull_score <= 35
+
+alertcondition(long_signal, "PA Bullish Bias", "PointAlgo: Bullish bias with upside targets active.")
+alertcondition(short_signal, "PA Bearish Bias", "PointAlgo: Bearish bias with downside targets active.")
+alertcondition(bull_cross_up, "Bull Cross 50", "PointAlgo: Bullish meter crossed above 50!")
+alertcondition(bear_cross_dn, "Bear Cross 50", "PointAlgo: Bullish meter crossed below 50!")

@@ -1,0 +1,244 @@
+//@version=6
+indicator(title = "CandelaCharts - Composite Pressure Index", shorttitle="CandelaCharts - Composite Pressure Index", overlay=false, precision=3)
+
+
+
+
+
+
+
+
+
+
+
+
+// # ========================================================================= #
+// # |   Colors   |
+// # ========================================================================= #
+
+//#region
+
+colors_black                        = color.black
+colors_purple                       = color.purple
+colors_red                          = color.red
+colors_gray                         = color.gray
+colors_cyan_dark                    = #089981
+colors_red_bright                   = #f23645
+
+//#endregion
+
+// # ========================================================================= #
+// # |   End   |
+// # ========================================================================= #
+
+
+
+
+
+
+
+
+
+
+
+// # ========================================================================= #
+// # |   Inputs   |
+// # ========================================================================= #
+
+//#region
+
+// # General ----------------------------------------------------------------- #
+
+general_font                        = input.string("Monospace", "Text                         ", options = ["Default", "Monospace"], inline = "1.0", group = "General")
+general_text                        = input.string("Tiny", "", options = ["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], inline = "1.0", group = "General", tooltip = "Customize global text size and style")
+general_brand_show                  = input.bool(false, "Hide Brand", group = "General")
+
+cpi_rsi_len                         = input.int(14, "RSI Length                ", minval=1, inline = "1.0", group = "Settings")
+cpi_mfi_len                         = input.int(14, "MFI Length               ", minval=1, inline = "2.0", group = "Settings")
+cpi_cmf_len                         = input.int(20, "CMF Length              ", minval=1, inline = "3.0", group = "Settings")
+cpi_rsi_weight                      = input.float(1.0, "RSI Weight                ", minval=0, step=0.1, inline = "4.0", group = "Settings")
+cpi_mfi_weight                      = input.float(1.0, "MFI Weight               ", minval=0, step=0.1, inline = "5.0", group = "Settings")
+cpi_cmf_weight                      = input.float(1.0, "CMF Weight              ", minval=0, step=0.1, inline = "6.0", group = "Settings")
+cpi_smooth_len                      = input.int(9, "Smoothing                ", minval=1, inline = "7.0", group = "Settings")
+cpi_stretch_len                     = input.int(100, "Z-score Window        ", minval=10, inline = "8.0", group = "Settings")
+cpi_stretch_gain                    = input.float(1.0, "Amplitude                 ", minval=0.1, step=0.1, inline = "9.0", group = "Settings")
+cpi_bull_css                        = input.color(colors_cyan_dark, "Colors                      ", inline = "10.0", group = "Settings")
+cpi_bear_css                        = input.color(colors_red_bright, "", inline = "10.0", group = "Settings")
+
+//#endregion
+
+// # ========================================================================= #
+// # |   End   |
+// # ========================================================================= #
+
+
+
+
+
+
+
+
+
+
+
+
+// # ========================================================================= #
+// # |   Functions   |
+// # ========================================================================= #
+
+//#region
+
+method text_size(string size) =>
+    out = switch size
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        "Auto"   => size.auto
+    out
+
+method line_style(string style) =>
+    out = switch style
+        '⎯⎯⎯'  => line.style_solid
+        '----'   => line.style_dashed
+        '····'   => line.style_dotted
+
+method font_style(string font) =>
+    out = switch font
+        'Default'   => font.family_default
+        'Monospace' => font.family_monospace
+
+//#endregion
+
+// # ========================================================================= #
+// # |   End   |
+// # ========================================================================= #
+
+
+
+
+
+
+
+
+
+
+
+
+// # ========================================================================= #
+// # |   Algorithm   |
+// # ========================================================================= #
+
+//#region
+
+// Replace your SMA-from-start with an NA-safe version (or add this helper)
+mean_from_start(src, len) =>
+    sum   = ta.cum(na(src) ? 0 : src)
+    count = ta.cum(na(src) ? 0 : 1)
+    n     = math.min(count, len)
+    n > 0 ? (sum - nz(sum[len])) / n : na
+
+stdev_from_start(src, len) =>
+    sum    = ta.cum(na(src) ? 0 : src)
+    sum2   = ta.cum(na(src) ? 0 : src*src)
+    count  = ta.cum(na(src) ? 0 : 1)
+    n      = math.min(count, len)
+    win    = sum  - nz(sum[len])
+    win2   = sum2 - nz(sum2[len])
+    mean   = win / n
+    // population variance; switch to (n-1) if you want sample stdev
+    varPop = math.max(win2 / n - mean*mean, 0)
+    math.sqrt(varPop)
+
+// Components
+rsi = ta.rsi(close, cpi_rsi_len)
+
+// Manual MFI
+mfi_manual(_h, _l, _c, _v, _len) =>
+    tp    = (_h + _l + _c) / 3.0
+    mf    = tp * _v
+    posMF = math.sum(mf * (tp >  nz(tp[1], tp) ? 1.0 : 0.0), _len)
+    negMF = math.sum(mf * (tp <  nz(tp[1], tp) ? 1.0 : 0.0), _len)
+    mfr   = negMF == 0.0 ? (posMF == 0.0 ? 1.0 : 1e9) : posMF / negMF
+    100.0 - (100.0 / (1.0 + mfr))
+mfi = mfi_manual(high, low, close, volume, cpi_mfi_len)
+
+// CMF
+rangeHL = math.max(high - low, syminfo.mintick)
+mfMult  = ((close - low) - (high - close)) / rangeHL
+mfVol   = mfMult * volume
+cmf     = math.sum(mfVol, cpi_cmf_len) / math.sum(volume, cpi_cmf_len)
+
+// Base composite in −1…1 (before stretch)
+rsiC = (rsi - 50.0) / 50.0     // −1…1
+mfiC = (mfi - 50.0) / 50.0     // −1…1
+cmfC = cmf                     // typically −1…1 but can exceed
+
+wSum     = math.max(cpi_rsi_weight + cpi_mfi_weight + cpi_cmf_weight, 1e-10)
+rawBase  = (cpi_rsi_weight * rsiC + cpi_mfi_weight * mfiC + cpi_cmf_weight * cmfC) / wSum
+
+// Stretching via rolling z-score (lets the series exceed ±1 during extremes)
+meanRB = mean_from_start(rawBase, cpi_stretch_len)
+stRB   = stdev_from_start(rawBase, cpi_stretch_len)
+zRB    = stRB > 0 ? (rawBase - meanRB) / stRB : 0.0
+
+// Optional amplitude gain
+cpiExt  = zRB * cpi_stretch_gain
+
+// Smoothing
+cpiSm = cpi_smooth_len > 1 ? ta.ema(cpiExt, cpi_smooth_len) : cpiExt
+
+// Levels −1, 0, +1
+midLine = hline(0,   "Zero",  color=color.new(color.gray, 60))
+topLine = hline(+1,  "Upper", color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+botLine = hline(-1,  "Lower", color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+fill(topLine, botLine, color=color.new(color.blue, 92))
+
+// Gradient color (orange above 0, blue below 0), stronger toward edges
+colAboveBase = color.from_gradient(cpiSm, 0.0, +1.0, color.new(cpi_bear_css, 70), cpi_bear_css)
+colBelowBase = color.from_gradient(cpiSm, -1.0, 0.0, color.new(cpi_bull_css,   70), cpi_bull_css)
+
+// Transparency fades near 0, saturates toward large |value|
+dist01  = math.min(math.abs(cpiSm), 2.0) / 2.0   // scale up to |2σ| for fade (tweak if desired)
+fadePow = 1.25
+alpha   = math.pow(dist01, fadePow)
+transp  = 70 - int(alpha * 70) // 70 near 0 → 0 at larger |value|
+
+colAbove = color.new(colAboveBase, transp)
+colBelow = color.new(colBelowBase, transp)
+cpiColor = cpiSm >= 0 ? colAbove : colBelow
+
+plot(cpiSm, "CPI (Smoothed, Stretchable)", color=cpiColor, linewidth=2)
+
+//#endregion
+
+// # ========================================================================= #
+// # |   End   |
+// # ========================================================================= #
+
+
+
+
+
+
+
+
+
+
+
+// # ========================================================================= #
+// # |   Brand   |
+// # ========================================================================= #
+
+//#region
+
+if barstate.isfirst and general_brand_show == false
+    var table brand = table.new(position.bottom_right, 1, 1, bgcolor = chart.bg_color)
+    table.cell(brand, 0, 0,  "© CandelaCharts", text_color = colors_gray, text_halign = text.align_center, text_size = text_size(general_text), text_font_family = font_style(general_font))
+
+//#endregion
+
+// # ========================================================================= #
+// # |   End   |
+// # ========================================================================= #

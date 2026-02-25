@@ -1,0 +1,237 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=5
+indicator("Monte Carlo (Polyline Traceback) [Kioseff Trading]", max_lines_count = 500, overlay = true, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 100)
+
+seed          = input.int      (defval = 0, title = "Set Seed", minval = 0)
+distT         = input.string   (defval = "Normal", title = "Type", options = ["Normal", "Bootstrap"])
+sims          = input.int      (defval = 1000,    title = "Simulations", minval = 1, step = 100)
+forx          = input.int      (defval = 100,     title = "Forecast", maxval = 498, step = 5) + 1
+only          = input.bool     (defval = false,  title = "Show Best Case / Worst Case Only")
+back          = input.int      (defval = 200,    title = "Historical Data Points", minval = 5, step = 10)
+lineS         = input.string   (defval = "Solid", title = "Line Style", options= ["Solid", "Dotted", "Dashed"], group = "Line Style")
+showScale     = input.bool     (defval = false, title = "Show Scale")
+forceForecast = input.bool     (defval = false, title = "Force Script Load [Cuts Off Some Simulations]")
+
+finS = switch lineS
+
+    "Dotted" => line.style_dotted
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+
+var ret    = array.new_float(), endPoints = array.new_float()
+
+Gauss(z, avg, std) => 
+    
+    avg + std * z
+
+method boot(array <float> id) => 
+
+
+    id.get(int(math.random(0, id.size(), seed)))
+
+distribution() => 
+
+    avg    = ret.avg(), std = ret.stdev(false), size = ret.size()
+    r1     = math.random(0.01, 0.99, seed)
+    r2     = math.random(0.01, 0.99, seed)  
+    result = math.sqrt  (-2.0 * math.log(r1)) * math.cos(2.0 * math.pi * r2)
+
+    switch distT
+
+        "Normal"   => Gauss(result, avg, std)
+        =>            ret.boot()
+
+
+method num(float id, val) => 
+
+    id * math.exp(val)
+
+method dete (matrix <float> id, val, i, x, int col, matrix<color> id2, color val2) => 
+
+    if i < id.rows()
+
+        id .set(i, col, val)
+        id2.set(i, col, val2)
+
+
+atr = ta.atr(14)
+
+method mult(float id, up = 1.002, dn = .998) =>
+    
+    id - atr
+
+if last_bar_index - bar_index <= back  
+
+    ret.push(math.log(close / close[1]))
+
+method iSwitch(matrix <float> id, lastClos, i, x, colData, col, matrix <float> minMax) => 
+
+    switch only
+
+        false => id.dete(lastClos, i, x, x, colData, col) 
+        
+        =>       minMax.set(0, x, math.min(nz(minMax.get(0, x), 1e8 ), lastClos)), 
+                 minMax.set(1, x, math.max(nz(minMax.get(1, x), -1e8), lastClos))
+
+
+method endTrim (array <box> histBox, array<float> val, array<float> freq, array<label> histLabs) => 
+
+    if freq.size() > 0 and val.size() == freq.size() and histLabs.size() == freq.size() and histBox.size() == freq.size()
+        for i = 0 to freq.size() - 1
+            switch val.get(i) == 9e9
+                true => histBox.get(i).delete(), histLabs.get(i).delete()
+                =>      break
+
+        for i = freq.size() - 1 to 0
+            switch val.get(i) == 9e9
+                true => histBox.get(i).delete(), histLabs.get(i).delete()
+                =>      break
+// 
+
+method returnCheck(array<float> id, array<string> id2) => 
+
+    if id2.size() > 0 
+        for i = 0 to id2.size() - 1
+            if not na(str.tonumber(id2.get(i)))
+                id.push(str.tonumber(id2.get(i)))
+
+keyValues      = map.new<string, float>()
+bestWorst      = matrix.new<float>(forx, 2)
+bestWorst.set(0, 0, close)
+bestWorst.set(0, 1, close)
+
+loopBreak(start, end) => 
+
+    totalPoints = sims * forx 
+    pointsPL    = math.ceil(totalPoints / 100) 
+    log.info(str.tostring(pointsPL))
+    sum  = close
+    
+    points = array.new<chart.point>()
+    created = false 
+
+    res = 0.
+
+
+    for i = start to end
+
+        lastClose = sum
+        lastCloseArr = array.new<float>()
+
+        col = color.rgb(math.random(0, 255), math.random(0, 255), math.random(0, 255))
+
+        for x = 1 to forx - 1
+ 
+            res       := distribution()
+            lastClose := lastClose.num(res)
+
+            lastCloseArr.push(lastClose)
+            points.push(chart.point.from_index(bar_index + x - 1, lastClose))
+
+            keyValues.put("Max", math.max(nz(keyValues.get("Max")), lastClose))
+            keyValues.put("Min", math.min(nz(keyValues.get("Min"), 20e20), lastClose))
+
+            if only 
+
+                bestWorst.set(x, 0, math.max(nz(bestWorst.get(x, 0)), lastClose))
+                bestWorst.set(x, 1, math.min(nz(bestWorst.get(x, 1), 20e20), lastClose))
+
+            else 
+
+                if x == forx - 1
+
+                    endPoints.push(lastClose)
+
+                    for z = lastCloseArr.size() - 1 to 0
+
+                        points.push(chart.point.from_index(bar_index + z, lastCloseArr.get(z)))
+
+                    if points.size() >= (forceForecast ? 1000 : pointsPL)
+
+                        created := true 
+                        polyline.new(points, line_color = col, line_style = finS)
+                        points.clear()
+
+
+    if not created and not only
+        polyline.new(points, line_color = color.rgb(math.random(0, 255), math.random(0, 255), math.random(0, 255)), line_style = finS)
+
+
+if barstate.islastconfirmedhistory 
+
+    div = math.floor(sims / 20) 
+
+    loopBreak(0, div)
+    loopBreak(div + 1, div * 2)
+    loopBreak(div * 2 + 1, div * 3)
+    loopBreak(div * 3 + 1, div * 4)
+    loopBreak(div * 4 + 1, div * 5)
+    loopBreak(div * 5 + 1, div * 6)
+    loopBreak(div * 6 + 1, div * 7)
+    loopBreak(div * 7 + 1, div * 8)
+    loopBreak(div * 8 + 1, div * 9)
+    loopBreak(div * 9 + 1, div * 10)
+    loopBreak(div * 10 + 1, div * 11)
+    loopBreak(div * 11 + 1, div * 12)
+    loopBreak(div * 12 + 1, div * 13)
+    loopBreak(div * 13 + 1, div * 14)
+    loopBreak(div * 14 + 1, div * 15)
+    loopBreak(div * 15 + 1, div * 16)
+    loopBreak(div * 16 + 1, div * 17)
+    loopBreak(div * 17 + 1, div * 18)
+    loopBreak(div * 18 + 1, div * 19)
+    loopBreak(div * 19 + 1, sims)
+
+    if only 
+
+        bestWorstPoints = matrix.new<chart.point>(0, 2)
+        
+        for i = 0 to bestWorst.rows() - 1
+
+            bestWorstPoints.add_row(
+
+                 bestWorstPoints.rows(), 
+
+                     array.from( chart.point.from_index(bar_index + i, bestWorst.get(i, 0)), 
+                                 chart.point.from_index(bar_index + i, bestWorst.get(i, 1))
+                     )
+             )
+
+        polyline.new(bestWorstPoints.col(0), line_color = #74ffbc, line_style = finS)
+        polyline.new(bestWorstPoints.col(1), line_color = color.rgb(255, 116, 116), line_style = finS)
+
+    if showScale
+
+        getMin = keyValues.get("Min") - atr
+
+        divScale = (keyValues.get("Max") - getMin) / 10
+
+        line.new(bar_index + forx + 5, keyValues.get("Max"), bar_index + forx + 5, getMin, color = chart.fg_color)
+        line.new(bar_index - 1, getMin, bar_index + forx + 5,  getMin, color = chart.fg_color)
+
+        for i = 0 to 10
+
+            calc = getMin + (divScale * i)
+
+            label.new(bar_index + forx + 5, calc, str.tostring(calc, format.mintick), 
+                         textcolor = chart.fg_color, 
+                         color     = #00000000, 
+                         size      = size.small, 
+                         style     = label.style_label_left
+                         )
+
+
+        for i = 0 to forx - 2
+            label.new(bar_index + i, getMin, str.tostring(i), textcolor = chart.fg_color, 
+                          color = #00000000, 
+                          style = label.style_label_up, 
+                          size = size.auto
+                          )
+
+    tablePerformance = table.new(position.bottom_right, 99, 99,  bgcolor =  #20222C, border_color = #363843, 
+              frame_color = #363843, border_width = 1, frame_width = 1)
+
+    tablePerformance.cell(0, 0, str.tostring(sims) + " Simulations", text_color = color.white)
+    tablePerformance.cell(1, 0, str.tostring(forx - 1) + " Bar Forecast", text_color = color.white)

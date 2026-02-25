@@ -1,0 +1,265 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © YourName - Dynamic Fractal Flow
+
+//@version=6
+indicator("Dynamic Fractal Flow [Alpha Extract]", overlay=false, max_bars_back=500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS & CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Core Settings
+fractalLength = input.int(5, "Fractal Length", minval=5, maxval=100, group="Core Settings")
+omegaLength = input.int(21, "Omega Weighting Period", minval=10, maxval=100, group="Core Settings")
+robustnessSteps = input.int(1, "Robustness Steps", minval=1, maxval=5, group="Core Settings")
+
+// Standard Deviation Bands
+showBands = input.bool(true, "Show SD Bands", group="Bands")
+sdMultiplier = input.float(0.5, "SD Multiplier", minval=0.5, maxval=5.0, step=0.5, group="Bands")
+bandLength = input.int(20, "Band Length", minval=20, maxval=200, group="Bands")
+
+// Visual Settings
+showSignals = input.bool(true, "Show Entry Signals", group="Visual")
+showGradient = input.bool(true, "Show Gradient Fill", group="Visual")
+showDashboard = input.bool(true, "Show Dashboard", group="Visual")
+showRawSignal = input.bool(false, "Show Raw Signal (Before Filter)", group="Visual")
+
+// Signal Threshold
+signalThreshold = input.float(0.3, "Signal Threshold", minval=0.1, maxval=1.0, step=0.1, group="Signals")
+
+// Divergence Settings removed
+
+// Noise Filter Settings
+useNoiseFilter = input.bool(true, "Use Noise Filter", group="Advanced Filters")
+noiseThreshold = input.float(1, "Noise Threshold", minval=0.1, maxval=1.0, step=0.1, group="Advanced Filters")
+
+// Acceleration Detection
+useAcceleration = input.bool(true, "Use Acceleration Signals", group="Advanced Filters")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FRACTAL ANALYSIS CORE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Calculate fractal highs and lows
+fractalHigh(len) =>
+    high[len] == ta.highest(high, len * 2 + 1)
+
+fractalLow(len) =>
+    low[len] == ta.lowest(low, len * 2 + 1)
+
+// Detect fractal points
+isUpFractal = fractalHigh(math.floor(fractalLength / 2))
+isDownFractal = fractalLow(math.floor(fractalLength / 2))
+
+// Track fractal values
+var float lastUpFractal = na
+var float lastDownFractal = na
+
+if isUpFractal
+    lastUpFractal := high[math.floor(fractalLength / 2)]
+
+if isDownFractal
+    lastDownFractal := low[math.floor(fractalLength / 2)]
+
+// Calculate fractal range
+atrFallback = ta.atr(fractalLength)
+fractalRange = na(lastUpFractal) or na(lastDownFractal) ? atrFallback : lastUpFractal - lastDownFractal
+
+// Normalized position within fractal range
+fractalPosition = na(lastUpFractal) or na(lastDownFractal) ? 0.0 :
+                  fractalRange > 0 ? (close - lastDownFractal) / fractalRange : 0.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DYNAMIC OMEGA WEIGHTING
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Calculate volatility for adaptive weighting
+volatility = ta.atr(omegaLength) / close
+normalizedVolatility = (volatility - ta.lowest(volatility, omegaLength)) /
+                       (ta.highest(volatility, omegaLength) - ta.lowest(volatility, omegaLength))
+
+// Volume strength (normalized)
+volumeMA = ta.sma(volume, omegaLength)
+volumeStrength = volume / volumeMA
+
+// Dynamic omega calculation
+omegaBase = 0.5
+omegaDynamic = omegaBase + (normalizedVolatility * 0.3) + (math.min(volumeStrength, 2.0) - 1.0) * 0.2
+omegaDynamic := math.max(0.3, math.min(omegaDynamic, 0.9))
+
+// Apply weighted calculation to fractal position
+weightedFractal = ta.wma(fractalPosition, omegaLength)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP ROBUSTNESS FILTERING
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Smoothing multiplier (fixed)
+smoothMultiplier = 1.0
+
+// Apply cascading EMA smoothing based on robustness steps
+robustSignal = weightedFractal
+smooth1 = robustnessSteps >= 1 ? ta.ema(robustSignal, int(math.round(fractalLength * 1.5 * smoothMultiplier))) : robustSignal
+smooth2 = robustnessSteps >= 2 ? ta.ema(smooth1, int(math.round(fractalLength * 2.0 * smoothMultiplier))) : smooth1
+smooth3 = robustnessSteps >= 3 ? ta.ema(smooth2, int(math.round(fractalLength * 2.5 * smoothMultiplier))) : smooth2
+smooth4 = robustnessSteps >= 4 ? ta.ema(smooth3, int(math.round(fractalLength * 3.0 * smoothMultiplier))) : smooth3
+robustSignal := robustnessSteps >= 5 ? ta.ema(smooth4, int(math.round(fractalLength * 3.5 * smoothMultiplier))) : smooth4
+
+// Normalize to oscillator range 
+robustSignalBase = (math.min(math.max(robustSignal, 0), 1) - 0.5) * 10
+robustSignalRaw = robustSignalBase  
+
+// Calculate momentum derivative with adaptive smoothing
+momentumPeriod = int(math.max(3, math.round(5 * smoothMultiplier)))
+momentumSmooth = ta.ema(ta.change(robustSignalBase, 1), momentumPeriod)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ADAPTIVE NOISE FILTER
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Adaptive noise filter period based on fractalLength
+choppyLength = fractalLength
+hhll = ta.highest(high, choppyLength) - ta.lowest(low, choppyLength)
+
+// Choppiness Index
+choppiness = hhll != 0 ? 100 * math.log10(math.sum(ta.atr(1), choppyLength) / hhll) / math.log10(choppyLength) : 0
+
+// Efficiency Ratio 
+efficiencyRatio = nz(math.abs(close - close[choppyLength]) / math.sum(math.abs(ta.change(close)), choppyLength), 0)
+
+// Noise damping: full strength when trending, reduced when choppy
+isTrending = useNoiseFilter ? (choppiness < 50 and efficiencyRatio > noiseThreshold) : true
+noiseDampingFactor = useNoiseFilter ? (isTrending ? 1.0 : math.max(0.2, efficiencyRatio / noiseThreshold)) : 1.0
+
+// Apply noise damping to signal
+robustSignalNorm = robustSignalBase * noiseDampingFactor
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DIVERGENCE DETECTION (removed)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Find price pivots
+// price/indicator pivot calculations removed
+
+// Find indicator pivots
+// indicator pivots removed
+
+// Track pivot history with arrays 
+// divergence-related arrays removed
+
+// Update histories when new pivots detected
+// divergence pivot history updates removed
+
+// divergence pivot history updates removed
+
+// divergence pivot history updates removed
+
+// divergence pivot history updates removed
+
+// Divergence detection removed
+// divergence conditions removed
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ACCELERATION & JERK DETECTION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Acceleration 
+accelerationSmooth = ta.ema(ta.change(momentumSmooth), 3)
+jerkSmooth = ta.ema(ta.change(accelerationSmooth), 3)
+
+// Detect explosive moves
+bullishAcceleration = useAcceleration and accelerationSmooth > 0 and jerkSmooth > 0 and robustSignalNorm < 0 and momentumSmooth > 0
+bearishAcceleration = useAcceleration and accelerationSmooth < 0 and jerkSmooth < 0 and robustSignalNorm > 0 and momentumSmooth < 0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STANDARD DEVIATION BANDS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Calculate Bollinger-style bands
+[midBand, upperBand, lowerBand] = ta.bb(robustSignalNorm, bandLength, sdMultiplier)
+
+// Band squeeze detection 
+isSqueeze = (upperBand - lowerBand) < ta.sma(upperBand - lowerBand, 50) * 0.8
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TREND CLASSIFICATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Determine trend state based on signal strength and momentum
+trendState = robustSignalNorm > signalThreshold and momentumSmooth > 0 ? "Strong Bullish" :
+             robustSignalNorm > 0 and momentumSmooth > 0 ? "Bullish" :
+             robustSignalNorm < -signalThreshold and momentumSmooth < 0 ? "Strong Bearish" :
+             robustSignalNorm < 0 and momentumSmooth < 0 ? "Bearish" : "Neutral"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Entry signals 
+bullishEntry = ta.crossover(robustSignalNorm, lowerBand) and robustSignalNorm < 0 and momentumSmooth > 0 and isTrending
+bearishEntry = ta.crossunder(robustSignalNorm, upperBand) and robustSignalNorm > 0 and momentumSmooth < 0 and isTrending
+
+// Strong momentum signals 
+strongBullSignal = ta.crossover(robustSignalNorm, signalThreshold) and not isSqueeze and isTrending
+strongBearSignal = ta.crossunder(robustSignalNorm, -signalThreshold) and not isSqueeze and isTrending
+
+// Divergence signals removed
+
+// Acceleration signals 
+accelBullSignal = bullishAcceleration and not isSqueeze
+accelBearSignal = bearishAcceleration and not isSqueeze
+
+// Combined signals (without divergence)
+anyBullSignal = accelBullSignal or bullishEntry or strongBullSignal
+anyBearSignal = accelBearSignal or bearishEntry or strongBearSignal
+
+// Signal strength as percentage
+signalStrength = math.abs(robustSignalNorm) * 10
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GRADIENT COLOR SYSTEM
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Color palette
+bullColor = #00ff88, bearColor = #ff0066, neutralColor = #888888
+
+// Dynamic gradient based on signal intensity
+lineColor = color.from_gradient(math.abs(robustSignalNorm), 0, 1, neutralColor, robustSignalNorm > 0 ? bullColor : bearColor)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VISUAL RENDERING
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Main signal line
+mainLine = plot(robustSignalNorm, "DFF Signal", color=lineColor, linewidth=3)
+plot(showRawSignal ? robustSignalRaw : na, "Raw Signal", color=color.new(color.gray, 30), linewidth=1, style=plot.style_circles)
+
+// Zero line and thresholds
+zeroLine = plot(0, "Zero", color=color.new(color.gray, 50), linewidth=1)
+plot(signalThreshold, "Upper Threshold", color=color.new(bullColor, 70), style=plot.style_circles)
+plot(-signalThreshold, "Lower Threshold", color=color.new(bearColor, 70), style=plot.style_circles)
+
+// Bollinger bands
+plot(showBands ? upperBand : na, "Upper Band", color=color.new(color.blue, 70))
+plot(showBands ? lowerBand : na, "Lower Band", color=color.new(color.blue, 70))
+plot(showBands ? midBand : na, "Mid Band", color=color.new(color.gray, 80), style=plot.style_cross)
+
+// Gradient fill between signal and zero
+intensity = math.abs(robustSignalNorm)
+baseColor = robustSignalNorm > 0 ? bullColor : bearColor
+fillColor = color.from_gradient(intensity, 0, 1, color.new(baseColor, 90), color.new(baseColor, 50))
+fill(mainLine, zeroLine, color=showGradient ? fillColor : na)
+
+// Trend background
+trendBg = str.contains(trendState, "Bullish") ? color.new(bullColor, 95) : str.contains(trendState, "Bearish") ? color.new(bearColor, 95) : color.new(neutralColor, 98)
+bgcolor(trendBg)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Alert conditions
+alertcondition(anyBullSignal, "DFF Bullish Signal", "Dynamic Fractal Flow: Bullish signal detected!")
+alertcondition(anyBearSignal, "DFF Bearish Signal", "Dynamic Fractal Flow: Bearish signal detected!")
+alertcondition(accelBullSignal, "DFF Bullish Acceleration", "Dynamic Fractal Flow: Bullish acceleration detected!")
+alertcondition(accelBearSignal, "DFF Bearish Acceleration", "Dynamic Fractal Flow: Bearish acceleration detected!")

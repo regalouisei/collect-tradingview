@@ -1,0 +1,150 @@
+//@version=5
+indicator("AVWAP TF_ATR", overlay=true)
+
+// --- General Settings ---
+tf_input = input.timeframe("", "AVWAP Timeframe", tooltip="The period for AVWAP calculation. Should not be smaller than the chart timeframe.")
+atrPeriod = input.int(14, "ATR Period", group="General Filter Settings")
+
+// --- Inputs ---
+group2 = "SWING HIGH"
+showSwing = input.bool(true, "Show Swing High", group=group2)
+lookback = input.int(200, "Lookback (Bars)", minval=10, group=group2, tooltip="Number of bars to automatically search for the peak.")
+atrMultSwing = input.float(1.15, "Peak ATR Filter Multiplier", minval=0.0, step=0.05, group=group2, tooltip="For a new peak to be accepted, the price must be ATR distance above the previous highest within the lookback.")
+colorSwing = input.color(color.orange, "Swing High Color", group=group2)
+
+group5 = "SWING LOW"
+showLow = input.bool(true, "Show Swing Low", group=group5)
+lookbackLow = input.int(200, "Lookback (Bars) - Low", minval=10, group=group5, tooltip="Number of bars to automatically search for the bottom.")
+atrMultLow = input.float(1.15, "Bottom ATR Filter Multiplier", minval=0.0, step=0.05, group=group5, tooltip="For a new bottom to be accepted, the price must be ATR distance below the previous lowest.")
+colorLow = input.color(color.rgb(0, 206, 189), "Swing Low Color", group=group5)
+
+group4 = "Anchored Date"
+showAnchor = input.bool(true, "Show Anchored Date", group=group4)
+anchorDate = input.time(timestamp("2026-02-01 03:00"), "Start Date", group=group4)
+colorAnchor = input.color(color.rgb(255, 0, 0), "Anchored Date Color", group=group4)
+
+group3 = "Volume Spike"
+showVol = input.bool(false, "Show Volume Spike", group=group3)
+volMult = input.float(2.0, "Volume Multiplier (Avg x N)", minval=1.1, group=group3)
+atrMultVol = input.float(0.5, "Volume ATR Filter Multiplier", minval=0.0, step=0.05, group=group3)
+colorVol = input.color(color.rgb(207, 186, 3), "Volume Color", group=group3)
+
+// --- MTF Safe Calculation Function ---
+f_calc_metrics(lb, mult, aDate, lbLow, aPeriod, mSwing, mLow, mVol) =>
+    atr = ta.atr(aPeriod)
+    
+    // Peak Control (Enhanced ATR Filter)
+    prevHigh = ta.highest(high[1], lb)
+    isNewHigh = high > prevHigh + (atr * mSwing)
+    highestIndex = ta.highestbars(high, lb)
+    isLatestHigh = (highestIndex == 0 and isNewHigh) ? 1.0 : 0.0
+
+    // Bottom Control (Enhanced ATR Filter)
+    prevLow = ta.lowest(low[1], lbLow)
+    isNewLow = low < prevLow - (atr * mLow)
+    lowestIndex = ta.lowestbars(low, lbLow)
+    isLatestLow = (lowestIndex == 0 and isNewLow) ? 1.0 : 0.0
+    
+    // Volume Control
+    avgVol = ta.sma(volume, 20)
+    isVolSpike = (volume > (avgVol * mult) and (high - low) > (atr * mVol)) ? 1.0 : 0.0
+    
+    isAnchorPoint = (time >= aDate and time[1] < aDate) ? 1.0 : 0.0
+
+    var float sumPV_Swing = 0.0, var float sumV_Swing = 0.0
+    var float sumPV_Low   = 0.0, var float sumV_Low   = 0.0
+    var float sumPV_Vol   = 0.0, var float sumV_Vol   = 0.0
+    var float sumPV_Date  = 0.0, var float sumV_Date  = 0.0
+    
+    // Swing High
+    if isLatestHigh == 1.0
+        sumPV_Swing := hlc3 * volume
+        sumV_Swing  := volume
+    else
+        sumPV_Swing += hlc3 * volume
+        sumV_Swing  += volume
+
+    // Swing Low
+    if isLatestLow == 1.0
+        sumPV_Low := hlc3 * volume
+        sumV_Low  := volume
+    else
+        sumPV_Low += hlc3 * volume
+        sumV_Low  += volume
+        
+    // Vol Spike
+    if isVolSpike == 1.0
+        sumPV_Vol := hlc3 * volume
+        sumV_Vol  := volume
+    else
+        sumPV_Vol += hlc3 * volume
+        sumV_Vol  += volume
+
+    // Date Anchor
+    if isAnchorPoint == 1.0
+        sumPV_Date := hlc3 * volume
+        sumV_Date  := volume
+    else if time > aDate
+        sumPV_Date += hlc3 * volume
+        sumV_Date  += volume
+        
+    [sumV_Swing > 0 ? sumPV_Swing / sumV_Swing : na, isLatestHigh, 
+     sumV_Vol > 0 ? sumPV_Vol / sumV_Vol : na, isVolSpike,
+     sumV_Date > 0 ? sumPV_Date / sumV_Date : na, isAnchorPoint,
+     sumV_Low > 0 ? sumPV_Low / sumV_Low : na, isLatestLow]
+
+// --- Security Data Fetch ---
+[swingAVWAP, isHigh, volAVWAP, isVol, anchorAVWAP, isAnc, lowAVWAP, isLow] = request.security(syminfo.tickerid, tf_input, f_calc_metrics(lookback, volMult, anchorDate, lookbackLow, atrPeriod, atrMultSwing, atrMultLow, atrMultVol), lookahead=barmerge.lookahead_off)
+
+// --- Plotting ---
+plot(showSwing ? swingAVWAP : na, "Swing AVWAP", color=colorSwing, linewidth=2)
+plot(showLow ? lowAVWAP : na, "Low AVWAP", color=colorLow, linewidth=2)
+plot(showVol ? volAVWAP : na, "Volume AVWAP", color=colorVol, linewidth=1, style=plot.style_linebr)
+plot(showAnchor and time >= anchorDate ? anchorAVWAP : na, "Anchored Date AVWAP", color=colorAnchor, linewidth=2)
+
+// --- Label Management ---
+var label zirveLabel = na
+if showSwing and isHigh == 1.0
+    label.delete(zirveLabel) 
+    zirveLabel := label.new(bar_index, high, text="PEAK", color=colorSwing, textcolor=color.black, style=label.style_label_down, size=size.small, tooltip="ATR Filtered Peak")
+
+var label dipLabel = na
+if showLow and isLow == 1.0
+    label.delete(dipLabel)
+    dipLabel := label.new(bar_index, low, text="BOTTOM", color=colorLow, textcolor=color.black, style=label.style_label_up, size=size.small, tooltip="ATR Filtered Bottom")
+
+if showAnchor and isAnc == 1.0 and isAnc[1] == 0.0
+    label.new(bar_index, low, text="START", color=colorAnchor, textcolor=color.black, style=label.style_label_up, size=size.small, tooltip="Manual AVWAP Anchor Point")
+
+plotshape(showVol and isVol == 1.0, "Volume Spike", shape.circle, location.belowbar, colorVol, size=size.tiny)
+
+// --- Combined Dynamic Alert Block ---
+
+// Crossing Conditions
+crossUpZirve     = ta.crossover(close, swingAVWAP)
+crossDownDip     = ta.crossunder(close, lowAVWAP)
+// Anchored Date Crossings
+crossUpAnchor    = ta.crossover(close, anchorAVWAP)
+crossDownAnchor  = ta.crossunder(close, anchorAVWAP)
+
+// Alert Message Variable
+string alertMsg = ""
+
+if crossUpZirve
+    alertMsg := "Price crossed Peak AVWAP up! Level: " + str.tostring(close) + ", Time: " + str.tostring(time, "HH:mm")
+
+if crossDownDip
+    alertMsg := "Price crossed Bottom AVWAP down! Level: " + str.tostring(close) + ", Time: " + str.tostring(time, "HH:mm")
+
+// Anchored Date Alert Scenarios
+if showAnchor and time >= anchorDate
+    if crossUpAnchor
+        alertMsg := "Price crossed Anchored AVWAP up! Level: " + str.tostring(close)
+    else if crossDownAnchor
+        alertMsg := "Price crossed Anchored AVWAP down! Level: " + str.tostring(close)
+
+// Trigger with a single alert function
+// Tooltip: In the TradingView 'Add Alert' panel, select this indicator as the Condition 
+// and choose 'Any alert() function call'.
+if alertMsg != ""
+    alert(alertMsg, alert.freq_once_per_bar_close)

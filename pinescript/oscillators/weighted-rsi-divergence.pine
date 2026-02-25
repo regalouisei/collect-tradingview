@@ -1,0 +1,569 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kingthies, marketgodx 
+
+//@version=6
+indicator("Weighted RSI Divergence", 
+     overlay = false,
+     max_lines_count = 500,
+     max_labels_count = 500)
+
+//                                  INPUT GROUPS
+
+// RSI Settings
+// Core momentum oscillator used for divergence detection
+group_rsi = "══════ RSI Settings ══════"
+rsiLength = input.int(14, "RSI Length", minval = 1, group = group_rsi, 
+     tooltip = "Standard RSI period. 14 is traditional, shorter = more sensitive")
+rsiSource = input.source(close, "RSI Source", group = group_rsi)
+rsiOverbought = input.int(70, "Overbought Level", minval = 50, maxval = 100, group = group_rsi)
+rsiOversold = input.int(30, "Oversold Level", minval = 0, maxval = 50, group = group_rsi)
+
+// Divergence Detection Settings
+// Controls how divergences are identified
+group_div = "══════ Divergence Detection ══════"
+pivotLookback = input.int(5, "Pivot Lookback", minval = 1, maxval = 20, group = group_div,
+     tooltip = "Bars to look back/forward for pivot confirmation. Higher = fewer but stronger pivots")
+maxDivBars = input.int(50, "Max Divergence Width", minval = 10, maxval = 200, group = group_div,
+     tooltip = "Maximum bars between divergence pivots")
+minDivBars = input.int(5, "Min Divergence Width", minval = 1, maxval = 50, group = group_div,
+     tooltip = "Minimum bars between divergence pivots")
+
+// Confirmation Factor Settings
+// Tune each confirmation factor's sensitivity
+group_conf = "══════ Confirmation Factors ══════"
+
+// Volume Confirmation
+useVolumeConf = input.bool(true, "Enable Volume Confirmation", group = group_conf)
+volumeMultiplier = input.float(1.5, "Volume Spike Threshold", minval = 1.0, maxval = 5.0, step = 0.1, group = group_conf,
+     tooltip = "Volume must be X times the average to confirm")
+volumeAvgLength = input.int(20, "Volume Average Length", minval = 5, maxval = 100, group = group_conf)
+
+// Trend Alignment
+useTrendConf = input.bool(true, "Enable Trend Confirmation", group = group_conf)
+trendMaLength = input.int(50, "Trend MA Length", minval = 10, maxval = 200, group = group_conf,
+     tooltip = "Moving average used to determine trend direction")
+trendMaType = input.string("EMA", "Trend MA Type", options = ["SMA", "EMA", "WMA", "VWMA"], group = group_conf)
+
+// Key Level Proximity
+useKeyLevelConf = input.bool(true, "Enable Key Level Confirmation", group = group_conf)
+keyLevelLookback = input.int(100, "Key Level Lookback", minval = 20, maxval = 500, group = group_conf,
+     tooltip = "Bars to look back for identifying support/resistance")
+keyLevelProximity = input.float(0.5, "Proximity Threshold %", minval = 0.1, maxval = 2.0, step = 0.1, group = group_conf,
+     tooltip = "How close price must be to a key level (as % of price)")
+
+// Momentum Strength (RSI extremes)
+useMomentumConf = input.bool(true, "Enable Momentum Strength Confirmation", group = group_conf)
+extremeOversold = input.int(25, "Extreme Oversold", minval = 10, maxval = 40, group = group_conf)
+extremeOverbought = input.int(75, "Extreme Overbought", minval = 60, maxval = 90, group = group_conf)
+
+// Candle Confirmation
+useCandleConf = input.bool(true, "Enable Candle Confirmation", group = group_conf)
+candleBodyRatio = input.float(0.6, "Engulfing Body Ratio", minval = 0.3, maxval = 0.9, step = 0.1, group = group_conf,
+     tooltip = "Minimum body-to-range ratio for engulfing candles")
+
+// Signal Filtering
+// Control which signals are displayed
+group_filter = "══════ Signal Filtering ══════"
+minConfidence = input.int(2, "Minimum Confidence to Show", minval = 1, maxval = 5, group = group_filter,
+     tooltip = "Only show divergences with this many confirmations or more")
+showLowConf = input.bool(true, "Show Low Confidence (1-2)", group = group_filter)
+showMedConf = input.bool(true, "Show Medium Confidence (3)", group = group_filter)
+showHighConf = input.bool(true, "Show High Confidence (4-5)", group = group_filter)
+
+// Visual Settings
+// Customize the indicator appearance
+group_visual = "══════ Visual Settings ══════"
+showDivLines = input.bool(true, "Show Divergence Lines", group = group_visual)
+showLabels = input.bool(true, "Show Signal Labels", group = group_visual)
+showConfMeter = input.bool(true, "Show Confidence Meter", group = group_visual)
+showBgHighlight = input.bool(true, "Background Highlight on Signals", group = group_visual)
+
+// Color Theme
+bullColor = input.color(color.new(#00E676, 0), "Bullish Color", group = group_visual)
+bearColor = input.color(color.new(#FF5252, 0), "Bearish Color", group = group_visual)
+lowConfColor = input.color(color.new(#9E9E9E, 0), "Low Confidence Color", group = group_visual)
+medConfColor = input.color(color.new(#FFD600, 0), "Medium Confidence Color", group = group_visual)
+highConfColor = input.color(color.new(#00E5FF, 0), "High Confidence Color", group = group_visual)
+
+//                              CORE CALCULATIONS
+
+// RSI Calculation
+// Using Wilder's smoothing method (standard RSI)
+rsiValue = ta.rsi(rsiSource, rsiLength)
+
+// Pivot Point Detection
+// Identifies swing highs and lows on both price and RSI
+// Price pivots
+pricePivotHigh = ta.pivothigh(high, pivotLookback, pivotLookback)
+pricePivotLow = ta.pivotlow(low, pivotLookback, pivotLookback)
+
+// RSI pivots
+rsiPivotHigh = ta.pivothigh(rsiValue, pivotLookback, pivotLookback)
+rsiPivotLow = ta.pivotlow(rsiValue, pivotLookback, pivotLookback)
+
+// Trend Calculation
+// Determines the current trend direction using selected MA type
+trendMa = switch trendMaType
+    "SMA" => ta.sma(close, trendMaLength)
+    "EMA" => ta.ema(close, trendMaLength)
+    "WMA" => ta.wma(close, trendMaLength)
+    "VWMA" => ta.vwma(close, trendMaLength)
+    => ta.ema(close, trendMaLength)
+
+isUptrend = close > trendMa
+isDowntrend = close < trendMa
+
+// Volume Analysis
+// Detect volume spikes that confirm price action
+volumeAvg = ta.sma(volume, volumeAvgLength)
+isVolumeSpike = volume > volumeAvg * volumeMultiplier
+
+// Key Level Detection
+// Identify significant support and resistance zones
+highestHigh = ta.highest(high, keyLevelLookback)
+lowestLow = ta.lowest(low, keyLevelLookback)
+
+// Calculate proximity to key levels
+proximityToResistance = math.abs(high - highestHigh) / high * 100
+proximityToSupport = math.abs(low - lowestLow) / low * 100
+
+isNearResistance = proximityToResistance <= keyLevelProximity
+isNearSupport = proximityToSupport <= keyLevelProximity
+
+// Candle Pattern Detection
+// Identify reversal candle patterns
+candleBody = math.abs(close - open)
+candleRange = high - low
+bodyRatio = candleRange > 0 ? candleBody / candleRange : 0
+
+// Bullish patterns
+isBullishEngulfing = close > open and close[1] < open[1] and close > open[1] and open < close[1] and bodyRatio >= candleBodyRatio
+
+bullishPinBar = close > open and (open - low) > (candleBody * 2) and (high - close) < candleBody
+
+isBullishCandle = isBullishEngulfing or bullishPinBar
+
+// Bearish patterns
+isBearishEngulfing = close < open and close[1] > open[1] and close < open[1] and open > close[1] and bodyRatio >= candleBodyRatio
+
+bearishPinBar = close < open and (high - open) > (candleBody * 2) and (close - low) < candleBody
+
+isBearishCandle = isBearishEngulfing or bearishPinBar
+
+//                           DIVERGENCE DETECTION ENGINE
+
+// Storage for pivot tracking
+var float lastPriceLow = na
+var float lastPriceHigh = na
+var float lastRsiLow = na
+var float lastRsiHigh = na
+var int lastPriceLowBar = na
+var int lastPriceHighBar = na
+var int lastRsiLowBar = na
+var int lastRsiHighBar = na
+
+// Update pivot tracking when new pivots are found
+if not na(pricePivotLow)
+    lastPriceLow := pricePivotLow
+    lastPriceLowBar := bar_index - pivotLookback
+
+if not na(pricePivotHigh)
+    lastPriceHigh := pricePivotHigh
+    lastPriceHighBar := bar_index - pivotLookback
+
+if not na(rsiPivotLow)
+    lastRsiLow := rsiPivotLow
+    lastRsiLowBar := bar_index - pivotLookback
+
+if not na(rsiPivotHigh)
+    lastRsiHigh := rsiPivotHigh
+    lastRsiHighBar := bar_index - pivotLookback
+
+// Bullish Divergence Detection
+// Price makes lower low, RSI makes higher low
+var float prevPriceLow = na
+var float prevRsiLow = na
+var int prevPriceLowBar = na
+var int prevRsiLowBar = na
+
+bullishDivergence = false
+bullishDivStartBar = 0
+bullishDivEndBar = 0
+bullishDivStartRsi = 0.0
+bullishDivEndRsi = 0.0
+
+if not na(pricePivotLow) and not na(prevPriceLow)
+    barDiff = bar_index - pivotLookback - prevPriceLowBar
+    
+    // Check for valid divergence
+    if barDiff >= minDivBars and barDiff <= maxDivBars
+        currentPriceLow = pricePivotLow
+        currentRsiLow = rsiPivotLow
+        
+        // Price lower low, RSI higher low = bullish divergence
+        if not na(currentRsiLow) and not na(prevRsiLow)
+            if currentPriceLow < prevPriceLow and currentRsiLow > prevRsiLow
+                bullishDivergence := true
+                bullishDivStartBar := prevPriceLowBar
+                bullishDivEndBar := bar_index - pivotLookback
+                bullishDivStartRsi := prevRsiLow
+                bullishDivEndRsi := currentRsiLow
+
+// Store previous pivots
+if not na(pricePivotLow)
+    prevPriceLow := pricePivotLow
+    prevPriceLowBar := bar_index - pivotLookback
+    prevRsiLow := rsiPivotLow
+    prevRsiLowBar := bar_index - pivotLookback
+
+// Bearish Divergence Detection
+// Price makes higher high, RSI makes lower high
+var float prevPriceHigh = na
+var float prevRsiHigh = na
+var int prevPriceHighBar = na
+var int prevRsiHighBar = na
+
+bearishDivergence = false
+bearishDivStartBar = 0
+bearishDivEndBar = 0
+bearishDivStartRsi = 0.0
+bearishDivEndRsi = 0.0
+
+if not na(pricePivotHigh) and not na(prevPriceHigh)
+    barDiff = bar_index - pivotLookback - prevPriceHighBar
+    
+    // Check for valid divergence
+    if barDiff >= minDivBars and barDiff <= maxDivBars
+        currentPriceHigh = pricePivotHigh
+        currentRsiHigh = rsiPivotHigh
+        
+        // Price higher high, RSI lower high = bearish divergence
+        if not na(currentRsiHigh) and not na(prevRsiHigh)
+            if currentPriceHigh > prevPriceHigh and currentRsiHigh < prevRsiHigh
+                bearishDivergence := true
+                bearishDivStartBar := prevPriceHighBar
+                bearishDivEndBar := bar_index - pivotLookback
+                bearishDivStartRsi := prevRsiHigh
+                bearishDivEndRsi := currentRsiHigh
+
+// Store previous pivots
+if not na(pricePivotHigh)
+    prevPriceHigh := pricePivotHigh
+    prevPriceHighBar := bar_index - pivotLookback
+    prevRsiHigh := rsiPivotHigh
+    prevRsiHighBar := bar_index - pivotLookback
+
+//                        CONFIRMATION WEIGHT CALCULATOR
+
+// Calculate confirmation score for BULLISH divergence
+calcBullishConfidence() =>
+    score = 0
+    factors = ""
+    
+    // Factor 1: Volume Confirmation
+    if useVolumeConf and isVolumeSpike
+        score += 1
+        factors += "V"
+    
+    // Factor 2: Trend Alignment (bullish div in downtrend = counter-trend, needs more confirmation)
+    // But bullish div suggesting reversal UP while in downtrend is the typical setup
+    if useTrendConf and isDowntrend
+        score += 1
+        factors += factors != "" ? "+T" : "T"
+    
+    // Factor 3: Key Level Proximity (near support)
+    if useKeyLevelConf and isNearSupport
+        score += 1
+        factors += factors != "" ? "+L" : "L"
+    
+    // Factor 4: Momentum Strength (RSI in oversold territory)
+    if useMomentumConf and rsiValue <= extremeOversold
+        score += 1
+        factors += factors != "" ? "+M" : "M"
+    
+    // Factor 5: Candle Confirmation
+    if useCandleConf and isBullishCandle
+        score += 1
+        factors += factors != "" ? "+C" : "C"
+    
+    [score, factors]
+
+// Calculate confirmation score for BEARISH divergence
+calcBearishConfidence() =>
+    score = 0
+    factors = ""
+    
+    // Factor 1: Volume Confirmation
+    if useVolumeConf and isVolumeSpike
+        score += 1
+        factors += "V"
+    
+    // Factor 2: Trend Alignment (bearish div in uptrend = typical setup)
+    if useTrendConf and isUptrend
+        score += 1
+        factors += factors != "" ? "+T" : "T"
+    
+    // Factor 3: Key Level Proximity (near resistance)
+    if useKeyLevelConf and isNearResistance
+        score += 1
+        factors += factors != "" ? "+L" : "L"
+    
+    // Factor 4: Momentum Strength (RSI in overbought territory)
+    if useMomentumConf and rsiValue >= extremeOverbought
+        score += 1
+        factors += factors != "" ? "+M" : "M"
+    
+    // Factor 5: Candle Confirmation
+    if useCandleConf and isBearishCandle
+        score += 1
+        factors += factors != "" ? "+C" : "C"
+    
+    [score, factors]
+
+// Calculate confidence scores
+[bullConfScore, bullFactors] = calcBullishConfidence()
+[bearConfScore, bearFactors] = calcBearishConfidence()
+
+// Determine confidence level and colors
+getConfidenceColor(score, isBull) =>
+    if score >= 4
+        highConfColor
+    else if score == 3
+        medConfColor
+    else if score >= 1
+        lowConfColor
+    else
+        color.gray
+
+shouldShowSignal(score) =>
+    if score >= 4 and showHighConf
+        true
+    else if score == 3 and showMedConf
+        true
+    else if score <= 2 and score >= minConfidence and showLowConf
+        true
+    else
+        false
+
+//                              VISUAL RENDERING
+
+// RSI Plot with Dynamic Coloring
+// Color intensity based on RSI level
+rsiColor = rsiValue >= rsiOverbought ? color.new(bearColor, 30) : rsiValue <= rsiOversold ? color.new(bullColor, 30) : color.new(color.white, 50)
+
+plot(rsiValue, "RSI", color = rsiColor, linewidth = 2)
+
+// RSI reference lines
+hline(rsiOverbought, "Overbought", color = color.new(bearColor, 70), linestyle = hline.style_dashed)
+hline(50, "Midline", color = color.new(color.gray, 80), linestyle = hline.style_dotted)
+hline(rsiOversold, "Oversold", color = color.new(bullColor, 70), linestyle = hline.style_dashed)
+
+// RSI gradient fill
+fillColorUpper = rsiValue >= 50 ? color.new(bearColor, 90) : na
+fillColorLower = rsiValue < 50 ? color.new(bullColor, 90) : na
+
+rsiPlot = plot(rsiValue, display = display.none)
+midPlot = plot(50, display = display.none)
+
+fill(rsiPlot, midPlot, color = rsiValue >= 50 ? color.new(bearColor, 90) : color.new(bullColor, 90))
+
+// Divergence Lines
+// Draw lines connecting divergence pivot points
+if bullishDivergence and showDivLines and shouldShowSignal(bullConfScore)
+    lineColor = getConfidenceColor(bullConfScore, true)
+    line.new(bullishDivStartBar, bullishDivStartRsi, bullishDivEndBar, bullishDivEndRsi, 
+         color = lineColor, width = 2, style = line.style_solid)
+
+if bearishDivergence and showDivLines and shouldShowSignal(bearConfScore)
+    lineColor = getConfidenceColor(bearConfScore, false)
+    line.new(bearishDivStartBar, bearishDivStartRsi, bearishDivEndBar, bearishDivEndRsi, 
+         color = lineColor, width = 2, style = line.style_solid)
+
+// Signal Labels
+// Display confidence score and confirmed factors
+if bullishDivergence and showLabels and shouldShowSignal(bullConfScore)
+    labelColor = getConfidenceColor(bullConfScore, true)
+    labelText = "▲ BULL DIV\nScore: " + str.tostring(bullConfScore) + "/5\n" + bullFactors
+    label.new(bar_index - pivotLookback, rsiValue - 5, labelText, 
+         color = labelColor, textcolor = color.black, style = label.style_label_up, 
+         size = size.small)
+
+if bearishDivergence and showLabels and shouldShowSignal(bearConfScore)
+    labelColor = getConfidenceColor(bearConfScore, false)
+    labelText = "▼ BEAR DIV\nScore: " + str.tostring(bearConfScore) + "/5\n" + bearFactors
+    label.new(bar_index - pivotLookback, rsiValue + 5, labelText, 
+         color = labelColor, textcolor = color.black, style = label.style_label_down, 
+         size = size.small)
+
+// Background Highlight
+// Flash background on high-confidence signals
+bgBullish = bullishDivergence and bullConfScore >= 4 and showBgHighlight ? color.new(bullColor, 85) : na
+bgBearish = bearishDivergence and bearConfScore >= 4 and showBgHighlight ? color.new(bearColor, 85) : na
+
+bgcolor(bgBullish, title = "Bullish Signal Background")
+bgcolor(bgBearish, title = "Bearish Signal Background")
+
+// Confidence Meter (Histogram)
+// Shows real-time confirmation factor strength
+
+// Helper functions to compute current bullish/bearish confirmation potential
+calcCurrentBullPotential() =>
+    potential = 0
+    if useVolumeConf and isVolumeSpike
+        potential += 1
+    if useTrendConf and isDowntrend
+        potential += 1
+    if useKeyLevelConf and isNearSupport
+        potential += 1
+    if useMomentumConf and rsiValue <= extremeOversold
+        potential += 1
+    if useCandleConf and isBullishCandle
+        potential += 1
+    potential
+
+calcCurrentBearPotential() =>
+    potential = 0
+    if useVolumeConf and isVolumeSpike
+        potential += 1
+    if useTrendConf and isUptrend
+        potential += 1
+    if useKeyLevelConf and isNearResistance
+        potential += 1
+    if useMomentumConf and rsiValue >= extremeOverbought
+        potential += 1
+    if useCandleConf and isBearishCandle
+        potential += 1
+    potential
+
+// Compute potentials as series (0 when meter is disabled)
+currentBullPotential = showConfMeter ? calcCurrentBullPotential() : 0
+currentBearPotential = showConfMeter ? calcCurrentBearPotential() : 0
+
+// Plot as small circles at bottom
+meterLevel = -10
+
+// Bullish potential dots
+plotchar(showConfMeter and currentBullPotential >= 1 ? meterLevel      : na, 
+     "Bull Factor 1", "●", location.absolute, color = bullColor, size = size.tiny)
+plotchar(showConfMeter and currentBullPotential >= 2 ? meterLevel - 3  : na, 
+     "Bull Factor 2", "●", location.absolute, color = bullColor, size = size.tiny)
+plotchar(showConfMeter and currentBullPotential >= 3 ? meterLevel - 6  : na, 
+     "Bull Factor 3", "●", location.absolute, color = bullColor, size = size.tiny)
+plotchar(showConfMeter and currentBullPotential >= 4 ? meterLevel - 9  : na, 
+     "Bull Factor 4", "●", location.absolute, color = bullColor, size = size.tiny)
+plotchar(showConfMeter and currentBullPotential >= 5 ? meterLevel - 12 : na, 
+     "Bull Factor 5", "●", location.absolute, color = bullColor, size = size.tiny)
+
+// Bearish potential dots (optional – uncomment if you want a separate row for bears)
+plotchar(showConfMeter and currentBearPotential >= 1 ? meterLevel - 15 : na, 
+      "Bear Factor 1", "●", location.absolute, color = bearColor, size = size.tiny)
+plotchar(showConfMeter and currentBearPotential >= 2 ? meterLevel - 18 : na, 
+      "Bear Factor 2", "●", location.absolute, color = bearColor, size = size.tiny)
+plotchar(showConfMeter and currentBearPotential >= 3 ? meterLevel - 21 : na, 
+      "Bear Factor 3", "●", location.absolute, color = bearColor, size = size.tiny)
+plotchar(showConfMeter and currentBearPotential >= 4 ? meterLevel - 24 : na, 
+      "Bear Factor 4", "●", location.absolute, color = bearColor, size = size.tiny)
+plotchar(showConfMeter and currentBearPotential >= 5 ? meterLevel - 27 : na, 
+      "Bear Factor 5", "●", location.absolute, color = bearColor, size = size.tiny)
+
+
+//                                  ALERTS
+
+// High Confidence Alerts (4-5 factors)
+alertcondition(bullishDivergence and bullConfScore >= 4, 
+     "High Confidence Bullish Divergence", 
+     "🟢 HIGH CONFIDENCE Bullish Divergence Detected! Score: {{plot_0}}/5")
+
+alertcondition(bearishDivergence and bearConfScore >= 4, 
+     "High Confidence Bearish Divergence", 
+     "🔴 HIGH CONFIDENCE Bearish Divergence Detected! Score: {{plot_0}}/5")
+
+// Medium Confidence Alerts (3 factors)
+alertcondition(bullishDivergence and bullConfScore == 3, 
+     "Medium Confidence Bullish Divergence", 
+     "🟡 MEDIUM Bullish Divergence Detected! Score: 3/5")
+
+alertcondition(bearishDivergence and bearConfScore == 3, 
+     "Medium Confidence Bearish Divergence", 
+     "🟡 MEDIUM Bearish Divergence Detected! Score: 3/5")
+
+// Any Divergence Alerts
+alertcondition(bullishDivergence and bullConfScore >= minConfidence, 
+     "Any Bullish Divergence", 
+     "Bullish Divergence Detected")
+
+alertcondition(bearishDivergence and bearConfScore >= minConfidence, 
+     "Any Bearish Divergence", 
+     "Bearish Divergence Detected")
+
+//                              DATA TABLE DISPLAY
+
+showTable = input.bool(true, "Show Info Table", group = group_visual)
+tablePosition = input.string("top_right", "Table Position", 
+     options = ["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], 
+     group = group_visual)
+
+tablePos = switch tablePosition
+    "top left" => position.top_left
+    "top center" => position.top_center
+    "top right" => position.top_right
+    "middle left" => position.middle_left
+    "middle center" => position.middle_center
+    "middle right" => position.middle_right
+    "bottom left" => position.bottom_left
+    "bottom center" => position.bottom_center
+    "bottom right" => position.bottom_right
+    => position.top_right
+
+var table infoTable = table.new(tablePos, 2, 8, bgcolor = color.new(#0D1117, 85), 
+     border_color = color.new(#30363D, 50), border_width = 1, frame_color = color.new(#FFFFFF, 20), frame_width = 2)
+if showTable and barstate.islast
+    // Header
+    table.cell(infoTable, 0, 0, "FACTOR", bgcolor = color.new(color.gray,0),
+         text_color = color.white, text_size = size.small)
+    table.cell(infoTable, 1, 0, "STATUS", bgcolor = color.new(color.gray,0),
+         text_color = color.white, text_size = size.small)
+    
+    // Volume
+    volStatus = isVolumeSpike ? "✓ SPIKE" : "—"
+    volColor = isVolumeSpike ? bullColor : color.white
+    table.cell(infoTable, 0, 1, "Volume", text_color = color.white, text_size = size.tiny)
+    table.cell(infoTable, 1, 1, volStatus, text_color = volColor, bgcolor = color.new(volColor,80),text_size = size.tiny)
+    
+    // Trend
+    trendStatus = isUptrend ? "↑ UP" : isDowntrend ? "↓ DOWN" : "— FLAT"
+    trendColor = isUptrend ? bullColor : isDowntrend ? bearColor : color.white
+    table.cell(infoTable, 0, 2, "Trend", text_color = color.white, text_size = size.tiny)
+    table.cell(infoTable, 1, 2, trendStatus, bgcolor = color.new(trendColor,80), text_color = trendColor, text_size = size.tiny)
+    
+    // Key Level
+    levelStatus = isNearSupport ? "@ SUPPORT" : isNearResistance ? "@ RESIST" : "—"
+    levelColor = isNearSupport ? bullColor : isNearResistance ? bearColor : color.white
+    table.cell(infoTable, 0, 3, "Key Level", text_color = color.white, text_size = size.tiny)
+    table.cell(infoTable, 1, 3, levelStatus, bgcolor = color.new(levelColor,80), text_color = levelColor, text_size = size.tiny)
+    
+    // RSI Status
+    rsiStatus = rsiValue >= extremeOverbought ? "OVERBOUGHT" : rsiValue <= extremeOversold ? "OVERSOLD" : str.tostring(rsiValue, "#.0")
+    rsiColorTable = rsiValue >= extremeOverbought ? bearColor : rsiValue <= extremeOversold ? bullColor : color.white
+    table.cell(infoTable, 0, 4, "RSI", text_color = color.white, text_size = size.tiny)
+    table.cell(infoTable, 1, 4, rsiStatus, bgcolor = color.new(rsiColorTable,80),text_color = rsiColorTable, text_size = size.tiny)
+    
+    // Candle
+    candleStatus = isBullishCandle ? "✓ BULL" : isBearishCandle ? "✓ BEAR" : "—"
+    candleColor = isBullishCandle ? bullColor : isBearishCandle ? bearColor : color.white
+    table.cell(infoTable, 0, 5, "Candle", text_color = color.white, text_size = size.tiny)
+    table.cell(infoTable, 1, 5, candleStatus, bgcolor = color.new(candleColor,80),text_color = candleColor, text_size = size.tiny)
+    
+    // Separator
+    table.cell(infoTable, 0, 6, " ", bgcolor = color.gray, text_size = size.tiny)
+    table.cell(infoTable, 1, 6, " ", bgcolor = color.gray, text_size = size.tiny)
+    
+    // Current max potential
+    maxPotential = math.max(bullConfScore, bearConfScore)
+    potentialType = bullConfScore > bearConfScore ? "BULL" : bearConfScore > bullConfScore ? "BEAR" : "NEUTRAL"
+    potentialColor = bullConfScore > bearConfScore ? bullColor : bearConfScore > bullConfScore ? bearColor : color.gray
+    table.cell(infoTable, 0, 7, "Potential", text_color = potentialColor, bgcolor = color.new(potentialColor,80),text_size = size.small)
+    table.cell(infoTable, 1, 7, potentialType + " " + str.tostring(maxPotential) + "/5", 
+         text_color = potentialColor, bgcolor = color.new(potentialColor,80), text_size = size.small)
+
+// [/pine]

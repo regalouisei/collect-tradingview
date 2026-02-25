@@ -1,0 +1,125 @@
+//@version=6
+indicator("eBacktesting - Learning: RSI Divergences", overlay=false, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+rsiLen    = input.int(14, "RSI Length", minval=2)
+src       = input.source(close, "RSI Source")
+osIn      = input.int(30, "Oversold", minval=0, maxval=100)
+obIn      = input.int(70, "Overbought", minval=0, maxval=100)
+
+pivotLen  = input.int(5, "Swing strength (divergence)", minval=2)
+
+signals   = input.string("Divergence", "Signals", options=["Divergence", "Overbought/Oversold", "Both"])
+
+showPivots    = input.bool(true, "Show pivots on price chart")
+showDivLines  = input.bool(true, "Show divergence lines on price chart")
+showDivLabels = input.bool(true, "Show divergence labels on price chart")
+keepPastMarks = input.int(20, "Keep past marks", minval=0, maxval=200)
+
+// Keep levels sane even if user misconfigures them
+ob = math.max(obIn, osIn + 1)
+os = math.min(osIn, ob - 1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSI pane
+r = ta.rsi(src, rsiLen)
+plot(r, "RSI", linewidth=2)
+hline(ob, "Overbought", linestyle=hline.style_dashed)
+hline(50, "Midline", linestyle=hline.style_dotted)
+hline(os, "Oversold", linestyle=hline.style_dashed)
+
+// Optional OB/OS “state” signals (your original request)
+useLevels = signals != "Divergence"
+bullOS = useLevels and (r <= os)   // bullish when oversold
+bearOB = useLevels and (r >= ob)   // bearish when overbought
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pivots (confirmed pivotLen bars later)
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+// Pivot markers on MAIN chart even though overlay=false:
+// Use plotshape(location.absolute) + force_overlay=true + offset=-pivotLen
+// With location.absolute, the first argument becomes the Y coordinate. :contentReference[oaicite:1]{index=1}
+plotshape(showPivots ? ph : na, title="Pivot High", style=shape.circle, location=location.absolute, size=size.tiny, offset=-pivotLen, force_overlay=true)
+plotshape(showPivots ? pl : na, title="Pivot Low",  style=shape.circle, location=location.absolute, size=size.tiny, offset=-pivotLen, force_overlay=true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Divergence logic (regular divergences)
+// Bearish divergence: price higher high, RSI lower high
+// Bullish divergence: price lower low, RSI higher low
+useDiv = signals != "Overbought/Oversold"
+
+// Store last pivot high/low in price + RSI value at pivot candle
+var int   prevHiIdx = na
+var float prevHiPx  = na
+var float prevHiRsi = na
+
+var int   prevLoIdx = na
+var float prevLoPx  = na
+var float prevLoRsi = na
+
+bearDiv = false
+bullDiv = false
+
+// Object storage (so chart doesn't get spammy)
+var line[]  divLines  = array.new_line()
+var label[] divLabels = array.new_label()
+
+f_pushLine(line ln) =>
+    array.push(divLines, ln)
+    if array.size(divLines) > keepPastMarks
+        line old = array.shift(divLines)
+        line.delete(old)
+
+f_pushLabel(label lb) =>
+    array.push(divLabels, lb)
+    if array.size(divLabels) > keepPastMarks
+        label old = array.shift(divLabels)
+        label.delete(old)
+
+// ── Pivot High → possible bearish divergence
+if useDiv and not na(ph)
+    int   hiIdx = bar_index - pivotLen
+    float hiPx  = ph
+    float hiRsi = r[pivotLen]  // RSI value on the pivot candle
+
+    bearDiv := not na(prevHiPx) and (hiPx > prevHiPx) and (hiRsi < prevHiRsi)
+
+    if bearDiv
+        if showDivLines
+            f_pushLine(line.new(prevHiIdx, prevHiPx, hiIdx, hiPx, xloc=xloc.bar_index, force_overlay=true))
+        if showDivLabels
+            f_pushLabel(label.new(hiIdx, hiPx, "Bear Div", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, force_overlay=true))
+
+    prevHiIdx := hiIdx
+    prevHiPx  := hiPx
+    prevHiRsi := hiRsi
+
+// ── Pivot Low → possible bullish divergence
+if useDiv and not na(pl)
+    int   loIdx = bar_index - pivotLen
+    float loPx  = pl
+    float loRsi = r[pivotLen]  // RSI value on the pivot candle
+
+    bullDiv := not na(prevLoPx) and (loPx < prevLoPx) and (loRsi > prevLoRsi)
+
+    if bullDiv
+        if showDivLines
+            f_pushLine(line.new(prevLoIdx, prevLoPx, loIdx, loPx, xloc=xloc.bar_index, force_overlay=true))
+        if showDivLabels
+            f_pushLabel(label.new(loIdx, loPx, "Bull Div", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up, force_overlay=true))
+
+    prevLoIdx := loIdx
+    prevLoPx  := loPx
+    prevLoRsi := loRsi
+
+// ─────────────────────────────────────────────────────────────────────────────
+// eBacktesting integration (data-window only; non-zero on signal)
+// Divergences are confirmed pivot-based; stamp them onto the pivot candle with offset.
+plot(bullOS ? 1 : 0, title="eBacktesting: RSI Oversold (Bullish)", display=display.data_window)
+plot(bearOB ? 1 : 0, title="eBacktesting: RSI Overbought (Bearish)", display=display.data_window)
+
+plot(useDiv and bullDiv ? 1 : 0, title="eBacktesting: RSI Bullish Divergence", display=display.data_window, offset=-pivotLen)
+plot(useDiv and bearDiv ? 1 : 0, title="eBacktesting: RSI Bearish Divergence", display=display.data_window, offset=-pivotLen)

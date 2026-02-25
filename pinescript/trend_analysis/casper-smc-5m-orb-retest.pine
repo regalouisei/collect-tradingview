@@ -1,0 +1,266 @@
+//@version=6
+strategy(
+    "Casper SMC: 5m ORB + Retest",
+    overlay=true,
+    initial_capital=1000,
+    default_qty_type=strategy.fixed,
+    default_qty_value=1,
+    currency=currency.USD,
+    process_orders_on_close=true,
+    margin_long=1,
+    margin_short=1
+)
+
+// 🔹 SETTINGS
+grp_time     = "Time Settings"
+sessRange    = input.session("0930-0935", "Session Range", group=grp_time)
+entryCutoff  = input.session("1630-1645", "Entry Ends After", group=grp_time, tooltip="No new trades will be taken after this time (NY Time)")
+sessZone     = input.string("America/New_York", "Timezone", group=grp_time)
+
+grp_strat    = "Strategy Settings"
+lotSize      = input.float(0.05, "Fixed Lot Size", minval=0.01, step=0.01, group=grp_strat, tooltip="Fixed lot size for every trade")
+contractSize = input.float(100, "Contract Size (Units per Lot)", minval=1, group=grp_strat, tooltip="Standard Forex=100000, Gold=100, Crypto=1, Indices varies. Used for P/L calculation.")
+rrRatio      = input.float(2.0, "Risk Reward Ratio (R)", minval=0.1, group=grp_strat)
+
+grp_retest   = "Retest Filters"
+minWickPct   = input.float(2.0, "Min Wick % (How deep into range)", minval=0, maxval=100, step=1, group=grp_retest, tooltip="2% means the wick must go at least 2% toward the SL to be valid")
+maxWickPct   = input.float(30.0, "Max Wick % (Cannot touch SL)", minval=0, maxval=100, step=1, group=grp_retest, tooltip="30% means the wick cannot go deeper than 30% toward the SL")
+
+grp_display  = "Visuals"
+showLabels   = input.bool(true, "Show P/L Labels", group=grp_display)
+txtSize      = size.tiny
+
+// 🔹 HELPER FUNCTIONS
+// Format duration from milliseconds to minimalistic string (e.g., "45m", "2h 15m")
+formatDuration(ms) =>
+    seconds = ms / 1000
+    totalMinutes = int(seconds / 60)
+    hours   = int(totalMinutes / 60)
+    remMinutes = totalMinutes % 60
+    
+    string res = ""
+    if hours > 0
+        res := str.tostring(hours) + "h"
+        if remMinutes > 0
+            res := res + " " + str.tostring(remMinutes) + "m"
+        else
+            res := res // Just hours if minutes 0
+    else
+        res := str.tostring(totalMinutes) + "m"
+    res
+
+// 🔹 STATE VARIABLES
+var float orbHigh  = na
+var float orbLow   = na
+var float orbMid   = na
+var bool  rangeSet = false
+
+var bool hasConfirmedBreakout = false
+var int  breakoutDir = 0        // 1 = bull, -1 = bear
+var int  breakoutBarIndex = na
+var bool dailyTradeTaken = false
+var bool sessionCancelled = false
+
+// Reset daily
+// Check if the day changed or if it's the start of a new session if using intraday sessions
+bool newSession = false
+t = time(timeframe.period, sessRange, sessZone)
+isORBCandle = not na(t)
+
+// Detect start of new session to reset variables
+// We use a change in day or simple logic if not strictly daily
+if dayofmonth != dayofmonth[1]
+    orbHigh := na
+    orbLow  := na
+    orbMid  := na
+    rangeSet := false
+    hasConfirmedBreakout := false
+    breakoutDir := 0
+    breakoutBarIndex := na
+    dailyTradeTaken := false
+    sessionCancelled := false
+
+// Capture ORB High/Low during the session
+if isORBCandle
+    if not rangeSet // First candle of session
+        orbHigh := high
+        orbLow  := low
+        orbMid  := math.avg(high, low)
+        rangeSet := true
+    else
+        orbHigh := math.max(orbHigh, high)
+        orbLow  := math.min(orbLow, low)
+        orbMid  := math.avg(orbHigh, orbLow)
+
+// Logic only after ORB forms
+// Allow trading only if within the allowable window defined by inputs
+// We construct a time range from session start to the cutoff time.
+
+// Helper to extract the start time string from a session string (e.g. "0930-0935" -> "0930")
+// Note: This simple string manipulation assumes the format "HHMM-HHMM"
+str_split(str, sep) =>
+    array.get(str.split(str, sep), 0)
+
+// Get start of ORB session (e.g. "0930")
+start_time = str_split(sessRange, "-")
+// Get start of Cutoff session (e.g. "1430")
+end_time   = str_split(entryCutoff, "-")
+
+// Construct the allowed trading window (e.g. "0930-1430")
+trade_window_str = start_time + "-" + end_time
+
+t_entry = time(timeframe.period, trade_window_str, sessZone)
+isWithinEntryWindow = not na(t_entry)
+
+canTrade = rangeSet and not isORBCandle and not dailyTradeTaken and not sessionCancelled and isWithinEntryWindow
+
+// 🔹 BREAKOUT & CANCELLATION LOGIC
+if canTrade
+    // 1. Check for Breakout
+    if not hasConfirmedBreakout
+        if close > orbHigh
+            hasConfirmedBreakout := true
+            breakoutDir := 1
+            breakoutBarIndex := bar_index
+        else if close < orbLow
+            hasConfirmedBreakout := true
+            breakoutDir := -1
+            breakoutBarIndex := bar_index
+
+    // 2. Check for Cancellation (Breakout Reversal)
+    // If we broke out Bullish  (1) but price drops below ORB Low  -> Cancel
+    // If we broke out Bearish (-1) but price rises above ORB High -> Cancel
+    else
+        if breakoutDir == 1 and close < orbLow
+            sessionCancelled := true
+            if showLabels
+                label.new(bar_index, low, "Session Cancelled\n(Reversal)", style=label.style_label_up, color=color.gray, textcolor=color.white, size=txtSize)
+        else if breakoutDir == -1 and close > orbHigh
+            sessionCancelled := true
+            if showLabels
+                label.new(bar_index, high, "Session Cancelled\n(Reversal)", style=label.style_label_down, color=color.gray, textcolor=color.white, size=txtSize)
+
+// 🔹 ENTRY LOGIC (WICK RETEST)
+if canTrade and hasConfirmedBreakout and not sessionCancelled and strategy.position_size == 0
+    
+    // We only look for retests AFTER the breakout candle
+    if bar_index > breakoutBarIndex
+
+        slPrice = orbMid
+        distToSL = breakoutDir == 1 ? (orbHigh - slPrice) : (slPrice - orbLow)
+        
+        // --- BULLISH SETUP ---
+        if breakoutDir == 1
+            // Identify wick depth into the range
+            // Wick must dip BELOW orbHigh
+            wickDepth = orbHigh - low
+            // Calculate % distance to SL
+            wickPct = distToSL > 0 ? (wickDepth / distToSL) * 100 : 0
+            
+            // Conditions
+            wickInRange    = wickPct >= minWickPct and wickPct <= maxWickPct
+            bodyOutside    = math.min(open, close) > orbHigh // Body stayed above ORB High
+            wickPierced    = low < orbHigh                   // Wick went inside
+            
+            if wickPierced and bodyOutside and wickInRange
+                // Calculate targets
+                limitPrice = close
+                riskPerShare = close - slPrice
+                takeProfitPrice = close + (riskPerShare * rrRatio)
+                
+                // Calculate P/L Estimate
+                // Profit = (TP - Entry) * ContractSize * Lots
+                potentialProfit = (takeProfitPrice - close) * contractSize * lotSize
+                potentialLoss   = (close - slPrice) * contractSize * lotSize
+                
+                // Construct Label Text
+                lblText = "BUY NOW " + str.tostring(lotSize) + " Lot\n" + 
+                          "TP: +$" + str.tostring(potentialProfit, "#.00") + "\n" + 
+                          "SL: -$" + str.tostring(potentialLoss, "#.00")
+
+                strategy.entry("Long", strategy.long, qty=lotSize * contractSize, comment=lblText)
+                strategy.exit("TP/SL", "Long", stop=slPrice, limit=takeProfitPrice, comment_profit="TP Hit", comment_loss="SL Hit")
+                
+                dailyTradeTaken := true
+
+        // --- BEARISH SETUP ---
+        else if breakoutDir == -1
+            // Identify wick depth into the range
+            // Wick must poke ABOVE orbLow
+            wickDepth = high - orbLow
+            // Calculate % distance to SL
+            wickPct = distToSL > 0 ? (wickDepth / distToSL) * 100 : 0
+            
+            // Conditions
+            wickInRange    = wickPct >= minWickPct and wickPct <= maxWickPct
+            bodyOutside    = math.max(open, close) < orbLow // Body stayed below ORB Low
+            wickPierced    = high > orbLow                  // Wick went inside
+            
+            if wickPierced and bodyOutside and wickInRange
+                // Calculate targets
+                limitPrice = close
+                riskPerShare = slPrice - close
+                takeProfitPrice = close - (riskPerShare * rrRatio)
+                
+                // Calculate P/L Estimate
+                potentialProfit = (close - takeProfitPrice) * contractSize * lotSize
+                potentialLoss   = (slPrice - close) * contractSize * lotSize
+                
+                // Construct Label Text
+                lblText = "SELL NOW " + str.tostring(lotSize) + " Lot\n" + 
+                          "TP: +$" + str.tostring(potentialProfit, "#.00") + "\n" + 
+                          "SL: -$" + str.tostring(potentialLoss, "#.00")
+
+                strategy.entry("Short", strategy.short, qty=lotSize * contractSize, comment=lblText)
+                strategy.exit("TP/SL", "Short", stop=slPrice, limit=takeProfitPrice, comment_profit="TP Hit", comment_loss="SL Hit")
+
+                dailyTradeTaken := true
+
+// 🔹 PLOTTING
+// Define "Brutal" Colors (Neon/High Contrast)
+col_bull = #00E676  // Neon Green
+col_bear = #FF1744  // Neon Red
+col_mid  = #FFFFFF  // White
+col_bg   = color.new(#089981, 85) // Deep Blue, high transparency
+
+// Logic to show lines only until 16:00 NY time
+isTradingHours = not na(time(timeframe.period, "0930-1600", sessZone))
+
+plot(rangeSet and isTradingHours ? orbHigh : na, "ORB High", color=col_bull, linewidth=2, style=plot.style_linebr)
+plot(rangeSet and isTradingHours ? orbLow  : na, "ORB Low",  color=col_bear,   linewidth=2, style=plot.style_linebr)
+plot(rangeSet and isTradingHours ? orbMid  : na, "ORB Mid",  color=col_mid,    linewidth=1, style=plot.style_linebr)
+
+// 🔹 TRADE DURATION & RESULT DISPLAY
+// Detect if a trade just closed
+if strategy.closedtrades > strategy.closedtrades[1] and showLabels
+    // Get index of the last closed trade
+    lastTradeIndex = strategy.closedtrades - 1
+    
+    // Get entry and exit times
+    entryTime = strategy.closedtrades.entry_time(lastTradeIndex)
+    exitTime  = strategy.closedtrades.exit_time(lastTradeIndex)
+    
+    // Calculate duration
+    durationMs = exitTime - entryTime
+    durationText = formatDuration(durationMs)
+    
+    // Determine if it was Profit or Loss
+    profit = strategy.closedtrades.profit(lastTradeIndex)
+    isWin = profit > 0
+    
+    // Create label text
+    resColor = isWin ? #00c164 : #FF1744 // Neon Green for wins, Neon Red for losses
+    
+    // To place it to the "left", we can use style_label_right (which points right, so the label body is to the left)
+    // or simply shift the bar_index back.
+    // Ideally, for "left of TP/SL", the user might mean visually next to the price level.
+    // Let's try placing it horizontally aligned with the exit price but slightly back in time or using label style.
+    
+    // Style: label_center to just float, or label_right to sit to the left of the anchor point.
+    resStyle = label.style_label_right 
+    
+    // Calculate precise exit price
+    exitPx = strategy.closedtrades.exit_price(lastTradeIndex)
+    
+    // Place label at the exit price, but at the specific bar index
+    label.new(bar_index - 1, exitPx, "⏱ " + durationText, color=color.new(resColor, 10), textcolor=color.white, style=resStyle, size=size.small)

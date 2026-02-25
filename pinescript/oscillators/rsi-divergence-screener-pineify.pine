@@ -1,0 +1,826 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+//@version=6
+indicator(title="RSI Divergence Screener [Pineify]", overlay=false)
+
+//#region —————————————————————————————————————————————————— Custom Code
+
+//#endregion ————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Common Dependence
+
+p_ta_Var_Func(src, length) =>
+    valpha = 2 / (length + 1)
+    vud1 = src > src[1] ? src - src[1] : 0
+    vdd1 = src < src[1] ? src[1] - src : 0
+    vUD = math.sum(vud1, 9)
+    vDD = math.sum(vdd1, 9)
+    vCMO = nz((vUD - vDD) / (vUD + vDD))
+    VAR = 0.0
+    VAR := nz(valpha * math.abs(vCMO) * src) + (1 - valpha * math.abs(vCMO)) * nz(VAR[1])
+    VAR
+p_ta_Wwma_Func(src, length) =>
+    wwalpha = 1 / length
+    WWMA = 0.0
+    WWMA := wwalpha * src + (1 - wwalpha) * nz(WWMA[1])
+    WWMA
+p_ta_Zlema_Func(src, length) =>
+    zxLag = length / 2 == math.round(length / 2) ? length / 2 : (length - 1) / 2
+    zxEMAData = src + src - src[zxLag]
+    ZLEMA = ta.ema(zxEMAData, length)
+    ZLEMA
+p_ta_Tsf_Func(src, length) =>
+    lrc = ta.linreg(src, length, 0)
+    lrc1 = ta.linreg(src, length, 1)
+    lrs = lrc - lrc1
+    TSF = ta.linreg(src, length, 0) + lrs
+    TSF
+p_ta_ma(series float source, simple int length, simple string ma_type) =>
+    switch ma_type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "RMA" => ta.rma(source, length)
+        "HMA" => ta.hma(source, length)
+        "WMA" => ta.wma(source, length)
+        "TMA" => ta.sma(ta.sma(source, math.ceil(length / 2)), math.floor(length / 2) + 1)
+        "VAR" => p_ta_Var_Func(source, length)
+        "WWMA" => p_ta_Wwma_Func(source, length)
+        "ZLEMA" => p_ta_Zlema_Func(source, length)
+        "TSF" => p_ta_Tsf_Func(source, length)
+        "VWMA" => ta.vwma(source, length)
+
+
+p_comm_get_display_symbol(string symbol, bool show_prefix) =>
+    string result = symbol == "" ? (syminfo.prefix + ":" + syminfo.ticker) : symbol
+    has_separator = str.contains(result, ':')
+    if not show_prefix and has_separator
+        symbol_values = str.split(result, ':')
+        result := symbol_values.get(1)
+    result
+
+
+p_comm_get_display_tf(string tf) =>
+    // Normalize input
+    s  = str.trim(tf)
+    su = str.upper(s)
+
+    // Explicit token sets (seconds & D/W/M)
+    isSecondToken = su == "1S"  or su == "5S"  or su == "10S" or su == "15S" or su == "20S" or su == "30S" or su == "45S"
+    isDWMToken    = su == "1D"  or su == "1W"  or su == "1M"  or su == "3M"  or su == "6M"  or su == "12M"
+
+    // Numeric (minutes) detection
+    numRaw = str.tonumber(su)
+    isNum  = not na(numRaw)
+    n      = isNum ? int(numRaw) : 0
+
+    // Compose result
+    result = su == "" ? "" : isSecondToken ? str.lower(su) : isDWMToken ? su : isNum ? ((n >= 60 and n % 60 == 0 and n <= 24*60) ? (str.tostring(int(n / 60)) + "h") : (str.tostring(n) + "m")) : s
+
+    ' · ' + result
+
+p_comm_get_price_format(float price) =>
+    price_str = str.tostring(price)
+    str_array = str.split(price_str, '.')
+    str_size = str_array.size()
+    if str_size == 1
+        '#'
+    else
+        format_str = array.get(str_array, 1)
+        format_str_size = str.length(format_str)
+        switch format_str_size
+            1 => '#.#'
+            2 => '#.##'
+            3 => '#.###'
+            4 => '#.####'
+            5 => '#.#####'
+            6 => '#.######'
+            7 => '#.#######'
+            8 => '#.########'
+            9 => '#.#########'
+            10 => '#.##########'
+            => '#.###############'
+
+p_comm_get_is_enabled_value(bool is_enabled) =>
+    if is_enabled
+        1
+    else
+        0
+
+// Common ta (Only Screener)
+p_ta_atr(simple int length, simple string ma_type) =>
+    p_ta_ma(ta.tr(true), length, ma_type)
+
+p_ta_bb_standard(simple int length, simple string ma_type, series float source, series float mult) =>
+    basis = p_ta_ma(source, length, ma_type)
+    dev = mult * ta.stdev(source, length)
+    upper = basis + dev
+    lower = basis - dev
+    bbr = (source - lower)/(upper - lower)
+    bbw = (upper-lower)/basis
+    [basis, upper, lower]
+
+p_ta_stoch(simple int k_length, simple int k_smoothing, simple int d_smoothing) =>
+    k = ta.sma(ta.stoch(close, high, low, k_length), k_smoothing)
+    d = ta.sma(k, d_smoothing)
+    [k, d]
+
+p_ta_smaroc(roclen, smalen) => ta.sma(ta.roc(close, roclen), smalen)
+
+p_ta_get2PoleSSF(series float src, simple int length) =>
+    PI = 2 * math.asin(1)
+    arg = math.sqrt(2) * PI / length
+    a1 = math.exp(-arg)
+    b1 = 2 * a1 * math.cos(arg)
+    c2 = b1
+    c3 = -math.pow(a1, 2)
+    c1 = 1 - c2 - c3
+    ssf = 0.0
+    ssf := c1 * src + c2 * nz(ssf[1]) + c3 * nz(ssf[2])
+    ssf
+
+p_ta_ehlers_super_smoother(series float source, simple int lower) =>
+    PI=3.14159265359
+    a1 = math.exp(-PI * math.sqrt(2) / lower)
+    coeff2 = 2 * a1 * math.cos(math.sqrt(2) * PI / lower)
+    coeff3 = -math.pow(a1, 2)
+    coeff1 = (1 - coeff2 - coeff3) / 2
+    filt = 0.0
+    filt := nz(coeff1 * (source + nz(source[1], source)) + coeff2 * filt[1] + coeff3 * nz(filt[2], filt[1]), source)
+
+p_ta_xema(series float source, simple int length) =>
+    mult = 2.0 / (length + 1.0)
+    res = float(na)
+    res := mult * source + (1.0 - mult) * nz(res[1], source)
+
+p_ta_ehlers_ema_smoother(series float source, simple int smoothK = 3, simple int smoothP = 3) =>
+    p_ta_ehlers_super_smoother(p_ta_xema(source, smoothK), smoothP)
+
+
+//#endregion —————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Ta Dependence
+
+
+//#endregion —————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Constants
+
+// Input Groups
+string P_GP_1      =      "Symbol"
+string P_GP_2      =      "Timeframe"
+string P_GP_3      =      "Indicators"
+
+//#endregion —————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Inputs
+
+// Symbol
+string p_inp_1      =      input.symbol(defval="BTCUSD", title="Symbol 1", group=P_GP_1)
+string p_inp_2      =      input.symbol(defval="ETHUSD", title="Symbol 2", group=P_GP_1)
+string p_inp_3      =      input.symbol(defval="XRPUSD", title="Symbol 3", group=P_GP_1)
+string p_inp_4      =      input.symbol(defval="USDT", title="Symbol 4", group=P_GP_1)
+string p_inp_5      =      input.symbol(defval="BNB", title="Symbol 5", group=P_GP_1)
+string p_inp_6      =      input.symbol(defval="SOLUSD", title="Symbol 6", group=P_GP_1)
+string p_inp_7      =      input.symbol(defval="DOGEUSD", title="Symbol 7", group=P_GP_1)
+string p_inp_8      =      input.symbol(defval="TRXUSD", title="Symbol 8", group=P_GP_1)
+
+
+// Timeframe
+string p_inp_9      =      input.timeframe(defval="1", title="TF 1", group=P_GP_2)
+string p_inp_a      =      input.timeframe(defval="5", title="TF 2", group=P_GP_2)
+string p_inp_b      =      input.timeframe(defval="10", title="TF 3", group=P_GP_2)
+string p_inp_c      =      input.timeframe(defval="30", title="TF 4", group=P_GP_2)
+
+
+// Indicators
+float p_inp_d      =      input.source(defval=close, title="Source", group=P_GP_3)
+int p_inp_e        =      input.int(defval=5, title="Length Fast RSI", group=P_GP_3)
+int p_inp_f        =      input.int(defval=14, title="Length Slow RSI", group=P_GP_3)
+
+
+//#endregion ———————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Define
+
+var p_screener      =      table.new(position=position.middle_center, frame_color=color.rgb(54, 58, 69, 0), frame_width=0, border_color=color.rgb(255, 255, 255, 100), border_width=2, rows=9, columns=180)
+
+//#endregion ————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Indicator Function Define
+
+
+var p_screener_symbol_row_number = (1 * 4) + (1 * 4) + (1 * 4) + (1 * 4) + (1 * 4) + (1 * 4) + (1 * 4) + (1 * 4)
+var p_screener_indicator_column_number = 1
+var p_screener_page_size = 8
+var p_screener_symbol_index = 0
+var p_screener_indicator_cursor = 0
+
+p_scr_rsi_divergence(series float source, simple int len_fast, simple int len_slow) =>
+    // Calculate Fast RSI
+    up_fast = ta.rma(math.max(ta.change(source), 0), len_fast)
+    down_fast = ta.rma(-math.min(ta.change(source), 0), len_fast)
+    rsi_fast = down_fast == 0 ? 100 : up_fast == 0 ? 0 : 100 - (100 / (1 + up_fast / down_fast))
+    
+    // Calculate Slow RSI
+    up_slow = ta.rma(math.max(ta.change(source), 0), len_slow)
+    down_slow = ta.rma(-math.min(ta.change(source), 0), len_slow)
+    rsi_slow = down_slow == 0 ? 100 : up_slow == 0 ? 0 : 100 - (100 / (1 + up_slow / down_slow))
+    
+    // Calculate divergence
+    divergence = rsi_fast - rsi_slow
+    [divergence]
+
+p_scr_rsi_divergence_display(series float divergence, simple color bullish_text_color, simple color bullish_background_color, simple color bearish_text_color, simple color bearish_background_color, simple color neutral_text_color, simple color neutral_background_color) =>
+    text_color = divergence > 0 ? bullish_text_color : divergence < 0 ? bearish_text_color : neutral_text_color
+    background_color = divergence > 0 ? bullish_background_color : divergence < 0 ? bearish_background_color : neutral_background_color
+    [str.tostring(divergence, "#.##"), text_color, background_color]
+
+p_screener_indicator(series float p_scr_ind_1_source, simple int p_scr_ind_1_len_fast, simple int p_scr_ind_1_len_slow) =>
+    [p_scr_ind_1_divergence] = p_scr_rsi_divergence(p_scr_ind_1_source, p_scr_ind_1_len_fast, p_scr_ind_1_len_slow)
+    [p_scr_ind_1_divergence]
+
+
+//#endregion ——————————————————————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Table Code
+need_calculate = (last_bar_index - bar_index <= 500)
+if need_calculate
+    p_scr_sym_1_0_enabled = true
+    p_scr_sym_1_0_symbol = p_inp_1
+    p_scr_sym_1_0_timeframe = p_inp_9
+    p_scr_sym_1_0_is_chart_tf = false
+    [p_scr_sym_1_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_1, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_1_1_enabled = true
+    p_scr_sym_1_1_symbol = p_inp_1
+    p_scr_sym_1_1_timeframe = p_inp_a
+    p_scr_sym_1_1_is_chart_tf = false
+    [p_scr_sym_1_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_1, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_1_2_enabled = true
+    p_scr_sym_1_2_symbol = p_inp_1
+    p_scr_sym_1_2_timeframe = p_inp_b
+    p_scr_sym_1_2_is_chart_tf = false
+    [p_scr_sym_1_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_1, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_1_3_enabled = true
+    p_scr_sym_1_3_symbol = p_inp_1
+    p_scr_sym_1_3_timeframe = p_inp_c
+    p_scr_sym_1_3_is_chart_tf = false
+    [p_scr_sym_1_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_1, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_2_0_enabled = true
+    p_scr_sym_2_0_symbol = p_inp_2
+    p_scr_sym_2_0_timeframe = p_inp_9
+    p_scr_sym_2_0_is_chart_tf = false
+    [p_scr_sym_2_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_2, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_2_1_enabled = true
+    p_scr_sym_2_1_symbol = p_inp_2
+    p_scr_sym_2_1_timeframe = p_inp_a
+    p_scr_sym_2_1_is_chart_tf = false
+    [p_scr_sym_2_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_2, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_2_2_enabled = true
+    p_scr_sym_2_2_symbol = p_inp_2
+    p_scr_sym_2_2_timeframe = p_inp_b
+    p_scr_sym_2_2_is_chart_tf = false
+    [p_scr_sym_2_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_2, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_2_3_enabled = true
+    p_scr_sym_2_3_symbol = p_inp_2
+    p_scr_sym_2_3_timeframe = p_inp_c
+    p_scr_sym_2_3_is_chart_tf = false
+    [p_scr_sym_2_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_2, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_3_0_enabled = true
+    p_scr_sym_3_0_symbol = p_inp_3
+    p_scr_sym_3_0_timeframe = p_inp_9
+    p_scr_sym_3_0_is_chart_tf = false
+    [p_scr_sym_3_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_3, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_3_1_enabled = true
+    p_scr_sym_3_1_symbol = p_inp_3
+    p_scr_sym_3_1_timeframe = p_inp_a
+    p_scr_sym_3_1_is_chart_tf = false
+    [p_scr_sym_3_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_3, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_3_2_enabled = true
+    p_scr_sym_3_2_symbol = p_inp_3
+    p_scr_sym_3_2_timeframe = p_inp_b
+    p_scr_sym_3_2_is_chart_tf = false
+    [p_scr_sym_3_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_3, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_3_3_enabled = true
+    p_scr_sym_3_3_symbol = p_inp_3
+    p_scr_sym_3_3_timeframe = p_inp_c
+    p_scr_sym_3_3_is_chart_tf = false
+    [p_scr_sym_3_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_3, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_4_0_enabled = true
+    p_scr_sym_4_0_symbol = p_inp_4
+    p_scr_sym_4_0_timeframe = p_inp_9
+    p_scr_sym_4_0_is_chart_tf = false
+    [p_scr_sym_4_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_4, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_4_1_enabled = true
+    p_scr_sym_4_1_symbol = p_inp_4
+    p_scr_sym_4_1_timeframe = p_inp_a
+    p_scr_sym_4_1_is_chart_tf = false
+    [p_scr_sym_4_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_4, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_4_2_enabled = true
+    p_scr_sym_4_2_symbol = p_inp_4
+    p_scr_sym_4_2_timeframe = p_inp_b
+    p_scr_sym_4_2_is_chart_tf = false
+    [p_scr_sym_4_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_4, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_4_3_enabled = true
+    p_scr_sym_4_3_symbol = p_inp_4
+    p_scr_sym_4_3_timeframe = p_inp_c
+    p_scr_sym_4_3_is_chart_tf = false
+    [p_scr_sym_4_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_4, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_5_0_enabled = true
+    p_scr_sym_5_0_symbol = p_inp_5
+    p_scr_sym_5_0_timeframe = p_inp_9
+    p_scr_sym_5_0_is_chart_tf = false
+    [p_scr_sym_5_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_5, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_5_1_enabled = true
+    p_scr_sym_5_1_symbol = p_inp_5
+    p_scr_sym_5_1_timeframe = p_inp_a
+    p_scr_sym_5_1_is_chart_tf = false
+    [p_scr_sym_5_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_5, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_5_2_enabled = true
+    p_scr_sym_5_2_symbol = p_inp_5
+    p_scr_sym_5_2_timeframe = p_inp_b
+    p_scr_sym_5_2_is_chart_tf = false
+    [p_scr_sym_5_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_5, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_5_3_enabled = true
+    p_scr_sym_5_3_symbol = p_inp_5
+    p_scr_sym_5_3_timeframe = p_inp_c
+    p_scr_sym_5_3_is_chart_tf = false
+    [p_scr_sym_5_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_5, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_6_0_enabled = true
+    p_scr_sym_6_0_symbol = p_inp_6
+    p_scr_sym_6_0_timeframe = p_inp_9
+    p_scr_sym_6_0_is_chart_tf = false
+    [p_scr_sym_6_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_6, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_6_1_enabled = true
+    p_scr_sym_6_1_symbol = p_inp_6
+    p_scr_sym_6_1_timeframe = p_inp_a
+    p_scr_sym_6_1_is_chart_tf = false
+    [p_scr_sym_6_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_6, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_6_2_enabled = true
+    p_scr_sym_6_2_symbol = p_inp_6
+    p_scr_sym_6_2_timeframe = p_inp_b
+    p_scr_sym_6_2_is_chart_tf = false
+    [p_scr_sym_6_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_6, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_6_3_enabled = true
+    p_scr_sym_6_3_symbol = p_inp_6
+    p_scr_sym_6_3_timeframe = p_inp_c
+    p_scr_sym_6_3_is_chart_tf = false
+    [p_scr_sym_6_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_6, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_7_0_enabled = true
+    p_scr_sym_7_0_symbol = p_inp_7
+    p_scr_sym_7_0_timeframe = p_inp_9
+    p_scr_sym_7_0_is_chart_tf = false
+    [p_scr_sym_7_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_7, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_7_1_enabled = true
+    p_scr_sym_7_1_symbol = p_inp_7
+    p_scr_sym_7_1_timeframe = p_inp_a
+    p_scr_sym_7_1_is_chart_tf = false
+    [p_scr_sym_7_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_7, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_7_2_enabled = true
+    p_scr_sym_7_2_symbol = p_inp_7
+    p_scr_sym_7_2_timeframe = p_inp_b
+    p_scr_sym_7_2_is_chart_tf = false
+    [p_scr_sym_7_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_7, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_7_3_enabled = true
+    p_scr_sym_7_3_symbol = p_inp_7
+    p_scr_sym_7_3_timeframe = p_inp_c
+    p_scr_sym_7_3_is_chart_tf = false
+    [p_scr_sym_7_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_7, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_8_0_enabled = true
+    p_scr_sym_8_0_symbol = p_inp_8
+    p_scr_sym_8_0_timeframe = p_inp_9
+    p_scr_sym_8_0_is_chart_tf = false
+    [p_scr_sym_8_0_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_8, timeframe=p_inp_9, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_8_1_enabled = true
+    p_scr_sym_8_1_symbol = p_inp_8
+    p_scr_sym_8_1_timeframe = p_inp_a
+    p_scr_sym_8_1_is_chart_tf = false
+    [p_scr_sym_8_1_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_8, timeframe=p_inp_a, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_8_2_enabled = true
+    p_scr_sym_8_2_symbol = p_inp_8
+    p_scr_sym_8_2_timeframe = p_inp_b
+    p_scr_sym_8_2_is_chart_tf = false
+    [p_scr_sym_8_2_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_8, timeframe=p_inp_b, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    p_scr_sym_8_3_enabled = true
+    p_scr_sym_8_3_symbol = p_inp_8
+    p_scr_sym_8_3_timeframe = p_inp_c
+    p_scr_sym_8_3_is_chart_tf = false
+    [p_scr_sym_8_3_0_p_scr_rsi_divergence_divergence] = request.security(symbol=p_inp_8, timeframe=p_inp_c, expression=p_screener_indicator(p_inp_d, p_inp_e, p_inp_f))
+    
+    if barstate.islast
+        p_tmp_1 = 'ignore_me'
+        p_screener_symbol_index := 0
+        p_tmp_3 = int(p_screener_symbol_row_number / p_screener_page_size)
+        p_screener_page_number = p_screener_symbol_row_number > (p_tmp_3 * p_screener_page_size) ? p_tmp_3 + 1 : p_tmp_3
+        for p_tmp_2 = 0 to p_screener_page_number - 1
+            table.cell(table_id=p_screener,column=(1 + p_screener_indicator_column_number) * p_tmp_2,row=0,text="Symbol",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+        if p_scr_sym_1_0_enabled
+            p_tmp_4 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_5,row=p_tmp_4,text=p_comm_get_display_symbol(p_scr_sym_1_0_symbol, false) + (p_scr_sym_1_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_1_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_1_enabled
+            p_tmp_6 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_7,row=p_tmp_6,text=p_comm_get_display_symbol(p_scr_sym_1_1_symbol, false) + (p_scr_sym_1_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_1_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_2_enabled
+            p_tmp_8 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_9 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_9,row=p_tmp_8,text=p_comm_get_display_symbol(p_scr_sym_1_2_symbol, false) + (p_scr_sym_1_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_1_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_3_enabled
+            p_tmp_a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_b,row=p_tmp_a,text=p_comm_get_display_symbol(p_scr_sym_1_3_symbol, false) + (p_scr_sym_1_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_1_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled
+            p_tmp_c = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_d = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_d,row=p_tmp_c,text=p_comm_get_display_symbol(p_scr_sym_2_0_symbol, false) + (p_scr_sym_2_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_2_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_1_enabled
+            p_tmp_e = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_f = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_f,row=p_tmp_e,text=p_comm_get_display_symbol(p_scr_sym_2_1_symbol, false) + (p_scr_sym_2_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_2_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_2_enabled
+            p_tmp_g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_h,row=p_tmp_g,text=p_comm_get_display_symbol(p_scr_sym_2_2_symbol, false) + (p_scr_sym_2_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_2_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_3_enabled
+            p_tmp_i = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_j = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_j,row=p_tmp_i,text=p_comm_get_display_symbol(p_scr_sym_2_3_symbol, false) + (p_scr_sym_2_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_2_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled
+            p_tmp_k = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_l = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_l,row=p_tmp_k,text=p_comm_get_display_symbol(p_scr_sym_3_0_symbol, false) + (p_scr_sym_3_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_3_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_1_enabled
+            p_tmp_m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_n,row=p_tmp_m,text=p_comm_get_display_symbol(p_scr_sym_3_1_symbol, false) + (p_scr_sym_3_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_3_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_2_enabled
+            p_tmp_o = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_p = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_p,row=p_tmp_o,text=p_comm_get_display_symbol(p_scr_sym_3_2_symbol, false) + (p_scr_sym_3_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_3_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_3_enabled
+            p_tmp_q = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_r = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_r,row=p_tmp_q,text=p_comm_get_display_symbol(p_scr_sym_3_3_symbol, false) + (p_scr_sym_3_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_3_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled
+            p_tmp_s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_t,row=p_tmp_s,text=p_comm_get_display_symbol(p_scr_sym_4_0_symbol, false) + (p_scr_sym_4_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_4_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_1_enabled
+            p_tmp_u = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_v = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_v,row=p_tmp_u,text=p_comm_get_display_symbol(p_scr_sym_4_1_symbol, false) + (p_scr_sym_4_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_4_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_2_enabled
+            p_tmp_w = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_x = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_x,row=p_tmp_w,text=p_comm_get_display_symbol(p_scr_sym_4_2_symbol, false) + (p_scr_sym_4_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_4_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_3_enabled
+            p_tmp_y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_z,row=p_tmp_y,text=p_comm_get_display_symbol(p_scr_sym_4_3_symbol, false) + (p_scr_sym_4_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_4_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled
+            p_tmp_10 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_11 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_11,row=p_tmp_10,text=p_comm_get_display_symbol(p_scr_sym_5_0_symbol, false) + (p_scr_sym_5_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_5_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_1_enabled
+            p_tmp_12 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_13 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_13,row=p_tmp_12,text=p_comm_get_display_symbol(p_scr_sym_5_1_symbol, false) + (p_scr_sym_5_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_5_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_2_enabled
+            p_tmp_14 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_15 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_15,row=p_tmp_14,text=p_comm_get_display_symbol(p_scr_sym_5_2_symbol, false) + (p_scr_sym_5_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_5_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_3_enabled
+            p_tmp_16 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_17 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_17,row=p_tmp_16,text=p_comm_get_display_symbol(p_scr_sym_5_3_symbol, false) + (p_scr_sym_5_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_5_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled
+            p_tmp_18 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_19 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_19,row=p_tmp_18,text=p_comm_get_display_symbol(p_scr_sym_6_0_symbol, false) + (p_scr_sym_6_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_6_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_1_enabled
+            p_tmp_1a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1b,row=p_tmp_1a,text=p_comm_get_display_symbol(p_scr_sym_6_1_symbol, false) + (p_scr_sym_6_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_6_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_2_enabled
+            p_tmp_1c = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1d = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1d,row=p_tmp_1c,text=p_comm_get_display_symbol(p_scr_sym_6_2_symbol, false) + (p_scr_sym_6_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_6_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_3_enabled
+            p_tmp_1e = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1f = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1f,row=p_tmp_1e,text=p_comm_get_display_symbol(p_scr_sym_6_3_symbol, false) + (p_scr_sym_6_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_6_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled
+            p_tmp_1g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1h,row=p_tmp_1g,text=p_comm_get_display_symbol(p_scr_sym_7_0_symbol, false) + (p_scr_sym_7_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_7_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_1_enabled
+            p_tmp_1i = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1j = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1j,row=p_tmp_1i,text=p_comm_get_display_symbol(p_scr_sym_7_1_symbol, false) + (p_scr_sym_7_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_7_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_2_enabled
+            p_tmp_1k = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1l = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1l,row=p_tmp_1k,text=p_comm_get_display_symbol(p_scr_sym_7_2_symbol, false) + (p_scr_sym_7_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_7_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_3_enabled
+            p_tmp_1m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1n,row=p_tmp_1m,text=p_comm_get_display_symbol(p_scr_sym_7_3_symbol, false) + (p_scr_sym_7_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_7_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled
+            p_tmp_1o = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1p = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1p,row=p_tmp_1o,text=p_comm_get_display_symbol(p_scr_sym_8_0_symbol, false) + (p_scr_sym_8_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_8_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_1_enabled
+            p_tmp_1q = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1r = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1r,row=p_tmp_1q,text=p_comm_get_display_symbol(p_scr_sym_8_1_symbol, false) + (p_scr_sym_8_1_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_8_1_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_2_enabled
+            p_tmp_1s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1t,row=p_tmp_1s,text=p_comm_get_display_symbol(p_scr_sym_8_2_symbol, false) + (p_scr_sym_8_2_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_8_2_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_3_enabled
+            p_tmp_1u = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1v = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_1v,row=p_tmp_1u,text=p_comm_get_display_symbol(p_scr_sym_8_3_symbol, false) + (p_scr_sym_8_3_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_8_3_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        for p_tmp_1w = 0 to p_screener_page_number - 1
+            p_screener_indicator_cursor := 0
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_1w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="RSI Div",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+        p_screener_indicator_cursor := 0
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_1y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1x_text, p_tmp_1x_textColor, p_tmp_1x_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_1_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_1z,row=p_tmp_1y,text=p_tmp_1x_text,text_color=p_tmp_1x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_1_enabled and true
+            p_tmp_21 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_22 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_20_text, p_tmp_20_textColor, p_tmp_20_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_1_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_22,row=p_tmp_21,text=p_tmp_20_text,text_color=p_tmp_20_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_20_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_2_enabled and true
+            p_tmp_24 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_25 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_23_text, p_tmp_23_textColor, p_tmp_23_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_1_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_25,row=p_tmp_24,text=p_tmp_23_text,text_color=p_tmp_23_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_23_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_1_3_enabled and true
+            p_tmp_27 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_28 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_26_text, p_tmp_26_textColor, p_tmp_26_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_1_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_28,row=p_tmp_27,text=p_tmp_26_text,text_color=p_tmp_26_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_26_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_2a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_29_text, p_tmp_29_textColor, p_tmp_29_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_2_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2b,row=p_tmp_2a,text=p_tmp_29_text,text_color=p_tmp_29_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_29_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_1_enabled and true
+            p_tmp_2d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2c_text, p_tmp_2c_textColor, p_tmp_2c_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_2_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2e,row=p_tmp_2d,text=p_tmp_2c_text,text_color=p_tmp_2c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_2_enabled and true
+            p_tmp_2g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2f_text, p_tmp_2f_textColor, p_tmp_2f_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_2_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2h,row=p_tmp_2g,text=p_tmp_2f_text,text_color=p_tmp_2f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_3_enabled and true
+            p_tmp_2j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2i_text, p_tmp_2i_textColor, p_tmp_2i_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_2_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2k,row=p_tmp_2j,text=p_tmp_2i_text,text_color=p_tmp_2i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_2m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2l_text, p_tmp_2l_textColor, p_tmp_2l_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_3_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2n,row=p_tmp_2m,text=p_tmp_2l_text,text_color=p_tmp_2l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_1_enabled and true
+            p_tmp_2p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2o_text, p_tmp_2o_textColor, p_tmp_2o_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_3_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2q,row=p_tmp_2p,text=p_tmp_2o_text,text_color=p_tmp_2o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_2_enabled and true
+            p_tmp_2s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2r_text, p_tmp_2r_textColor, p_tmp_2r_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_3_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2t,row=p_tmp_2s,text=p_tmp_2r_text,text_color=p_tmp_2r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_3_enabled and true
+            p_tmp_2v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2u_text, p_tmp_2u_textColor, p_tmp_2u_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_3_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2w,row=p_tmp_2v,text=p_tmp_2u_text,text_color=p_tmp_2u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_2y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2x_text, p_tmp_2x_textColor, p_tmp_2x_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_4_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_2z,row=p_tmp_2y,text=p_tmp_2x_text,text_color=p_tmp_2x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_1_enabled and true
+            p_tmp_31 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_32 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_30_text, p_tmp_30_textColor, p_tmp_30_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_4_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_32,row=p_tmp_31,text=p_tmp_30_text,text_color=p_tmp_30_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_30_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_2_enabled and true
+            p_tmp_34 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_35 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_33_text, p_tmp_33_textColor, p_tmp_33_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_4_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_35,row=p_tmp_34,text=p_tmp_33_text,text_color=p_tmp_33_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_33_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_3_enabled and true
+            p_tmp_37 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_38 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_36_text, p_tmp_36_textColor, p_tmp_36_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_4_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_38,row=p_tmp_37,text=p_tmp_36_text,text_color=p_tmp_36_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_36_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_3a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_39_text, p_tmp_39_textColor, p_tmp_39_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_5_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3b,row=p_tmp_3a,text=p_tmp_39_text,text_color=p_tmp_39_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_39_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_1_enabled and true
+            p_tmp_3d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3c_text, p_tmp_3c_textColor, p_tmp_3c_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_5_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3e,row=p_tmp_3d,text=p_tmp_3c_text,text_color=p_tmp_3c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_2_enabled and true
+            p_tmp_3g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3f_text, p_tmp_3f_textColor, p_tmp_3f_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_5_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3h,row=p_tmp_3g,text=p_tmp_3f_text,text_color=p_tmp_3f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_3_enabled and true
+            p_tmp_3j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3i_text, p_tmp_3i_textColor, p_tmp_3i_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_5_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3k,row=p_tmp_3j,text=p_tmp_3i_text,text_color=p_tmp_3i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_3m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3l_text, p_tmp_3l_textColor, p_tmp_3l_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_6_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3n,row=p_tmp_3m,text=p_tmp_3l_text,text_color=p_tmp_3l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_1_enabled and true
+            p_tmp_3p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3o_text, p_tmp_3o_textColor, p_tmp_3o_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_6_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3q,row=p_tmp_3p,text=p_tmp_3o_text,text_color=p_tmp_3o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_2_enabled and true
+            p_tmp_3s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3r_text, p_tmp_3r_textColor, p_tmp_3r_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_6_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3t,row=p_tmp_3s,text=p_tmp_3r_text,text_color=p_tmp_3r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_3_enabled and true
+            p_tmp_3v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3u_text, p_tmp_3u_textColor, p_tmp_3u_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_6_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3w,row=p_tmp_3v,text=p_tmp_3u_text,text_color=p_tmp_3u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_3y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3x_text, p_tmp_3x_textColor, p_tmp_3x_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_7_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3z,row=p_tmp_3y,text=p_tmp_3x_text,text_color=p_tmp_3x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_1_enabled and true
+            p_tmp_41 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_42 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_40_text, p_tmp_40_textColor, p_tmp_40_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_7_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_42,row=p_tmp_41,text=p_tmp_40_text,text_color=p_tmp_40_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_40_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_2_enabled and true
+            p_tmp_44 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_45 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_43_text, p_tmp_43_textColor, p_tmp_43_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_7_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_45,row=p_tmp_44,text=p_tmp_43_text,text_color=p_tmp_43_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_43_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_3_enabled and true
+            p_tmp_47 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_48 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_46_text, p_tmp_46_textColor, p_tmp_46_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_7_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_48,row=p_tmp_47,text=p_tmp_46_text,text_color=p_tmp_46_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_46_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_4a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_49_text, p_tmp_49_textColor, p_tmp_49_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_8_0_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4b,row=p_tmp_4a,text=p_tmp_49_text,text_color=p_tmp_49_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_49_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_1_enabled and true
+            p_tmp_4d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4c_text, p_tmp_4c_textColor, p_tmp_4c_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_8_1_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4e,row=p_tmp_4d,text=p_tmp_4c_text,text_color=p_tmp_4c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_2_enabled and true
+            p_tmp_4g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4f_text, p_tmp_4f_textColor, p_tmp_4f_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_8_2_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4h,row=p_tmp_4g,text=p_tmp_4f_text,text_color=p_tmp_4f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_3_enabled and true
+            p_tmp_4j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4i_text, p_tmp_4i_textColor, p_tmp_4i_bgColor] = p_scr_rsi_divergence_display(p_scr_sym_8_3_0_p_scr_rsi_divergence_divergence, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4k,row=p_tmp_4j,text=p_tmp_4i_text,text_color=p_tmp_4i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+
+//#endregion ———————————————————————————————————————————————————————————————————

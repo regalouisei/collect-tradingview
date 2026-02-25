@@ -1,0 +1,283 @@
+//@version=6
+strategy("Trade Manager", overlay = true, initial_capital = 10000, pyramiding = 9)
+
+// === Lot precision settings ===
+lot_precision    = input.int(1, "Lot precision (decimal places)", minval = 0, maxval = 8)
+show_base_labels = input.bool(true, "Show base order labels")
+show_small_table = input.bool(true, "Show mini-table")
+
+roundQty(q) =>
+    factor = math.pow(10.0, lot_precision)
+    raw    = math.ceil(q * factor) / factor
+    math.max(1.0 / factor, raw)
+
+// === Auto-trading VWRSI ===
+use_first_order = input.bool(true, "Use automatic trading (VWRSI)")
+
+// === Level entries ===
+use_level_long      = input.bool(false, "Use LONG level entry")
+use_level_short     = input.bool(false, "Use SHORT level entry")
+long_level_price_in = input.float(0.0, "LONG entry price",  step = 0.1)
+short_level_price_in= input.float(0.0, "SHORT entry price", step = 0.1)
+
+// Reset levels button
+reset_levels = input.bool(false, "Reset levels")
+
+// === Internal level and line variables ===
+var float long_level_price  = na
+var float short_level_price = na
+var line  long_line  = na
+var line  short_line = na
+var bool  reset_done = false
+
+// Reset levels (one-time trigger)
+if reset_levels and not reset_done
+    if not na(long_line)
+        line.delete(long_line)
+        long_line := na
+    if not na(short_line)
+        line.delete(short_line)
+        short_line := na
+    long_level_price  := na
+    short_level_price := na
+    reset_done := true
+if not reset_levels
+    reset_done := false
+
+// Update/create LONG line
+if use_level_long and long_level_price_in > 0 and not reset_levels
+    if na(long_level_price) or long_level_price != long_level_price_in
+        if not na(long_line)
+            line.delete(long_line)
+        long_level_price := long_level_price_in
+        x1 = bar_index > 5000 ? bar_index - 5000 : 0
+        long_line := line.new(x1, long_level_price, bar_index, long_level_price,
+                              extend = extend.right, color = color.new(color.green, 0), width = 1)
+else
+    if not na(long_line)
+        line.delete(long_line)
+        long_line := na
+    long_level_price := na
+
+// Update/create SHORT line
+if use_level_short and short_level_price_in > 0 and not reset_levels
+    if na(short_level_price) or short_level_price != short_level_price_in
+        if not na(short_line)
+            line.delete(short_line)
+        short_level_price := short_level_price_in
+        x1s = bar_index > 5000 ? bar_index - 5000 : 0
+        short_line := line.new(x1s, short_level_price, bar_index, short_level_price,
+                               extend = extend.right, color = color.new(color.red, 0), width = 1)
+else
+    if not na(short_line)
+        line.delete(short_line)
+        short_line := na
+    short_level_price := na
+
+// Maintain x2 on last bar
+if not na(long_line)
+    line.set_x2(long_line, bar_index)
+if not na(short_line)
+    line.set_x2(short_line, bar_index)
+
+// === Fixed date window ===
+start  = timestamp(2020, 1, 1, 00, 00)
+finish = timestamp(9999, 1, 1, 23, 59)
+window = time >= start and time <= finish
+
+// === Main strategy parameters ===
+longTrades   = input.bool(true, "Enable LONG trades")
+shortTrades  = input.bool(true, "Enable SHORT trades")
+Breven       = input.bool(false, "Use breakeven")
+nb           = input.int(1, "Trades count for breakeven")
+matren       = input.bool(false, "Use MA filter")
+
+price_deviationS = input.float(3.1, "Price deviation for SHORT (%)", step = 0.1) / -100
+price_deviationL = input.float(3.1, "Price deviation for LONG (%)",  step = 0.1) /  100 
+
+take_profitS = input.float(3.0, "Take Profit SHORT (%)", step = 0.01) / 100
+take_profitL = input.float(3.0, "Take Profit LONG (%)",  step = 0.01) / 100
+
+// Orders with rounding
+first_order = roundQty(input.float(100.0, "Initial order ($)")/close)
+safe_order  = roundQty(input.float(200.0, "Safety order ($)")/close)
+
+safe_order_volume_scale = input.float(1.49, step = 0.01, title = "Safety order volume scale")
+safe_order_step_scale   = input.float(1.37, step = 0.01, title = "Safety order step scale")
+max_safe_order          = input.int(8, title = "Max number of safety orders")
+
+var float initial_order = 0.0
+
+// === Take Profit levels ===
+take_profit_levelS = strategy.position_avg_price * (1 - take_profitS)
+take_profit_levelL = strategy.position_avg_price * (1 + take_profitL)
+
+// === VWRSI ===
+rsiLength      = input.int(14, minval = 1, title = "VWRSI length")
+rsiSourceInput = input.source(close, "VWRSI source")
+ovb            = input.int(80, "RSI overbought level")
+ovs            = input.int(20, "RSI oversold level")
+
+pine_vwrma(x, y) =>
+    ta.rma(x * volume, y) / ta.rma(volume, y)
+
+up   = pine_vwrma(math.max(ta.change(rsiSourceInput), 0), rsiLength)
+down = pine_vwrma(-math.min(ta.change(rsiSourceInput), 0), rsiLength)
+rsi  = down == 0 ? 100 : up == 0 ? 0 : 100 - 100 / (1 + up / down)
+
+// === MA filter ===
+src    = input(hlc3, "MA filter source")
+vib    = input.int(4, "Vibration", 1, 7)
+period = input.int(200, "MA filter period", 1)
+nbs    = input.int(20, "MA falling candles for SHORT")
+nbl    = input.int(20, "MA rising candles for LONG")
+
+r   = math.asin(1) * 2
+bet = (1 - math.cos(2 * r / period)) / (math.pow(1.393, 2 / vib) - 1)
+f   = -bet + math.sqrt(bet * bet + 2 * bet)
+
+Filter(inf, x, v) =>
+    ema = ta.ema(inf, int(2 / x))
+    res = ema
+    if v >= 2
+        res := ta.ema(res, int(1 / x))
+    if v >= 3
+        res := ta.ema(res, int(2 / x))
+    if v >= 4
+        res := ta.ema(res, int(3 / x))
+    res
+
+filt = Filter(src, f, vib)
+trendColor = filt > filt[1] ? #0aff68 : filt < filt[1] ? #ff0a0a : na
+plot(filt, "MA filter", trendColor, 2)
+
+// MA filter conditions
+fml = ta.rising(filt, nbl)
+fms = ta.falling(filt, nbs)
+
+// VWRSI signals
+s = matren ? ta.crossunder(rsi, ovb) and fms : ta.crossunder(rsi, ovb)
+b = matren ? ta.crossover(rsi, ovs) and fml : ta.crossover(rsi, ovs)
+
+// Price deviation
+price_deviation = 0.0
+if (s and strategy.position_size == 0) or strategy.position_size < 0
+    price_deviation := price_deviationS
+if (b and strategy.position_size == 0) or strategy.position_size > 0
+    price_deviation := price_deviationL
+
+// === Base order logic: VWRSI + levels ===
+existing_position = strategy.position_size != 0
+can_new_entry     = strategy.opentrades == 0 and window and not existing_position
+
+// VWRSI entries
+long_vwrsi_entry  = use_first_order and longTrades  and b
+short_vwrsi_entry = use_first_order and shortTrades and s
+
+// Level entries
+long_level_entry  = use_level_long  and longTrades  and not na(long_level_price)  and close <= long_level_price
+short_level_entry = use_level_short and shortTrades and not na(short_level_price) and close >= short_level_price
+
+// Priority: 1) SHORT level, 2) LONG level, 3) VWRSI SHORT, 4) VWRSI LONG
+if can_new_entry
+    if short_level_entry
+        strategy.entry("Short", strategy.short, qty = first_order)
+        initial_order := close
+        if not na(short_line)
+            line.delete(short_line)
+            short_line := na
+        short_level_price := na
+        if show_base_labels
+            label.new(bar_index, high, "Short base: " + str.tostring(first_order),
+                      style = label.style_label_down, color = color.red)
+    else if long_level_entry
+        strategy.entry("Long", strategy.long, qty = first_order)
+        initial_order := close
+        if not na(long_line)
+            line.delete(long_line)
+            long_line := na
+        long_level_price := na
+        if show_base_labels
+            label.new(bar_index, low, "Long base: " + str.tostring(first_order),
+                      style = label.style_label_up, color = color.green)
+    else if short_vwrsi_entry
+        strategy.entry("Short", strategy.short, qty = first_order)
+        initial_order := close
+        if show_base_labels
+            label.new(bar_index, high, "Short base: " + str.tostring(first_order),
+                      style = label.style_label_down, color = color.red)
+    else if long_vwrsi_entry
+        strategy.entry("Long", strategy.long, qty = first_order)
+        initial_order := close
+        if show_base_labels
+            label.new(bar_index, low, "Long base: " + str.tostring(first_order),
+                      style = label.style_label_up, color = color.green)
+
+// If auto-trading disabled but position exists — capture avg price
+if not use_first_order and existing_position
+    initial_order := strategy.position_avg_price
+
+// === Safety order level calculation ===
+saveorder = 0.0
+if safe_order_step_scale == 1.0
+    saveorder := initial_order - initial_order * price_deviation * safe_order_step_scale * strategy.opentrades
+else
+    saveorder := initial_order - initial_order * ((price_deviation * math.pow(safe_order_step_scale, strategy.opentrades) - price_deviation) / (safe_order_step_scale - 1))
+
+ns = str.tostring(strategy.opentrades)
+
+// Safety orders SHORT
+if strategy.opentrades > 0 and strategy.opentrades < max_safe_order and strategy.position_size < 0
+    so_qty = roundQty(safe_order * math.pow(safe_order_volume_scale, strategy.opentrades - 1))
+    strategy.entry("Safety " + ns, strategy.short, qty = so_qty, limit = saveorder)
+
+// Safety orders LONG
+if strategy.opentrades > 0 and strategy.opentrades < max_safe_order and strategy.position_size > 0
+    so_qty = roundQty(safe_order * math.pow(safe_order_volume_scale, strategy.opentrades - 1))
+    strategy.entry("Safety " + ns, strategy.long, qty = so_qty, limit = saveorder)
+
+// Exits
+if strategy.position_size < 0
+    strategy.exit("Exit", limit = take_profit_levelS)
+if strategy.position_size > 0
+    strategy.exit("Exit", limit = take_profit_levelL)
+
+// TP and safety order plots
+plot(strategy.position_size < 0 ? take_profit_levelS : na, style = plot.style_linebr, linewidth = 2, color = color.green)
+plot(strategy.position_size > 0 ? take_profit_levelL : na, style = plot.style_linebr, linewidth = 2, color = color.green)
+plot(saveorder, color = strategy.position_size != 0 ? color.red : na)
+
+// === Breakeven ===
+fee = input.float(0.1, step = 0.1, title = "Exchange fee (%)") / 100
+short_order_fee = strategy.position_avg_price * (1 - fee)
+long_order_fee  = strategy.position_avg_price * (1 + fee)
+
+plot(short_order_fee, style = plot.style_linebr, linewidth = 2, color = strategy.position_size < 0 ? color.rgb(63, 54, 69, 84) : na)
+plot(long_order_fee,  style = plot.style_linebr, linewidth = 2, color = strategy.position_size > 0 ? color.rgb(63, 54, 69, 84) : na)
+
+if strategy.position_size < 0 and strategy.opentrades > nb and close < short_order_fee and Breven
+    strategy.close_all("Breakeven Short")
+
+if strategy.position_size > 0 and strategy.opentrades > nb and close > long_order_fee and Breven
+    strategy.close_all("Breakeven Long")
+
+// Close all orders when opentrades resets
+if ta.crossunder(strategy.opentrades, 0.5)
+    strategy.close_all()
+    strategy.cancel_all()
+
+// === Mini-table ===
+if show_small_table
+    sum_qty     = strategy.position_size
+    sum_usd     = sum_qty * close
+    open_trades = strategy.opentrades
+    open_pnl    = strategy.openprofit
+    eq          = strategy.equity
+
+    var table mini = table.new(position.top_right, 5, 1, bgcolor = na)
+
+    table.cell(mini, 0, 0, "Qty: "    + str.tostring(sum_qty),                  text_color = color.white)
+    table.cell(mini, 1, 0, "USD: "    + str.tostring(sum_usd,  format.mintick), text_color = color.white)
+    table.cell(mini, 2, 0, "Trades: " + str.tostring(open_trades),              text_color = color.white)
+    table.cell(mini, 3, 0, "PnL: "    + str.tostring(open_pnl, format.mintick), text_color = open_pnl >= 0 ? color.green : color.red)
+    table.cell(mini, 4, 0, "Equity: " + str.tostring(eq,       format.mintick), text_color = eq >= 0 ? color.green : color.red)

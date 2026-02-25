@@ -1,0 +1,170 @@
+//@version=6
+indicator("ATR Ratio – HTF/LTF", overlay=true, max_labels_count=50)
+
+//====================================================
+// Inputs
+//====================================================
+grpUI = "Panel UI"
+panelPos = input.string("Top Right", "Panel position",
+     options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grpUI)
+
+txtSizeOpt = input.string("Small", "Text size", options=["Tiny","Small","Normal","Large","Huge"], group=grpUI)
+cellPad    = input.int(1, "Cell padding (spaces)", minval=0, maxval=5, group=grpUI)
+
+grpATR = "ATR Ratio"
+tfHTF = input.timeframe("15", "HTF", group=grpATR)
+tfLTF = input.timeframe("1",  "LTF", group=grpATR)
+
+atrLen  = input.int(14, "ATR Length", minval=1, group=grpATR)
+avgMode = input.string("Yesterday (prev day avg)", "Average Mode",
+     options=["Yesterday (prev day avg)", "Today (day avg)", "Rolling (N bars)"], group=grpATR)
+rollN   = input.int(240, "Rolling N bars", minval=5, group=grpATR)
+minBarsToday = input.int(10, "Min bars for Today avg", minval=1, group=grpATR)
+
+watchTh = input.float(1.20, "WATCH threshold", step=0.01, group=grpATR)
+tradeTh = input.float(1.40, "TRADE threshold", step=0.01, group=grpATR)
+coolTh  = input.float(1.05, "COOL threshold",  step=0.01, group=grpATR)
+
+grpCol = "Colors"
+headerBg   = input.color(color.black, "Header BG", group=grpCol)
+headerTc   = input.color(color.white, "Header Text", group=grpCol)
+
+reserveBg      = input.color(color.new(color.gray, 75), "Panel BG", group=grpCol)
+reserveTextCol = input.color(color.white, "Panel Text", group=grpCol)
+
+atrTradeBg = input.color(color.new(color.red, 0),    "ATR BG: TRADE", group=grpCol)
+atrWatchBg = input.color(color.new(color.orange, 0), "ATR BG: WATCH", group=grpCol)
+atrMidBg   = input.color(color.new(color.yellow, 0), "ATR BG: MID",   group=grpCol)
+atrCoolBg  = input.color(color.new(color.gray, 20),  "ATR BG: COOL",  group=grpCol)
+atrTc      = input.color(color.white, "ATR Text", group=grpCol)
+
+//====================================================
+// Helpers
+//====================================================
+f_pos(_s) =>
+    _s == "Top Left" ? position.top_left :
+     _s == "Bottom Right" ? position.bottom_right :
+     _s == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+f_textSize(opt) =>
+    opt == "Tiny" ? size.tiny :
+     opt == "Small" ? size.small :
+     opt == "Normal" ? size.normal :
+     opt == "Large" ? size.large :
+     size.huge
+
+ts = f_textSize(txtSizeOpt)
+
+f_pad(s) =>
+    p = str.repeat(" ", cellPad)
+    p + s + p
+
+f_state(r) =>
+    s = "NA"
+    if na(r)
+        s := "NA"
+    else if r >= tradeTh
+        s := "TRADE"
+    else if r >= watchTh
+        s := "WATCH"
+    else if r < coolTh
+        s := "COOL"
+    else
+        s := "MID"
+    s
+
+f_atrBg(st) =>
+    st == "TRADE" ? atrTradeBg :
+     st == "WATCH" ? atrWatchBg :
+     st == "MID"   ? atrMidBg :
+     st == "COOL"  ? atrCoolBg :
+     reserveBg
+
+//====================================================
+// ATR avg funcs (run inside requested TF)
+//====================================================
+f_todayAvgATR(_atrLen, _minBars) =>
+    atrLocal = ta.atr(_atrLen)
+    newDay = ta.change(time("D")) != 0
+    var float s = 0.0
+    var int n = 0
+    if barstate.isfirst or newDay
+        s := 0.0
+        n := 0
+    s += atrLocal
+    n += 1
+    n >= _minBars ? (s / n) : na
+
+f_prevDayAvgATR(_atrLen) =>
+    atrLocal = ta.atr(_atrLen)
+    newDay = ta.change(time("D")) != 0
+    var float s = 0.0
+    var int n = 0
+    var float prevAvg = na
+    if newDay
+        prevAvg := (n > 0 ? (s / n) : na)
+        s := 0.0
+        n := 0
+    s += atrLocal
+    n += 1
+    prevAvg
+
+f_pack_ratio(tfStr) =>
+    request.security(
+        syminfo.tickerid, tfStr,
+        [
+            ta.atr(atrLen),
+            avgMode == "Today (day avg)" ? f_todayAvgATR(atrLen, minBarsToday) :
+             avgMode == "Yesterday (prev day avg)" ? f_prevDayAvgATR(atrLen) :
+             ta.sma(ta.atr(atrLen), rollN)
+        ],
+        barmerge.gaps_off, barmerge.lookahead_off
+    )
+
+//====================================================
+// Compute HTF/LTF ratio
+//====================================================
+[atrHTF, avgHTF] = f_pack_ratio(tfHTF)
+[atrLTF, avgLTF] = f_pack_ratio(tfLTF)
+
+ratioHTF = (not na(avgHTF) and avgHTF > 0) ? (atrHTF / avgHTF) : na
+ratioLTF = (not na(avgLTF) and avgLTF > 0) ? (atrLTF / avgLTF) : na
+
+stateHTF = f_state(ratioHTF)
+stateLTF = f_state(ratioLTF)
+
+//====================================================
+// Table
+//====================================================
+// rows: header + AVG + HTF + LTF + H R + L R = 6
+var table t = table.new(f_pos(panelPos), 2, 6, frame_width=1)
+
+f_cell(c, r, txt, bg, tc) =>
+    table.cell(t, c, r, f_pad(txt), bgcolor=bg, text_color=tc, text_size=ts)
+
+if barstate.islast
+    table.clear(t, 0, 0)
+
+    // Header
+    f_cell(0, 0, "ATR", headerBg, headerTc)
+    f_cell(1, 0, "RATIO", headerBg, headerTc)
+
+    // AVG mode
+    avgTxt = avgMode == "Yesterday (prev day avg)" ? "YDAY" : avgMode == "Today (day avg)" ? "TODAY" : "ROLL"
+    f_cell(0, 1, "AVG", reserveBg, reserveTextCol)
+    f_cell(1, 1, avgTxt, reserveBg, reserveTextCol)
+
+    // HTF / LTF state
+    f_cell(0, 2, "HTF " + tfHTF, reserveBg, reserveTextCol)
+    f_cell(1, 2, stateHTF, f_atrBg(stateHTF), atrTc)
+
+    f_cell(0, 3, "LTF " + tfLTF, reserveBg, reserveTextCol)
+    f_cell(1, 3, stateLTF, f_atrBg(stateLTF), atrTc)
+
+    // Ratios
+    f_cell(0, 4, "H R", reserveBg, reserveTextCol)
+    f_cell(1, 4, na(ratioHTF) ? "NA" : str.tostring(ratioHTF, "#.##"), f_atrBg(stateHTF), atrTc)
+
+    f_cell(0, 5, "L R", reserveBg, reserveTextCol)
+    f_cell(1, 5, na(ratioLTF) ? "NA" : str.tostring(ratioLTF, "#.##"), f_atrBg(stateLTF), atrTc)

@@ -1,0 +1,202 @@
+//@version=6
+indicator("RSI Swing Indicator (v13.5, Trade Win-Rate + Avg Return + Forecast Line + Range Row)", overlay=false, max_labels_count=200, max_lines_count=200)
+
+// -------------------------
+// Inputs
+// -------------------------
+rsiSource      = input.source(close, "RSI Source")
+rsiLength      = input.int(7, "RSI Length", minval=1)
+rsiOverbought  = input.int(70, "RSI Overbought", minval=51, maxval=100)
+rsiOversold    = input.int(30, "RSI Oversold", minval=1, maxval=49)
+forecastBars   = input.int(10, "Forecast Bars", minval=1, maxval=50)
+lookaheadBars  = input.int(10, "Bars to check continuation", minval=1)
+slopeThreshold = input.float(0.1, "Range slope threshold", minval=0.01)
+rangeMidLow    = input.int(40, "Range RSI lower bound", minval=1, maxval=49)
+rangeMidHigh   = input.int(60, "Range RSI upper bound", minval=51, maxval=100)
+
+// -------------------------
+// RSI + Forecast
+// -------------------------
+rsiValue   = ta.rsi(rsiSource, rsiLength)
+slope      = ta.linreg(rsiValue, rsiLength, 0) - ta.linreg(rsiValue, rsiLength, 1)
+intercept  = ta.linreg(rsiValue, rsiLength, 0)
+rsiForecast = math.min(100, math.max(0, intercept + slope * forecastBars))
+biasForecast = slope > 0 ? "Likely Bullish" : "Likely Bearish"
+
+// -------------------------
+// Trade Win-Rate + Profit tracking
+// -------------------------
+var int totalLongTrades = 0
+var int successfulLongTrades = 0
+var int totalShortTrades = 0
+var int successfulShortTrades = 0
+
+var float sumLongReturns = 0.0
+var float sumShortReturns = 0.0
+
+isUpTrend   = slope > 0 and rsiValue > 50
+isDownTrend = slope < 0 and rsiValue < 50
+
+if barstate.isconfirmed
+    if bar_index >= lookaheadBars and isUpTrend[lookaheadBars]
+        totalLongTrades += 1
+        entryPrice = close[lookaheadBars]
+        exitPrice  = close
+        ret = ((exitPrice - entryPrice) / entryPrice) * 100
+        sumLongReturns += ret
+        if ret > 0
+            successfulLongTrades += 1
+
+    if bar_index >= lookaheadBars and isDownTrend[lookaheadBars]
+        totalShortTrades += 1
+        entryPrice = close[lookaheadBars]
+        exitPrice  = close
+        ret = ((entryPrice - exitPrice) / entryPrice) * 100
+        sumShortReturns += ret
+        if ret > 0
+            successfulShortTrades += 1
+
+longWinRate   = totalLongTrades > 0 ? (successfulLongTrades / totalLongTrades) * 100 : na
+shortWinRate  = totalShortTrades > 0 ? (successfulShortTrades / totalShortTrades) * 100 : na
+avgLongReturn = totalLongTrades > 0 ? sumLongReturns / totalLongTrades : na
+avgShortReturn= totalShortTrades > 0 ? sumShortReturns / totalShortTrades : na
+
+// -------------------------
+// Buffered bias thresholds
+// -------------------------
+bullThreshold = 55
+bearThreshold = 45
+
+currentBias = rsiValue >= bullThreshold ? "Bullish" :
+              rsiValue <= bearThreshold ? "Bearish" : "Neutral"
+
+combinedProb = currentBias == "Bullish" ? longWinRate :
+               currentBias == "Bearish" ? shortWinRate : na
+
+// -------------------------
+// Conflict flag
+// -------------------------
+conflict = (biasForecast == "Likely Bullish" and currentBias == "Bearish") or
+           (biasForecast == "Likely Bearish" and currentBias == "Bullish")
+
+conflictStatus = conflict ? 
+     (biasForecast == "Likely Bullish" and currentBias == "Bearish" ? 
+        "Forecast bullish vs Bias bearish → possible reversal" :
+      biasForecast == "Likely Bearish" and currentBias == "Bullish" ? 
+        "Forecast bearish vs Bias bullish → momentum weakening" : 
+        "General divergence") 
+     : "Aligned"
+
+// -------------------------
+// Range detection + probability
+// -------------------------
+var int totalRangeChecks = 0
+var int successfulRanges = 0
+
+isRange = not na(slope) and math.abs(slope) < slopeThreshold and rsiValue > rangeMidLow and rsiValue < rangeMidHigh
+
+if barstate.isconfirmed
+    totalRangeChecks += 1
+    if isRange
+        successfulRanges += 1
+
+rangeProb = totalRangeChecks > 0 ? (successfulRanges / totalRangeChecks) * 100 : na
+
+// -------------------------
+// Plot RSI + Forecast
+// -------------------------
+plot(rsiValue, color=color.orange, linewidth=2, title="RSI")
+plot(rsiForecast, color=color.blue, linewidth=2, title="RSI Forecast")
+
+// Forecast projected line
+var line forecastLine = na
+if barstate.islast
+    if na(forecastLine)
+        forecastLine := line.new(bar_index, rsiValue, bar_index + forecastBars, rsiForecast, color=color.blue, width=2)
+    else
+        line.set_xy1(forecastLine, bar_index, rsiValue)
+        line.set_xy2(forecastLine, bar_index + forecastBars, rsiForecast)
+
+// -------------------------
+// Helper function to interpret forecast value
+// -------------------------
+forecastText(val) =>
+    val >= rsiOverbought ? "Projected Overbought" :    val <= rsiOversold  ? "Projected Oversold"  :
+                          "Projected Neutral"
+
+// -------------------------
+// Trend + Forecast + Probability table
+// -------------------------
+var table trendTable = table.new(position.top_right, 3, 10, border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(trendTable, 0, 0, "Metric", bgcolor=color.gray, text_color=color.white)
+    table.cell(trendTable, 1, 0, "Value",  bgcolor=color.gray, text_color=color.white)
+    table.cell(trendTable, 2, 0, "Status", bgcolor=color.gray, text_color=color.white)
+
+    // Forecast row (normalized)
+    table.cell(trendTable, 0, 1, "Forecast", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 1, str.tostring(rsiForecast, "#.##"), bgcolor=color.blue, text_color=color.white)
+    table.cell(trendTable, 2, 1, forecastText(rsiForecast), 
+        bgcolor=rsiForecast >= rsiOverbought ? color.red : rsiForecast <= rsiOversold ? color.green : color.yellow, 
+        text_color=color.white)
+
+    // Long Win-Rate row
+    table.cell(trendTable, 0, 2, "Long Win-Rate", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 2, na(longWinRate) ? "n/a" : str.tostring(longWinRate, "#.##") + "%", bgcolor=color.green, text_color=color.white)
+    table.cell(trendTable, 2, 2, na(longWinRate) ? "Insufficient data" : (longWinRate > 50 ? "Profitable Bias" : "Weak Bias"), 
+        bgcolor=na(longWinRate) ? color.yellow : (longWinRate > 50 ? color.green : color.red), text_color=color.white)
+
+    // Short Win-Rate row
+    table.cell(trendTable, 0, 3, "Short Win-Rate", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 3, na(shortWinRate) ? "n/a" : str.tostring(shortWinRate, "#.##") + "%", bgcolor=color.red, text_color=color.white)
+    table.cell(trendTable, 2, 3, na(shortWinRate) ? "Insufficient data" : (shortWinRate > 50 ? "Profitable Bias" : "Weak Bias"), 
+        bgcolor=na(shortWinRate) ? color.yellow : (shortWinRate > 50 ? color.red : color.green), text_color=color.white)
+
+    // Long Avg Return row
+    table.cell(trendTable, 0, 4, "Long Avg Return", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 4, na(avgLongReturn) ? "n/a" : str.tostring(avgLongReturn, "#.##") + "%", 
+        bgcolor=avgLongReturn > 0 ? color.green : color.red, text_color=color.white)
+    table.cell(trendTable, 2, 4, na(avgLongReturn) ? "Insufficient data" : (avgLongReturn > 0 ? "Positive" : "Negative"), 
+        bgcolor=avgLongReturn > 0 ? color.green : color.red, text_color=color.white)
+
+     // Short Avg Return row
+    table.cell(trendTable, 0, 5, "Short Avg Return", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 5, na(avgShortReturn) ? "n/a" : str.tostring(avgShortReturn, "#.##") + "%", 
+        bgcolor=avgShortReturn > 0 ? color.green : color.red, text_color=color.white)
+    table.cell(trendTable, 2, 5, na(avgShortReturn) ? "Insufficient data" : (avgShortReturn > 0 ? "Positive" : "Negative"), 
+        bgcolor=avgShortReturn > 0 ? color.green : color.red, text_color=color.white)
+
+    // Prob Bias row
+    table.cell(trendTable, 0, 6, "Prob Bias", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 6, na(combinedProb) ? "n/a" : str.tostring(combinedProb, "#.##") + "%", 
+        bgcolor=currentBias=="Bullish"?color.green:currentBias=="Bearish"?color.red:color.yellow, text_color=color.white)
+    table.cell(trendTable, 2, 6, currentBias, 
+        bgcolor=currentBias=="Bullish"?color.green:currentBias=="Bearish"?color.red:color.yellow, text_color=color.white)
+
+    // Conflict row
+    table.cell(trendTable, 0, 7, "Conflict", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 7, conflict ? "Yes" : "No", 
+        bgcolor=conflict?color.orange:color.black, text_color=color.white)
+    table.cell(trendTable, 2, 7, conflictStatus, 
+        bgcolor=conflict ? (conflictStatus=="Forecast bullish vs Bias bearish → possible reversal" ? color.orange : color.red) : color.black, 
+        text_color=color.white)
+
+    // Range Probability row
+    //table.cell(trendTable, 0, 8, "Range Prob", bgcolor=color.black, text_color=color.white)
+    //table.cell(trendTable, 1, 8, na(rangeProb) ? "n/a" : str.tostring(rangeProb, "#.##") + "%", 
+    //    bgcolor=color.yellow, text_color=color.black)
+    //table.cell(trendTable, 2, 8, isRange ? "Range Likely" : "Trending", 
+    //    bgcolor=isRange ? color.orange : color.black, text_color=color.white)
+
+    // Range row (explicit combined status)
+    table.cell(trendTable, 0, 8, "Range", bgcolor=color.black, text_color=color.white)
+    table.cell(trendTable, 1, 8, na(rangeProb) ? "n/a" : str.tostring(rangeProb, "#.##") + "%", 
+        bgcolor=color.yellow, text_color=color.black)
+    table.cell(trendTable, 2, 8, 
+        (isRange or (not na(longWinRate) and longWinRate < 50 and not na(shortWinRate) and shortWinRate < 50)) 
+            ? "Range Likely" : "Trending", 
+        bgcolor=(isRange or (not na(longWinRate) and longWinRate < 50 and not na(shortWinRate) and shortWinRate < 50)) 
+            ? color.orange : color.black, 
+        text_color=color.white)

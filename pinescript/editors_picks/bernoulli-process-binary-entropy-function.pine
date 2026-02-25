@@ -1,0 +1,144 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kocurekc
+//
+//@version=6
+//
+// @author Kocurekc
+// Rev-3, Ver=6, Added OBV-ADX & Ehler Smoother
+// Rev-2, Updates for Bernoulli calc, added functions, averaging methods, Purest Calcs 
+// Rev-1, Added Alert for UP/DOWN triangle 
+// Rev-0, Bernoulli Process,  Information Measurement
+// Binary Entropy Function
+//
+// Thanks to @Picte for his inspiring idea STOCH-HVP(Balipour)
+// Live a little, publish your scripts...be a John Elhers
+//
+indicator('Bernoulli - V3', overlay = false, shorttitle = 'Bernoulli', precision = 2)
+
+//Elhers UltimateSmoother
+UltimateSmoother(float src, int period) =>
+    float a1 = math.exp(-1.414 * math.pi / period)
+    float c2 = 2.0 * a1 * math.cos(1.414 * math.pi / period)
+    float c3 = -a1 * a1
+    float c1 = (1.0 + c2 - c3) / 4.0
+    float us = src
+    if bar_index >= 4
+        us := (1.0 - c1) * src + (2.0 * c1 - c2) * src[1] - (c1 + c3) * src[2] + c2 * nz(us[1]) + c3 * nz(us[2])
+        us
+    us
+
+//so many ways to measure the same thing...except acceleration, that one is neat
+measure(_type, _src, _lbl) =>
+    float result = 0
+    if _type == 'Value' //Average value over lookback
+        result := _src
+        result
+    if _type == 'SMA' //Average value over lookback
+        result := ta.sma(_src, _lbl)
+        result
+    if _type == 'Change' //Average difference (1-bar) over lookback
+        result := ta.sma(ta.change(_src), _lbl)
+        result
+    if _type == 'Momentum' //Average difference (lookback bars) over lookback
+        result := ta.sma(ta.change(_src, _lbl), _lbl)
+        result
+    if _type == 'Acceleration' //Average Change of the Change over lookback, average acceleration 
+        result := ta.sma(ta.change(ta.change(_src, _lbl), _lbl), _lbl)
+        result
+    if _type == 'Contribution' //Today ratiod to total over lookback, how much did this bar contirbute to the total
+        result := _src / math.sum(_src, _lbl)
+        result
+    if _type == '%-Change' //Percent Change over lookback
+        result := ta.sma(ta.change(_src) / nz(_src[_lbl], _src), _lbl)
+        result
+    if _type == 'Volatility' //Natural Log Volatility adjusted
+        Vaa = math.log(_src / nz(_src[1], _src))
+        Vam = ta.sma(Vaa, _lbl)
+        result := math.sqrt(math.sum(math.pow(Vaa - Vam, 2), _lbl) / _lbl)
+        result
+    if _type == 'Elher_smoother' //Percent Change over lookback
+        result := UltimateSmoother(_src, _lbl)
+        result
+    result
+
+
+//Returns the normal distribution CDF
+n_CDF(_src, _len, _smo) =>
+    x_bar = ta.sma(_src, _len) //mean
+    s = math.sqrt(math.sum(math.pow(_src - x_bar, 2), _len) / (_len - 1))
+    z_bar = math.max(math.min((_src - x_bar) / s, 5.55), -5.55)
+    CDF = ta.sma(1 / (1 + math.pow(1 - z_bar / 5.555, 1 / 0.1186)), _smo)
+    CDF
+
+//Returns the Burn, Bernoulli calc
+bern(_src, _avg, _len, _xn) =>
+    _r2 = math.min(math.max(ta.percentrank(_src, _avg) / 100, 0.001), 0.999)
+    burn = math.sum((_xn ? -1 : 1) * _r2 * math.log(_r2) / math.log(2) - (1 - _r2) * math.log(1 - _r2) / math.log(2), _len)
+    burn
+
+//ADX
+obv_adx(_len, _lensig) =>
+    up = ta.change(ta.obv)
+    down = -ta.change(ta.obv)
+    plusDM = na(up) ? na : up > down and up > 0 ? up : 0
+    minusDM = na(down) ? na : down > up and down > 0 ? down : 0
+    trur = ta.rma(ta.stdev(ta.obv, _len), _len)
+    plus = fixnan(100 * ta.ema(plusDM, _len) / trur)
+    minus = fixnan(100 * ta.ema(minusDM, _len) / trur)
+    diDiff = plus - minus
+    diDiff
+
+
+src = close
+len = input.int(22, title = 'Entropy Length')
+trange = input.float(0.67, title = 'Trade Band - confirmation')
+avg = input.int(88, title = 'Averaging Length')
+
+type = input.string('Contribution', 'Measurement Type', options = ['Value', 'SMA', 'Change', '%-Change', 'Momentum', 'Acceleration', 'Contribution', 'Volatility', 'Elher_smoother'])
+diLen = input.int(11, title = 'ADX-DI Length')
+
+vPR = input.int(5, title = 'Percent Rank Limit')
+bc = input.bool(true, title = 'Include Source')
+vc = input.bool(false, title = 'Include Volume')
+pb = input.bool(false, title = 'Print Bands')
+pobv = input.bool(false, title = 'Print OBV-ADX', tooltip = "Prints OBV-ADX when moving opposite from Bernoulli")
+xc = input.bool(true, title = 'Extra Highlighting', tooltip = "These are highlighted for a reason")
+xn = input.bool(false, title = 'Bernoulli Purest', tooltip = "Passes Measurement Type through a CDF function")
+
+smo = input.int(3, title = 'Probability Smoother', minval = 1, tooltip = "Smoother for CDF with Bernoulli Purest")
+
+//Entropy Calculation, Bernoulli Process source (close) or for Volume or both
+cr = measure(type, src, len)
+vr = measure(type, math.log(volume), len)
+cr2 = xn ? n_CDF(cr, len, smo) : cr
+vr2 = xn ? n_CDF(vr, len, smo) : vr
+infoc = bc ? bern(cr2, avg, len, xn) : 0
+infov = vc ? bern(vr2, avg, len, xn) : 0
+info2 = bc and vc ? infoc - infov : xn ? 0 + (infoc + infov) / (-len + 1) : infoc + infov //sum both information streams or either based on bc/vc switch
+
+hvp = ta.percentrank(info2, avg)
+
+//obv_adx Plotting
+diDiff = obv_adx(diLen, diLen)
+diDiff2 = math.sign(info2) == math.sign(diDiff) ? 0 : diDiff
+plot(pobv ? diDiff2 / 10 : na, style = plot.style_columns, title = 'DI Difference')
+
+//Plotting 
+col1 = info2 > trange ? color.green : info2 < -trange ? color.red : color.gray
+col2 = info2 > trange and hvp > 100 - vPR and diDiff2 != 0 ? color.maroon : info2 < -trange and hvp < vPR and diDiff2 != 0 ? color.lime : info2 > trange ? color.green : info2 < -trange ? color.red : color.gray
+plot(info2, title = 'Bernoulli', style = plot.style_columns, color = xc ? col2 : col1)
+plot(pb and bc and vc and xn ? na : pb and bc and vc ? infoc : na, title = 'price', color = color.blue)
+plot(pb and bc and vc and xn ? na : pb and bc and vc ? -infov : na, title = 'volume', color = color.orange)
+
+red_arrows = hvp < vPR and math.abs(info2) > math.abs(trange) and info2 <= trange
+green_arrows = hvp > 100 - vPR and math.abs(info2) > math.abs(trange) and info2 >= trange
+
+//Percent Rank and ploting
+plotshape(green_arrows ? info2 : na, location = location.absolute, style = shape.triangledown, color = color.new(color.red, transp = 50), size = size.tiny)
+plotshape(red_arrows ? info2 : na, location = location.absolute, style = shape.triangleup, color = color.new(color.green, transp = 50), size = size.tiny)
+
+//Alerts
+downAlert = hvp[1] < 100 - vPR and hvp > 100 - vPR ? true : false
+upAlert = hvp[1] > vPR and hvp < vPR ? true : false
+alertcondition(downAlert, title = 'Alert on Down Triangle', message = 'Bernoulli Down Triangle!')
+alertcondition(upAlert, title = 'Alert on Up Triangle', message = 'Bernoulli Up Triangle!')

@@ -1,0 +1,247 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Zeiierman {
+//@version=6
+indicator("Volume Profile 3D (Zeiierman)",overlay = true,max_polylines_count = 100)
+//}
+// ~~ Tooltips {
+t1  = "Use Active Chart\n\nWhen enabled, the profile is computed from ONLY the currently visible candles. This lets you zoom/pan to quickly re-profile sessions (open, midday balance, close) without changing any other inputs.\n\nWhen disabled, the script uses a fixed Custom Period lookback. Choose this for consistent comparisons across symbols/time ranges."
+t2  = "Custom Period (bars)\n\nNumber of most-recent bars to include when 'Use Active Chart' is OFF. Valid range: 1–2500.\n\nTuning:\n• Intraday: 150–300 for focused sessions.\n• Swing/HTF: 500–1500 to capture stable value.\n\nTip: Larger periods smooth profiles but can hide fine LVNs; smaller periods reveal current microstructure."
+t3  = "Up/Down (3D Tilt)\n\nControls the vertical tilt of the 3D effect. Positive values tilt forward; negative values tilt backward. This is a STYLE control — it does not change volume stats.\n\nTuning:\n• Subtle depth: 0.05–0.15\n• Strong depth: 0.20–0.40\n\nIf the effect looks flat on tiny-priced symbols (FX/crypto), reduce magnitude or increase Left/Right for more width contrast."
+t4  = "\n\nLeft/Right (Profile Width Scale)\n\nScales the horizontal extent of the profile relative to the visible area. Higher values draw wider shapes, making high-volume areas stand out more.\n\nTuning:\n• 0.3–0.6 for compact charts\n• 0.7–1.0 for bold emphasis\n\nTip: If shapes overlap too much, decrease this value."
+t5  = "Aggregated (One Shape per Level)\n\nON: Combines bullish and bearish volume into a single shape per price level — cleaner, high-level read of value.\nOFF: Keeps bull/bear separate (requires/uses Bull/Bear Shift if ON) — better for directional diagnostics.\n\nUse aggregated for structure, split for insight into who built the level."
+t6  = "\n\nBull/Bear Shift (Directional Separation)\n\nWhen ON, bullish volume and bearish volume at each price level are offset slightly to make directional dominance visible at a glance.\n\nUse Cases:\n• Identify whether buyers or sellers built a node.\n• Spot imbalances inside balanced profiles."
+t7  = "Buckets (Number of Price Levels)\n\nDivides the price range into N equal-height levels. More buckets = more detail; fewer buckets = smoother profile.\n\nTuning:\n• Intraday: 12–30\n• Daily/HTF: 20–60\n\nTip: Too many buckets can create ultra-thin levels that are visually noisy. Balance detail vs. readability."
+t8  = "Coloring (Template)\n\nSelects a prebuilt color palette for bullish vs. bearish sections. These are optimized for clarity and depth effects.\n\nTemplates:\n• Green/Red – classic\n• Blue/Yellow – high contrast\n• Blue/Purple – cool tones\n• Teal/Yellow – balanced contrast\n\nTip: Switch to 'Custom' below to set your exact colors."
+t9  = "\n\nGradient (Intensity by Volume)\n\nWhen ON, transparency is driven by the relative size of each level’s volume: larger levels appear more solid; smaller ones fade. This creates a natural depth hierarchy.\n\nUse ON to emphasize HVNs; turn OFF for a flat, uniform fill."
+t10 = "Custom (Use Your Own Colors)\n\nWhen ON, the script uses the Bull Color, Bear Color, and Line Color below instead of the selected template.\n\nTip: Pick moderately transparent fills (20–40) to preserve depth layering."
+t11 = "Bull Color\n\nColor for bullish (close > open) volume. Used when 'Custom' is ON.\n\nTip: Cooler tones (blue/teal) read cleanly; warmer tones reserved for bearish side increase contrast."
+t12 = "\n\nBear Color\n\nColor for bearish (close < open) volume. Used when 'Custom' is ON.\n\nTip: Warm hues (orange/red) pair well against cooler bull tones for fast interpretation."
+t13 = "\n\nLine Color (Edges)\n\nOutline color for the 3D shapes. Slight transparency (20–40) keeps edges soft while preserving structure.\n\nTip: Dark neutrals (black/gray with 20–40 transparency) keep focus on fills."
+//~~}
+// ~~ Inputs {
+activeChart = input.bool(false, "Use Active Chart", tooltip = t1, group = "Period")
+prd         = input.int(200, "Custom Period", minval = 1, maxval = 2500, tooltip = t2, group = "Period")
+dev         = input.float(0.05, "Up/Down", step = .05, minval = -1, maxval = 1, inline = "direction", tooltip = t3, group = "Visualization & 3D Effect") * 10
+mult        = input.float(0.5,  "Left/Right", step = .1, minval = .1, maxval = 1, inline = "direction", tooltip = t3 + t4, group = "Visualization & 3D Effect")
+agg         = input.bool(false, "Aggregated", inline = "settings", tooltip = t5, group = "Visualization & 3D Effect")
+shift       = input.bool(true,  "Bull/Bear Shift", inline = "settings", tooltip = t5 + t6, group = "Visualization & 3D Effect")
+buckets     = input.int(15, "Buckets", minval = 1, maxval = 100, tooltip = t7, group = "Visualization & 3D Effect")
+colTemplate = input.string("Blue/Yellow", "Coloring", ["Green/Red","Blue/Yellow","Blue/Purple","Teal/Yellow"], inline = "col", tooltip = t8, group = "Coloring")
+gradient    = input.bool(false, "Gradient", inline = "col", tooltip = t8 + t9, group = "Coloring")
+customCol   = input.bool(false, "Custom", inline = "coloring", tooltip = t10, group = "Coloring")
+bullCol     = input.color(color.new(color.blue,   30), "", inline = "coloring", tooltip = t11, group = "Coloring")
+bearCol     = input.color(color.new(color.orange, 30), "", inline = "coloring", tooltip = t12, group = "Coloring")
+lineCol     = input.color(color.new(color.black,  30), "", inline = "coloring", tooltip = t11 + t12 + t13, group = "Coloring")
+//~~}
+// ~~ UDT's {
+type Vals
+    int start  = na
+    float  top = na
+    float  bot = na
+    
+type Arrays
+    array<float> v
+    array<float> c
+    array<float> o
+    array<float> m
+
+type Buckets
+    array<float> bu
+    array<float> be
+
+type Points
+    array<chart.point> p1
+    array<chart.point> p2
+
+type Coloring
+    array<color> c1
+    array<color> c2
+//~~}
+// ~~ Variables {
+b           = bar_index
+hi          = ta.highest(high,prd)
+lo          = ta.lowest(low,prd)
+priceLevels = array.new<float>()
+
+var v   = Vals.new(b)
+groups  = array.new<Points>()
+var a   = Arrays.new(array.new<float>(),
+ array.new<float>(),
+ array.new<float>(),
+ array.new<float>())
+bins    = Buckets.new(array.new<float>(buckets,0.0),
+ array.new<float>(buckets,0.0))
+cols    = Coloring.new(array.new<color>(),
+ array.new<color>())
+//~~}
+// ~~ Functions {
+method CandlestickData(Arrays arr)=>
+    arr.v.push(volume)
+    arr.c.push(close)
+    arr.o.push(open)
+    arr.m.push(hl2)
+
+method CandlestickDataClean(Arrays arr)=>
+    arr.v.shift()
+    arr.c.shift()
+    arr.o.shift()
+    arr.m.shift()
+
+AddPoint(p,x,y)=>p.push(chart.point.from_index(x,y))
+AddDots(p,x,y)=>p.unshift(chart.point.from_index(x,y))
+
+AddLevels(min,max,step)=>
+    for i=min to max by step
+        priceLevels.push(i)
+
+AddVolume()=>
+    for [i,vo] in a.v    
+        for j=0 to priceLevels.size()-2
+            if a.m.get(i)>=priceLevels.get(j) and a.m.get(i)<priceLevels.get(j+1)
+                if a.c.get(i)>a.o.get(i)
+                    bins.bu.set(j,bins.bu.get(j)+vo)
+                else if a.c.get(i)<a.o.get(i)
+                    bins.be.set(j,bins.be.get(j)+vo)
+                break
+
+AddColor(c1,c2)=>
+    cols.c1.push(c1)
+    cols.c2.push(c2)
+
+ColoringTemplates()=>
+    if customCol
+        [bullCol,bearCol]
+    else
+        [c1,c2] = switch colTemplate
+            "Green/Red"   => [color.new(color.lime, 30),color.new(color.red, 30)]
+            "Blue/Yellow" => [color.new(color.blue, 30),color.new(color.orange, 30)]
+            "Blue/Purple" => [color.new(color.blue, 30),color.new(color.purple, 30)]
+            "Teal/Yellow" => [color.new(color.teal, 30),color.new(color.orange, 30)]
+
+GradientColorSingle(c, size, max)=>
+    factor = max > 0 ? size / max : 0.0
+    factor := math.min(1.0, math.max(0.0, factor))
+    baseTransp = 90
+    maxTransp  = 10
+    transp = math.round(baseTransp * (1 - factor) + maxTransp * factor)
+    color.new(c, transp)
+//~~}
+// ~~ Main {
+//~Start{
+if barstate.isfirst
+    v.start := bar_index
+//~}
+//~Mid{
+if activeChart
+    if time==chart.left_visible_bar_time
+        v.top := high
+        v.bot := low
+        v.start := bar_index
+        a.CandlestickData()
+    if time>chart.left_visible_bar_time
+        v.top := math.max(v.top,high)
+        v.bot := math.min(v.bot,low)
+        a.CandlestickData()
+else
+    v.top := hi
+    v.bot := lo
+    if bar_index>prd
+        v.start += 1
+    a.CandlestickData()
+    if a.v.size()>prd
+        a.CandlestickDataClean()
+//~}
+//~Last{
+if barstate.islast
+    //~Clear old polylines{
+    old = polyline.all
+    for e in old
+        e.delete()
+    //~}
+    //~Calculate Levels{
+    step = (v.top-v.bot)/buckets
+    AddLevels(v.bot,v.top,step)
+    //~}
+    //~Calculate Volume{
+    AddVolume()
+    //~}
+    //~Create the boxes{
+    max_volume = bins.bu.max()+bins.be.max()
+    [col1,col2] = ColoringTemplates()
+
+    for [i,vo] in bins.bu
+        vv = agg ? vo+bins.be.get(i) : shift ? vo : bins.be.get(i)
+        vvv = shift ? bins.be.get(i) : vo
+        
+        slope = -(step * dev) / ((b - v.start) * (mult/2))
+        factor = math.pow(math.min(1.0, math.abs(slope) / step), .5)
+
+        if gradient
+            c1 = GradientColorSingle(col1, vv+vvv, max_volume)
+            c2 = GradientColorSingle(col2, vv+vvv, max_volume)
+            AddColor(c1,c2)
+        else
+            AddColor(col1,col2)
+
+        s = v.start
+        p1 = priceLevels.get(i)
+        p2 = priceLevels.get(i+1)
+        w  = math.max(1, math.floor(vv / max_volume * ((b-s)*mult)))
+        xr = s+w+math.max(1, math.floor(vvv / max_volume * ((b - s) * mult)))
+        x  = math.floor((b - s) * factor * .1)
+        y  = math.abs(p2 - p1) * factor * .5
+        o  = slope * w
+
+        point = Points.new(array.new<chart.point>(),
+         array.new<chart.point>())
+
+        if dev>0
+            xA = array.from(s,s,s+w,s+w,s,s,s+x,s+w+x,s+w,s+w+x,s+w+x,s+w,s,s)
+            yA = array.from(p1,p2,p2+o,p1+o,p1,p2,p2+y,p2+o+y,p2+o,p2+o+y,p1+o+y,p1+o,p1,p2)
+            for [z,e] in xA
+                AddPoint(point.p1,e,yA.get(z))
+        else if dev<0
+            xA = array.from(s,s+w,s+w,s,s,s+x,s+w+x,s+w,s+w+x,s+w+x,s+w,s)
+            yA = array.from(p1,p1+o,p2+o,p2,p1,p1-y,p1+o-y,p1+o,p1+o-y,p2+o-y,p2+o,p2)
+            for [z,e] in xA
+                AddPoint(point.p1,e,yA.get(z))
+        else
+            xA = array.from(s,s,s+w,s+w,s)
+            yA = array.from(p1,p2,p2+o,p1+o,p1)
+            for [z, e] in xA
+                AddPoint(point.p1,e,yA.get(z))
+        if not agg
+            xl = s + w
+            ofl = slope * (xl - s)
+            ofr = slope * (xr - s)
+            if dev>0
+                xA = array.from(xl,xl,xr,xr,xl,xl,xl+x,xr+x,xr,xr+x,xr+x,xr,xl,xl)
+                yA = array.from(p1+ofl,p2+ofl,p2+ofr,p1+ofr,p1+ofl,p2+ofl,p2+ofl+y,p2+ofr+y,p2+ofr,p2+ofr+y,p1+ofr+y,p1+ofr,p1+ofl,p2+ofl)
+                for [z, e] in xA
+                    AddPoint(point.p2,e,yA.get(z))
+            else if dev<0
+                xA = array.from(xl, xr, xr, xl, xl, xl+x, xr+x, xr, xr+x, xr+x, xr, xl)
+                yA = array.from(p1+ofl, p1+ofr, p2+ofr, p2+ofl, p1+ofl, p1+ofl-y, p1+ofr-y, p1+ofr, p1+ofr-y, p2+ofr-y, p2+ofr, p2+ofl)
+                for [z, e] in xA
+                    AddPoint(point.p2,e,yA.get(z))
+            else
+                xA = array.from(xl,xl,xr,xr,xl,xl)
+                yA = array.from(p1+ofl,p2+ofl,p2+ofr,p1+ofr,p1+ofl,p2+ofl)
+                for [z, e] in xA
+                    AddPoint(point.p2,e,yA.get(z))
+        groups.push(point)
+        //~}
+    //~Plot polylines{
+    for [i,e] in groups
+        polyline.new(e.p1,false,false,
+         line_color = lineCol,
+         fill_color = agg ? cols.c1.get(i) : (shift ? cols.c1.get(i) : cols.c2.get(i)))
+    if not agg
+        for [i,e] in groups
+            polyline.new(e.p2,false,false,
+             line_color = lineCol,
+             fill_color = shift ? cols.c2.get(i) : cols.c1.get(i))
+    //~}
+//~}
+//~~}

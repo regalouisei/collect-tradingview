@@ -1,0 +1,286 @@
+//@version=6
+//@author https://github.com/KodaTao
+//@author https://t.me/kodatao
+indicator("量能猎杀指标 (Delta Strike)", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+// ================= 1. 参数设置 =================
+ticks_per_row = input.int(50, title="Ticks Per Row (网格聚合)", group="订单流底层设置")
+
+va_percent = input.int(86, title="VP价值区间比例", group="Volume Profile")
+lose_balance_ratio = input.float(15, title="流动性失衡比", group="Volume Profile")
+
+vol_length_short = input.int(20, title="短均量计算周期", group="成交量设置")
+vol_length_middle = input.int(60, title="中均量计算周期", group="成交量设置")
+vol_length_long  = input.int(180, title="长均量计算周期", group="成交量设置")
+
+ratio_short   = input.float(1.5, title="短期反转放量倍数", group="放量级别判定")
+ratio_mid     = input.float(3.0, title="中期反转放量倍数", group="放量级别判定")
+ratio_long    = input.float(5.0, title="长期反转放量倍数", group="放量级别判定")
+
+rsi_len       = input.int(14, title="RSI 周期", group="超买超卖环境过滤")
+rsi_ob        = input.int(60, title="RSI 超买线 (寻顶阈值)", group="超买超卖环境过滤")
+rsi_os        = input.int(40, title="RSI 超卖线 (寻底阈值)", group="超买超卖环境过滤")
+
+n_confirm        = input.int(12, title="最大等待确认K线数 (N)", group="右侧跟进确认", minval=1)
+use_strict_delta = input.bool(true, title="启用右侧 Delta 强度过滤", group="右侧跟进确认")
+min_delta_pct    = input.float(5.0, title="最小主动净胜比例(%)", group="右侧跟进确认") / 100.0
+
+st_atr_len       = input.int(14, title="Supertrend ATR 周期", group="超级趋势突破设置")
+st_mult          = input.float(3.0, title="Supertrend 乘数", group="超级趋势突破设置")
+st_filter_delta  = input.bool(true, title="ST突破需结合Delta方向验证", group="超级趋势突破设置")
+
+// --- 告警控制面板 ---
+grp_alert = "告警设置 (Alerts)"
+alert_bottom  = input.bool(true, title="开启：底部吸收确认告警 (做多)", group=grp_alert)
+alert_top     = input.bool(true, title="开启：顶部吸收确认告警 (做空)", group=grp_alert)
+alert_st_buy  = input.bool(true, title="开启：ST有效多头突破告警", group=grp_alert)
+alert_st_sell = input.bool(true, title="开启：ST有效空头突破告警", group=grp_alert)
+
+// ================= 2. 获取底层数据 =================
+fp = request.footprint(ticks_per_row, va_percent, 300)
+float delta_vol = na(fp) ? na : fp.delta()
+
+avg_vol_short   = ta.sma(volume, vol_length_short)
+vol_ratio_short = volume / avg_vol_short
+avg_vol_middle   = ta.sma(volume, vol_length_middle)
+vol_ratio_middle = volume / avg_vol_middle
+avg_vol_long    = ta.sma(volume, vol_length_long)
+vol_ratio_long  = volume / avg_vol_long
+
+rsi_val = ta.rsi(close, rsi_len)
+float current_delta_pct = volume == 0 ? 0 : math.abs(delta_vol) / volume
+[st_value, st_dir] = ta.supertrend(st_mult, st_atr_len)
+
+var int last_base_index_bottom = na
+var int last_base_index_top = na
+
+// ================= 3. 核心量化逻辑 (更新加入 Footprint 深度验证) =================
+bool is_vol_spike = (vol_ratio_short >= ratio_short) or (vol_ratio_middle >= ratio_short) or (vol_ratio_long >= ratio_short)
+
+// 提取原有的基础判断逻辑
+bool base_setup_bottom = is_vol_spike and (delta_vol < 0) and (close > low + (high - low) * 0.2) and (rsi_val <= rsi_os)
+bool base_setup_top    = is_vol_spike and (delta_vol > 0) and (close < high - (high - low) * 0.2) and (rsi_val >= rsi_ob)
+
+bool fp_bottom_exhaustion = false
+bool fp_top_exhaustion = false
+float current_imb_bottom = na // 新增：当前K线底部失衡比
+float current_imb_top = na    // 新增：当前K线顶部失衡比
+
+if not na(fp)
+    volume_row val_row = fp.val()
+    volume_row vah_row = fp.vah()
+    array<volume_row> rows = fp.rows()
+    
+    // 1. 判断底部吸收：遍历所有位于 VAL 之下的行，如果总卖出 > 总买入，视为恐慌盘可能杀尽
+    if not na(val_row)
+        float val_price = val_row.down_price()
+        float sum_sell_below_val = 0.0
+        float sum_buy_below_val  = 0.0
+        for r in rows
+            if r.up_price() <= val_price
+                sum_sell_below_val += r.sell_volume()
+                sum_buy_below_val  += r.buy_volume()
+        
+        // 安全计算：防止买入量为0导致除以零错误
+        current_imb_bottom := sum_buy_below_val == 0 ? (sum_sell_below_val > 0 ? 999.0 : 0) : (sum_sell_below_val / sum_buy_below_val)
+        if current_imb_bottom > lose_balance_ratio
+            fp_bottom_exhaustion := true
+
+    // 2. 判断顶部吸收：遍历所有位于 VAH 之上的行，如果总买入 > 总卖出，视为逼空盘可能耗尽
+    if not na(vah_row)
+        float vah_price = vah_row.up_price()
+        float sum_sell_above_vah = 0.0
+        float sum_buy_above_vah  = 0.0
+        for r in rows
+            if r.down_price() >= vah_price
+                sum_sell_above_vah += r.sell_volume()
+                sum_buy_above_vah  += r.buy_volume()
+        
+        // 安全计算：防止卖出量为0导致除以零错误
+        current_imb_top := sum_sell_above_vah == 0 ? (sum_buy_above_vah > 0 ? 999.0 : 0) : (sum_buy_above_vah / sum_sell_above_vah)
+        if current_imb_top > lose_balance_ratio
+            fp_top_exhaustion := true
+
+// 组合最终的 Setup 判定，将基础逻辑与深度过滤结果合并，保证向下兼容不影响后续 history 引用 [j]
+bool is_setup_bottom = base_setup_bottom and fp_bottom_exhaustion
+bool is_setup_top    = base_setup_top and fp_top_exhaustion
+
+
+bool  confirm_bottom = false
+int   setup_offset_b = na
+float setup_ratio_s_b = na
+float setup_ratio_m_b = na
+float setup_ratio_l_b = na
+float setup_delta_b  = na
+float setup_imb_b    = na // 记录触发信号时的底部失衡比
+
+bool  confirm_top = false
+int   setup_offset_t = na
+float setup_ratio_s_t = na
+float setup_ratio_m_t = na
+float setup_ratio_l_t = na
+float setup_delta_t  = na
+float setup_imb_t    = na // 记录触发信号时的顶部失衡比
+
+// 向前寻找底部确认
+for j = 1 to n_confirm
+    if is_setup_bottom[j]
+        bool base_confirm = (close > open) and (close > close[j])
+        bool delta_confirm = (delta_vol > 0) and (not use_strict_delta or current_delta_pct >= min_delta_pct)
+
+        if base_confirm and delta_confirm
+            confirm_bottom := true
+            setup_offset_b := j
+            setup_ratio_s_b := vol_ratio_short[j]
+            setup_ratio_m_b := vol_ratio_middle[j]
+            setup_ratio_l_b := vol_ratio_long[j]
+            setup_delta_b  := delta_vol[j]
+            setup_imb_b    := current_imb_bottom[j] // 捕获当时的失衡比
+            break
+
+// 向前寻找顶部确认
+for j = 1 to n_confirm
+    if is_setup_top[j]
+        bool base_confirm = (close < open) and (close < close[j])
+        bool delta_confirm = (delta_vol < 0) and (not use_strict_delta or current_delta_pct >= min_delta_pct)
+
+        if base_confirm and delta_confirm
+            confirm_top := true
+            setup_offset_t := j
+            setup_ratio_s_t := vol_ratio_short[j]
+            setup_ratio_m_t := vol_ratio_middle[j]
+            setup_ratio_l_t := vol_ratio_long[j]
+            setup_delta_t  := delta_vol[j]
+            setup_imb_t    := current_imb_top[j] // 捕获当时的失衡比
+            break
+
+bool is_st_buy_breakout  = ta.change(st_dir) < 0
+bool is_st_sell_breakout = ta.change(st_dir) > 0
+bool valid_st_buy  = is_st_buy_breakout  and (not st_filter_delta or delta_vol > 0)
+bool valid_st_sell = is_st_sell_breakout and (not st_filter_delta or delta_vol < 0)
+
+// ================= 4. 可视化绘制 (原有逻辑完整保留) =================
+var int base_index = na
+var bool is_bottom = false
+if confirm_bottom
+    base_index := bar_index - setup_offset_b
+    is_bottom := true
+    if na(last_base_index_bottom) or base_index != last_base_index_bottom
+        string spike_type = "评分："
+        int spike_score = 0
+        if (setup_ratio_s_b >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_m_b >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_l_b >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_s_b >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_m_b >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_l_b >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_s_b >= ratio_long)
+            spike_score += 1
+        if (setup_ratio_m_b >= ratio_long)
+            spike_score += 1
+        if (setup_ratio_l_b >= ratio_long)
+            spike_score += 1
+        spike_type := spike_type+str.tostring(spike_score)+"/9"
+        
+        // 更新了 Label 内容，加入“失衡”比例
+        string imb_str = setup_imb_b >= 999.0 ? "MAX" : str.tostring(math.round(setup_imb_b, 1)) + "x"
+        string base_text = "😱恐慌😱\n" + spike_type + "\n失衡: " + imb_str + "\n短期: " + str.tostring(math.round(setup_ratio_s_b, 1)) +"x\n中期: " + str.tostring(math.round(setup_ratio_m_b, 1)) + "x\n长期: " + str.tostring(math.round(setup_ratio_l_b, 1)) + "x\n被动: " + str.tostring(setup_delta_b, format.volume)
+        label.new(base_index, low[setup_offset_b] - ta.tr[setup_offset_b] * 0.5, text=base_text, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+        last_base_index_bottom := base_index
+
+if confirm_top
+    base_index := bar_index - setup_offset_t
+    is_bottom := false
+    if na(last_base_index_top) or base_index != last_base_index_top
+        
+        string spike_type = "评分："
+        int spike_score = 0
+        if (setup_ratio_s_t >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_m_t >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_l_t >= ratio_short)
+            spike_score += 1
+        if (setup_ratio_s_t >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_m_t >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_l_t >= ratio_mid)
+            spike_score += 1
+        if (setup_ratio_s_t >= ratio_long)
+            spike_score += 1
+        if (setup_ratio_m_t >= ratio_long)
+            spike_score += 1
+        if (setup_ratio_l_t >= ratio_long)
+            spike_score += 1
+        spike_type := spike_type+str.tostring(spike_score)+"/9"
+        
+        // 更新了 Label 内容，加入“失衡”比例
+        string imb_str = setup_imb_t >= 999.0 ? "MAX" : str.tostring(math.round(setup_imb_t, 1)) + "x"
+        string base_text = "👑逼空👑\n" + spike_type + "\n失衡: " + imb_str + "\n短期: " + str.tostring(math.round(setup_ratio_s_t, 1)) +"x\n中期: " + str.tostring(math.round(setup_ratio_m_t, 1)) + "x\n长期: " + str.tostring(math.round(setup_ratio_l_t, 1)) + "x\n被动: " + str.tostring(setup_delta_t, format.volume)
+        label.new(base_index, high[setup_offset_t] + ta.tr[setup_offset_t] * 0.5, text=base_text, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+        last_base_index_top := base_index
+
+// --- N 根 K 线总结 ---
+if barstate.islast and bar_index <= base_index + n_confirm
+    int bull_bars = 0
+    int bear_bars = 0
+    float sum_delta = 0.0
+    float sum_bull_delta = 0.0
+    float sum_bear_delta = 0.0
+    int bull_close_cnt = 0
+    int bear_close_cnt = 0
+
+    for k = 0 to n_confirm - 1
+        float d = nz(delta_vol[k])
+        sum_delta += d
+        if d > 0
+            bull_bars += 1
+            sum_bull_delta += d
+        else if d < 0
+            bear_bars += 1
+            sum_bear_delta += d
+        if close[k] > open[k]
+            bull_close_cnt += 1
+        else if close[k] < open[k]
+            bear_close_cnt += 1
+
+    string winner = sum_delta < 0 ? "🔴 空胜" : (sum_delta > 0 ? "🟢 多胜" : "⚪ 均衡")
+    string summary_txt = "═══ "+ str.tostring(n_confirm) +"K总结 ═══\n" + winner + "\n多Δ根: " + str.tostring(bull_bars) + " | 空Δ根: " + str.tostring(bear_bars) + "\n阳线: " + str.tostring(bull_close_cnt) + " | 阴线: " + str.tostring(bear_close_cnt) + "\n净Δ合计: " + str.tostring(sum_delta, format.volume) + "\n多方Δ: +" + str.tostring(sum_bull_delta, format.volume) + "\n空方Δ: " + str.tostring(sum_bear_delta, format.volume) + "\n"
+
+    if (is_bottom)
+        label.new(bar_index, low-ta.tr * 0.15, text=summary_txt, style=label.style_label_up, color=color.new(#c4ffae, 10), textcolor=color.black, size=size.tiny)
+        // line.new(x1=base_index, y1=low[setup_offset_b], x2=bar_index, y2=low, color=color.new(color.lime, 40), style=line.style_arrow_both, width=2)
+    else
+        label.new(bar_index, high+ta.tr*0.15, text=summary_txt, style=label.style_label_down, color=color.new(#f5c9ad, 10), textcolor=color.black, size=size.tiny)
+        // line.new(x1=base_index, y1=high[setup_offset_t], x2=bar_index, y2=high, color=color.new(color.red, 40), style=line.style_dashed, width=2)
+
+
+plot(st_dir < 0 ? st_value : na, color=color.new(color.teal, 20), style=plot.style_linebr, linewidth=2, title="ST 支撑线")
+plot(st_dir > 0 ? st_value : na, color=color.new(color.orange, 20), style=plot.style_linebr, linewidth=2, title="ST 阻力线")
+plotshape(valid_st_buy,  title="ST 有效多头突破", style=shape.triangleup,   location=location.belowbar, color=color.teal,   size=size.small, text="ST突破", textcolor=color.teal)
+plotshape(valid_st_sell, title="ST 有效空头突破", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.small, text="ST跌破", textcolor=color.orange)
+
+// ================= 5. 告警触发模块 (原有完整保留) =================
+if confirm_bottom and alert_bottom
+    alert("🟢【做多信号】订单流底部吸收已被强力确认！", alert.freq_once_per_bar_close)
+
+if confirm_top and alert_top
+    alert("🔴【做空信号】订单流顶部吸收已被强力确认！", alert.freq_once_per_bar_close)
+
+if valid_st_buy and alert_st_buy
+    alert("🚀【趋势做多】超级趋势向上有效突破！", alert.freq_once_per_bar_close)
+
+if valid_st_sell and alert_st_sell
+    alert("🔻【趋势做空】超级趋势向下有效跌破！", alert.freq_once_per_bar_close)
+
+alertcondition(confirm_bottom and alert_bottom, title="[告警] 底部吸收确认 (做多)", message="🟢【做多信号】订单流底部吸收已确认！")
+alertcondition(confirm_top and alert_top,       title="[告警] 顶部吸收确认 (做空)", message="🔴【做空信号】订单流顶部吸收已确认！")
+alertcondition(valid_st_buy and alert_st_buy,   title="[告警] ST有效多头突破",     message="🚀【趋势做多】超级趋势向上有效突破！")
+alertcondition(valid_st_sell and alert_st_sell, title="[告警] ST有效空头突破",     message="🔻【趋势做空】超级趋势向下有效跌破！")

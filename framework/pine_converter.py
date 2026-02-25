@@ -1,63 +1,74 @@
-"""Convert Pine Script to Python backtesting.py Strategy using OpenClaw's AI models.
+"""Pine Script to Python converter with multiple AI providers.
 
-Supports multiple AI providers configured in .env:
-- OPENAI_API_KEY: GPT models (gpt-4, gpt-3.5-turbo)
-- GEMINI_API_KEY: Google Gemini (gemini-pro)
-- ZHIPU_API_KEY: zhipu AI (glm-4-flash)
-- ANTHROPIC_API_KEY: Anthropic Claude (claude-haiku, fallback)
+Supports:
+- OpenAI (GPT)
+- Anthropic (Claude)
+- Google Gemini
+- Zhipu AI (GLM)
+
+Features:
+- Content-based deduplication (SHA256 hash)
+- Fallback mechanism
+- State persistence for incremental scraping
+
+Usage:
+    python scripts/run_pipeline.py
+    python scripts/convert_single.py pinescript/momentum/rsi.pine
 """
 
+import json
 import os
 import re
+import sys
+from pathlib import Path
+from typing import Optional
+import hashlib
 
-# Load .env file if it exists
-def load_env():
-    """Load environment variables from .env file."""
-    env_file = os.path.join(os.path.dirname(__file__), '..', '.env')
-    if os.path.exists(env_file):
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    # Set environment variable if not already set
-                    if key not in os.environ:
-                        os.environ[key] = value
+PROJECT_ROOT = Path(__file__).parent.parent
+PINE_DIR = PROJECT_ROOT / "pinescript"
+BACKTEST_DIR = PROJECT_ROOT / "backtests"
+ENV_FILE = PROJECT_ROOT / ".env"
+HASHES_FILE = PROJECT_ROOT / "results" / ".script_hashes.json"
 
-load_env()
+# Load environment variables
+if ENV_FILE.exists():
+    for line in ENV_FILE.read_text().splitlines():
+        if line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        os.environ[key.strip()] = value.strip()
 
-# Configuration from environment (now loaded from .env)
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Configuration
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'zhipu')  # Default to zhipu
+DEFAULT_MODEL = os.getenv('OPENCLAW_DEFAULT_MODEL', 'glm-4.7')
 
-# OpenClaw model configuration
-DEFAULT_MODEL = os.environ.get("OPENCLAW_DEFAULT_MODEL", "gpt-4o-mini")
+# API Keys
+ZHIPU_API_KEY = os.getenv('ZHIPU_API_KEY', '')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 
-# Model mapping for each provider
+# Provider configurations
 MODELS = {
     "openai": {
         "default": "gpt-4o-mini",
-        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
+        "api_key_env": "OPENAI_API_KEY"
     },
     "anthropic": {
         "default": "claude-haiku-4-5-20251001",
-        "models": ["claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022"]
+        "api_key_env": "ANTHROPIC_API_KEY"
     },
     "gemini": {
         "default": "gemini-1.5-flash",
-        "models": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+        "api_key_env": "GEMINI_API_KEY"
     },
     "zhipu": {
-        "default": "glm-4-flash",
-        "models": ["glm-4-flash", "glm-4-air", "glm-4"]
+        "default": "glm-4.7",
+        "api_key_env": "ZHIPU_API_KEY"
     }
 }
 
+# Conversion Prompt (IMPROVED)
 CONVERSION_PROMPT = """You are a Pine Script to Python converter for algorithmic trading backtests.
 
 Given the following Pine Script indicator or strategy from TradingView, generate a COMPLETE, RUNNABLE Python backtest file using `backtesting.py` library.
@@ -67,7 +78,7 @@ REQUIREMENTS:
 2. Import from backtesting.lib: `from backtesting.lib import crossover` (if needed)
 3. Use `pandas_ta` for indicator calculations (import as `import pandas_ta as pta`)
 4. Import pandas and numpy as needed
-5. Define a Strategy class with `init()` and `next()` methods
+5. Define a Strategy class with `__init__()` and `next()` methods
 6. The Strategy class MUST be named `TvStrategy`
 
 TRADING RULES:
@@ -77,7 +88,7 @@ TRADING RULES:
   - For oscillators (RSI, Stochastic): buy when oversold and turning up, sell when overbought and turning down
   - For bands (Bollinger, Keltner): buy on lower band touch with reversal, sell on upper band touch
   - For volume indicators: use as confirmation with price trend
-  - For custom indicators: analyze the signal logic and create appropriate entry/exit rules
+  - For custom indicators: analyze signal logic and create appropriate entry/exit rules
 
 INDICATOR MAPPING (Pine Script -> pandas_ta):
 - ta.sma(src, len) -> pta.sma(close, length=len)
@@ -95,19 +106,21 @@ INDICATOR MAPPING (Pine Script -> pandas_ta):
 - ta.dmi(len, smooth) -> pta.adx(high, low, close, length=len)
 
 IMPORTANT RULES:
-- Use self.I() wrapper for ALL indicator calculations in init()
+- Use self.I() wrapper for ALL indicator calculations in __init__()
 - Access data via self.data.Close, self.data.Open, self.data.High, self.data.Low, self.data.Volume
-- In init(), pass pandas Series: pd.Series(self.data.Close)
+- In __init__(), pass pandas Series: pd.Series(self.data.Close)
 - In next(), access current values via self.indicator_name[-1] (last value)
 - For crossover detection, use backtesting.lib.crossover()
 - Use self.buy() and self.sell() for entries (no position sizing needed)
 - DO NOT use self.position.close() — use self.sell() to exit longs, self.buy() to exit shorts
-- Keep it simple — no optimization parameters, just the raw indicator logic
-- If the indicator requires Volume data, access via self.data.Volume
+- Keep it simple — no optimization parameters, just raw indicator logic
+- If indicator requires Volume data, access via self.data.Volume
 - Never use `len(self)`. Always use `len(self.data)` or `len(self.data.Close)` to get the number of bars.
 - pandas_ta does NOT have `highest()` or `lowest()` functions. Instead use: `df['High'].rolling(n).max()` for highest high, and `df['Low'].rolling(n).min()` for lowest low. Wrap these in self.I() lambda calls.
 - Always check if indicator calculation returns None before using it. Some pandas_ta functions return None for insufficient data. Use `if result is not None:` guards, and for self.I() wrappers, provide a fallback: `self.I(lambda: pta.rsi(close, length=14) or pd.Series(50, index=close.index))`
 - Do NOT use pta.supertrend() as it may not exist in all versions. Instead implement supertrend manually using ATR. Also avoid pta.ichimoku() — use manual calculation with rolling means.
+- **CRITICAL**: All indicator functions MUST return numpy arrays or pandas Series, NEVER return None. Use self.I() with proper fallback values.
+- **CRITICAL**: Never use `lambda` keyword inside self.I() wrappers. Instead define helper functions in __init__() and call them.
 
 TEMPLATE:
 ```python
@@ -122,7 +135,7 @@ class TvStrategy(Strategy):
     # Default parameters from Pine Script
     param1 = 14  # example
 
-    def init(self):
+    def __init__(self):
         close = pd.Series(self.data.Close)
         # Calculate indicators using self.I() wrapper
         self.indicator = self.I(pta.rsi, close, length=self.param1)
@@ -142,12 +155,12 @@ PINE SCRIPT:
 
 
 def _get_model_name() -> str:
-    """Get the model name based on provider and configuration."""
+    """Get model name based on provider and configuration."""
     # Check if user specified a model
     if DEFAULT_MODEL:
         return DEFAULT_MODEL
 
-    # Use default for the provider
+    # Use default for provider
     provider_config = MODELS.get(LLM_PROVIDER, MODELS["anthropic"])
     return provider_config["default"]
 
@@ -167,10 +180,7 @@ def _call_openai(prompt: str) -> str:
 
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": "You are an expert at converting Pine Script to Python code."},
-            {"role": "user", "content": prompt},
-        ],
+        messages=[{"role": "user", "content": prompt}],
         max_tokens=4096,
         temperature=0.7,
     )
@@ -205,7 +215,7 @@ def _call_gemini(prompt: str) -> str:
     try:
         import google.generativeai as genai
     except ImportError:
-        raise RuntimeError("Google Generative AI package not installed. Run: pip install google-generativeai")
+        raise RuntimeError("Gemini package not installed. Run: pip install google-generativeai")
 
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set in .env")
@@ -218,7 +228,7 @@ def _call_gemini(prompt: str) -> str:
 
 
 def _call_zhipu(prompt: str) -> str:
-    """Call zhipu AI API (GLM models)."""
+    """Call Zhipu AI API (GLM models) - CODING专用."""
     try:
         from zhipuai import ZhipuAI
     except ImportError:
@@ -227,7 +237,8 @@ def _call_zhipu(prompt: str) -> str:
     if not ZHIPU_API_KEY:
         raise RuntimeError("ZHIPU_API_KEY not set in .env")
 
-    client = ZhipuAI(api_key=ZHIPU_API_KEY)
+    # 使用 coding 专用 API 地址（与 OpenClaw 相同）
+    client = ZhipuAI(api_key=ZHIPU_API_KEY, base_url="https://open.bigmodel.cn/api/coding/paas/v4")
     model = _get_model_name()
 
     response = client.chat.completions.create(
@@ -243,14 +254,14 @@ def _call_zhipu(prompt: str) -> str:
 def convert_pine_to_python(
     pine_code: str,
     script_name: str = "unknown",
-    previous_error: str | None = None,
+    previous_error: Optional[str] = None,
 ) -> str:
     """Convert Pine Script to a Python backtesting.py Strategy file.
 
     Args:
         pine_code: Raw Pine Script source code
-        script_name: Name of the TradingView script (for docstring)
-        previous_error: If retrying, error from the previous attempt
+        script_name: Name of TradingView script (for docstring)
+        previous_error: If retrying, error from previous attempt
 
     Returns:
         Complete Python source code string
@@ -259,7 +270,7 @@ def convert_pine_to_python(
     if previous_error:
         prompt_content += f"\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: {previous_error}\nPlease fix the issue and try again."
 
-    # Call the appropriate API based on provider
+    # Call appropriate API based on provider
     try:
         if LLM_PROVIDER == "openai":
             raw_code = _call_openai(prompt_content)
@@ -270,38 +281,150 @@ def convert_pine_to_python(
         elif LLM_PROVIDER == "zhipu":
             raw_code = _call_zhipu(prompt_content)
         else:
-            raise RuntimeError(f"Unsupported LLM provider: {LLM_PROVIDER}. Choose from: openai, anthropic, gemini, zhipu")
+            raise RuntimeError(f"Unknown LLM provider: {LLM_PROVIDER}")
+
     except Exception as e:
-        # Fallback to Anthropic if configured
-        if ANTHROPIC_API_KEY and LLM_PROVIDER != "anthropic":
-            print(f"[pine_converter] Primary provider ({LLM_PROVIDER}) failed: {e}")
-            print(f"[pine_converter] Falling back to Anthropic...")
-            raw_code = _call_anthropic(prompt_content)
-        else:
-            raise
-
-    raw_code = raw_code.strip()
-
-    # Strip markdown fences if present
-    raw_code = _strip_code_fences(raw_code)
-
-    # Validate it at least has a Strategy class
-    if "class TvStrategy" not in raw_code:
-        # Try to find any Strategy subclass and rename it
-        match = re.search(r"class (\w+)\(Strategy\)", raw_code)
-        if match:
-            raw_code = raw_code.replace(match.group(1), "TvStrategy")
-        else:
-            raise ValueError(
-                f"Conversion failed for {script_name}: no Strategy class found in output"
-            )
+        raise RuntimeError(f"LLM API call failed: {e}")
 
     return raw_code
 
 
-def _strip_code_fences(code: str) -> str:
-    """Remove markdown code fences from LLM output."""
-    # Remove ```python ... ``` wrapping
-    code = re.sub(r"^```(?:python)?\s*\n", "", code)
-    code = re.sub(r"\n```\s*$", "", code)
-    return code.strip()
+def load_hashes() -> dict:
+    """Load script content hashes for deduplication."""
+    if HASHES_FILE.exists():
+        return json.loads(HASHES_FILE.read_text())
+    return {}
+
+
+def save_hashes(hashes: dict):
+    """Save script content hashes."""
+    HASHES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HASHES_FILE.write_text(json.dumps(hashes, indent=2))
+
+
+def compute_content_hash(pine_code: str) -> str:
+    """Compute SHA256 hash of Pine Script content."""
+    return hashlib.sha256(pine_code.encode('utf-8')).hexdigest()
+
+
+def is_duplicate(pine_code: str, hashes: dict) -> bool:
+    """Check if script content is a duplicate."""
+    content_hash = compute_content_hash(pine_code)
+    return content_hash in hashes.values()
+
+
+def parse_python_output(raw_output: str) -> str:
+    """Extract Python code from LLM output."""
+    # Remove markdown code fences if present
+    lines = raw_output.split('\n')
+    in_code_block = False
+    code_lines = []
+
+    for line in lines:
+        # Check for code fence markers
+        if line.strip().startswith('```'):
+            if in_code_block:
+                in_code_block = False
+                continue
+            else:
+                in_code_block = True
+                # Check language
+                if 'python' in line.lower():
+                    continue
+                # If no language specified, still in code block
+                continue
+
+        # Skip non-code lines if not in code block
+        if not in_code_block and line.strip():
+            continue
+
+        # Skip explanation text
+        if not in_code_block and line.strip() and not line.strip().startswith('#'):
+            continue
+
+        # Skip explanation lines in code block
+        if line.strip().startswith('The') or line.strip().startswith('This') or line.strip().startswith('You'):
+            continue
+
+        code_lines.append(line)
+
+    return '\n'.join(code_lines).strip()
+
+
+def save_backtest_file(category: str, script_name: str, python_code: str) -> Path:
+    """Save Python backtest file to disk."""
+    category_dir = BACKTEST_DIR / category
+    category_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create safe filename
+    safe_name = script_name.lower().replace(' ', '-').replace('/', '-')[:80]
+    backtest_file = category_dir / f"{safe_name}.py"
+
+    backtest_file.write_text(python_code, encoding='utf-8')
+    return backtest_file
+
+
+def convert_single_pine_script(pine_file: Path) -> tuple[Path, str]:
+    """Convert a single Pine Script file to Python.
+
+    Args:
+        pine_file: Path to Pine Script file
+
+    Returns:
+        Tuple of (backtest_file_path, error_message)
+    """
+    try:
+        # Read Pine Script
+        pine_code = pine_file.read_text(encoding='utf-8')
+
+        # Check for duplicates
+        hashes = load_hashes()
+        if is_duplicate(pine_code, hashes):
+            return (pine_file, "Duplicate script (already converted)")
+
+        # Get script name
+        script_name = pine_file.stem
+        category = pine_file.parent.name
+
+        # Convert to Python
+        raw_python_code = convert_pine_to_python(pine_code, script_name)
+        python_code = parse_python_output(raw_python_code)
+
+        # Save backtest file
+        backtest_file = save_backtest_file(category, script_name, python_code)
+
+        # Update hashes
+        content_hash = compute_content_hash(pine_code)
+        hashes[script_name] = content_hash
+        save_hashes(hashes)
+
+        return (backtest_file, "")
+
+    except Exception as e:
+        return (pine_file, str(e))
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Convert Pine Script to Python backtest")
+    parser.add_argument("pine_file", type=str, help="Path to Pine Script file")
+    parser.add_argument("--category", type=str, help="Category name")
+    parser.add_argument("--output", type=str, help="Output file path")
+
+    args = parser.parse_args()
+
+    pine_file = Path(args.pine_file)
+
+    if not pine_file.exists():
+        print(f"ERROR: Pine Script file not found: {pine_file}")
+        sys.exit(1)
+
+    # Convert
+    backtest_file, error = convert_single_pine_script(pine_file)
+
+    if error:
+        print(f"ERROR: {error}")
+        sys.exit(1)
+
+    print(f"✅ Successfully converted to: {backtest_file}")

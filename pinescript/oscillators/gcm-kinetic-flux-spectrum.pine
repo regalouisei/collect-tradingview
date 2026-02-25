@@ -1,0 +1,135 @@
+//@version=6
+indicator("GCM Kinetic Flux Spectrum", shorttitle="GCM KFS", overlay=false, format=format.price, precision=2)
+
+// ==========================================
+// --- INPUTS ---
+// ==========================================
+rsi_grp     = "Momentum & Shared Settings"
+len_rsi     = input.int(7, "RSI & VFI Calculation Length", minval=1, group=rsi_grp)
+mode_rsi    = input.bool(true, "Smoothed Mode RSI?", group=rsi_grp)
+ema_len     = input.int(7, "Mean Line EMA Smoothing", group=rsi_grp)
+
+vfi_grp     = "Volume Flux (VFI) Settings"
+vfi_coef    = input.float(0.2, "VFI Coefficient", group=vfi_grp)
+vfi_vcoef   = input.float(2.5, "VFI Max. Vol. Cutoff", group=vfi_grp)
+vfi_scale   = input.float(4.0, "VFI Scale Multiplier", group=vfi_grp)
+
+lvl_grp     = "Threshold Level Settings"
+ob_extreme  = input.int(30, "Extreme Overbought", group=lvl_grp, tooltip="Equivalent to RSI 80")
+ob_level    = input.int(20, "Overbought", group=lvl_grp, tooltip="Equivalent to RSI 70")
+os_level    = input.int(-20, "Oversold", group=lvl_grp, tooltip="Equivalent to RSI 30")
+os_extreme  = input.int(-30, "Extreme Oversold", group=lvl_grp, tooltip="Equivalent to RSI 20")
+
+div_grp     = "Kinetic Divergence Settings"
+show_reg    = input.bool(true, "Show Regular Divergence", group=div_grp)
+show_hid    = input.bool(true, "Show Hidden Divergence", group=div_grp)
+show_main   = input.bool(true, "Project Div on Main Chart", group=div_grp)
+pivot_right = input.int(5, "Pivot Lookback Right", group=div_grp)
+pivot_left  = input.int(5, "Pivot Lookback Left", group=div_grp)
+max_range   = input.int(60, "Max Lookback Range", group=div_grp)
+min_range   = input.int(5, "Min Lookback Range", group=div_grp)
+
+// ==========================================
+// --- CALCULATIONS ---
+// ==========================================
+
+// --- VFI Logic ---
+typical = hlc3
+vfi_inter = math.log(typical) - math.log(typical[1])
+vfi_vinter = ta.stdev(vfi_inter, 30)
+vfi_cutoff = vfi_coef * vfi_vinter * close
+vave = ta.sma(volume, len_rsi)[1]
+vmax = vave * vfi_vcoef
+vc   = volume < vmax ? volume : vmax 
+mf   = typical - typical[1]
+vcp  = mf > vfi_cutoff ? vc : (mf < -vfi_cutoff ? -vc : 0)
+vfi_sum   = ta.sma(vcp, len_rsi) * len_rsi
+vfi_raw   = (vfi_sum / vave) * vfi_scale
+vfi_final = ta.ema(vfi_raw, len_rsi) 
+
+// --- RSI High/Low Logic (Zero-Centered) ---
+float raw_rsi_low = ta.rsi(low, len_rsi) - 50
+var float rsi_low_smooth = na
+rsi_low_smooth := na(rsi_low_smooth[1]) ? raw_rsi_low : (rsi_low_smooth[1] + raw_rsi_low) / 2
+float RSI_L = mode_rsi ? rsi_low_smooth : raw_rsi_low
+
+float raw_rsi_high = ta.rsi(high, len_rsi) - 50
+var float rsi_high_smooth = na
+rsi_high_smooth := na(rsi_high_smooth[1]) ? raw_rsi_high : (rsi_high_smooth[1] + raw_rsi_high) / 2
+float RSI_H = mode_rsi ? rsi_high_smooth : raw_rsi_high
+
+float mean_line = (RSI_L + RSI_H) / 2
+float m_ema = ta.ema(mean_line, ema_len)
+bool mean_is_green = ta.rising(m_ema, 1) and mean_line > m_ema
+color m_col = mean_is_green ? color.new(#00ffbb, 0) : color.new(#ff0055, 0)
+
+// ==========================================
+// --- DIVERGENCE ENGINE ---
+// ==========================================
+ph = ta.pivothigh(mean_line, pivot_left, pivot_right)
+pl = ta.pivotlow(mean_line, pivot_left, pivot_right)
+
+if not na(pl)
+    prev_pl = ta.valuewhen(not na(pl), pl, 1), prev_pl_idx = ta.valuewhen(not na(pl), bar_index[pivot_right], 1)
+    prev_low = ta.valuewhen(not na(pl), low[pivot_right], 1), bars_since = bar_index[pivot_right] - prev_pl_idx
+    if bars_since <= max_range and bars_since >= min_range
+        if low[pivot_right] < prev_low and pl > prev_pl and show_reg
+            line.new(prev_pl_idx, prev_pl, bar_index[pivot_right], pl, color=color.green, width=1)
+            label.new(bar_index[pivot_right], pl, "R-BULL", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+            if show_main
+                line.new(prev_pl_idx, prev_low, bar_index[pivot_right], low[pivot_right], color=color.green, width=1, force_overlay=true)
+                label.new(bar_index[pivot_right], low[pivot_right], "R-BULL", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small, force_overlay=true)
+        if low[pivot_right] > prev_low and pl < prev_pl and show_hid
+            line.new(prev_pl_idx, prev_pl, bar_index[pivot_right], pl, color=color.green, width=1, style=line.style_dashed)
+            label.new(bar_index[pivot_right], pl, "H-BULL", color=color.new(color.green, 40), textcolor=color.white, style=label.style_label_up, size=size.small)
+            if show_main
+                line.new(prev_pl_idx, prev_low, bar_index[pivot_right], low[pivot_right], color=color.green, width=1, style=line.style_dashed, force_overlay=true)
+                label.new(bar_index[pivot_right], low[pivot_right], "H-BULL", color=color.new(color.green, 40), textcolor=color.white, style=label.style_label_up, size=size.small, force_overlay=true)
+
+if not na(ph)
+    prev_ph = ta.valuewhen(not na(ph), ph, 1), prev_ph_idx = ta.valuewhen(not na(ph), bar_index[pivot_right], 1)
+    prev_high = ta.valuewhen(not na(ph), high[pivot_right], 1), bars_since = bar_index[pivot_right] - prev_ph_idx
+    if bars_since <= max_range and bars_since >= min_range
+        if high[pivot_right] > prev_high and ph < prev_ph and show_reg
+            line.new(prev_ph_idx, prev_ph, bar_index[pivot_right], ph, color=color.red, width=1)
+            label.new(bar_index[pivot_right], ph, "R-BEAR", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+            if show_main
+                line.new(prev_ph_idx, prev_high, bar_index[pivot_right], high[pivot_right], color=color.red, width=1, force_overlay=true)
+                label.new(bar_index[pivot_right], high[pivot_right], "R-BEAR", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay=true)
+        if high[pivot_right] < prev_high and ph > prev_ph and show_hid
+            line.new(prev_ph_idx, prev_ph, bar_index[pivot_right], ph, color=color.red, width=1, style=line.style_dashed)
+            label.new(bar_index[pivot_right], ph, "H-BEAR", color=color.new(color.red, 40), textcolor=color.white, style=label.style_label_down, size=size.small)
+            if show_main
+                line.new(prev_ph_idx, prev_high, bar_index[pivot_right], high[pivot_right], color=color.red, width=1, style=line.style_dashed, force_overlay=true)
+                label.new(bar_index[pivot_right], high[pivot_right], "H-BEAR", color=color.new(color.red, 40), textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay=true)
+
+// ==========================================
+// --- VISUAL LEVELS & PLOTS ---
+// ==========================================
+
+// Horizontal Levels (Using hline for cleaner static levels)
+h_ext_ob = hline(ob_extreme, "Extreme Overbought", color=color.new(#ff0055, 60), linestyle=hline.style_dashed)
+h_ob     = hline(ob_level, "Overbought", color=color.new(#ff0055, 80), linestyle=hline.style_dotted)
+h_zero   = hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_solid)
+h_os     = hline(os_level, "Oversold", color=color.new(#00ffbb, 80), linestyle=hline.style_dotted)
+h_ext_os = hline(os_extreme, "Extreme Oversold", color=color.new(#00ffbb, 60), linestyle=hline.style_dashed)
+
+// Zone Fills (Subtle background coloring for extreme areas)
+fill(h_ext_ob, h_ob, color.new(#ff0055, 92), "OB Zone")
+fill(h_ext_os, h_os, color.new(#00ffbb, 92), "OS Zone")
+
+// Main Indicator Plots
+f_ghost(_base, _target, _perc) => _base + (_target - _base) * _perc
+p_m     = plot(mean_line, "Mean Line", m_col, 2)
+p_rsi_l = plot(RSI_L, "RSI Low Boundary", color.new(color.white, 100), 1)
+p_rsi_h = plot(RSI_H, "RSI High Boundary", color.new(color.white, 100), 1)
+p_vfi   = plot(vfi_final, "Volume Flux Line", color.new(color.orange, 0), 1, plot.style_line, linestyle=plot.linestyle_dotted)
+
+// Spectrum Ribbon Fills
+pg_l1 = plot(f_ghost(mean_line, RSI_L, 0.1), display=display.none, editable=false), pg_l2 = plot(f_ghost(mean_line, RSI_L, 0.2), display=display.none, editable=false), pg_l3 = plot(f_ghost(mean_line, RSI_L, 0.3), display=display.none, editable=false), pg_l4 = plot(f_ghost(mean_line, RSI_L, 0.4), display=display.none, editable=false), pg_l5 = plot(f_ghost(mean_line, RSI_L, 0.5), display=display.none, editable=false), pg_l6 = plot(f_ghost(mean_line, RSI_L, 0.6), display=display.none, editable=false), pg_l7 = plot(f_ghost(mean_line, RSI_L, 0.7), display=display.none, editable=false), pg_l8 = plot(f_ghost(mean_line, RSI_L, 0.8), display=display.none, editable=false), pg_l9 = plot(f_ghost(mean_line, RSI_L, 0.9), display=display.none, editable=false)
+pg_h1 = plot(f_ghost(mean_line, RSI_H, 0.1), display=display.none, editable=false), pg_h2 = plot(f_ghost(mean_line, RSI_H, 0.2), display=display.none, editable=false), pg_h3 = plot(f_ghost(mean_line, RSI_H, 0.3), display=display.none, editable=false), pg_h4 = plot(f_ghost(mean_line, RSI_H, 0.4), display=display.none, editable=false), pg_h5 = plot(f_ghost(mean_line, RSI_H, 0.5), display=display.none, editable=false), pg_h6 = plot(f_ghost(mean_line, RSI_H, 0.6), display=display.none, editable=false), pg_h7 = plot(f_ghost(mean_line, RSI_H, 0.7), display=display.none, editable=false), pg_h8 = plot(f_ghost(mean_line, RSI_H, 0.8), display=display.none, editable=false), pg_h9 = plot(f_ghost(mean_line, RSI_H, 0.9), display=display.none, editable=false)
+pg_v1 = plot(f_ghost(mean_line, vfi_final, 0.1), display=display.none, editable=false), pg_v2 = plot(f_ghost(mean_line, vfi_final, 0.2), display=display.none, editable=false), pg_v3 = plot(f_ghost(mean_line, vfi_final, 0.3), display=display.none, editable=false), pg_v4 = plot(f_ghost(mean_line, vfi_final, 0.4), display=display.none, editable=false), pg_v5 = plot(f_ghost(mean_line, vfi_final, 0.5), display=display.none, editable=false), pg_v6 = plot(f_ghost(mean_line, vfi_final, 0.6), display=display.none, editable=false), pg_v7 = plot(f_ghost(mean_line, vfi_final, 0.7), display=display.none, editable=false), pg_v8 = plot(f_ghost(mean_line, vfi_final, 0.8), display=display.none, editable=false), pg_v9 = plot(f_ghost(mean_line, vfi_final, 0.9), display=display.none, editable=false)
+
+fill(p_m, pg_l1, color.new(m_col, 15)), fill(pg_l1, pg_l2, color.new(m_col, 24)), fill(pg_l2, pg_l3, color.new(m_col, 33)), fill(pg_l3, pg_l4, color.new(m_col, 42)), fill(pg_l4, pg_l5, color.new(m_col, 51)), fill(pg_l5, pg_l6, color.new(m_col, 60)), fill(pg_l6, pg_l7, color.new(m_col, 69)), fill(pg_l7, pg_l8, color.new(m_col, 78)), fill(pg_l8, pg_l9, color.new(m_col, 87)), fill(pg_l9, p_rsi_l, color.new(m_col, 95))
+fill(p_m, pg_h1, color.new(m_col, 15)), fill(pg_h1, pg_h2, color.new(m_col, 24)), fill(pg_h2, pg_h3, color.new(m_col, 33)), fill(pg_h3, pg_h4, color.new(m_col, 42)), fill(pg_h4, pg_h5, color.new(m_col, 51)), fill(pg_h5, pg_h6, color.new(m_col, 60)), fill(pg_h6, pg_h7, color.new(m_col, 69)), fill(pg_h7, pg_h8, color.new(m_col, 78)), fill(pg_h8, pg_h9, color.new(m_col, 87)), fill(pg_h9, p_rsi_h, color.new(m_col, 95))
+fill(p_m, pg_v1, color.new(m_col, 15)), fill(pg_v1, pg_v2, color.new(m_col, 24)), fill(pg_v2, pg_v3, color.new(m_col, 33)), fill(pg_v3, pg_v4, color.new(m_col, 42)), fill(pg_v4, pg_v5, color.new(m_col, 51)), fill(pg_v5, pg_v6, color.new(m_col, 60)), fill(pg_v6, pg_v7, color.new(m_col, 69)), fill(pg_v7, pg_v8, color.new(m_col, 78)), fill(pg_v8, pg_v9, color.new(m_col, 87)), fill(pg_v9, p_vfi, color.new(m_col, 95))

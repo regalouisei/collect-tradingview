@@ -1,0 +1,119 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © chuckb504
+
+//@version=5
+indicator("Local Hurst Slope [Dynamic Regime]", shorttitle="Hurst Slope", overlay=false, max_bars_back=500)
+
+// === INPUTS ===
+int   min_tau       = input.int(4,   "Min τ",     minval=2,   maxval=32)
+int   max_tau       = input.int(64,  "Max τ",     minval=32,  maxval=256)
+int   num_steps     = input.int(5,   "Steps",     minval=3,   maxval=8)
+int   lookback      = input.int(100, "Lookback",  minval=50,  maxval=500)
+float long_thresh   = input.float(0.12, "Long Threshold",  step=0.01)
+float short_thresh  = input.float(-0.08, "Short Threshold", step=0.01)
+
+// === STEP 1: Build log-returns array (oldest → newest) ===
+var array<float> log_returns = array.new<float>()
+array.clear(log_returns)
+
+int max_lookback = math.min(lookback, bar_index + 1)
+for i = 1 to max_lookback
+    float prev_close = close[i]
+    float curr_close = close[i - 1]
+    if prev_close > 0
+        float log_ret = math.log(curr_close / prev_close)
+        array.push(log_returns, log_ret)
+
+// === STEP 2: Generate log-spaced τ values ===
+var array<int> taus = array.new<int>()
+array.clear(taus)
+
+float log_min = math.log(min_tau)
+float log_max = math.log(max_tau)
+float step = (log_max - log_min) / math.max(num_steps - 1, 1)
+
+for i = 0 to num_steps - 1
+    float log_tau = log_min + i * step
+    int tau = math.round(math.exp(log_tau))
+    array.push(taus, tau)
+
+// === STEP 3: Compute H(τ) for each τ ===
+var array<float> h_vals     = array.new<float>()
+var array<float> log_tau_arr = array.new<float>()
+array.clear(h_vals)
+array.clear(log_tau_arr)
+
+for i = 0 to array.size(taus) - 1
+    int tau = array.get(taus, i)
+    int n = array.size(log_returns)
+    if n < tau or tau < 2
+        continue
+
+    int num_segments = n / tau
+    if num_segments == 0
+        continue
+
+    var array<float> rs_ratios = array.new<float>()
+    array.clear(rs_ratios)
+
+    for seg = 0 to num_segments - 1
+        int start_idx = seg * tau
+        var array<float> segment = array.new<float>()
+        array.clear(segment)
+
+        for j = 0 to tau - 1
+            array.push(segment, array.get(log_returns, start_idx + j))
+
+        float mean_val = array.avg(segment)
+
+        // Cumulative deviations
+        var array<float> cum_dev = array.new<float>()
+        array.clear(cum_dev)
+        float cum = 0.0
+        for val in segment
+            cum += val - mean_val
+            array.push(cum_dev, cum)
+
+        float rs_range = array.max(cum_dev) - array.min(cum_dev)
+        float stdev = array.stdev(segment)
+        if stdev > 0 and rs_range > 0
+            float rs = rs_range / stdev
+            array.push(rs_ratios, rs)
+
+    if array.size(rs_ratios) > 0
+        float avg_rs = array.avg(rs_ratios)
+        if avg_rs > 0
+            float h = math.log(avg_rs) / math.log(tau)
+            array.push(h_vals, h)
+            array.push(log_tau_arr, math.log(tau))
+
+// === STEP 4: Slope = dH / d(log τ) ===
+float slope = na
+if array.size(h_vals) >= 2
+    float cov = array.covariance(h_vals, log_tau_arr)
+    float var_log = array.variance(log_tau_arr)
+    if var_log > 0
+        slope := cov / var_log
+
+// === STEP 5: Plot ===
+plot_color = slope > long_thresh ? color.green : slope < short_thresh ? color.red : color.gray
+plot(slope, title="Hurst Slope", color=plot_color, linewidth=2)
+
+// === STEP 6: Signals ===
+bool long_signal  = ta.crossover(slope, long_thresh)
+bool short_signal = ta.crossunder(slope, short_thresh)
+
+plotshape(long_signal,  title="Long Breakout",  location=location.bottom, color=color.green, style=shape.triangleup,   size=size.small)
+plotshape(short_signal, title="Short Reversal", location=location.top,    color=color.red,   style=shape.triangledown, size=size.small)
+
+// === ALERTS – Use alert() for dynamic messages ===
+if long_signal
+    alert(str.format("Hurst Slope crossed above {0,number,#.##} → Trend Persistence", long_thresh), alert.freq_once_per_bar_close)
+if short_signal
+    alert(str.format("Hurst Slope crossed below {0,number,#.##} → Mean Reversion Ahead", short_thresh), alert.freq_once_per_bar_close)
+
+// === MATH CITATION ===
+// Di Matteo (2007) – Multi-scale Hurst, Physica A
+// H(τ) = log(R/S) / log(τ)
+// R = max(cum_dev) - min(cum_dev), S = stdev(segment)
+// slope = dH/d(log τ): negative → mean-reversion ahead, positive → persistent trend

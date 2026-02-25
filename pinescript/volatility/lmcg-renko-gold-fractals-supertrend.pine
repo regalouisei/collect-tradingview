@@ -1,0 +1,80 @@
+//@version=6
+indicator("Quick Fractals + Adaptive SuperTrend + Volume Filter", overlay = true, max_lines_count=100)
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+int    fractal_len      = input.int(2,   "Fractal Strength (1-3 for quick on Renko)", minval=1, maxval=5)
+int    atr_len          = input.int(10,  "ATR Length")
+float  factor_base      = input.float(2.0, "Base Factor", minval=0.5, step=0.1)
+float  alpha_perf       = input.float(0.15, "Performance Memory (0-1)", minval=0.01, maxval=1.0)
+int    vol_ma_len       = input.int(20,  "Volume MA Length")
+bool   show_supertrend  = input.bool(true, "Show Adaptive SuperTrend Line")
+
+// Manual tanh (since math.tanh doesn't exist)
+tanh(x) =>
+    float e_x     = math.exp(x)
+    float e_neg_x = math.exp(-x)
+    (e_x - e_neg_x) / (e_x + e_neg_x)
+
+// ── Quick Fractals ────────────────────────────────────────────────────────
+float ph = ta.pivothigh(high, fractal_len, fractal_len)
+float pl = ta.pivotlow (low,  fractal_len, fractal_len)
+
+bool   up_fractal   = not na(ph)
+bool   dn_fractal   = not na(pl)
+
+plotshape(up_fractal, "Up Fractal",   shape.triangledown, location.abovebar, color.orange, size=size.tiny)
+plotshape(dn_fractal, "Dn Fractal",   shape.triangleup,   location.belowbar, color.orange, size=size.tiny)
+
+// ── Adaptive SuperTrend (simple performance-weighted factor) ──────────────
+float atr      = ta.atr(atr_len)
+float src      = hlc3
+
+// Performance tracking for factor adjustment
+var float perf_up   = 0.0
+var float perf_down = 0.0
+
+float delta    = close - close[1]
+bool  was_up   = close[1] > close[2]
+bool  was_down = close[1] < close[2]
+
+// Simple momentum-based performance
+float momentum = ta.change(close, 3)
+perf_up   := perf_up   + alpha_perf * (was_up   ? momentum : 0) - alpha_perf * perf_up
+perf_down := perf_down + alpha_perf * (was_down ? -momentum : 0) - alpha_perf * perf_down
+
+// Dynamic factor: higher performance → tighter (more sensitive) factor
+float dyn_factor = factor_base * (1.0 - tanh(perf_up - perf_down) * 0.4)  // range ~1.2–3.2
+
+// SuperTrend calc
+var float up_trend   = na
+var float dn_trend   = na
+var int   trend_dir  = na
+
+float upper_band = src - (dyn_factor * atr)
+float lower_band = src + (dyn_factor * atr)
+
+up_trend  := na(up_trend[1]) ? upper_band : close[1] > up_trend[1] ? math.max(upper_band, up_trend[1]) : upper_band
+dn_trend  := na(dn_trend[1]) ? lower_band : close[1] < dn_trend[1] ? math.min(lower_band, dn_trend[1]) : lower_band
+
+int new_dir = close > dn_trend[1] ? 1 : close < up_trend[1] ? -1 : nz(trend_dir[1], 1)
+trend_dir := new_dir
+
+float st_line = trend_dir == 1 ? up_trend : dn_trend
+
+plot(show_supertrend ? st_line : na, "Adaptive SuperTrend", color = trend_dir == 1 ? color.green : color.red, linewidth=2, style=plot.style_linebr)
+
+// ── Volume Filter ─────────────────────────────────────────────────────────
+float vol_ma   = ta.sma(volume, vol_ma_len)
+bool  high_vol = volume > vol_ma * 1.3   // 30% above average for stronger confirmation
+
+// ── Signals: Fractal + SuperTrend direction change + high volume ──────────
+bool trend_flip_up   = trend_dir == 1 and trend_dir[1] == -1
+bool trend_flip_down = trend_dir == -1 and trend_dir[1] == 1
+
+bool buy_sig  = dn_fractal and trend_flip_up   and high_vol
+bool sell_sig = up_fractal and trend_flip_down and high_vol
+
+plotshape(buy_sig,  "BUY",  shape.labelup,   location.belowbar, color.green,  text="BUY",  size=size.large, textcolor=color.white)
+plotshape(sell_sig, "SELL", shape.labeldown, location.abovebar, color.red,    text="SELL", size=size.large, textcolor=color.white)
+alertcondition(buy_sig, title="Renko BUY Alert", message="BUY Signal on Gold Renko: Fractal + Trend Flip + High Vol")
+alertcondition(sell_sig, title="Renko SELL Alert", message="SELL Signal on Gold Renko: Fractal + Trend Flip + High Vol")

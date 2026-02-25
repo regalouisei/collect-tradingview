@@ -1,0 +1,229 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © agahakanaga (original logic), modified by Bilguut
+
+//@version=6
+indicator("Bilguut DEMA MACD", shorttitle="DEMA MACD SIGNAL", overlay=true, max_labels_count=500)
+
+// === HaP MACD Inputs ===
+float  sourceInput  = input.source(close, "Source")
+int    fastLenInput = input.int(12, "Fast Length",   minval=1)
+int    slowLenInput = input.int(26, "Slow Length",   minval=1)
+int    sigLenInput  = input.int(9,  "Signal Length", minval=1)
+
+string oscTypeInput = input.string("EMA", "Oscillator MA Type", options = ["EMA", "SMA"])
+string sigTypeInput = input.string("EMA", "Signal MA Type",     options = ["EMA", "SMA"])
+
+// === Trend / Momentum Filters ===
+macdStructureLookback = input.int(14, "Trend Filter: MACD structure lookback", minval=3)
+
+// Only enforce "MACD rising" when MACD > 0
+macdRiseBars        = input.int(2, "BUY filter (MACD>0 only): MACD must rise N bars", minval=1, maxval=5)
+requireSignalRising = input.bool(false, "BUY filter (MACD>0 only): Signal line rising too")
+
+// === Stats / Table ===
+statsTradesToKeep = input.int(50, "Stats: track last N trades", minval=10, maxval=200)
+showStatsTable    = input.bool(true, "Show stats table")
+showUptrendNote   = input.bool(true, "Show uptrend note")
+
+// --- FUNCTIONS ---
+f_dema(source, length) =>
+    ema1 = ta.ema(source, length)
+    ema2 = ta.ema(ema1, length)
+    2 * ema1 - ema2
+
+ma(float source, int length, simple string maType) =>
+    switch maType
+        "EMA" => ta.ema(source, length)
+        "SMA" => ta.sma(source, length)
+
+// --- 1) STANDARD MACD ---
+float maFast = ma(sourceInput, fastLenInput, oscTypeInput)
+float maSlow = ma(sourceInput, slowLenInput, oscTypeInput)
+float macd   = maFast - maSlow
+float signal = ma(macd, sigLenInput, sigTypeInput)
+float hist   = macd - signal
+
+// --- 2) DEMA MACD FOR DOT LOGIC ---
+fast_dema = f_dema(sourceInput, fastLenInput)
+slow_dema = f_dema(sourceInput, slowLenInput)
+dema_macd_line   = fast_dema - slow_dema
+dema_signal_line = f_dema(dema_macd_line, sigLenInput)
+
+// --- BUY CONDITIONS (original HaP logic) ---
+dema_ustunde             = dema_macd_line > dema_signal_line
+dema_signal_egim_pozitif = dema_signal_line > dema_signal_line[1]
+buy_condition            = dema_ustunde and dema_signal_egim_pozitif
+is_first_signal          = buy_condition and not buy_condition[1]
+
+// Exit (red dot) logic from original
+orange_dot_condition = buy_condition[1] and not buy_condition
+
+// --- DOT COLOR LOGIC (same as original) ---
+color dot_color = if is_first_signal
+    color.blue
+else if buy_condition
+    macd > macd[1] ? color.green : color.orange
+else
+    na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trend filter logic (MACD structure, not level)
+// ─────────────────────────────────────────────────────────────────────────────
+macdRecovered = macd > ta.lowest(macd, macdStructureLookback)
+
+// MACD rising for N bars (used only when macd > 0)
+macdRisingN = true
+for i = 0 to macdRiseBars - 1
+    macdRisingN := macdRisingN and (macd[i] > macd[i + 1])
+
+signalRising = signal > signal[1]
+
+// Your rule:
+// If macd > 0 -> must satisfy rising filter
+// If macd <= 0 -> ignore rising filter (allow entries)
+momentumOk = (macd <= 0) or (macdRisingN and (requireSignalRising ? signalRising : true))
+
+trendUp = macdRecovered and momentumOk
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hide original MACD pane drawings
+// ─────────────────────────────────────────────────────────────────────────────
+hline(0, "Zero", color=color.new(color.gray, 50), display=display.none)
+plot(hist,   "Histogram", color=color.gray, display=display.none)
+plot(macd,   "MACD",      color=color.black, display=display.none)
+plot(signal, "Signal",    color=color.orange, display=display.none)
+
+// Hidden original dots (optional)
+plotshape(buy_condition ? macd : na, title="HaP Dot (hidden)", style=shape.circle, location=location.absolute, color=dot_color, size=size.tiny, display=display.none)
+plotshape(orange_dot_condition ? macd : na, title="Exit Dot (hidden)", style=shape.circle, location=location.absolute, color=color.red, size=size.tiny, display=display.none)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNALS ON PRICE CHART
+// BUY = filtered first signal
+// SELL = only allowed AFTER a BUY happened
+// ─────────────────────────────────────────────────────────────────────────────
+buySignalRaw  = is_first_signal and trendUp
+sellSignalRaw = orange_dot_condition
+
+var bool  inPosition = false
+var float entryPrice = na
+
+buySignal  = buySignalRaw and barstate.isconfirmed and not inPosition
+sellSignal = sellSignalRaw and barstate.isconfirmed and inPosition
+
+if buySignal
+    inPosition := true
+    entryPrice := close
+
+if sellSignal
+    inPosition := false
+
+plotshape(buySignal, title="BUY", style=shape.labelup, text="BUY",
+     location=location.belowbar, size=size.tiny, color=color.blue, textcolor=color.white)
+
+plotshape(sellSignal, title="SELL", style=shape.labeldown, text="SELL",
+     location=location.abovebar, size=size.tiny, color=color.red, textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trade stats: last N closed trades (based on BUY->SELL)
+// ─────────────────────────────────────────────────────────────────────────────
+var float[] tradeRets = array.new_float()
+
+if sellSignal and not na(entryPrice)
+    tradeRetPct = (close - entryPrice) / entryPrice * 100.0
+    array.push(tradeRets, tradeRetPct)
+    // keep only last N
+    if array.size(tradeRets) > statsTradesToKeep
+        array.shift(tradeRets)
+    // reset entry price for safety
+    entryPrice := na
+
+// Compute stats (safe when there are 0 trades)
+trades = array.size(tradeRets)
+
+wins = 0
+loss = 0
+sum  = 0.0
+
+if trades > 0
+    for i = 0 to trades - 1
+        r = array.get(tradeRets, i)
+        sum += r
+        if r > 0
+            wins += 1
+        else
+            loss += 1
+
+winrate = trades > 0 ? (wins * 100.0 / trades) : na
+avgRet  = trades > 0 ? (sum / trades) : na
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table + Note
+// ─────────────────────────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 8, border_width=1)
+
+if showStatsTable and barstate.islast
+    table.cell(t, 0, 0, "Bilguut DEMA MACD", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 0, "Last " + str.tostring(statsTradesToKeep) + " Trades", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 1, "Trades", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 1, str.tostring(trades), text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 2, "Wins", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 2, str.tostring(wins), text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 3, "Losses", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 3, str.tostring(loss), text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 4, "Winrate", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 4, trades > 0 ? (str.tostring(winrate, "#.##") + "%") : "n/a", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 5, "Avg % / trade", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 5, trades > 0 ? (str.tostring(avgRet, "#.##") + "%") : "n/a", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 6, "Total % (sum)", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 6, trades > 0 ? (str.tostring(sum, "#.##") + "%") : "n/a", text_color=color.white, bgcolor=color.new(color.black, 0))
+    // --- Uptrend note inside table ---
+    if showUptrendNote
+        table.cell(
+            t, 0, 7,
+            "⚠️ NOTE",
+            text_color=color.white,
+            bgcolor=color.new(color.black, 0)
+        )
+        table.cell(
+            t, 1, 7,
+            "This signal works best in UPTREND.\nAvoid consolidation & downtrend charts.",
+            text_color=color.white,
+            bgcolor=color.new(color.black, 0)
+        )
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alerts (use: "Any alert() function call")
+// ─────────────────────────────────────────────────────────────────────────────
+if buySignal
+    alert("BUY (Bilguut DEMA MACD): " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if sellSignal
+    alert("SELL (Bilguut DEMA MACD): " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// ───────────────────────────────────────────────────────────────
+// Alerts (use TradingView alert: "Any alert() function call")
+// ───────────────────────────────────────────────────────────────
+if buySignal
+    alert(
+        "BUY | " + syminfo.ticker +
+        " | TF=" + timeframe.period +
+        " | Price=" + str.tostring(close, format.mintick),
+        alert.freq_once_per_bar_close
+    )
+
+if sellSignal
+    alert(
+        "SELL | " + syminfo.ticker +
+        " | TF=" + timeframe.period +
+        " | Price=" + str.tostring(close, format.mintick),
+        alert.freq_once_per_bar_close
+    )

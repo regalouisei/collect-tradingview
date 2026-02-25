@@ -1,0 +1,403 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © FredAstaire
+
+//@version=6
+strategy("1M XAU Cumulative Delta Volume with OB Breakouts", overlay=true, fill_orders_on_standard_ohlc = true)
+
+
+//────────────────────────────────────────────────────────────
+// Imports
+//────────────────────────────────────────────────────────────
+import PineCoders/lower_tf/4 as PCltf
+
+//────────────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────────────
+string tzInput      = input.string("Europe/Berlin", "Session timezone (CEST/CET)")
+string profSess     = input.session("0000-0700", "Profile window 00:00–07:00")
+
+// Zone sizing
+int   atrLen         = input.int(14, "ATR length")
+float zoneAtrMult    = input.float(0.15, "Zone thickness (ATR mult)", step=0.05)
+float nearAtrMult    = input.float(0.35, "Near-miss marker distance (ATR mult)", step=0.05)
+
+// CVD delta filter
+int   deltaLookback  = input.int(20, "Recent delta lookback (bars)")
+float deltaThresh    = input.float(1000, "Recent delta threshold (±)")
+
+// Pending / cooldown
+int pendMaxBars      = input.int(60, "Pending timeout (bars)")
+int cooldownBars     = input.int(10, "Cooldown between same-side signals (bars)")
+
+// Intrabar precision
+string LTF1  = "Covering most chart bars (least precise)"
+string LTF2  = "Covering some chart bars (less precise)"
+string LTF3  = "Covering less chart bars (more precise)"
+string LTF4  = "Covering few chart bars (very precise)"
+string LTF5  = "Covering the least chart bars (most precise)"
+string LTF6  = "~12 intrabars per chart bar"
+string LTF7  = "~24 intrabars per chart bar"
+string LTF8  = "~50 intrabars per chart bar"
+string LTF9  = "~100 intrabars per chart bar"
+string LTF10 = "~250 intrabars per chart bar"
+
+string ltfModeInput  = input.string(LTF2, "Intrabar Precision",
+     options=[LTF1,LTF2,LTF3,LTF4,LTF5,LTF6,LTF7,LTF8,LTF9,LTF10])
+
+string ltfOverrideInput = input.timeframe("", "Override intrabar TF (blank=Auto)",
+     tooltip="Force a fixed intrabar TF to extend history. Examples: 15S, 30S, 1, 3.")
+
+// Visual toggles
+bool showZones       = input.bool(true, "Show zones")
+bool showNearMiss    = input.bool(true, "Show near-miss markers (reserved, currently unused)")
+
+// Strategy risk management (TP/SL only)
+float tpPerc = input.float(0.50, "Take Profit (%)", minval=0.0, step=0.05)
+float slPerc = input.float(0.50, "Stop Loss (%)",  minval=0.0, step=0.05)
+
+// Big-move breakout setting (for visuals / info, not entries)
+float breakoutMovePerc = input.float(0.50, "Breakout move threshold (%)",
+     minval=0.0, step=0.05,
+     tooltip="Minimum % move beyond the 00–07 CEST SR zone edge to call it a breakout")
+
+//────────────────────────────────────────────────────────────
+// Helpers
+//────────────────────────────────────────────────────────────
+
+// Rolling sum replacement for ta.sum / sum
+f_rollSum(series float src, int len) =>
+    float c = ta.cum(src)
+    c - nz(c[len])
+
+// Up/down intrabar volume split
+upDnIntrabarVolumes() =>
+    float upVol = 0.0
+    float dnVol = 0.0
+    switch
+        close > open => upVol += volume
+        close < open => dnVol -= volume
+        close > nz(close[1]) => upVol += volume
+        close < nz(close[1]) => dnVol -= volume
+        nz(upVol[1]) > 0 => upVol += volume
+        nz(dnVol[1]) < 0 => dnVol -= volume
+    [upVol, dnVol]
+
+//────────────────────────────────────────────────────────────
+// 00:00–07:00 CEST profile SR (daily)
+//────────────────────────────────────────────────────────────
+bool inProf     = not na(time(timeframe.period, profSess, tzInput))
+bool profStart  = inProf and not inProf[1]
+bool profEnd    = not inProf and inProf[1]
+
+var float profHigh  = na
+var float profLow   = na
+var bool  profReady = false
+
+if profStart
+    profHigh := high
+    profLow  := low
+    profReady := false
+
+if inProf
+    profHigh := na(profHigh) ? high : math.max(profHigh, high)
+    profLow  := na(profLow)  ? low  : math.min(profLow, low)
+
+if profEnd
+    profReady := true
+
+float atr     = ta.atr(atrLen)
+float th      = atr * zoneAtrMult
+float nearTh  = atr * nearAtrMult
+
+float supportBot = profLow  - th
+float supportTop = profLow  + th
+float resistBot  = profHigh - th
+float resistTop  = profHigh + th
+
+//────────────────────────────────────────────────────────────
+// Intrabar CVD delta + recent filter
+//────────────────────────────────────────────────────────────
+var string ltfString = ""
+ltfString := (ltfOverrideInput != "") ? ltfOverrideInput :
+     PCltf.ltf(ltfModeInput, LTF1,LTF2,LTF3,LTF4,LTF5,LTF6,LTF7,LTF8,LTF9,LTF10)
+
+[upVolumes, dnVolumes] = request.security_lower_tf(syminfo.tickerid, ltfString, upDnIntrabarVolumes())
+
+float barUp    = nz(upVolumes.sum())
+float barDn    = nz(dnVolumes.sum())   // negative
+float barDelta = barUp + barDn
+
+float recentDelta = f_rollSum(barDelta, deltaLookback)
+
+//────────────────────────────────────────────────────────────
+// Smart pending-reclaim signals (NO REPAINT)
+//────────────────────────────────────────────────────────────
+var bool pendBuy  = false
+var bool pendSell = false
+var int  pendBuyBars  = 0
+var int  pendSellBars = 0
+var int  lastBuyBar   = na
+var int  lastSellBar  = na
+
+// Additional pending states for pure price line-reversal logic
+var bool pendSupBounce     = false  // Yellow: from above, hit support zone, then bounce up
+var bool pendSupReject     = false  // Yellow: from below, hit zone, then reject down
+var bool pendResReject     = false  // Purple: from below, hit zone, then reject down
+var bool pendResBounce     = false  // Purple: from above, hit zone, then bounce up
+var int  pendSupBounceBars = 0
+var int  pendSupRejectBars = 0
+var int  pendResRejectBars = 0
+var int  pendResBounceBars = 0
+var int  lastYellowBuyBar  = na
+var int  lastYellowSellBar = na
+var int  lastPurpleBuyBar  = na
+var int  lastPurpleSellBar = na
+
+bool touchSupport = profReady and low <= supportTop and high >= supportBot
+bool touchResist  = profReady and high >= resistBot and low <= resistTop
+
+bool fromAboveSupport = profReady and close[1] > supportTop
+bool fromBelowResist  = profReady and close[1] < resistBot
+bool fromBelowSupport = profReady and close[1] < supportBot
+bool fromAboveResist  = profReady and close[1] > resistTop
+
+bool buySignal         = false   // CVD-based BUY (this will trigger longs)
+bool sellSignal        = false   // CVD-based SELL (this will trigger shorts)
+bool yellowBuySignal   = false
+bool yellowSellSignal  = false
+bool purpleBuySignal   = false
+bool purpleSellSignal  = false
+
+// Crosses of zone edges used for line-reversal signals
+bool crossUpSupTop    = profReady and ta.crossover(close, supportTop)
+bool crossDownSupBot  = profReady and ta.crossunder(close, supportBot)
+bool crossUpResTop    = profReady and ta.crossover(close, resistTop)
+bool crossDownResBot  = profReady and ta.crossunder(close, resistBot)
+
+//────────────────────────────────────────────────────────────
+// Big % breakout detection + breakout-retest zones (visual/info)
+//────────────────────────────────────────────────────────────
+var bool breakoutUp      = false
+var bool breakoutDown    = false
+var int  breakoutUpBar   = na
+var int  breakoutDownBar = na
+
+bool bigUpBreak   = profReady and close > resistTop  and ((close - resistTop)  / resistTop ) * 100 >= breakoutMovePerc
+bool bigDownBreak = profReady and close < supportBot and ((supportBot - close) / supportBot) * 100 >= breakoutMovePerc
+
+if barstate.isconfirmed
+    // Arm pending only if hit from correct side (CVD-based logic)
+    if fromAboveSupport and touchSupport
+        pendBuy := true
+        pendBuyBars := 0
+        // Yellow zone bounce: came from above into support
+        pendSupBounce := true
+        pendSupBounceBars := 0
+
+    if fromBelowResist and touchResist
+        pendSell := true
+        pendSellBars := 0
+        // Purple zone rejection: came from below into resistance
+        pendResReject := true
+        pendResRejectBars := 0
+
+    // Additional arms for opposite-side interactions (yellow/purple both ways)
+    if fromBelowSupport and touchSupport
+        // Yellow zone acting as resistance
+        pendSupReject := true
+        pendSupRejectBars := 0
+
+    if fromAboveResist and touchResist
+        // Purple zone acting as support after breakout
+        pendResBounce := true
+        pendResBounceBars := 0
+
+    // Age/kill pending for original CVD signals
+    if pendBuy
+        pendBuyBars += 1
+        if pendBuyBars > pendMaxBars or close < supportBot
+            pendBuy := false
+
+    if pendSell
+        pendSellBars += 1
+        if pendSellBars > pendMaxBars or close > resistTop
+            pendSell := false
+
+    // Age/kill pending for line-reversal logic
+    if pendSupBounce
+        pendSupBounceBars += 1
+        if pendSupBounceBars > pendMaxBars or close < supportBot
+            pendSupBounce := false
+
+    if pendSupReject
+        pendSupRejectBars += 1
+        if pendSupRejectBars > pendMaxBars or close > supportTop
+            pendSupReject := false
+
+    if pendResReject
+        pendResRejectBars += 1
+        if pendResRejectBars > pendMaxBars or close > resistTop
+            pendResReject := false
+
+    if pendResBounce
+        pendResBounceBars += 1
+        if pendResBounceBars > pendMaxBars or close < resistBot
+            pendResBounce := false
+
+    // Reset breakout state each new profile day
+    if profStart
+        breakoutUp      := false
+        breakoutDown    := false
+        breakoutUpBar   := na
+        breakoutDownBar := na
+
+    // Mark big breakouts
+    if bigUpBreak
+        breakoutUp      := true
+        breakoutDown    := false
+        breakoutUpBar   := bar_index
+
+    if bigDownBreak
+        breakoutDown    := true
+        breakoutUp      := false
+        breakoutDownBar := bar_index
+
+    // Trigger on reclaim/rejection + delta threshold + cooldown (original)
+    bool cooldownBuyOk        = na(lastBuyBar)        or (bar_index - lastBuyBar        > cooldownBars)
+    bool cooldownSellOk       = na(lastSellBar)       or (bar_index - lastSellBar       > cooldownBars)
+    bool cooldownYellowBuyOk  = na(lastYellowBuyBar)  or (bar_index - lastYellowBuyBar  > cooldownBars)
+    bool cooldownYellowSellOk = na(lastYellowSellBar) or (bar_index - lastYellowSellBar > cooldownBars)
+    bool cooldownPurpleBuyOk  = na(lastPurpleBuyBar)  or (bar_index - lastPurpleBuyBar  > cooldownBars)
+    bool cooldownPurpleSellOk = na(lastPurpleSellBar) or (bar_index - lastPurpleSellBar > cooldownBars)
+
+    // *** CVD-based core signals (ONLY these will open trades) ***
+    buySignal  := pendBuy  and close > supportTop and recentDelta >=  deltaThresh and cooldownBuyOk
+    sellSignal := pendSell and close < resistBot  and recentDelta <= -deltaThresh and cooldownSellOk
+
+    // Price-only reversal signals (for plotting / alerts, not for entries)
+    yellowBuySignal  := pendSupBounce and crossUpSupTop   and cooldownYellowBuyOk
+    yellowSellSignal := pendSupReject and crossDownSupBot and cooldownYellowSellOk
+    purpleSellSignal := pendResReject and crossDownResBot and cooldownPurpleSellOk
+    purpleBuySignal  := pendResBounce and crossUpResTop   and cooldownPurpleBuyOk
+
+    if buySignal
+        pendBuy := false
+        lastBuyBar := bar_index
+
+    if sellSignal
+        pendSell := false
+        lastSellBar := bar_index
+
+    if yellowBuySignal
+        pendSupBounce := false
+        lastYellowBuyBar := bar_index
+
+    if yellowSellSignal
+        pendSupReject := false
+        lastYellowSellBar := bar_index
+
+    if purpleBuySignal
+        pendResBounce := false
+        lastPurpleBuyBar := bar_index
+
+    if purpleSellSignal
+        pendResReject := false
+        lastPurpleSellBar := bar_index
+
+// Breakout-retest trigger zones (visual/info only, not entries)
+bool breakoutRetestLong  = breakoutUp   and not na(breakoutUpBar)   and bar_index > breakoutUpBar   and high >= resistTop  and low <= resistTop  and close > resistTop
+bool breakoutRetestShort = breakoutDown and not na(breakoutDownBar) and bar_index > breakoutDownBar and high >= supportBot and low <= supportBot and close < supportBot
+
+//────────────────────────────────────────────────────────────
+// Persistent zone lines (avoid max_lines_count explosion)
+//────────────────────────────────────────────────────────────
+var line supTopLine = na
+var line supBotLine = na
+var line resTopLine = na
+var line resBotLine = na
+
+// Reset lines each new profile window
+if profStart and showZones
+    if not na(supTopLine)
+        line.delete(supTopLine), line.delete(supBotLine), line.delete(resTopLine), line.delete(resBotLine)
+    supTopLine := na
+    supBotLine := na
+    resTopLine := na
+    resBotLine := na
+
+if profReady and showZones
+    // Create once after profile ends, then update/extend
+    if na(supTopLine)
+        supTopLine := line.new(bar_index, supportTop, bar_index, supportTop, extend=extend.right, color=color.new(color.yellow, 0), width=2)
+        supBotLine := line.new(bar_index, supportBot, bar_index, supportBot, extend=extend.right, color=color.new(color.yellow, 0), width=2)
+        resTopLine := line.new(bar_index, resistTop,  bar_index, resistTop,  extend=extend.right, color=color.new(color.purple, 0), width=2)
+        resBotLine := line.new(bar_index, resistBot,  bar_index, resistBot,  extend=extend.right, color=color.new(color.purple, 0), width=2)
+    else
+        line.set_xy1(supTopLine, bar_index, supportTop), line.set_xy2(supTopLine, bar_index+1, supportTop)
+        line.set_xy1(supBotLine, bar_index, supportBot), line.set_xy2(supBotLine, bar_index+1, supportBot)
+        line.set_xy1(resTopLine, bar_index, resistTop),  line.set_xy2(resTopLine, bar_index+1, resistTop)
+        line.set_xy1(resBotLine, bar_index, resistBot),  line.set_xy2(resBotLine, bar_index+1, resistBot)
+
+    // Thicken lines when price is near them so "almost hits" don't go unnoticed
+    if not na(supTopLine)
+        bool nearYellow = math.min(math.abs(close - supportTop), math.abs(close - supportBot)) <= nearTh
+        bool nearPurple = math.min(math.abs(close - resistTop),  math.abs(close - resistBot))  <= nearTh
+        int  yellowWidth = nearYellow ? 3 : 2
+        int  purpleWidth = nearPurple ? 3 : 2
+        line.set_width(supTopLine, yellowWidth)
+        line.set_width(supBotLine, yellowWidth)
+        line.set_width(resTopLine, purpleWidth)
+        line.set_width(resBotLine, purpleWidth)
+
+//────────────────────────────────────────────────────────────
+// STRATEGY ENTRIES (ONLY CVD BUY/SELL; EXITS = TP/SL ONLY)
+//────────────────────────────────────────────────────────────
+bool longEntry  = buySignal
+bool shortEntry = sellSignal
+
+// Only open new trade when flat
+if longEntry and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+
+if shortEntry and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+//────────────────────────────────────────────────────────────
+// STRATEGY EXITS: TAKE PROFIT & STOP LOSS ONLY
+//────────────────────────────────────────────────────────────
+float longStopPrice   = na
+float longTakeProfit  = na
+float shortStopPrice  = na
+float shortTakeProfit = na
+
+if strategy.position_size > 0
+    longStopPrice  := strategy.position_avg_price * (1 - slPerc / 100.0)
+    longTakeProfit := strategy.position_avg_price * (1 + tpPerc / 100.0)
+    strategy.exit("Long TP/SL", "Long", stop=longStopPrice, limit=longTakeProfit)
+
+if strategy.position_size < 0
+    shortStopPrice  := strategy.position_avg_price * (1 + slPerc / 100.0)
+    shortTakeProfit := strategy.position_avg_price * (1 - tpPerc / 100.0)
+    strategy.exit("Short TP/SL", "Short", stop=shortStopPrice, limit=shortTakeProfit)
+
+//────────────────────────────────────────────────────────────
+// Visual shapes
+//────────────────────────────────────────────────────────────
+plotshape(buySignal,  title="BUY (CVD)",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.small, text="BUY")
+plotshape(sellSignal, title="SELL (CVD)", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.small, text="SELL")
+
+// Price-only reversal markers on yellow (support) and purple (resistance) zones (visual only)
+plotshape(yellowBuySignal,  title="Yellow Reversal BUY",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.yellow, 0), size=size.tiny, text="Y-BUY")
+plotshape(yellowSellSignal, title="Yellow Reversal SELL", style=shape.triangledown, location=location.abovebar, color=color.new(color.yellow, 0), size=size.tiny, text="Y-SELL")
+plotshape(purpleBuySignal,  title="Purple Reversal BUY",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.purple, 0), size=size.tiny, text="P-BUY")
+plotshape(purpleSellSignal, title="Purple Reversal SELL", style=shape.triangledown, location=location.abovebar, color=color.new(color.purple, 0), size=size.tiny, text="P-SELL")
+
+// Big breakout and breakout-retest visuals (info only)
+plotshape(bigUpBreak,          title="Big Up Breakout",        style=shape.circle,       location=location.abovebar, color=color.new(color.lime, 0),    size=size.tiny, text="BO↑")
+plotshape(bigDownBreak,        title="Big Down Breakout",      style=shape.circle,       location=location.belowbar, color=color.new(color.red,  0),    size=size.tiny, text="BO↓")
+plotshape(breakoutRetestLong,  title="Breakout Retest LONG",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.aqua,  0),   size=size.small, text="BO-L")
+plotshape(breakoutRetestShort, title="Breakout Retest SHORT",  style=shape.triangledown, location=location.abovebar, color=color.new(color.orange,0),   size=size.small, text="BO-S")
+
+// Alerts (optional)
+alertcondition(buySignal,  "Buy Signal (CVD)",  "BUY: 00-07 CEST support rejected + recent CVD delta ≥ threshold.")
+alertcondition(sellSignal, "Sell Signal (CVD)", "SELL: 00-07 CEST resistance rejected + recent CVD delta ≤ −threshold.")

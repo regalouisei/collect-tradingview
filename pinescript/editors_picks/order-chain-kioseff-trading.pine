@@ -1,0 +1,314 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=5
+indicator("Order Chain [Kioseff Trading]", overlay = false, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+chain    = input.int   (defval = 150,  minval = 5, title = "Chain Length", maxval = 450), var timeArr = array.new_int()
+hide     = input.bool  (defval = false ,           title = "Hide Zero Values"          )
+hideR    = input.bool  (defval = false,            title = "Hide Range Boxes"          )
+hideTick = input.bool  (defval = false,            title = "Hide Tick Delta Stats"     )
+minus    = input.color (defval = #FC8083,        title = "-", inline = "col"         )
+plus     = input.color (defval = #ADAEF4,        title = "+", inline = "col"         )
+orderCol = input.color (defval = #08080B,        title = "Order Text Color"          )
+chainT   = input.string(defval = "Auto" ,          title = "Chain Text Size" , options = ["Auto", "Tiny", "Small", "Normal", "Large", "Huge"])
+dSize    = input.string(defval = "Small",          title = "Delta Label Size", options = ["Auto", "Tiny", "Small"])
+
+var finSize  = switch dSize 
+
+    "Auto"  => size.auto
+    "Tiny"  => size.tiny
+    "Small" => size.small
+
+var finChain = switch chainT
+
+    "Auto"   => size.auto
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+
+import RicardoSantos/MathOperator/2 
+import PineCoders/Time/4 as pct 
+
+type tickData 
+
+    varip float  price 
+    varip float  volFlow
+    varip int    location
+    varip color  bgcol 
+    varip float  delta 
+    varip color  dCol
+    varip map   <string, float> relData
+    varip float  ticks
+    varip array<float> levels 
+    array<chart.point> coords
+
+
+dirCol(float direction) => 
+
+    switch math.sign(direction)
+
+        -1 => minus
+        1  => plus
+        =>     chart.fg_color
+
+method format(float value) => 
+
+    switch 
+
+        value < 1 and value > -1 => format.mintick 
+        =>                          format.volume
+
+method unPop(array<int> id) => 
+
+    if last_bar_index - bar_index <= 5000 
+        id.unshift(time)
+    
+    if id.size() > 5000
+        id.pop()
+
+timeArr.unPop()
+
+if barstate.islast
+    if barstate.isrealtime  
+
+
+        varip vol = 0., varip vol1 = 0., varip c = 0., varip c1 = 0.    
+
+        varip ladder    = array.new<tickData>(3, tickData.new(delta = 0, dCol = chart.fg_color))    
+
+        varip keyValues = tickData.new(
+
+                                         relData = map.new<string, float>(),    
+
+                                         ticks   = syminfo.mintick * 50,    
+
+                                         levels  = 
+                                             array.from(
+                                             close - syminfo.mintick * 50, 
+                                             close, 
+                                             close + syminfo.mintick * 50
+                                             ))
+
+
+
+        vol1 := vol, vol := volume, c1 := c, c := close 
+
+        var priceLabs      = array.new<label>(2),
+        varip marketOrders = array.new<tickData>()
+        coords             = array.new<chart.point>()   
+
+        if keyValues.relData.size() == 0    
+
+            keyValues.relData.put("Top", 0), keyValues.relData.put("Bot", 20e25)
+            keyValues.relData.put("Abs", 0), keyValues.relData.put("Max",   0  )    
+
+        if math.max(keyValues.relData.get("Top"), c).over(keyValues.levels.last())  
+
+            while keyValues.levels.last() < math.max(keyValues.relData.get("Top"), c)
+
+                keyValues.levels.push(keyValues.levels.last().add(keyValues.ticks))
+                ladder.push(tickData.new(delta = 0, dCol = chart.fg_color)) 
+
+        keyValues.relData.put("Top", math.max(keyValues.relData.get("Top"), keyValues.levels.last()))   
+
+        if math.min(keyValues.relData.get("Bot"), c).under(keyValues.levels.first())    
+
+            while keyValues.levels.first() > math.min(keyValues.relData.get("Bot"), c)  
+
+                keyValues.levels .unshift(keyValues.levels.first().subtract(keyValues.ticks))
+                ladder           .unshift(tickData.new(delta = 0, dCol = chart.fg_color))
+
+        keyValues.relData.put("Bot", math.min(keyValues.relData.get("Bot"), keyValues.levels.first()))  
+
+        if vol.over(vol1) and vol1.not_equal(0) and c.not_equal(c1)     
+
+            direction = math.sign(c - c1), col = dirCol(direction)  
+
+            marketOrders.push(tickData.new(c, vol.subtract(vol1).multiply(direction), 1, col))  
+
+            keyValues.relData.put("Abs", math.max(keyValues.relData.get("Abs"), (vol.subtract(vol1))))
+            keyValues.relData.put("Max", math.max(keyValues.relData.get("Max"),      c      ))  
+
+            indexof = keyValues.levels.binary_search_leftmost(c)
+            calc    = ladder.get(indexof).delta.add(vol.subtract(vol1).multiply(direction)) 
+
+            ladder.set(indexof, tickData.new(delta = calc, dCol = dirCol(calc)))    
+
+        for BOX in box.all 
+            BOX.delete()    
+
+        for poly in polyline.all 
+            poly.delete()   
+
+        for lab in label.all
+            if not priceLabs.includes(lab)
+                lab.delete()    
+
+        if marketOrders.size() > chain
+            marketOrders.shift()
+
+        if marketOrders.size() > 1  
+
+            firstData  = marketOrders.last()    
+
+            Range = math.abs(keyValues.relData.get("Top") - keyValues.relData.get("Bot"))   
+
+            normedSize = (0.05 + 0.1 * math.abs(firstData.volFlow) / keyValues.relData.get("Abs")) * Range * math.sign(firstData.volFlow)
+            normedX    = math.ceil((0.1 + 0.2 * math.abs(firstData.volFlow) / keyValues.relData.get("Abs")) * 10)   
+
+            top = keyValues.relData.get("Top")
+            bot = keyValues.relData.get("Bot")  
+
+            box.new(
+            
+                     timeArr.get(normedX), firstData.price.add(normedSize), 
+                     time, 
+                     firstData.price                                                             , 
+                     text           = str.tostring(firstData.volFlow, firstData.volFlow.format()), 
+                     text_color     = orderCol, 
+                     border_color   = #08080B, 
+                     bgcolor        = color.new(firstData.bgcol, 33), 
+                     xloc           = xloc.bar_time, 
+                     text_size      = finChain
+
+                     )  
+
+
+            avg = math.avg(firstData.price.add(normedSize), firstData.price)    
+
+            coords.push(chart.point.from_time(math.round(math.avg(timeArr.get(normedX), time)) , avg))  
+
+            keyValues.relData.put("Top", math.max(keyValues.relData.get("Top"), firstData.price, firstData.price.add(normedSize)))
+            keyValues.relData.put("Bot", math.min(keyValues.relData.get("Bot"), firstData.price, firstData.price.add(normedSize)))  
+
+            for i = marketOrders.size() - 2 to 0    
+
+                getPrev = box.all.last(), getData = marketOrders.get(i) 
+
+                normedSizeLoop = (0.05 + 0.1 * math.abs(getData.volFlow) / keyValues.relData.get("Abs")) * Range * math.sign(getData.volFlow)
+                normedXLoop    = math.ceil((0.1 + 0.2 * math.abs(getData.volFlow) / keyValues.relData.get("Abs")) * 10) 
+
+                box.new(timeArr.get(timeArr.indexof(getPrev.get_left()) + getData.location + normedXLoop),  
+
+                                 getData.price.add(normedSizeLoop),
+                                 timeArr.get(timeArr.indexof(getPrev.get_left()) + getData.location), 
+                                 getData.price                                                             , 
+                                 text             = str.tostring(getData.volFlow, getData.volFlow.format()), 
+                                 bgcolor          = color.new(getData.bgcol, 33), 
+                                 text_color       = orderCol,
+                                 border_color     = #08080B,
+                                 xloc             = xloc.bar_time, 
+                                 text_size        = finChain
+
+                                 )  
+
+                avgLoop = math.avg(getData.price.add(normedSizeLoop), getData.price)    
+
+                keyValues.relData.put("Top", math.max(keyValues.relData.get("Top"), firstData.price, getData.price.add(normedSizeLoop)))
+                keyValues.relData.put("Bot", math.min(keyValues.relData.get("Bot"), firstData.price, getData.price.add(normedSizeLoop)))    
+
+                coords.push(chart.point.from_time(timeArr.get(timeArr.indexof(getPrev.get_left()) + getData.location + 1), avgLoop))    
+
+            getLeft = box.all.last().get_left(), getBot = keyValues.relData.get("Bot"), getTop = keyValues.relData.get("Top")   
+
+            if not hideTick 
+
+                switch na(priceLabs.first())    
+
+                    true =>  priceLabs.set(0, label.new(math.round(math.avg(getLeft, time)), 
+                                                         getTop                                          , 
+                                                         text      = str.tostring(getTop, format.mintick), 
+                                                         textcolor = plus, 
+                                                         color     = #00000000, 
+                                                         size      = size.small,
+                                                         xloc      = xloc.bar_time
+                                                         )),    
+
+                             priceLabs.set(1, label.new(math.round(math.avg(getLeft, time)), 
+                                                         getBot, 
+                                                         text      = str.tostring(getBot, format.mintick), 
+                                                         textcolor = minus, 
+                                                         color     = #00000000, 
+                                                         style     = label.style_label_up, 
+                                                         size      = size.small, 
+                                                         xloc      = xloc.bar_time
+                                                         )) 
+
+                    =>          
+
+                             priceLabs.first().set_xy(math.round(math.avg(getLeft, time)), getTop),
+                             priceLabs.get(1) .set_xy(math.round(math.avg(getLeft, time)), getBot), 
+
+                             priceLabs.first().set_text(str.tostring(getTop, format.mintick)),
+                             priceLabs.get(1) .set_text(str.tostring(getBot, format.mintick))   
+
+
+            if not hideR    
+
+                pineCoders = pct.timeFrom("bar", 1, "chart")    
+
+                var upLine = line.new(getLeft, getBot, pineCoders, 
+                                               getBot, 
+                                               style = line.style_dotted, 
+                                               color = color.new(minus, 25),
+                                               xloc  = xloc.bar_time    
+
+                                               )    
+
+                var dnLine = line.new(getLeft, getTop, pineCoders, 
+                                               getTop, 
+                                               style = line.style_dotted, 
+                                               color = color.new(plus, 25),
+                                               xloc  = xloc.bar_time    
+
+                                               )    
+
+                var mdLine = line.new(getLeft, math.avg(getTop, getBot), pineCoders, 
+                                               math.avg(getTop, getBot), 
+                                               color = #00000000, 
+                                               xloc  = xloc.bar_time
+                                               )    
+
+                upLine.set_xy1(getLeft, getBot), upLine.set_xy2(pineCoders, getBot)
+                dnLine.set_xy1(getLeft, getTop), dnLine.set_xy2(pineCoders, getTop)
+                mdLine.set_xy1(getLeft, math.avg(getTop, getBot)), mdLine.set_xy2(pineCoders, math.avg(getTop, getBot)) 
+
+                linefill.new(upLine, mdLine, color.new(minus, 95))
+                linefill.new(dnLine, mdLine, color.new(plus, 95))   
+
+            polyline.new(coords, line_color = color.new(chart.fg_color, 50), curved = false, xloc = xloc.bar_time)  
+
+        for [i, level] in keyValues.levels  
+
+            if not hideTick 
+
+                if not hide or hide and ladder.get(i).delta.not_equal(0)    
+
+                    if level.over_equal(c - keyValues.ticks * 100) and level.under_equal(c + keyValues.ticks * 100) 
+
+                        finTxt = switch math.sign(ladder.get(i).delta)  
+
+                            0 => "-"
+                            =>   str.tostring(ladder.get(i).delta, format.volume)   
+
+
+                        label.new(bar_index + 1, level,  finTxt, 
+                                                     style     = label.style_label_left, 
+                                                     color     = #00000000, 
+                                                     textcolor = ladder.get(i).dCol, 
+                                                     size      = finSize
+                                                     )  
+
+
+    else 
+
+        if timenow >= time_close
+
+            var t = table.new(position.middle_center, 99, 99)
+
+            t.cell(0, 0, text = "This Indicator Works On Live Markets Without Bar Replay :D",
+                                                     text_color = #FC8083, 
+                                                     text_size = size.huge)

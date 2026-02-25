@@ -1,0 +1,223 @@
+//@version=6
+indicator("BTC Bear-Low Band", overlay=true, max_lines_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Purpose
+// A higher-timeframe High/Low moving-average band intended to approximate
+// Bitcoin bear-market low regions on the 1M chart (lower band).
+// Includes a curved, EMA-rule-respecting forward projection.
+//──────────────────────────────────────────────────────────────────────────────
+
+//══════════════════════════════════════════════════════════════════════════════
+// Inputs
+//══════════════════════════════════════════════════════════════════════════════
+groupCore   = "Core"
+calcTF      = input.timeframe("1M", "Calculation timeframe", group=groupCore)
+len         = input.int(21, "MA Length", minval=1, group=groupCore)
+maType      = input.string("EMA", "MA Type", options=["SMA","EMA","RMA","WMA"], group=groupCore)
+startMode   = input.string("Seeded", "Start mode", options=["Strict","Seeded","AdaptiveSMA"], group=groupCore)
+extraSmooth = input.int(2, "Extra smoothing length (1 = off)", minval=1, group=groupCore)
+
+groupBand   = "Band Placement"
+lowerMult   = input.float(0.66, "Lower Multiplier", step=0.01, group=groupBand)
+upperMult   = input.float(0.82, "Upper Multiplier", step=0.01, group=groupBand)
+
+groupDisp   = "Display"
+showFill    = input.bool(true, "Fill band", group=groupDisp)
+showMid     = input.bool(true, "Show midline (between bands)", group=groupDisp)
+
+groupAlerts = "Alerts"
+alertBasis  = input.string("Wick Touch (High/Low)", "Trigger basis",
+              options=["Close Cross", "Wick Touch (High/Low)"], group=groupAlerts)
+
+groupProj   = "Projection"
+showProj    = input.bool(true, "Show projection (curved dotted)", group=groupProj)
+projBars    = input.int(6, "Projection bars", minval=1, maxval=60, group=groupProj)
+segments    = input.int(6, "Projection segments", minval=2, maxval=60, group=groupProj)
+projAssump  = input.string("Hold last", "Projection assumption",
+              options=["Hold last", "Drift (last delta)"], group=groupProj)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Helpers
+//══════════════════════════════════════════════════════════════════════════════
+smooth2(series float x) =>
+    extraSmooth <= 1 ? x : ta.ema(x, extraSmooth)
+
+// Adaptive SMA seed: running average until enough bars exist
+adaptiveSma(series float x, int l) =>
+    bars = bar_index + 1
+    bars < l ? ta.sma(x, bars) : ta.sma(x, l)
+
+maCore(series float x, int l) =>
+    switch maType
+        "EMA" => ta.ema(x, l)
+        "RMA" => ta.rma(x, l)
+        "WMA" => ta.wma(x, l)
+        => ta.sma(x, l)
+
+ma(series float x, int l) =>
+    if maType == "SMA" and startMode == "AdaptiveSMA"
+        adaptiveSma(x, l)
+    else
+        v = maCore(x, l)
+        startMode == "Seeded" ? nz(v, x) : v
+
+// Forward simulate EMA for `steps` with constant assumed source `srcAssumed`
+emaForwardConst(float emaNow, float srcAssumed, float alpha, int steps) =>
+    float v = emaNow
+    for _ = 0 to steps - 1
+        v := v + alpha * (srcAssumed - v)
+    v
+
+//══════════════════════════════════════════════════════════════════════════════
+// Band Calculation (runs on HTF then mapped down)
+//══════════════════════════════════════════════════════════════════════════════
+calcBand() =>
+    float hiMA = ma(high, len)
+    float loMA = ma(low,  len)
+
+    hiMA := smooth2(hiMA)
+    loMA := smooth2(loMA)
+
+    float upper = hiMA * upperMult
+    float lower = loMA * lowerMult
+    float mid   = (upper + lower) / 2.0
+
+    [upper, lower, mid]
+
+// Pull HTF values to chart TF
+[upper, lower, mid] = request.security(
+     syminfo.tickerid, calcTF, calcBand(),
+     barmerge.gaps_off, barmerge.lookahead_off
+)
+
+// Pull HTF sources for projection assumptions
+[srcHi, srcLo] = request.security(
+     syminfo.tickerid, calcTF, [high, low],
+     barmerge.gaps_off, barmerge.lookahead_off
+)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Plots
+//══════════════════════════════════════════════════════════════════════════════
+pU = plot(upper, "Upper Band", color=color.new(color.green, 0), linewidth=2)
+pL = plot(lower, "Lower Band", color=color.new(color.green, 0), linewidth=2)
+
+fillColor = showFill ? color.new(color.green, 85) : color.new(color.green, 100)
+fill(pU, pL, color=fillColor)
+
+plot(showMid ? mid : na, "Midline", color=color.new(color.yellow, 0), linewidth=1)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Alerts (Pine requires constant strings in alertcondition titles/messages)
+// Dropdown controls which source is used for crossing logic.
+//══════════════════════════════════════════════════════════════════════════════
+useWicks = alertBasis == "Wick Touch (High/Low)"
+srcDn = useWicks ? low  : close
+srcUp = useWicks ? high : close
+
+// LOWER band alerts
+alertcondition(ta.crossunder(srcDn, lower),
+     "Lower Band - Cross Under",
+     "BTC Bear-Low Band: Price crossed UNDER the LOWER band.")
+
+alertcondition(ta.crossover(srcUp, lower),
+     "Lower Band - Cross Over",
+     "BTC Bear-Low Band: Price crossed OVER the LOWER band.")
+
+// UPPER band alerts
+alertcondition(ta.crossunder(srcDn, upper),
+     "Upper Band - Cross Under",
+     "BTC Bear-Low Band: Price crossed UNDER the UPPER band.")
+
+alertcondition(ta.crossover(srcUp, upper),
+     "Upper Band - Cross Over",
+     "BTC Bear-Low Band: Price crossed OVER the UPPER band.")
+
+//══════════════════════════════════════════════════════════════════════════════
+// Projection (curved dotted polyline)
+// Curved projection only when MA Type is EMA; fallback is simple last-delta.
+//══════════════════════════════════════════════════════════════════════════════
+var line[] projLines = array.new_line()
+
+clearProj() =>
+    int n = array.size(projLines)
+    if n > 0
+        for i = n - 1 to 0
+            line.delete(array.get(projLines, i))
+        array.clear(projLines)
+
+isLast = barstate.islast or barstate.islastconfirmedhistory
+
+if showProj and isLast
+    clearProj()
+
+    // anchor values (last stable)
+    u0 = nz(upper, upper[1])
+    l0 = nz(lower, lower[1])
+    m0 = nz(mid,   mid[1])
+
+    h0  = nz(srcHi, srcHi[1])
+    lo0 = nz(srcLo, srcLo[1])
+
+    // assumption deltas for sources
+    hDelta  = projAssump == "Drift (last delta)" ? (h0  - nz(srcHi[1], h0))  : 0.0
+    loDelta = projAssump == "Drift (last delta)" ? (lo0 - nz(srcLo[1], lo0)) : 0.0
+
+    segs     = math.min(segments, projBars)
+    stepBars = math.max(1, math.floor(projBars / segs))
+
+    if maType == "EMA" and upperMult != 0 and lowerMult != 0
+        alpha = 2.0 / (len + 1.0)
+
+        // approximate underlying EMA(high/low) levels by reversing multipliers
+        emaHi = u0 / upperMult
+        emaLo = l0 / lowerMult
+
+        float uPrev = u0
+        float lPrev = l0
+        float mPrev = m0
+        int   xPrev = bar_index
+
+        float hAssumed  = h0
+        float loAssumed = lo0
+
+        for _seg = 1 to segs
+            hAssumed  := hAssumed  + hDelta  * stepBars
+            loAssumed := loAssumed + loDelta * stepBars
+
+            emaHi := emaForwardConst(emaHi, hAssumed,  alpha, stepBars)
+            emaLo := emaForwardConst(emaLo, loAssumed, alpha, stepBars)
+
+            uNext = emaHi * upperMult
+            lNext = emaLo * lowerMult
+            mNext = (uNext + lNext) / 2.0
+            xNext = xPrev + stepBars
+
+            array.push(projLines, line.new(xPrev, uPrev, xNext, uNext, xloc=xloc.bar_index,
+                extend=extend.none, style=line.style_dotted, width=2, color=color.new(color.green, 0)))
+            array.push(projLines, line.new(xPrev, lPrev, xNext, lNext, xloc=xloc.bar_index,
+                extend=extend.none, style=line.style_dotted, width=2, color=color.new(color.green, 0)))
+
+            if showMid
+                array.push(projLines, line.new(xPrev, mPrev, xNext, mNext, xloc=xloc.bar_index,
+                    extend=extend.none, style=line.style_dotted, width=1, color=color.new(color.yellow, 0)))
+
+            uPrev := uNext
+            lPrev := lNext
+            mPrev := mNext
+            xPrev := xNext
+    else
+        // fallback projection: last delta scaled by projBars
+        uNext = u0 + (u0 - nz(upper[1], u0)) * projBars
+        lNext = l0 + (l0 - nz(lower[1], l0)) * projBars
+        mNext = (uNext + lNext) / 2.0
+
+        array.push(projLines, line.new(bar_index, u0, bar_index + projBars, uNext, xloc=xloc.bar_index,
+            extend=extend.none, style=line.style_dotted, width=2, color=color.new(color.green, 0)))
+        array.push(projLines, line.new(bar_index, l0, bar_index + projBars, lNext, xloc=xloc.bar_index,
+            extend=extend.none, style=line.style_dotted, width=2, color=color.new(color.green, 0)))
+
+        if showMid
+            array.push(projLines, line.new(bar_index, m0, bar_index + projBars, mNext, xloc=xloc.bar_index,
+                extend=extend.none, style=line.style_dotted, width=1, color=color.new(color.yellow, 0)))

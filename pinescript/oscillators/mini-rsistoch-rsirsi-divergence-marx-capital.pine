@@ -1,0 +1,239 @@
+//@version=6
+indicator("Mini RSI+STOCH-RSI-DIV @Marx_Capital", shorttitle="Mini RSI+STOCH-DIV", overlay=true, max_bars_back=5000)
+
+// ─────────────────────────────────────────────────────────────
+// RSI
+src    = input.source(close, "Source", group="RSI")
+rsiLen = input.int(14, "RSI Length", minval=1, group="RSI")
+rsiOB  = input.float(70.0, "RSI Overbought", step=0.1, group="RSI")
+rsiOS  = input.float(30.0, "RSI Oversold",  step=0.1, group="RSI")
+
+// Stoch RSI
+stochLen = input.int(14, "Stoch RSI Length", minval=1, group="Stoch RSI")
+kLen     = input.int(3, "%K Smoothing", minval=1, group="Stoch RSI")
+dLen     = input.int(3, "%D Smoothing", minval=1, group="Stoch RSI")
+stochOB  = input.float(80.0, "Stoch Overbought", step=0.1, group="Stoch RSI")
+stochOS  = input.float(20.0, "Stoch Oversold",  step=0.1, group="Stoch RSI")
+
+// Table
+posOpt = input.string("Top Right", "Table Position", options=[
+     "Top Left","Top Center","Top Right",
+     "Middle Left","Middle Center","Middle Right",
+     "Bottom Left","Bottom Center","Bottom Right"
+], group="Table")
+sizeOpt = input.string("Normal", "Text Size", options=["Tiny","Small","Normal","Large","Huge"], group="Table")
+fmt = input.string("#.##", "Number Format", group="Table")
+updateOnClose = input.bool(true, "Update Only On Bar Close", group="Table")
+
+showBg    = input.bool(true, "Cell Background", group="Table")
+neutralBg = input.color(color.new(color.black, 75), "Neutral BG", group="Table")
+neutralTxt= input.color(color.new(color.white, 0), "Neutral Text", group="Table")
+goodCol   = input.color(color.new(color.lime, 0), "Low (Green)", group="Table")
+badCol    = input.color(color.new(color.red, 0),  "High (Red)", group="Table")
+frameCol  = input.color(color.new(color.white, 70), "Frame Color", group="Table")
+borderCol = input.color(color.new(color.white, 80), "Border Color", group="Table")
+frameW    = input.int(1, "Frame Width", minval=0, maxval=5, group="Table")
+borderW   = input.int(1, "Border Width", minval=0, maxval=5, group="Table")
+
+// Divergence (shared)
+divGroup = "Divergence"
+divPriceSrc    = input.source(close, "Price Source", group=divGroup)
+pL             = input.int(5, "Pivot Left",  minval=1, group=divGroup)
+pR             = input.int(5, "Pivot Right", minval=1, group=divGroup)
+divHoldBars    = input.int(50, "Hold Bars", minval=1, group=divGroup)
+divBgStrength  = input.int(80, "DIV BG Transparency", minval=0, maxval=100, group=divGroup)
+divWidthOpt    = input.string("M", "DIV Cell Width", options=["Tight","S","M","L","XL"], group=divGroup)
+
+// RSI DIV filter
+rsiFilterMode = input.string("Both Pivots", "RSI DIV Filter Mode", options=["Off","Current Pivot Only","Both Pivots"], group=divGroup)
+bullRsiMax    = input.float(35.0, "RSI Bull: Osc ≤", step=0.1, group=divGroup)
+bearRsiMin    = input.float(65.0, "RSI Bear: Osc ≥", step=0.1, group=divGroup)
+
+// Stoch DIV filter
+showStochDiv  = input.bool(true, "Show Stoch RSI Divergence", group=divGroup)
+stochDivSourceOpt = input.string("%K", "Stoch DIV Uses", options=["%K","%D","Raw"], group=divGroup)
+stochFilterMode   = input.string("Both Pivots", "Stoch DIV Filter Mode", options=["Off","Current Pivot Only","Both Pivots"], group=divGroup)
+bullStochMax      = input.float(25.0, "Stoch Bull: Osc ≤", step=0.1, group=divGroup)
+bearStochMin      = input.float(75.0, "Stoch Bear: Osc ≥", step=0.1, group=divGroup)
+
+// ─────────────────────────────────────────────────────────────
+pos = switch posOpt
+    "Top Left" => position.top_left
+    "Top Center" => position.top_center
+    "Top Right" => position.top_right
+    "Middle Left" => position.middle_left
+    "Middle Center" => position.middle_center
+    "Middle Right" => position.middle_right
+    "Bottom Left" => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    => position.bottom_right
+
+txtSize = switch sizeOpt
+    "Tiny" => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge" => size.huge
+    => size.normal
+
+f_txt(v, lo, hi) =>
+    v <= lo ? goodCol : v >= hi ? badCol : neutralTxt
+
+f_bg(v, lo, hi) =>
+    showBg ? (v <= lo ? color.new(goodCol, 85) : v >= hi ? color.new(badCol, 85) : neutralBg) : na
+
+padN = switch divWidthOpt
+    "Tight" => 0
+    "S" => 1
+    "M" => 3
+    "L" => 5
+    => 7
+
+// Figure space (equal-width) for stable padding
+padChar = " "
+pad = padN > 0 ? str.repeat(padChar, padN) : ""
+
+shouldUpdate = not updateOnClose or barstate.isconfirmed
+
+// ─────────────────────────────────────────────────────────────
+// Values
+rsiVal = ta.rsi(src, rsiLen)
+
+loR = ta.lowest(rsiVal, stochLen)
+hiR = ta.highest(rsiVal, stochLen)
+stochRaw = (hiR == loR) ? 50.0 : 100.0 * (rsiVal - loR) / (hiR - loR)
+k = ta.sma(stochRaw, kLen)
+d = ta.sma(k, dLen)
+
+stochDivSeries = switch stochDivSourceOpt
+    "%D" => d
+    "Raw" => stochRaw
+    => k
+
+// Hold displayed values (optional close-only update)
+var float rsiHold = na
+var float kHold   = na
+var float dHold   = na
+if shouldUpdate
+    rsiHold := rsiVal
+    kHold   := k
+    dHold   := d
+
+// ─────────────────────────────────────────────────────────────
+// Divergence helpers
+bullFilterOk(mode, cur, prev, maxV) =>
+    mode == "Off" ? true :
+     mode == "Current Pivot Only" ? (cur <= maxV) :
+     (cur <= maxV and prev <= maxV)
+
+bearFilterOk(mode, cur, prev, minV) =>
+    mode == "Off" ? true :
+     mode == "Current Pivot Only" ? (cur >= minV) :
+     (cur >= minV and prev >= minV)
+
+// Price pivots
+pl = ta.pivotlow(divPriceSrc, pL, pR)
+ph = ta.pivothigh(divPriceSrc, pL, pR)
+
+// Track previous pivots (shared price) and oscillator values (separate per oscillator)
+var float prevLowPrice  = na
+var float prevHighPrice = na
+
+var float prevLowRsi    = na
+var float prevHighRsi   = na
+
+var float prevLowStoch  = na
+var float prevHighStoch = na
+
+// Last signals (separate cells)
+var int lastDivBarRsi   = na
+var int lastDivDirRsi   = 0
+
+var int lastDivBarStoch = na
+var int lastDivDirStoch = 0
+
+// Pivot Low event: evaluate RSI + Stoch divergence, then update prevs
+if shouldUpdate and not na(pl)
+    curLowPrice = pl
+    curLowRsi   = rsiVal[pR]
+    curLowStoch = stochDivSeries[pR]
+
+    if not na(prevLowPrice)
+        // RSI bullish divergence: price LL, RSI HL
+        if not na(prevLowRsi)
+            bullDivRsi = (curLowPrice < prevLowPrice) and (curLowRsi > prevLowRsi)
+            bullOkRsi  = bullFilterOk(rsiFilterMode, curLowRsi, prevLowRsi, bullRsiMax)
+            if bullDivRsi and bullOkRsi
+                lastDivBarRsi := bar_index
+                lastDivDirRsi := 1
+
+        // Stoch bullish divergence
+        if showStochDiv and not na(prevLowStoch)
+            bullDivSt = (curLowPrice < prevLowPrice) and (curLowStoch > prevLowStoch)
+            bullOkSt  = bullFilterOk(stochFilterMode, curLowStoch, prevLowStoch, bullStochMax)
+            if bullDivSt and bullOkSt
+                lastDivBarStoch := bar_index
+                lastDivDirStoch := 1
+
+    prevLowPrice := curLowPrice
+    prevLowRsi   := curLowRsi
+    prevLowStoch := curLowStoch
+
+// Pivot High event: evaluate RSI + Stoch divergence, then update prevs
+if shouldUpdate and not na(ph)
+    curHighPrice = ph
+    curHighRsi   = rsiVal[pR]
+    curHighStoch = stochDivSeries[pR]
+
+    if not na(prevHighPrice)
+        // RSI bearish divergence: price HH, RSI LH
+        if not na(prevHighRsi)
+            bearDivRsi = (curHighPrice > prevHighPrice) and (curHighRsi < prevHighRsi)
+            bearOkRsi  = bearFilterOk(rsiFilterMode, curHighRsi, prevHighRsi, bearRsiMin)
+            if bearDivRsi and bearOkRsi
+                lastDivBarRsi := bar_index
+                lastDivDirRsi := -1
+
+        // Stoch bearish divergence
+        if showStochDiv and not na(prevHighStoch)
+            bearDivSt = (curHighPrice > prevHighPrice) and (curHighStoch < prevHighStoch)
+            bearOkSt  = bearFilterOk(stochFilterMode, curHighStoch, prevHighStoch, bearStochMin)
+            if bearDivSt and bearOkSt
+                lastDivBarStoch := bar_index
+                lastDivDirStoch := -1
+
+    prevHighPrice := curHighPrice
+    prevHighRsi   := curHighRsi
+    prevHighStoch := curHighStoch
+
+// Build table text/bg for RSI DIV
+divActiveRsi = not na(lastDivBarRsi) and (bar_index - lastDivBarRsi <= divHoldBars)
+arrowRsi = lastDivDirRsi == 1 ? "▲" : "▼"
+divTextRsi = divActiveRsi ? (pad + arrowRsi + pad) : (pad + " " + pad)
+divTextColorRsi = divActiveRsi ? (lastDivDirRsi == 1 ? goodCol : badCol) : neutralTxt
+divBgRsi = showBg ? (divActiveRsi ? color.new(lastDivDirRsi == 1 ? goodCol : badCol, divBgStrength) : neutralBg) : na
+
+// Build table text/bg for Stoch DIV
+divActiveSt = showStochDiv and not na(lastDivBarStoch) and (bar_index - lastDivBarStoch <= divHoldBars)
+arrowSt = lastDivDirStoch == 1 ? "▲" : "▼"
+divTextSt = showStochDiv ? (divActiveSt ? (pad + arrowSt + pad) : (pad + " " + pad)) : ""
+divTextColorSt = divActiveSt ? (lastDivDirStoch == 1 ? goodCol : badCol) : neutralTxt
+divBgSt = showBg ? (divActiveSt ? color.new(lastDivDirStoch == 1 ? goodCol : badCol, divBgStrength) : neutralBg) : na
+
+// ─────────────────────────────────────────────────────────────
+// Table (RSI | %K | %D | RSI-DIV | STOCH-DIV)
+cols = showStochDiv ? 5 : 4
+var table t = table.new(pos, cols, 1, frame_color=frameCol, frame_width=frameW, border_color=borderCol, border_width=borderW)
+
+if barstate.islast and (shouldUpdate or na(rsiHold))
+    r  = na(rsiHold) ? rsiVal : rsiHold
+    kk = na(kHold)   ? k      : kHold
+    dd = na(dHold)   ? d      : dHold
+
+    table.cell(t, 0, 0, "RSI " + str.tostring(r, fmt),  text_color=f_txt(r,  rsiOS,   rsiOB),   bgcolor=f_bg(r,  rsiOS,   rsiOB),   text_size=txtSize)
+    table.cell(t, 1, 0, "%K "  + str.tostring(kk, fmt), text_color=f_txt(kk, stochOS, stochOB), bgcolor=f_bg(kk, stochOS, stochOB), text_size=txtSize)
+    table.cell(t, 2, 0, "%D "  + str.tostring(dd, fmt), text_color=f_txt(dd, stochOS, stochOB), bgcolor=f_bg(dd, stochOS, stochOB), text_size=txtSize)
+
+    table.cell(t, 3, 0, divTextRsi, text_color=divTextColorRsi, bgcolor=divBgRsi, text_size=txtSize)
+
+    if showStochDiv
+        table.cell(t, 4, 0, divTextSt, text_color=divTextColorSt, bgcolor=divBgSt, text_size=txtSize)

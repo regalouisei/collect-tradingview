@@ -1,0 +1,1027 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+//@version=6
+indicator("BK AK-Crosswind Falcon", shorttitle="🦅", overlay=false, precision=2, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+groupTF     = "Calculation Timeframe"
+groupCore   = "Core"
+groupColor  = "Line Color Mode"
+groupRegime = "Regime"
+groupBands  = "Bands / Extremes"
+groupSig    = "Peak/Valley Signals"
+groupSess   = "Session Filter"
+groupHUD    = "HUD"
+groupViz    = "Visuals"
+
+// ── Calculation Timeframe
+useCalcTF = input.bool(false, "Use Fixed Calculation TF", group=groupTF)
+calcTF    = input.timeframe("30", "Calculation Timeframe", group=groupTF)
+
+// ── Core
+lenDI  = input.int(14, "DI Length", minval=1, group=groupCore)
+lenADX = input.int(14, "ADX Smoothing", minval=1, group=groupCore)
+sigLen = input.int(5,  "Zenith Signal Length", minval=1, group=groupCore)
+sigMAType = input.string("EMA", "Signal MA Type", options=["EMA", "SMA", "WMA", "HMA", "ZLEMA", "DEMA", "TEMA", "VWMA", "RMA"], group=groupCore)
+
+zenMode = input.string("DX Signed", "Zenith Formula", options=["DI Spread × ADX","ADX Signed","DX Signed"], group=groupCore)
+
+// ── Line Color
+colorSource = input.string("Slope (Instant)", "Color Driver", options=["Slope (Instant)", "DI Spread (RAW)", "DI Spread (Fast EMA)", "Zenith (RAW)", "Zenith (Fast EMA)"], group=groupColor)
+colorLen   = input.int(3, "Fast EMA Len", minval=1, group=groupColor)
+dimInRange = input.bool(true, "Dim color in RANGE regime", group=groupColor)
+
+// ── Regime
+trendThresh   = input.float(25.0, "Trend threshold (ADX)", minval=5.0, maxval=60.0, step=0.5, group=groupRegime)
+showRegimeBg  = input.bool(true, "Show regime background", group=groupRegime)
+flashOnSwitch = input.bool(true, "Flash on regime/direction switch", group=groupRegime)
+flashBars     = input.int(1, "Flash duration (bars)", minval=1, maxval=10, group=groupRegime)
+
+bgMode = input.string("Turn Legs (Hybrid: Extreme+Vel+Price)", "Background Mode", options=["Original (Regime/Dir Flash)", "Peak↔Valley Legs (Signals)", "Turn Legs (Hybrid: Extreme+Vel+Price)", "Turn Legs (Slope+Extreme)", "Slope Direction", "Slope Flip Flash"], group=groupRegime)
+
+turnPriceLookback    = input.int(5, "Turn: Price Swing Lookback", minval=1, maxval=50, group=groupRegime)
+turnUsePriceConfirm  = input.bool(true, "Turn: Require Price Confirm", group=groupRegime)
+turnUseSwingPrice    = input.bool(true, "Turn: Require Price at Swing", group=groupRegime)
+
+// ── Bands
+bandMode        = input.string("Dynamic", "Band Mode", options=["Dynamic","Static"], group=groupBands)
+dynLen          = input.int(100, "Dynamic band lookback", minval=20, group=groupBands)
+dynMult         = input.float(1.6, "Dynamic band stdev ×", minval=0.5, step=0.1, group=groupBands)
+staticBand      = input.float(40.0, "Static band level (±)", minval=5.0, step=1.0, group=groupBands)
+showBands       = input.bool(true, "Show bands", group=groupBands)
+showExtremeDots = input.bool(true, "Show extreme dots", group=groupBands)
+
+obDotCooldown = input.int(5, "OB Dot Cooldown (bars)", minval=0, maxval=500, group=groupBands)
+osDotCooldown = input.int(5, "OS Dot Cooldown (bars)", minval=0, maxval=500, group=groupBands)
+
+// ── Peak/Valley Signal Engine
+showSignals   = input.bool(true, "Show Peak/Valley Signals", group=groupSig)
+signalMode    = input.string("Confirmed Pivot", "Signal Mode", options=["Instant Cross", "Confirmed Pivot"], group=groupSig, tooltip="Instant Cross = fires immediately on signal line cross in extreme (no delay). Confirmed Pivot = waits for pivot confirmation (slight delay).")
+extremePct    = input.float(0.65, "Extreme Zone % (of band)", minval=0.5, maxval=1.0, step=0.05, group=groupSig, tooltip="How deep into band for signal. 0.65 = 65% of band distance from zero.")
+extremeLookback = input.int(3, "Extreme Lookback (bars)", minval=1, maxval=10, group=groupSig, tooltip="For Instant Cross: how many bars back to check if was in extreme (catches crosses right at band edge)")
+cooldownBars  = input.int(6, "Signal Cooldown (bars)", minval=1, maxval=30, group=groupSig)
+signalSize    = input.string("Tiny", "Signal Size", options=["Tiny","Small","Normal"], group=groupSig)
+
+zenPivotLeft  = input.int(3, "Pivot Left Bars", minval=1, maxval=10, group=groupSig, tooltip="Only for Confirmed Pivot mode")
+zenPivotRight = input.int(3, "Pivot Right Bars", minval=1, maxval=10, group=groupSig, tooltip="Only for Confirmed Pivot mode")
+
+// ── Session Filter
+useSessionFilter = input.bool(true, "Block Off-Hours Signals", group=groupSess, tooltip="Blocks signals during overnight/low volume hours")
+sessStartHour    = input.int(6, "Session Start Hour", minval=0, maxval=23, group=groupSess)
+sessStartMin     = input.int(0, "Session Start Minute", minval=0, maxval=59, group=groupSess)
+sessEndHour      = input.int(18, "Session End Hour", minval=0, maxval=23, group=groupSess)
+sessEndMin       = input.int(0, "Session End Minute", minval=0, maxval=59, group=groupSess)
+
+// ── HUD
+showHUD     = input.bool(true, "Show HUD", group=groupHUD)
+hudPos      = input.string("Middle Left", "HUD Position", options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Left"], group=groupHUD)
+hudTextSize = input.string("Small", "HUD Text Size", options=["Tiny","Small","Normal"], group=groupHUD)
+
+// ── Visuals
+showDI  = input.bool(false, "Plot +DI / -DI", group=groupViz)
+showADX = input.bool(true, "Plot ADX", group=groupViz)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+clamp01(x)  => math.max(0.0, math.min(1.0, x))
+clamp100(x) => math.max(0.0, math.min(100.0, x))
+txtSize = hudTextSize == "Tiny" ? size.tiny : hudTextSize == "Small" ? size.small : size.normal
+
+f_ma(_src, _len, _type) =>
+    switch _type
+        "EMA"   => ta.ema(_src, _len)
+        "SMA"   => ta.sma(_src, _len)
+        "WMA"   => ta.wma(_src, _len)
+        "HMA"   => ta.hma(_src, _len)
+        "RMA"   => ta.rma(_src, _len)
+        "VWMA"  => ta.vwma(_src, _len)
+        "ZLEMA" =>
+            lag = math.floor((_len - 1) / 2)
+            ta.ema(2 * _src - _src[lag], _len)
+        "DEMA"  =>
+            e1 = ta.ema(_src, _len)
+            e2 = ta.ema(e1, _len)
+            2 * e1 - e2
+        "TEMA"  =>
+            e1 = ta.ema(_src, _len)
+            e2 = ta.ema(e1, _len)
+            e3 = ta.ema(e2, _len)
+            3 * e1 - 3 * e2 + e3
+        => ta.ema(_src, _len)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+currentHour = hour(time, syminfo.timezone)
+currentMin  = minute(time, syminfo.timezone)
+currentTimeInMins = currentHour * 60 + currentMin
+sessStartInMins   = sessStartHour * 60 + sessStartMin
+sessEndInMins     = sessEndHour * 60 + sessEndMin
+
+inSession = currentTimeInMins >= sessStartInMins and currentTimeInMins < sessEndInMins
+sessionOK = not useSessionFilter or inSession
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CORE CALCULATION FUNCTION
+// ─────────────────────────────────────────────────────────────────────────────
+f_falcon_core() =>
+    up   = ta.change(high)
+    down = -ta.change(low)
+    plusDM  = na(up)   ? na : (up > down and up > 0 ? up : 0)
+    minusDM = na(down) ? na : (down > up and down > 0 ? down : 0)
+    trur  = ta.rma(ta.tr, lenDI)
+    plus  = fixnan(100 * ta.rma(plusDM, lenDI) / trur)
+    minus = fixnan(100 * ta.rma(minusDM, lenDI) / trur)
+    sum   = plus + minus
+    diff  = plus - minus
+    dxFrac   = math.abs(diff) / (sum == 0 ? 1 : sum)
+    adx      = 100 * ta.rma(dxFrac, lenADX)
+    dxSigned = (sum == 0 ? 0.0 : (diff / sum) * 100.0)
+    
+    zenRaw = zenMode == "DI Spread × ADX" ? diff * (adx / 100.0) : zenMode == "ADX Signed" ? (diff == 0 ? 0.0 : math.sign(diff) * adx) : dxSigned
+    zenSig = f_ma(zenRaw, sigLen, sigMAType)
+    zenVel = zenRaw - nz(zenRaw[1])
+    zenAcc = zenVel - nz(zenVel[1])
+    
+    band  = bandMode == "Dynamic" ? dynMult * ta.stdev(zenRaw, dynLen) : staticBand
+    upper = +band
+    lower = -band
+    
+    [plus, minus, adx, diff, zenRaw, zenSig, zenVel, zenAcc, upper, lower, band]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET VALUES
+// ─────────────────────────────────────────────────────────────────────────────
+[plus_raw, minus_raw, adx_raw, diff_raw, zenRaw_raw, zenSig_raw, zenVel_raw, zenAcc_raw, upper_raw, lower_raw, band_raw] = f_falcon_core()
+
+[plus_tf, minus_tf, adx_tf, diff_tf, zenRaw_tf, zenSig_tf, zenVel_tf, zenAcc_tf, upper_tf, lower_tf, band_tf] = request.security(syminfo.tickerid, useCalcTF ? calcTF : timeframe.period, f_falcon_core(), lookahead=barmerge.lookahead_off)
+
+float plus   = useCalcTF ? plus_tf   : plus_raw
+float minus  = useCalcTF ? minus_tf  : minus_raw
+float adx    = useCalcTF ? adx_tf    : adx_raw
+float diff   = useCalcTF ? diff_tf   : diff_raw
+float zenRaw = useCalcTF ? zenRaw_tf : zenRaw_raw
+float zenSig = useCalcTF ? zenSig_tf : zenSig_raw
+float zenVel = useCalcTF ? zenVel_tf : zenVel_raw
+float zenAcc = useCalcTF ? zenAcc_tf : zenAcc_raw
+float upper  = useCalcTF ? upper_tf  : upper_raw
+float lower  = useCalcTF ? lower_tf  : lower_raw
+float band   = useCalcTF ? band_tf   : band_raw
+
+// Derived
+inTrend  = adx >= trendThresh
+dirBull  = diff >= 0
+dirBear  = diff < 0
+bandSafe = band == 0 ? 1.0 : band
+
+// Extreme thresholds
+extremeUpper = upper * extremePct
+extremeLower = lower * extremePct
+inOB = zenRaw > upper
+inOS = zenRaw < lower
+nearOB = zenRaw >= extremeUpper
+nearOS = zenRaw <= extremeLower
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZENITH PIVOT DETECTION (for Confirmed Pivot mode)
+// ─────────────────────────────────────────────────────────────────────────────
+zenPivotHigh = ta.pivothigh(zenRaw, zenPivotLeft, zenPivotRight)
+zenPivotLow  = ta.pivotlow(zenRaw, zenPivotLeft, zenPivotRight)
+
+isZenPeakBar   = not na(zenPivotHigh)
+isZenValleyBar = not na(zenPivotLow)
+
+zenAtPivot = zenRaw[zenPivotRight]
+upperAtPivot = upper[zenPivotRight]
+lowerAtPivot = lower[zenPivotRight]
+extremeUpperAtPivot = upperAtPivot * extremePct
+extremeLowerAtPivot = lowerAtPivot * extremePct
+
+zenPeakInExtreme   = isZenPeakBar and (zenAtPivot >= extremeUpperAtPivot)
+zenValleyInExtreme = isZenValleyBar and (zenAtPivot <= extremeLowerAtPivot)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTANT CROSS DETECTION (zero delay mode)
+// ─────────────────────────────────────────────────────────────────────────────
+sigCrossDown = ta.crossunder(zenRaw, zenSig)
+sigCrossUp   = ta.crossover(zenRaw, zenSig)
+
+wasInUpperExtreme = ta.highest(nearOB ? 1.0 : 0.0, extremeLookback) > 0
+wasInLowerExtreme = ta.highest(nearOS ? 1.0 : 0.0, extremeLookback) > 0
+
+inOrNearUpperExtreme = nearOB or wasInUpperExtreme
+inOrNearLowerExtreme = nearOS or wasInLowerExtreme
+
+instantPeakSignal   = sigCrossDown and inOrNearUpperExtreme and (zenVel < 0)
+instantValleySignal = sigCrossUp and inOrNearLowerExtreme and (zenVel > 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL COOLDOWN
+// ─────────────────────────────────────────────────────────────────────────────
+var int barsSinceShort = 999
+var int barsSinceLong  = 999
+
+barsSinceShort := barsSinceShort + 1
+barsSinceLong  := barsSinceLong + 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FINAL SIGNAL LOGIC - MODE SELECTION
+// ─────────────────────────────────────────────────────────────────────────────
+bool peakSignal   = false
+bool valleySignal = false
+int  signalOffset = 0
+
+if signalMode == "Instant Cross"
+    peakSignal   := instantPeakSignal and (barsSinceShort >= cooldownBars) and sessionOK
+    valleySignal := instantValleySignal and (barsSinceLong >= cooldownBars) and sessionOK
+    signalOffset := 0
+else
+    peakSignal   := zenPeakInExtreme and (zenVel < 0) and (barsSinceShort >= cooldownBars) and sessionOK
+    valleySignal := zenValleyInExtreme and (zenVel > 0) and (barsSinceLong >= cooldownBars) and sessionOK
+    signalOffset := -zenPivotRight
+
+if peakSignal
+    barsSinceShort := 0
+if valleySignal
+    barsSinceLong := 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LINE COLOR
+// ─────────────────────────────────────────────────────────────────────────────
+diffFast = ta.ema(diff, colorLen)
+zenFast  = ta.ema(zenRaw, colorLen)
+slopeColorUp = zenRaw > nz(zenRaw[1])
+
+colorBull = switch colorSource
+    "Slope (Instant)"       => slopeColorUp
+    "DI Spread (RAW)"       => diff >= 0
+    "DI Spread (Fast EMA)"  => diffFast >= 0
+    "Zenith (RAW)"          => zenRaw >= 0
+    "Zenith (Fast EMA)"     => zenFast >= 0
+    => slopeColorUp
+
+bullColor = (dimInRange and not inTrend) ? color.new(color.lime, 35) : color.new(color.lime, 0)
+bearColor = (dimInRange and not inTrend) ? color.new(color.red,  35) : color.new(color.red,  0)
+zenColor  = colorBull ? bullColor : bearColor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REGIME BACKGROUND (with selectable turn engines)
+// ─────────────────────────────────────────────────────────────────────────────
+var int flashLeft = 0
+regimeSwitch = bar_index > 0 and ((inTrend != inTrend[1]) or (dirBull != dirBull[1]))
+
+if flashOnSwitch and regimeSwitch
+    flashLeft := flashBars
+else
+    flashLeft := math.max(0, flashLeft - 1)
+
+// Peak↔Valley legs from signals
+var int pvLegState = 0
+var int pvFlashLeft = 0
+var int pvFlashDir  = 0
+
+if valleySignal
+    pvLegState := 1
+    if flashOnSwitch
+        pvFlashLeft := flashBars
+        pvFlashDir  := 1
+if peakSignal
+    pvLegState := -1
+    if flashOnSwitch
+        pvFlashLeft := flashBars
+        pvFlashDir  := -1
+pvFlashLeft := math.max(0, pvFlashLeft - 1)
+
+// Hybrid turns (closest non-repainting)
+atPriceHigh = ta.highestbars(high, turnPriceLookback) <= 1
+atPriceLow  = ta.lowestbars(low,  turnPriceLookback) <= 1
+
+velFlipDown = (zenVel < 0) and (zenVel[1] >= 0)
+velFlipUp   = (zenVel > 0) and (zenVel[1] <= 0)
+
+priceConfTop = close < close[1] or close < open
+priceConfBot = close > close[1] or close > open
+
+peakTurnHybrid   = nearOB and velFlipDown and (not turnUseSwingPrice or atPriceHigh) and (not turnUsePriceConfirm or priceConfTop)
+valleyTurnHybrid = nearOS and velFlipUp   and (not turnUseSwingPrice or atPriceLow)  and (not turnUsePriceConfirm or priceConfBot)
+
+var int hyLegState  = 0
+var int hyFlashLeft = 0
+var int hyFlashDir  = 0
+
+if valleyTurnHybrid
+    hyLegState := 1
+    if flashOnSwitch
+        hyFlashLeft := flashBars
+        hyFlashDir  := 1
+if peakTurnHybrid
+    hyLegState := -1
+    if flashOnSwitch
+        hyFlashLeft := flashBars
+        hyFlashDir  := -1
+hyFlashLeft := math.max(0, hyFlashLeft - 1)
+
+// Slope+Extreme turns
+slopeFlipDown = (zenRaw < zenRaw[1]) and (zenRaw[1] >= zenRaw[2])
+slopeFlipUp   = (zenRaw > zenRaw[1]) and (zenRaw[1] <= zenRaw[2])
+
+peakTurnSlope   = nearOB and slopeFlipDown
+valleyTurnSlope = nearOS and slopeFlipUp
+
+var int slLegState  = 0
+var int slFlashLeft = 0
+var int slFlashDir  = 0
+
+if valleyTurnSlope
+    slLegState := 1
+    if flashOnSwitch
+        slFlashLeft := flashBars
+        slFlashDir  := 1
+if peakTurnSlope
+    slLegState := -1
+    if flashOnSwitch
+        slFlashLeft := flashBars
+        slFlashDir  := -1
+slFlashLeft := math.max(0, slFlashLeft - 1)
+
+// Slope flip flash
+var int slopeFlashLeft = 0
+int slopeNow  = slopeColorUp ? 1 : 0
+int slopePrev = slopeNow[1]
+bool slopeFlip = bar_index > 0 and (slopeNow != (na(slopePrev) ? slopeNow : slopePrev))
+
+if flashOnSwitch and slopeFlip
+    slopeFlashLeft := flashBars
+else
+    slopeFlashLeft := math.max(0, slopeFlashLeft - 1)
+
+color bg = na
+if showRegimeBg
+    if bgMode == "Original (Regime/Dir Flash)"
+        if flashLeft > 0
+            bg := color.new(color.yellow, 80)
+        else if inTrend
+            bg := dirBull ? color.new(color.lime, 92) : color.new(color.red, 92)
+        else
+            bg := color.new(color.gray, 94)
+    else if bgMode == "Peak↔Valley Legs (Signals)"
+        if pvFlashLeft > 0
+            bg := pvFlashDir == 1 ? color.new(color.lime, 80) : pvFlashDir == -1 ? color.new(color.red, 80) : color.new(color.yellow, 80)
+        else if pvLegState == 1
+            bg := color.new(color.lime, 92)
+        else if pvLegState == -1
+            bg := color.new(color.red, 92)
+        else
+            bg := color.new(color.gray, 94)
+    else if bgMode == "Turn Legs (Hybrid: Extreme+Vel+Price)"
+        if hyFlashLeft > 0
+            bg := hyFlashDir == 1 ? color.new(color.lime, 80) : hyFlashDir == -1 ? color.new(color.red, 80) : color.new(color.yellow, 80)
+        else if hyLegState == 1
+            bg := color.new(color.lime, 92)
+        else if hyLegState == -1
+            bg := color.new(color.red, 92)
+        else
+            bg := color.new(color.gray, 94)
+    else if bgMode == "Turn Legs (Slope+Extreme)"
+        if slFlashLeft > 0
+            bg := slFlashDir == 1 ? color.new(color.lime, 80) : slFlashDir == -1 ? color.new(color.red, 80) : color.new(color.yellow, 80)
+        else if slLegState == 1
+            bg := color.new(color.lime, 92)
+        else if slLegState == -1
+            bg := color.new(color.red, 92)
+        else
+            bg := color.new(color.gray, 94)
+    else if bgMode == "Slope Direction"
+        bg := slopeColorUp ? color.new(color.lime, 92) : color.new(color.red, 92)
+    else
+        if slopeFlashLeft > 0
+            bg := color.new(color.yellow, 80)
+        else
+            bg := slopeColorUp ? color.new(color.lime, 92) : color.new(color.red, 92)
+
+bgcolor(bg)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HUD SCORES
+// ─────────────────────────────────────────────────────────────────────────────
+strengthScore = clamp100(adx)
+momentumScore = clamp100(clamp01(math.abs(zenVel) / bandSafe) * 100.0)
+accelScore    = clamp100(clamp01(math.abs(zenAcc) / bandSafe) * 100.0)
+revDown       = zenVel < 0 and zenRaw > 0
+revUp         = zenVel > 0 and zenRaw < 0
+exhaustScore  = ((inOB and revDown) or (inOS and revUp)) ? 100.0 : 0.0
+masterScore   = clamp100(0.35 * strengthScore + 0.25 * momentumScore + 0.15 * accelScore + 0.25 * (100 - exhaustScore))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOOLTIP ENGINE — Institutional-Grade Context & Education
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Shared building blocks ──
+string _sep     = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+string _sepThin = "─────────────────────────────────"
+
+// Zone depth (how far into band, as %)
+float zenBandPct = bandSafe != 0 ? math.abs(zenRaw) / bandSafe * 100.0 : 0.0
+string zoneTxt = zenRaw > upper ? "OVERBOUGHT (" + str.tostring(zenBandPct, "#") + "% of band)" : zenRaw < lower ? "OVERSOLD (" + str.tostring(zenBandPct, "#") + "% of band)" : zenRaw > extremeUpper ? "NEAR OB (" + str.tostring(zenBandPct, "#") + "%)" : zenRaw < extremeLower ? "NEAR OS (" + str.tostring(zenBandPct, "#") + "%)" : zenRaw > 0 ? "BULL ZONE (" + str.tostring(zenBandPct, "#") + "%)" : "BEAR ZONE (" + str.tostring(zenBandPct, "#") + "%)"
+
+// Regime context string
+string regimeStr = inTrend ? (adx > 50 ? "STRONG TREND" : adx > 35 ? "TRENDING" : "MILD TREND") : (adx < 15 ? "DEAD RANGE" : "RANGING")
+
+// Velocity interpretation
+string velStr = switch
+    zenVel > 0 and zenAcc > 0 => "Accelerating UP"
+    zenVel > 0                => "Decelerating UP"
+    zenVel < 0 and zenAcc < 0 => "Accelerating DOWN"
+    zenVel < 0                => "Decelerating DOWN"
+    => "FLAT"
+
+// Bias with DI detail
+string biasDetail = "+DI: " + str.tostring(plus, "#.#")
+biasDetail += " | -DI: " + str.tostring(minus, "#.#")
+biasDetail += " | Spread: " + str.tostring(diff, "#.#")
+
+// Session context
+string sessStr = inSession ? "RTH ACTIVE" : "OFF-HOURS"
+
+// ── Confluence Engine (counts how many factors align for each direction) ──
+int bullConf = 0
+int bearConf = 0
+
+// Factor 1: DI Direction
+bullConf += dirBull ? 1 : 0
+bearConf += dirBear ? 1 : 0
+
+// Factor 2: Zenith above/below zero
+bullConf += zenRaw > 0 ? 1 : 0
+bearConf += zenRaw < 0 ? 1 : 0
+
+// Factor 3: Velocity direction
+bullConf += zenVel > 0 ? 1 : 0
+bearConf += zenVel < 0 ? 1 : 0
+
+// Factor 4: Zenith above/below signal
+bullConf += zenRaw > zenSig ? 1 : 0
+bearConf += zenRaw < zenSig ? 1 : 0
+
+// Factor 5: Slope direction
+bullConf += slopeColorUp ? 1 : 0
+bearConf += not slopeColorUp ? 1 : 0
+
+// Factor 6: Acceleration confirming
+bullConf += (zenVel > 0 and zenAcc > 0) ? 1 : 0
+bearConf += (zenVel < 0 and zenAcc < 0) ? 1 : 0
+
+string confTxt = "Bull: " + str.tostring(bullConf) + "/6 | Bear: " + str.tostring(bearConf) + "/6"
+
+// ── Risk Assessment ──
+bool highRiskZone = (inOB and zenVel < 0) or (inOS and zenVel > 0) or (not inSession and useSessionFilter)
+bool exhausting   = exhaustScore > 0
+string riskTxt = exhausting ? "⚠ HIGH — Exhaustion detected" : highRiskZone ? "⚠ ELEVATED — Extreme w/ reversal signs" : not inTrend ? "◉ MODERATE — Range environment" : "◎ NORMAL — Trending conditions"
+
+// ── Market Phase Context ──
+string phaseTxt = inOB and zenVel < 0 ? "DISTRIBUTION — Smart money likely selling into retail buying" : inOS and zenVel > 0 ? "ACCUMULATION — Smart money likely buying retail panic" : inTrend and dirBull and zenVel > 0 ? "MARKUP — Institutional buying driving trend higher" : inTrend and dirBear and zenVel < 0 ? "MARKDOWN — Institutional selling driving trend lower" : not inTrend and math.abs(zenRaw) < bandSafe * 0.3 ? "CONSOLIDATION — Balanced auction, waiting for catalyst" : "TRANSITION — Directional commitment forming"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL TOOLTIPS — Peak & Valley (built with label.new)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Peak Signal Tooltip ──
+string peakTip = ""
+if peakSignal
+    peakTip := "🔴 PEAK SIGNAL DETECTED\n"
+    peakTip += _sep + "\n"
+    peakTip += "Zenith: " + str.tostring(zenRaw, "#.##") + " → Signal: " + str.tostring(zenSig, "#.##") + "\n"
+    peakTip += "Velocity: " + str.tostring(zenVel, "#.###") + " (" + velStr + ")\n"
+    peakTip += "ADX: " + str.tostring(adx, "#.#") + " | " + regimeStr + "\n"
+    peakTip += biasDetail + "\n"
+    peakTip += "Zone: " + zoneTxt + "\n"
+    peakTip += "Confluence: " + confTxt + "\n"
+    peakTip += _sepThin + "\n"
+    peakTip += "▸ WHAT HAPPENED\n"
+    peakTip += "Momentum peaked at an overbought extreme\n"
+    peakTip += "and velocity flipped negative = buying\n"
+    peakTip += "pressure is exhausting.\n"
+    peakTip += _sepThin + "\n"
+    peakTip += "▸ STRATEGY\n"
+    peakTip += "• Short bias — fade the extreme\n"
+    peakTip += "• Entry: Below signal line or on retest\n"
+    peakTip += "• Stop: Above the swing high at peak\n"
+    peakTip += "• T1: Zero line | T2: Opposite extreme\n"
+    if inTrend and adx > 40
+        peakTip += "• ⚠ CAUTION: Strong trend — use tighter\n  targets, wider stop, smaller size\n"
+    else if not inTrend
+        peakTip += "• RANGE MODE: High-probability mean\n  reversion — full target to lower band\n"
+    peakTip += _sepThin + "\n"
+    peakTip += "▸ INSTITUTIONAL EDGE\n"
+    peakTip += "Smart money distributes at extremes.\n"
+    peakTip += "Retail chases momentum; institutions\n"
+    peakTip += "sell into that liquidity. Velocity\n"
+    peakTip += "reversal confirms distribution began.\n"
+    if adx > 35
+        peakTip += "High ADX = extended auction — watch\nfor trapped longs above."
+    else
+        peakTip += "Low ADX = range bound — high probability\nmean reversion setup."
+    peakTip += "\n" + _sep
+
+// ── Valley Signal Tooltip ──
+string valleyTip = ""
+if valleySignal
+    valleyTip := "🟢 VALLEY SIGNAL DETECTED\n"
+    valleyTip += _sep + "\n"
+    valleyTip += "Zenith: " + str.tostring(zenRaw, "#.##") + " → Signal: " + str.tostring(zenSig, "#.##") + "\n"
+    valleyTip += "Velocity: " + str.tostring(zenVel, "#.###") + " (" + velStr + ")\n"
+    valleyTip += "ADX: " + str.tostring(adx, "#.#") + " | " + regimeStr + "\n"
+    valleyTip += biasDetail + "\n"
+    valleyTip += "Zone: " + zoneTxt + "\n"
+    valleyTip += "Confluence: " + confTxt + "\n"
+    valleyTip += _sepThin + "\n"
+    valleyTip += "▸ WHAT HAPPENED\n"
+    valleyTip += "Momentum bottomed at an oversold extreme\n"
+    valleyTip += "and velocity flipped positive = selling\n"
+    valleyTip += "pressure is exhausting.\n"
+    valleyTip += _sepThin + "\n"
+    valleyTip += "▸ STRATEGY\n"
+    valleyTip += "• Long bias — fade the extreme\n"
+    valleyTip += "• Entry: Above signal line or on retest\n"
+    valleyTip += "• Stop: Below the swing low at valley\n"
+    valleyTip += "• T1: Zero line | T2: Opposite extreme\n"
+    if inTrend and adx > 40
+        valleyTip += "• ⚠ CAUTION: Strong downtrend — use\n  tighter targets, wider stop, smaller size\n"
+    else if not inTrend
+        valleyTip += "• RANGE MODE: High-probability mean\n  reversion — full target to upper band\n"
+    valleyTip += _sepThin + "\n"
+    valleyTip += "▸ INSTITUTIONAL EDGE\n"
+    valleyTip += "Smart money accumulates at extremes.\n"
+    valleyTip += "Retail panics and sells; institutions\n"
+    valleyTip += "buy that liquidity. Velocity reversal\n"
+    valleyTip += "confirms accumulation has begun.\n"
+    if adx > 35
+        valleyTip += "High ADX = extended selloff — watch\nfor trapped shorts below."
+    else
+        valleyTip += "Low ADX = range bound — high probability\nmean reversion setup."
+    valleyTip += "\n" + _sep
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXTREME DOT TOOLTIPS — OB / OS
+// ══════════════════════════════════════════════════════════════════════════════
+float obDepth = inOB ? ((zenRaw - upper) / bandSafe * 100.0) : 0.0
+float osDepth = inOS ? ((lower - zenRaw) / bandSafe * 100.0) : 0.0
+
+string obDotTip = "⚠ OVERBOUGHT EXTREME\n"
+obDotTip += _sep + "\n"
+obDotTip += "Zenith: " + str.tostring(zenRaw, "#.##") + " | Band: ±" + str.tostring(band, "#.##") + "\n"
+obDotTip += "Depth Beyond Band: +" + str.tostring(obDepth, "#.#") + "%\n"
+obDotTip += "Velocity: " + str.tostring(zenVel, "#.###") + " | " + velStr + "\n"
+obDotTip += "ADX: " + str.tostring(adx, "#.#") + " | " + regimeStr + "\n"
+obDotTip += _sepThin + "\n"
+obDotTip += "▸ WHAT THIS MEANS\n"
+obDotTip += "Directional momentum has pushed beyond\n"
+obDotTip += "normal statistical boundaries. This is\n"
+obDotTip += "where reversals are BORN — but strong\n"
+obDotTip += "trends can persist in extremes.\n"
+obDotTip += _sepThin + "\n"
+obDotTip += "▸ WATCH FOR\n"
+obDotTip += "• Velocity flip (vel turns negative)\n"
+obDotTip += "  → Buying pressure fading\n"
+obDotTip += "• Signal line crossunder\n"
+obDotTip += "  → Confirmed momentum peak\n"
+obDotTip += "• Price rejection candle (wick/doji)\n"
+obDotTip += "  → Sellers stepping in\n"
+obDotTip += "• Volume divergence on price chart\n"
+obDotTip += "  → Institutions distributing\n"
+obDotTip += _sepThin + "\n"
+obDotTip += "▸ DO NOT\n"
+obDotTip += "Chase new longs here. If you're long,\n"
+obDotTip += "this is a profit-taking zone. Wait for\n"
+obDotTip += "a confirmed PEAK signal before shorting.\n"
+if adx > 40
+    obDotTip += "Strong trend — extremes can extend.\nBe patient, don't front-run the turn."
+obDotTip += "\n" + _sep
+
+string osDotTip = "⚠ OVERSOLD EXTREME\n"
+osDotTip += _sep + "\n"
+osDotTip += "Zenith: " + str.tostring(zenRaw, "#.##") + " | Band: ±" + str.tostring(band, "#.##") + "\n"
+osDotTip += "Depth Beyond Band: -" + str.tostring(osDepth, "#.#") + "%\n"
+osDotTip += "Velocity: " + str.tostring(zenVel, "#.###") + " | " + velStr + "\n"
+osDotTip += "ADX: " + str.tostring(adx, "#.#") + " | " + regimeStr + "\n"
+osDotTip += _sepThin + "\n"
+osDotTip += "▸ WHAT THIS MEANS\n"
+osDotTip += "Directional momentum has pushed beyond\n"
+osDotTip += "normal statistical boundaries to the\n"
+osDotTip += "downside. This is where bottoms form —\n"
+osDotTip += "but waterfalls can persist in extremes.\n"
+osDotTip += _sepThin + "\n"
+osDotTip += "▸ WATCH FOR\n"
+osDotTip += "• Velocity flip (vel turns positive)\n"
+osDotTip += "  → Selling pressure fading\n"
+osDotTip += "• Signal line crossover\n"
+osDotTip += "  → Confirmed momentum valley\n"
+osDotTip += "• Price rejection candle (hammer)\n"
+osDotTip += "  → Buyers stepping in\n"
+osDotTip += "• Volume divergence on price chart\n"
+osDotTip += "  → Institutions accumulating\n"
+osDotTip += _sepThin + "\n"
+osDotTip += "▸ DO NOT\n"
+osDotTip += "Chase new shorts here. If you're short,\n"
+osDotTip += "this is a profit-taking zone. Wait for\n"
+osDotTip += "a confirmed VALLEY signal before going long.\n"
+if adx > 40
+    osDotTip += "Strong trend — extremes can extend.\nBe patient, don't front-run the turn."
+osDotTip += "\n" + _sep
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HUD CELL TOOLTIPS — Educational + Real-Time Context
+// ══════════════════════════════════════════════════════════════════════════════
+string tfTxt    = useCalcTF ? calcTF : timeframe.period
+bool   tfMatch  = useCalcTF and (calcTF != timeframe.period)
+
+string tipTF = "📊 CALCULATION TIMEFRAME\n"
+tipTF += _sep + "\n"
+tipTF += "Current Chart: " + timeframe.period + "\n"
+tipTF += "Calculating On: " + tfTxt + "\n"
+if tfMatch
+    tipTF += "⚠ MISMATCH — Zenith is computed on\na different TF than your chart.\n"
+else
+    tipTF += "✓ Matched — chart and calc TF are same.\n"
+tipTF += _sepThin + "\n"
+tipTF += "Higher TF calcs smooth noise and show\n"
+tipTF += "the dominant directional force. Lower\n"
+tipTF += "chart TF gives faster visual updates.\n"
+tipTF += "\n"
+tipTF += "▸ USE CASE\n"
+tipTF += "Calculate on 15-30m for NQ/ES while\n"
+tipTF += "viewing on 1-5m for precise entries.\n"
+tipTF += "The Zenith reflects higher TF momentum\n"
+tipTF += "while you scalp intrabar moves."
+
+string modeTxt  = signalMode == "Instant Cross" ? "INST" : "CONF"
+string tipMode = "🎯 SIGNAL DETECTION MODE\n"
+tipMode += _sep + "\n"
+tipMode += "Active: " + signalMode + "\n"
+tipMode += _sepThin + "\n"
+tipMode += "INSTANT CROSS (INST)\n"
+tipMode += "Fires the moment Zenith crosses its\n"
+tipMode += "signal line while in/near the extreme\n"
+tipMode += "zone. Zero delay but may get fakeouts\n"
+tipMode += "in choppy markets.\n"
+tipMode += "Best for: Fast scalps, strong trends\n"
+tipMode += "\n"
+tipMode += "CONFIRMED PIVOT (CONF)\n"
+tipMode += "Waits for a Zenith pivot high/low to\n"
+tipMode += "form (left+right bars confirmed).\n"
+tipMode += "Slight delay but filters noise.\n"
+tipMode += "Best for: Swing trades, ranging markets\n"
+tipMode += _sepThin + "\n"
+tipMode += "▸ EDGE TIP\n"
+tipMode += "Use INST in strong trends (ADX>30)\n"
+tipMode += "for speed. Switch to CONF in ranges\n"
+tipMode += "(ADX<25) to avoid chop signals."
+
+string sessTxt  = inSession ? "LIVE" : "OFF"
+string tipSess = "⏰ SESSION FILTER\n"
+tipSess += _sep + "\n"
+tipSess += "Status: " + sessStr + "\n"
+tipSess += "Window: " + str.tostring(sessStartHour) + ":" + (sessStartMin < 10 ? "0" : "") + str.tostring(sessStartMin)
+tipSess += " → " + str.tostring(sessEndHour) + ":" + (sessEndMin < 10 ? "0" : "") + str.tostring(sessEndMin) + "\n"
+tipSess += "Filter Active: " + (useSessionFilter ? "YES" : "NO") + "\n"
+tipSess += _sepThin + "\n"
+if not inSession and useSessionFilter
+    tipSess += "⚠ SIGNALS BLOCKED — Off-hours have\nthin liquidity, wide spreads, and\nalgorithmic noise. Signals generated\nnow are unreliable.\n"
+else if inSession
+    tipSess += "✓ SESSION ACTIVE — Peak liquidity\nwindow. Signals are reliable.\n"
+else
+    tipSess += "Filter disabled — all signals fire.\n"
+tipSess += "\n▸ WHY IT MATTERS\n"
+tipSess += "80%+ of institutional volume occurs in\n"
+tipSess += "RTH. Off-hours signals often trigger\n"
+tipSess += "on thin-book stop runs that reverse\n"
+tipSess += "immediately at the open."
+
+string regimeTxt = inTrend ? "TREND" : "RANGE"
+string tipRegime = "📈 MARKET REGIME\n"
+tipRegime += _sep + "\n"
+tipRegime += "Regime: " + regimeStr + "\n"
+tipRegime += "ADX: " + str.tostring(adx, "#.#") + " (threshold: " + str.tostring(trendThresh, "#.#") + ")\n"
+tipRegime += "Phase: " + phaseTxt + "\n"
+tipRegime += _sepThin + "\n"
+tipRegime += "ADX < " + str.tostring(trendThresh, "#") + ": RANGE — Mean-reversion\n"
+tipRegime += "  setups dominate. Fade extremes.\n"
+tipRegime += "ADX ≥ " + str.tostring(trendThresh, "#") + ": TREND — Momentum\n"
+tipRegime += "  continuation setups dominate.\n"
+tipRegime += _sepThin + "\n"
+tipRegime += "▸ REGIME TACTICS\n"
+if inTrend
+    tipRegime += "TREND: Trade pullbacks to signal line\nin direction of bias. Extremes may extend.\nDon't fade too early.\n"
+else
+    tipRegime += "RANGE: Fade extremes aggressively.\nMean-reversion has highest edge here.\nTighten stops, take profits at zero.\n"
+tipRegime += "\n▸ TRAP AWARENESS\n"
+tipRegime += "Regime transitions are where most\n"
+tipRegime += "retail gets trapped. Watch for ADX\n"
+tipRegime += "curling from <20 → regime shift coming."
+
+string biasTxt  = dirBull ? "BULL" : "BEAR"
+string tipBias = "🧭 DIRECTIONAL BIAS\n"
+tipBias += _sep + "\n"
+tipBias += "Bias: " + biasTxt + "\n"
+tipBias += biasDetail + "\n"
+tipBias += _sepThin + "\n"
+tipBias += "+DI measures upward directional\n"
+tipBias += "movement. -DI measures downward.\n"
+tipBias += "When +DI > -DI = bullish bias.\n"
+tipBias += "When -DI > +DI = bearish bias.\n"
+tipBias += "\n"
+tipBias += "Spread magnitude shows conviction:\n"
+tipBias += "• |Spread| > 10 = moderate conviction\n"
+tipBias += "• |Spread| > 20 = strong conviction\n"
+tipBias += "• |Spread| < 5  = no real edge\n"
+tipBias += _sepThin + "\n"
+tipBias += "Current Spread: " + str.tostring(math.abs(diff), "#.#") + "\n"
+if math.abs(diff) > 20
+    tipBias += "Strong directional conviction"
+else if math.abs(diff) > 10
+    tipBias += "Moderate conviction"
+else
+    tipBias += "Weak — likely range/chop environment"
+
+string tipADX = "💪 ADX — Trend Strength Index\n"
+tipADX += _sep + "\n"
+tipADX += "Value: " + str.tostring(adx, "#.#") + "\n"
+tipADX += "Reading: " + regimeStr + "\n"
+tipADX += _sepThin + "\n"
+tipADX += "ADX measures trend STRENGTH, not\n"
+tipADX += "direction. It's the smoothed DX.\n"
+tipADX += "\n"
+tipADX += "  0-15: Very weak / dead range\n"
+tipADX += " 15-25: Emerging (watch for breakout)\n"
+tipADX += " 25-40: Healthy trend\n"
+tipADX += " 40-60: Strong trend (caution on fades)\n"
+tipADX += "   60+: Extreme (rare, exhaustion likely)\n"
+tipADX += _sepThin + "\n"
+tipADX += "▸ INSTITUTIONAL READ\n"
+tipADX += "Rising ADX from <20 = new trend forming.\n"
+tipADX += "  → Best breakout signals\n"
+tipADX += "Falling ADX from >40 = trend weakening.\n"
+tipADX += "  → Prepare for range or reversal\n"
+tipADX += "ADX flat <20 = accumulation/distribution.\n"
+tipADX += "  → Big move brewing, direction TBD"
+
+string tipZen = "🌀 ZENITH — Directional Momentum\n"
+tipZen += _sep + "\n"
+tipZen += "Value: " + str.tostring(zenRaw, "#.##") + "\n"
+tipZen += "Signal: " + str.tostring(zenSig, "#.##") + "\n"
+tipZen += "Formula: " + zenMode + "\n"
+tipZen += "Zone: " + zoneTxt + "\n"
+tipZen += _sepThin + "\n"
+tipZen += "Zenith combines directional movement\n"
+tipZen += "(DI spread) with trend strength into\n"
+tipZen += "a single signed oscillator.\n"
+tipZen += "\n"
+tipZen += "• Above zero = net bullish momentum\n"
+tipZen += "• Below zero = net bearish momentum\n"
+tipZen += "• Above band = overbought extreme\n"
+tipZen += "• Below band = oversold extreme\n"
+tipZen += "• Cross signal = momentum shifting\n"
+tipZen += _sepThin + "\n"
+tipZen += "▸ KEY LEVELS\n"
+tipZen += "Upper Band: " + str.tostring(upper, "#.##") + "\n"
+tipZen += "Extreme Upper: " + str.tostring(extremeUpper, "#.##") + "\n"
+tipZen += "Zero Line: Mean reversion target\n"
+tipZen += "Extreme Lower: " + str.tostring(extremeLower, "#.##") + "\n"
+tipZen += "Lower Band: " + str.tostring(lower, "#.##")
+
+string tipVel = "⚡ VELOCITY — Rate of Change\n"
+tipVel += _sep + "\n"
+tipVel += "Velocity: " + str.tostring(zenVel, "#.###") + "\n"
+tipVel += "Acceleration: " + str.tostring(zenAcc, "#.####") + "\n"
+tipVel += "State: " + velStr + "\n"
+tipVel += _sepThin + "\n"
+tipVel += "Velocity = Zenith[0] - Zenith[1]\n"
+tipVel += "Acceleration = Velocity[0] - Velocity[1]\n"
+tipVel += "\n"
+tipVel += "VELOCITY tells you WHO is winning NOW:\n"
+tipVel += "• Positive = bulls pushing harder\n"
+tipVel += "• Negative = bears pushing harder\n"
+tipVel += "• Flipping = momentum shifting\n"
+tipVel += "\n"
+tipVel += "ACCELERATION tells you if they're\n"
+tipVel += "gaining or losing steam:\n"
+tipVel += "• Vel+ / Acc+ = bulls accelerating\n"
+tipVel += "• Vel+ / Acc- = bulls decelerating\n"
+tipVel += "• Vel- / Acc- = bears accelerating\n"
+tipVel += "• Vel- / Acc+ = bears decelerating\n"
+tipVel += _sepThin + "\n"
+tipVel += "▸ EDGE: Velocity flip at extremes is\n"
+tipVel += "the earliest reversal signal. It fires\n"
+tipVel += "BEFORE the signal line cross."
+
+string tipExh = "🔥 EXHAUSTION DETECTOR\n"
+tipExh += _sep + "\n"
+tipExh += "Score: " + str.tostring(exhaustScore, "#") + "/100\n"
+tipExh += _sepThin + "\n"
+tipExh += "Exhaustion fires when:\n"
+tipExh += "• Zenith is in OB AND velocity is\n"
+tipExh += "  negative (distribution underway)\n"
+tipExh += "  — OR —\n"
+tipExh += "• Zenith is in OS AND velocity is\n"
+tipExh += "  positive (accumulation underway)\n"
+tipExh += "\n"
+if exhaustScore > 0
+    tipExh += "⚠ EXHAUSTION ACTIVE!\n"
+    tipExh += "The dominant side is losing steam at\n"
+    tipExh += "an extreme. This is where institutional\n"
+    tipExh += "reversals begin. Smart money is already\n"
+    tipExh += "positioning against the crowd.\n"
+else
+    tipExh += "✓ No exhaustion detected.\n"
+    tipExh += "Momentum is either not at extreme or\n"
+    tipExh += "velocity hasn't flipped yet.\n"
+tipExh += _sepThin + "\n"
+tipExh += "▸ MARKET MICROSTRUCTURE\n"
+tipExh += "Exhaustion = passive limit orders\n"
+tipExh += "absorbing aggressive market orders.\n"
+tipExh += "The price stops moving despite volume.\n"
+tipExh += "This is absorption → reversal sequence."
+
+string tipOBStatus = "🟠 OVERBOUGHT STATUS\n"
+tipOBStatus += _sep + "\n"
+tipOBStatus += "In OB Zone: " + (nearOB ? "YES" : "NO") + "\n"
+tipOBStatus += "Beyond Band: " + (inOB ? "YES" : "NO") + "\n"
+tipOBStatus += "Zenith: " + str.tostring(zenRaw, "#.##") + "\n"
+tipOBStatus += "OB Threshold: " + str.tostring(extremeUpper, "#.##") + "\n"
+tipOBStatus += "Upper Band: " + str.tostring(upper, "#.##") + "\n"
+tipOBStatus += _sepThin + "\n"
+if inOB
+    tipOBStatus += "⚠ DEEP OVERBOUGHT\n"
+    tipOBStatus += "Zenith has breached the upper band.\n"
+    tipOBStatus += "Historically, these extremes resolve\n"
+    tipOBStatus += "with a reversal or sharp pullback.\n"
+    tipOBStatus += "Do NOT chase longs here.\n"
+else if nearOB
+    tipOBStatus += "◉ APPROACHING OVERBOUGHT\n"
+    tipOBStatus += "Momentum entering the extreme zone.\n"
+    tipOBStatus += "Begin watching for peak signals.\n"
+    tipOBStatus += "Tighten long stops if positioned.\n"
+else
+    tipOBStatus += "○ Not in overbought territory.\n"
+    tipOBStatus += "Momentum has room to run upward\n"
+    tipOBStatus += "before reaching extreme levels.\n"
+tipOBStatus += "\n▸ OB zones are where institutions\n"
+tipOBStatus += "sell to retail FOMO buyers."
+
+string tipOSStatus = "🟣 OVERSOLD STATUS\n"
+tipOSStatus += _sep + "\n"
+tipOSStatus += "In OS Zone: " + (nearOS ? "YES" : "NO") + "\n"
+tipOSStatus += "Beyond Band: " + (inOS ? "YES" : "NO") + "\n"
+tipOSStatus += "Zenith: " + str.tostring(zenRaw, "#.##") + "\n"
+tipOSStatus += "OS Threshold: " + str.tostring(extremeLower, "#.##") + "\n"
+tipOSStatus += "Lower Band: " + str.tostring(lower, "#.##") + "\n"
+tipOSStatus += _sepThin + "\n"
+if inOS
+    tipOSStatus += "⚠ DEEP OVERSOLD\n"
+    tipOSStatus += "Zenith has breached the lower band.\n"
+    tipOSStatus += "Historically, these extremes resolve\n"
+    tipOSStatus += "with a reversal or sharp bounce.\n"
+    tipOSStatus += "Do NOT chase shorts here.\n"
+else if nearOS
+    tipOSStatus += "◉ APPROACHING OVERSOLD\n"
+    tipOSStatus += "Momentum entering the extreme zone.\n"
+    tipOSStatus += "Begin watching for valley signals.\n"
+    tipOSStatus += "Tighten short stops if positioned.\n"
+else
+    tipOSStatus += "○ Not in oversold territory.\n"
+    tipOSStatus += "Momentum has room to run downward\n"
+    tipOSStatus += "before reaching extreme levels.\n"
+tipOSStatus += "\n▸ OS zones are where institutions\n"
+tipOSStatus += "buy from retail panic sellers."
+
+string tipMaster = "🏆 MASTER SCORE — Composite Rating\n"
+tipMaster += _sep + "\n"
+tipMaster += "Score: " + str.tostring(masterScore, "#.#") + "/100\n"
+tipMaster += _sepThin + "\n"
+tipMaster += "COMPONENT BREAKDOWN:\n"
+tipMaster += "Strength (35%): " + str.tostring(strengthScore, "#.#") + "\n"
+tipMaster += "  → ADX trend power\n"
+tipMaster += "Momentum (25%): " + str.tostring(momentumScore, "#.#") + "\n"
+tipMaster += "  → Velocity magnitude\n"
+tipMaster += "Accel    (15%): " + str.tostring(accelScore, "#.#") + "\n"
+tipMaster += "  → Momentum acceleration\n"
+tipMaster += "Health   (25%): " + str.tostring(100 - exhaustScore, "#.#") + "\n"
+tipMaster += "  → Inverse exhaustion\n"
+tipMaster += _sepThin + "\n"
+tipMaster += "INTERPRETATION:\n"
+tipMaster += "70-100: Strong directional edge.\n"
+tipMaster += "  Trend trades have wind at their back.\n"
+tipMaster += "50-70:  Moderate. Selective entries only.\n"
+tipMaster += "30-50:  Weak. Chop likely. Reduce size.\n"
+tipMaster += " 0-30:  Exhausted or dead range.\n"
+tipMaster += "  Reversal setups may be forming.\n"
+tipMaster += _sepThin + "\n"
+tipMaster += "▸ RISK LEVEL: " + riskTxt + "\n"
+tipMaster += "▸ CONFLUENCE: " + confTxt + "\n"
+tipMaster += "▸ MARKET PHASE: " + phaseTxt
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HUD
+// ─────────────────────────────────────────────────────────────────────────────
+pos = hudPos == "Top Left" ? position.top_left : hudPos == "Bottom Left" ? position.bottom_left : hudPos == "Bottom Right" ? position.bottom_right : hudPos == "Middle Left" ? position.middle_left : position.top_right
+
+var table hud = table.new(pos, 12, 1, border_width=1, frame_color=color.new(color.black, 80), border_color=color.new(color.black, 80))
+
+valBg(c) => color.new(c, 60)
+scoreCol(x) => x >= 70 ? color.new(color.lime, 0) : x >= 50 ? color.new(color.yellow, 0) : color.new(color.red, 0)
+
+if showHUD and barstate.islast
+    table.clear(hud, 0, 0, 11, 0)
+    table.cell(hud, 0,  0, "TF:" + tfTxt, text_color=color.white, bgcolor=valBg(tfMatch ? color.orange : color.gray), text_size=txtSize, tooltip=tipTF)
+    table.cell(hud, 1,  0, modeTxt, text_color=color.white, bgcolor=valBg(signalMode == "Instant Cross" ? color.aqua : color.purple), text_size=txtSize, tooltip=tipMode)
+    table.cell(hud, 2,  0, sessTxt, text_color=color.white, bgcolor=valBg(inSession ? color.lime : color.gray), text_size=txtSize, tooltip=tipSess)
+    table.cell(hud, 3,  0, "REG:" + regimeTxt, text_color=color.white, bgcolor=valBg(inTrend ? color.lime : color.gray), text_size=txtSize, tooltip=tipRegime)
+    table.cell(hud, 4,  0, "BIAS:" + biasTxt, text_color=color.white, bgcolor=valBg(dirBull ? color.lime : color.red), text_size=txtSize, tooltip=tipBias)
+    table.cell(hud, 5,  0, "ADX:" + str.tostring(adx, "#.#"), text_color=color.white, bgcolor=valBg(scoreCol(strengthScore)), text_size=txtSize, tooltip=tipADX)
+    table.cell(hud, 6,  0, "ZEN:" + str.tostring(zenRaw, "#.#"), text_color=color.white, bgcolor=valBg(dirBull ? color.lime : color.red), text_size=txtSize, tooltip=tipZen)
+    table.cell(hud, 7,  0, "VEL:" + str.tostring(zenVel, "#.##"), text_color=color.white, bgcolor=valBg(scoreCol(momentumScore)), text_size=txtSize, tooltip=tipVel)
+    table.cell(hud, 8,  0, "EXH:" + str.tostring(exhaustScore, "#"), text_color=color.white, bgcolor=valBg(scoreCol(100 - exhaustScore)), text_size=txtSize, tooltip=tipExh)
+    table.cell(hud, 9,  0, "OB:" + (nearOB ? "●" : "○"), text_color=color.white, bgcolor=valBg(nearOB ? color.orange : color.gray), text_size=txtSize, tooltip=tipOBStatus)
+    table.cell(hud, 10, 0, "OS:" + (nearOS ? "●" : "○"), text_color=color.white, bgcolor=valBg(nearOS ? color.fuchsia : color.gray), text_size=txtSize, tooltip=tipOSStatus)
+    table.cell(hud, 11, 0, "M:" + str.tostring(masterScore, "#"), text_color=color.white, bgcolor=valBg(scoreCol(masterScore)), text_size=txtSize, tooltip=tipMaster)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+hline(0, "Zero", color=color.new(color.gray, 70))
+
+plot(zenRaw, "Zenith", linewidth=2, color=zenColor)
+plot(zenSig, "Signal", linewidth=1, color=color.new(color.white, 35))
+
+pU = plot(showBands ? upper : na, "Upper Band", color=color.new(color.gray, 55))
+pL = plot(showBands ? lower : na, "Lower Band", color=color.new(color.gray, 55))
+fill(pU, pL, color = showBands ? color.new(color.gray, 92) : na)
+
+plot(showBands ? extremeUpper : na, "Extreme Upper", color=color.new(color.orange, 70), style=plot.style_linebr)
+plot(showBands ? extremeLower : na, "Extreme Lower", color=color.new(color.fuchsia, 70), style=plot.style_linebr)
+
+// ── Extreme Dots (with tooltip labels) ──
+var int barsSinceOBDot = 1000000
+var int barsSinceOSDot = 1000000
+barsSinceOBDot := barsSinceOBDot + 1
+barsSinceOSDot := barsSinceOSDot + 1
+
+obDotFire = showExtremeDots and inOB and (obDotCooldown == 0 or barsSinceOBDot >= obDotCooldown)
+osDotFire = showExtremeDots and inOS and (osDotCooldown == 0 or barsSinceOSDot >= osDotCooldown)
+
+if obDotFire
+    barsSinceOBDot := 0
+if osDotFire
+    barsSinceOSDot := 0
+
+// Extreme dots — single clean icon with tooltip (no background)
+if obDotFire
+    label.new(bar_index, zenRaw, "●", tooltip=obDotTip, style=label.style_none, textcolor=color.new(color.orange, 0), size=size.normal)
+
+if osDotFire
+    label.new(bar_index, zenRaw, "●", tooltip=osDotTip, style=label.style_none, textcolor=color.new(color.fuchsia, 0), size=size.normal)
+
+// ── Peak/Valley Signals — single clean icon with tooltip (no background) ──
+sigSize = signalSize == "Tiny" ? size.tiny : signalSize == "Small" ? size.small : size.normal
+
+// Instant Cross mode — labels at zenRaw value
+if showSignals and peakSignal and signalMode == "Instant Cross"
+    label.new(bar_index, zenRaw, "▼", tooltip=peakTip, style=label.style_none, textcolor=color.new(color.red, 0), size=sigSize)
+if showSignals and valleySignal and signalMode == "Instant Cross"
+    label.new(bar_index, zenRaw, "▲", tooltip=valleyTip, style=label.style_none, textcolor=color.new(color.lime, 0), size=sigSize)
+
+// Confirmed Pivot mode — labels offset to pivot bar
+if showSignals and peakSignal and signalMode == "Confirmed Pivot"
+    label.new(bar_index - zenPivotRight, zenRaw[zenPivotRight], "▼", tooltip=peakTip, style=label.style_none, textcolor=color.new(color.red, 0), size=sigSize)
+if showSignals and valleySignal and signalMode == "Confirmed Pivot"
+    label.new(bar_index - zenPivotRight, zenRaw[zenPivotRight], "▲", tooltip=valleyTip, style=label.style_none, textcolor=color.new(color.lime, 0), size=sigSize)
+
+// DI/ADX optional
+plot(showDI  ? plus  : na, "+DI", color=color.new(color.blue, 0))
+plot(showDI  ? minus : na, "-DI", color=color.new(color.orange, 0))
+plot(showADX ? adx   : na, "ADX", color=color.new(color.fuchsia, 0))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(valleySignal, title="Falcon Valley", message="Falcon: Momentum valley in extreme - potential long")
+alertcondition(peakSignal,   title="Falcon Peak",   message="Falcon: Momentum peak in extreme - potential short")
+alertcondition(nearOB and not nearOB[1], title="Entering OB Zone", message="Falcon: Entering overbought zone")
+alertcondition(nearOS and not nearOS[1], title="Entering OS Zone", message="Falcon: Entering oversold zone")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DATA WINDOW
+// ─────────────────────────────────────────────────────────────────────────────
+plot(sigCrossDown ? 1 : 0, "Signal Cross Down", display=display.data_window)
+plot(sigCrossUp ? 1 : 0, "Signal Cross Up", display=display.data_window)
+plot(nearOB ? 1 : 0, "Near OB", display=display.data_window)
+plot(nearOS ? 1 : 0, "Near OS", display=display.data_window)
+plot(wasInUpperExtreme ? 1 : 0, "Was In Upper Extreme", display=display.data_window)
+plot(wasInLowerExtreme ? 1 : 0, "Was In Lower Extreme", display=display.data_window)
+plot(instantPeakSignal ? 1 : 0, "Instant Peak Raw", display=display.data_window)
+plot(instantValleySignal ? 1 : 0, "Instant Valley Raw", display=display.data_window)
+plot(inSession ? 1 : 0, "In Session", display=display.data_window)

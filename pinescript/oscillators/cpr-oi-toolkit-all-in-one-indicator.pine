@@ -1,0 +1,452 @@
+//@version=6
+indicator("CPR OI Toolkit", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// EMA Settings
+ema1Length = input.int(9, "EMA 1 (Fast)", minval=1, group="EMA Settings")
+ema2Length = input.int(21, "EMA 2 (Medium)", minval=1, group="EMA Settings")
+ema3Length = input.int(50, "EMA 3 (Slow)", minval=1, group="EMA Settings")
+
+// Filter Mode Selection
+filterMode = input.string("Stochastic", "Filter Mode", options=["Stochastic", "ADX"], group="Filter Settings", tooltip="Choose between Stochastic or ADX for entry confirmation")
+enableBreakout = input.bool(true, "Enable Breakout Confirmation", group="Filter Settings", tooltip="Require price to break previous high/low for entry")
+breakoutLookback = input.int(10, "Breakout Lookback Period", minval=2, maxval=100, group="Filter Settings", tooltip="Number of bars to look back for swing high/low")
+
+// Stochastic Settings
+stochLength = input.int(14, "Stochastic %K Length", minval=1, group="Stochastic Settings")
+stochSmoothK = input.int(3, "Stochastic %K Smoothing", minval=1, group="Stochastic Settings")
+stochSmoothD = input.int(3, "Stochastic %D Smoothing", minval=1, group="Stochastic Settings")
+stochOverbought = input.int(80, "Overbought Level", minval=50, maxval=100, group="Stochastic Settings")
+stochOversold = input.int(20, "Oversold Level", minval=0, maxval=50, group="Stochastic Settings")
+
+// ADX Settings
+adxLength = input.int(14, "ADX Length", minval=1, group="ADX Settings")
+enableAdxFilter = input.bool(true, "Enable ADX Filter", group="ADX Settings", tooltip="Apply ADX threshold check regardless of filter mode")
+adxThreshold = input.int(20, "ADX Threshold", minval=1, group="ADX Settings", tooltip="Minimum ADX value required for trade entry (applies when ADX filter enabled)")
+
+// Exit Settings
+exitOnlyOnEMACross = input.bool(true, "Exit ONLY on EMA Cross", group="Exit Settings", tooltip="If enabled, ATR Trailing Stop will be for reference only. Entry will only close on EMA1/2 crossover.")
+exitOnEMACross = input.bool(true, "EMA 1/2 Cross Exit", group="Exit Settings", tooltip="Exit Long when EMA1 crosses below EMA2, Exit Short when EMA1 crosses above EMA2")
+
+// ATR Trailing Stop Settings
+atrLength = input.int(14, "ATR Length", minval=1, group="ATR Settings")
+atrMultiplier = input.float(2.0, "ATR Multiplier", minval=0.1, step=0.1, group="ATR Settings")
+
+// Mean Reversion Settings
+enableReversion = input.bool(false, "Enable Mean Reversion Mode", group="Mean Reversion", tooltip="Catch reversions when price deviates from EMA2")
+reversionPercent = input.float(3.0, "Reversion Threshold %", minval=0.5, step=0.5, group="Mean Reversion", tooltip="% deviation from EMA2 to trigger reversion signal")
+
+// CPR Settings
+group_cpr = "CPR Settings"
+show_daily_cpr = input.bool(true, "Show Daily CPR", group=group_cpr)
+show_cpr_targets = input.bool(true, "Show CPR Targets (R1/S1, R2/S2)", group=group_cpr)
+cpr_color = input.color(color.new(color.blue, 50), "CPR Color", group=group_cpr)
+target_color = input.color(color.new(color.gray, 60), "Target Color", group=group_cpr)
+enable_cpr_filter = input.bool(true, "Use CPR for Entry Confirmation", group=group_cpr, tooltip="Long above TC, Short below BC")
+
+// Open Interest Settings
+group_oi = "Open Interest Settings"
+show_oi_dashboard = input.bool(true, "Show OI in Dashboard", group=group_oi)
+enable_oi_bar_color = input.bool(true, "Enable OI Bar Coloring", group=group_oi, tooltip="Color bars based on Accumulation vs Unwinding")
+oi_analysis_lookback = input.int(5, "OI Change Lookback", minval=1, group=group_oi, tooltip="Check OI change over X bars for status interpretation")
+
+// Alert Settings
+enableAlerts = input.bool(true, "Enable Alerts", group="Alerts")
+
+// ═══════════════════════════════════════════════════════════════════════
+// INDICATOR CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+// EMAs
+ema1 = ta.ema(close, ema1Length)
+ema2 = ta.ema(close, ema2Length)
+ema3 = ta.ema(close, ema3Length)
+
+// EMA Alignment
+bullishAlignment = ema1 > ema2 and ema2 > ema3
+bearishAlignment = ema1 < ema2 and ema2 < ema3
+
+// Stochastic Calculation
+stochK = ta.sma(ta.stoch(close, high, low, stochLength), stochSmoothK)
+stochD = ta.sma(stochK, stochSmoothD)
+
+// Stochastic Signals
+stochBuySignal = ta.crossover(stochK, stochD) and stochK < stochOversold
+stochSellSignal = ta.crossunder(stochK, stochD) and stochK > stochOverbought
+stochBullish = stochK > stochD and stochK < stochOverbought
+stochBearish = stochK < stochD and stochK > stochOversold
+
+// ADX Calculation
+[diPlus, diMinus, adx] = ta.dmi(adxLength, adxLength)
+
+// ADX Signals
+adxActive = adx > adxThreshold
+adxBullish = adxActive and diPlus > diMinus
+adxBearish = adxActive and diMinus > diPlus
+
+// ATR Calculation
+atr = ta.atr(atrLength)
+
+// CPR Calculations (Daily)
+[d_high, d_low, d_close] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+pivot = (d_high + d_low + d_close) / 3
+bc = (d_high + d_low) / 2
+tc = (pivot - bc) + pivot
+
+// CPR Targets
+r1 = (2 * pivot) - d_low
+s1 = (2 * pivot) - d_high
+r2 = pivot + (d_high - d_low)
+s2 = pivot - (d_high - d_low)
+
+// Open Interest Calculation
+oi_ticker = ticker.new(syminfo.prefix, syminfo.ticker + "_OI")
+oi_raw = request.security(oi_ticker, "D", close, ignore_invalid_symbol=true)
+oi = na(oi_raw) ? 0 : oi_raw
+oi_prev = nz(oi[oi_analysis_lookback], 0)
+oi_change = oi - oi_prev
+oi_percent_change = oi_prev != 0 ? (oi_change / oi_prev) * 100 : 0
+oi_available = not na(oi_raw)
+
+// OI Status Logic
+oi_status = "Neutral"
+if close > close[oi_analysis_lookback] and oi_change > 0
+    oi_status := "Long Accumulation"
+else if close < close[oi_analysis_lookback] and oi_change > 0
+    oi_status := "Short Accumulation"
+else if close > close[oi_analysis_lookback] and oi_change < 0
+    oi_status := "Short Covering"
+else if close < close[oi_analysis_lookback] and oi_change < 0
+    oi_status := "Long Unwinding"
+
+// Breakout Detection
+prevHighValue = ta.highest(high, breakoutLookback)
+prevLowValue = ta.lowest(low, breakoutLookback)
+breakoutLong = close > prevHighValue[1]  // Current close breaks previous high
+breakoutShort = close < prevLowValue[1]  // Current close breaks previous low
+
+// CPR Filters
+cpr_long_ok = not enable_cpr_filter or close > math.max(tc, bc)
+cpr_short_ok = not enable_cpr_filter or close < math.min(tc, bc)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ENTRY SIGNAL LOGIC
+// ═══════════════════════════════════════════════════════════════════════
+
+// PRIMARY ENTRY LOGIC:
+// 1. Filter Signal: Stochastic bullish OR ADX directional signal
+// 2. EMA Confirmation: MUST have EMA1 > EMA2 > EMA3 (long) or reverse (short)
+// 3. Breakout Confirmation: Price breaks previous high (long) or low (short)
+// 4. ADX Filter: Optional check that ADX > threshold (applies to both modes)
+
+// ═══════════════════════════════════════════════════════════════════════
+// CYCLE TRACKING (SETUP -> CONFIRMATION -> EXIT)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Detect Stochastic Crossovers for setup
+stochCrossover = ta.crossover(stochK, stochD)
+stochCrossunder = ta.crossunder(stochK, stochD)
+
+// EMA Exit Conditions
+emaExitLong = ta.crossunder(ema1, ema2)
+emaExitShort = ta.crossover(ema1, ema2)
+
+// Mode variables to track if we are currently in a "Stochastic-initiated" cycle
+var bool stochBullishSetup = false
+var bool stochBearishSetup = false
+
+if stochCrossover
+    stochBullishSetup := true
+    stochBearishSetup := false
+
+if stochCrossunder
+    stochBearishSetup := true
+    stochBullishSetup := false
+
+// Reset setup if EMA exit occurs (User: "exit only on emas")
+if emaExitLong
+    stochBullishSetup := false
+if emaExitShort
+    stochBearishSetup := false
+
+// Entry Signals Variables
+var bool longSignal = false
+var bool shortSignal = false
+
+// Requirement: Stochastic setup found + EMA confirmation + Breakout + CPR
+longSignal := stochBullishSetup and bullishAlignment and breakoutLong and cpr_long_ok
+shortSignal := stochBearishSetup and bearishAlignment and breakoutShort and cpr_short_ok
+
+// Apply optional ADX filter
+if enableAdxFilter
+    longSignal := longSignal and adxActive
+    shortSignal := shortSignal and adxActive
+
+// Mean Reversion Signals
+var bool reversionLong = false
+var bool reversionShort = false
+
+if enableReversion
+    // Price deviation from EMA2
+    deviationPercent = ((close - ema2) / ema2) * 100
+    
+    // Reversion long: Price significantly below EMA2, but showing bounce
+    reversionLong := deviationPercent < -reversionPercent and close > open and (stochK < stochOversold or adxActive)
+    
+    // Reversion short: Price significantly above EMA2, but showing rejection
+    reversionShort := deviationPercent > reversionPercent and close < open and (stochK > stochOverbought or adxActive)
+
+// Combined Signals
+finalLongSignal = enableReversion ? (longSignal or reversionLong) : longSignal
+finalShortSignal = enableReversion ? (shortSignal or reversionShort) : shortSignal
+
+// ═══════════════════════════════════════════════════════════════════════
+// ATR TRAILING STOP
+// ═══════════════════════════════════════════════════════════════════════
+
+var float longTrailStop = na
+var float shortTrailStop = na
+var bool inLongPosition = false
+var bool inShortPosition = false
+
+// Track position state
+if finalLongSignal and not inLongPosition
+    inLongPosition := true
+    inShortPosition := false
+    longTrailStop := close - (atr * atrMultiplier)
+
+if finalShortSignal and not inShortPosition
+    inShortPosition := true
+    inLongPosition := false
+    shortTrailStop := close + (atr * atrMultiplier)
+
+// Update trailing stops
+if inLongPosition
+    newStop = close - (atr * atrMultiplier)
+    longTrailStop := na(longTrailStop) ? newStop : math.max(longTrailStop, newStop)
+    
+    // EMA Cross Exit for Long
+    emaCrossExitLong = exitOnEMACross and ta.crossunder(ema1, ema2)
+    
+    // Exit Condition Selection
+    exitTriggerLong = exitOnlyOnEMACross ? emaCrossExitLong : (close < longTrailStop or emaCrossExitLong)
+    
+    // Exit if triggered
+    if exitTriggerLong
+        inLongPosition := false
+        longTrailStop := na
+
+if inShortPosition
+    newStop = close + (atr * atrMultiplier)
+    shortTrailStop := na(shortTrailStop) ? newStop : math.min(shortTrailStop, newStop)
+    
+    // EMA Cross Exit for Short
+    emaCrossExitShort = exitOnEMACross and ta.crossover(ema1, ema2)
+    
+    // Exit Condition Selection
+    exitTriggerShort = exitOnlyOnEMACross ? emaCrossExitShort : (close > shortTrailStop or emaCrossExitShort)
+    
+    // Exit if triggered
+    if exitTriggerShort
+        inShortPosition := false
+        shortTrailStop := na
+
+// ═══════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Plot EMAs
+plot(ema1, "EMA 1", color=color.new(color.blue, 0), linewidth=2)
+plot(ema2, "EMA 2", color=color.new(color.orange, 0), linewidth=2)
+plot(ema3, "EMA 3", color=color.new(color.red, 0), linewidth=2)
+
+// Plot Breakout Levels (if enabled)
+plot(enableBreakout ? prevHighValue : na, "Breakout High Target", color=color.new(color.green, 50), style=plot.style_stepline, linewidth=1)
+plot(enableBreakout ? prevLowValue : na, "Breakout Low Target", color=color.new(color.red, 50), style=plot.style_stepline, linewidth=1)
+
+// Plot Trailing Stops
+plot(inLongPosition ? longTrailStop : na, "Long Trail Stop", color=color.new(color.red, 0), style=plot.style_stepline, linewidth=2)
+plot(inShortPosition ? shortTrailStop : na, "Short Trail Stop", color=color.new(color.green, 0), style=plot.style_stepline, linewidth=2)
+
+// Plot CPR
+plot(show_daily_cpr ? (tc > bc ? tc : bc) : na, "TC", color=cpr_color, style=plot.style_linebr)
+plot(show_daily_cpr ? pivot : na, "Pivot", color=cpr_color, style=plot.style_linebr, linewidth=2)
+plot(show_daily_cpr ? (tc > bc ? bc : tc) : na, "BC", color=cpr_color, style=plot.style_linebr)
+
+// Plot CPR Targets
+plot(show_cpr_targets ? r1 : na, "R1", color=target_color, style=plot.style_linebr)
+plot(show_cpr_targets ? s1 : na, "S1", color=target_color, style=plot.style_linebr)
+plot(show_cpr_targets ? r2 : na, "R2", color=target_color, style=plot.style_linebr)
+plot(show_cpr_targets ? s2 : na, "S2", color=target_color, style=plot.style_linebr)
+
+// Background for EMA alignment
+bgcolor(bullishAlignment ? color.new(color.green, 95) : bearishAlignment ? color.new(color.red, 95) : na, title="EMA Alignment")
+
+// Entry Signal Markers
+plotshape(finalLongSignal, "Long Signal", shape.triangleup, location.belowbar, color=color.new(color.lime, 0), size=size.small, text="BUY")
+plotshape(finalShortSignal, "Short Signal", shape.triangledown, location.abovebar, color=color.new(color.red, 0), size=size.small, text="SELL")
+
+// Setup Phase Markers (Small dots to show when setup starts)
+plotshape(stochCrossover, "Long Setup Start", shape.circle, location.belowbar, color=color.new(color.blue, 50), size=size.tiny)
+plotshape(stochCrossunder, "Short Setup Start", shape.circle, location.abovebar, color=color.new(color.orange, 50), size=size.tiny)
+
+// OI Bar Coloring
+oi_bar_color = oi_status == "Long Accumulation" ? color.new(color.lime, 50) : 
+               oi_status == "Short Accumulation" ? color.new(color.red, 50) : 
+               oi_status == "Short Covering" ? color.new(color.yellow, 70) : 
+               oi_status == "Long Unwinding" ? color.new(color.orange, 70) : na
+
+barcolor(enable_oi_bar_color and oi_available ? oi_bar_color : na, title="OI Status Bar Color")
+
+// Exit Signal Markers
+plotshape(emaExitLong and inLongPosition[1], "Long Exit", shape.circle, location.abovebar, color=color.new(color.orange, 0), size=size.small, text="EXIT")
+plotshape(emaExitShort and inShortPosition[1], "Short Exit", shape.circle, location.belowbar, color=color.new(color.fuchsia, 0), size=size.small, text="EXIT")
+
+// Mean Reversion Markers (if enabled)
+plotshape(enableReversion and reversionLong, "Reversion Long", shape.circle, location.belowbar, color=color.new(color.aqua, 0), size=size.small, text="R")
+plotshape(enableReversion and reversionShort, "Reversion Short", shape.circle, location.abovebar, color=color.new(color.fuchsia, 0), size=size.small, text="R")
+
+// ═══════════════════════════════════════════════════════════════════════
+// STOCHASTIC PANEL
+// ═══════════════════════════════════════════════════════════════════════
+
+// Plot Stochastic in separate panel (only if Stochastic mode)
+hline(stochOverbought, "Overbought", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+hline(stochOversold, "Oversold", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(50, "Midline", color=color.new(color.gray, 70))
+
+stochKPlot = plot(filterMode == "Stochastic" ? stochK : na, "%K", color=color.new(color.blue, 0), linewidth=2)
+stochDPlot = plot(filterMode == "Stochastic" ? stochD : na, "%D", color=color.new(color.orange, 0), linewidth=1)
+fill(stochKPlot, stochDPlot, color=stochK > stochD ? color.new(color.green, 80) : color.new(color.red, 80))
+
+// ═══════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════
+
+var table dashboard = table.new(position.top_right, 2, 22, border_width=1)
+
+if barstate.islast
+    table.cell(dashboard, 0, 0, "Filter Mode", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(dashboard, 1, 0, filterMode, bgcolor=color.new(color.blue, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 1, "ADX Filter", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    adxFilterStatus = enableAdxFilter ? (adxActive ? "ON (" + str.tostring(adx, "#.#") + ")" : "ON (" + str.tostring(adx, "#.#") + " <" + str.tostring(adxThreshold) + ")") : "OFF"
+    table.cell(dashboard, 1, 1, adxFilterStatus, bgcolor=enableAdxFilter ? (adxActive ? color.new(color.green, 70) : color.new(color.orange, 70)) : color.new(color.gray, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 2, "EMA Alignment", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    emaStatus = bullishAlignment ? "BULLISH ↑" : bearishAlignment ? "BEARISH ↓" : "NEUTRAL"
+    table.cell(dashboard, 1, 2, emaStatus, bgcolor=bullishAlignment ? color.new(color.green, 70) : bearishAlignment ? color.new(color.red, 70) : color.new(color.gray, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 3, "Breakout", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    breakoutStatus = enableBreakout ? (breakoutLong ? "LONG ↑" : breakoutShort ? "SHORT ↓" : "NONE") : "OFF"
+    table.cell(dashboard, 1, 3, breakoutStatus, bgcolor=enableBreakout ? (breakoutLong ? color.new(color.green, 70) : breakoutShort ? color.new(color.red, 70) : color.new(color.gray, 70)) : color.new(color.gray, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 4, "Stoch Setup", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    setupStatus = stochBullishSetup ? "BULLISH" : stochBearishSetup ? "BEARISH" : "NONE"
+    table.cell(dashboard, 1, 4, setupStatus, bgcolor=stochBullishSetup ? color.new(color.green, 70) : stochBearishSetup ? color.new(color.red, 70) : color.new(color.gray, 70), text_color=color.white)
+
+    if filterMode == "Stochastic"
+        table.cell(dashboard, 0, 5, "Stoch %K", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 5, str.tostring(stochK, "#.##"), bgcolor=color.new(color.blue, 70), text_color=color.white)
+        
+        table.cell(dashboard, 0, 6, "Stoch %D", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 6, str.tostring(stochD, "#.##"), bgcolor=color.new(color.orange, 70), text_color=color.white)
+        
+        table.cell(dashboard, 0, 7, "Stoch Crs", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        stochSignalState = stochK > stochD ? "K > D" : "D > K"
+        table.cell(dashboard, 1, 7, stochSignalState, bgcolor=stochK > stochD ? color.new(color.green, 70) : color.new(color.red, 70), text_color=color.white)
+    else
+        table.cell(dashboard, 0, 4, "ADX", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 4, str.tostring(adx, "#.##"), bgcolor=adxActive ? color.new(color.green, 70) : color.new(color.red, 70), text_color=color.white)
+        
+        table.cell(dashboard, 0, 5, "DI+", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 5, str.tostring(diPlus, "#.##"), bgcolor=color.new(color.green, 80), text_color=color.white)
+        
+        table.cell(dashboard, 0, 6, "DI-", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 6, str.tostring(diMinus, "#.##"), bgcolor=color.new(color.red, 80), text_color=color.white)
+    
+    table.cell(dashboard, 0, 7, "ATR", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(dashboard, 1, 7, str.tostring(atr, "#.##"), bgcolor=color.new(color.blue, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 8, "Position", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    posStatus = inLongPosition ? "LONG" : inShortPosition ? "SHORT" : "FLAT"
+    table.cell(dashboard, 1, 8, posStatus, bgcolor=inLongPosition ? color.new(color.green, 70) : inShortPosition ? color.new(color.red, 70) : color.new(color.gray, 70), text_color=color.white)
+    
+    // CPR Dashboard Info
+    table.cell(dashboard, 0, 9, "CPR Relation", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    cprRel = close > math.max(tc, bc) ? "Above CPR ↑" : close < math.min(tc, bc) ? "Below CPR ↓" : "Inside CPR ↔"
+    cprBg = close > math.max(tc, bc) ? color.new(color.green, 70) : close < math.min(tc, bc) ? color.new(color.red, 70) : color.new(color.orange, 70)
+    table.cell(dashboard, 1, 9, cprRel, bgcolor=cprBg, text_color=color.white)
+
+    // CPR Targets in Dashboard
+    if show_cpr_targets
+        table.cell(dashboard, 0, 10, "Target R1 / S1", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 10, str.tostring(r1, "#.##") + " / " + str.tostring(s1, "#.##"), bgcolor=color.new(color.gray, 80), text_color=color.white)
+        table.cell(dashboard, 0, 11, "Target R2 / S2", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 11, str.tostring(r2, "#.##") + " / " + str.tostring(s2, "#.##"), bgcolor=color.new(color.gray, 80), text_color=color.white)
+
+    // OI Dashboard Info
+    if show_oi_dashboard
+        table.cell(dashboard, 0, 12, "Open Interest", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 12, oi_available ? str.tostring(oi, "#.##") : "N/A", bgcolor=color.new(color.blue, 70), text_color=color.white)
+        
+        table.cell(dashboard, 0, 13, "OI Change %", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 13, oi_available ? str.tostring(oi_percent_change, "#.##") + "%" : "N/A", bgcolor=oi_available ? (oi_change > 0 ? color.new(color.green, 70) : color.new(color.red, 70)) : color.new(color.gray, 70), text_color=color.white)
+        
+        table.cell(dashboard, 0, 14, "OI Status", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        oiStatColor = not oi_available ? color.new(color.gray, 70) : (oi_status == "Long Accumulation" or oi_status == "Short Covering") ? color.new(color.green, 70) : (oi_status == "Short Accumulation" or oi_status == "Long Unwinding") ? color.new(color.red, 70) : color.new(color.gray, 70)
+        table.cell(dashboard, 1, 14, oi_available ? oi_status : "N/A", bgcolor=oiStatColor, text_color=color.white)
+
+    // Show active trailing stop OR calculated stop for next trade
+    table.cell(dashboard, 0, 15, "Trail Stop", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    stopValue = inLongPosition ? longTrailStop : inShortPosition ? shortTrailStop : na
+    calculatedLongStop = close - (atr * atrMultiplier)
+    calculatedShortStop = close + (atr * atrMultiplier)
+    displayStop = not na(stopValue) ? str.tostring(stopValue, "#.##") : "L:" + str.tostring(calculatedLongStop, "#.##") + " S:" + str.tostring(calculatedShortStop, "#.##")
+    table.cell(dashboard, 1, 15, displayStop, bgcolor=not na(stopValue) ? color.new(color.orange, 70) : color.new(color.gray, 80), text_color=color.white)
+    
+    table.cell(dashboard, 0, 16, "Mean Reversion", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(dashboard, 1, 16, enableReversion ? "ON" : "OFF", bgcolor=enableReversion ? color.new(color.green, 70) : color.new(color.gray, 70), text_color=color.white)
+    
+    if enableReversion
+        deviationPercent = ((close - ema2) / ema2) * 100
+        table.cell(dashboard, 0, 17, "Deviation %", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(dashboard, 1, 17, str.tostring(deviationPercent, "#.##") + "%", bgcolor=color.new(color.blue, 70), text_color=color.white)
+    
+    table.cell(dashboard, 0, 18, "EMA 1", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(dashboard, 1, 18, str.tostring(ema1, "#.##"), bgcolor=color.new(color.blue, 80), text_color=color.white)
+    
+    table.cell(dashboard, 0, 19, "EMA 2", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(dashboard, 1, 19, str.tostring(ema2, "#.##"), bgcolor=color.new(color.orange, 80), text_color=color.white)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+
+if enableAlerts
+    // Long Entry Alert
+    if finalLongSignal
+        alertMessage = enableReversion and reversionLong ? "REVERSION LONG Signal | Price: " + str.tostring(close, "#.##") + " | EMA2: " + str.tostring(ema2, "#.##") : "LONG Signal | " + filterMode + " confirmed | EMA Bullish | Price: " + str.tostring(close, "#.##")
+        alert(alertMessage, alert.freq_once_per_bar)
+    
+    // Short Entry Alert
+    if finalShortSignal
+        alertMessage = enableReversion and reversionShort ? "REVERSION SHORT Signal | Price: " + str.tostring(close, "#.##") + " | EMA2: " + str.tostring(ema2, "#.##") : "SHORT Signal | " + filterMode + " confirmed | EMA Bearish | Price: " + str.tostring(close, "#.##")
+        alert(alertMessage, alert.freq_once_per_bar)
+    
+    // EMA Alignment Change
+    if bullishAlignment and not bullishAlignment[1]
+        alert("EMA Alignment: BULLISH - EMA1 > EMA2 > EMA3", alert.freq_once_per_bar)
+    
+    if bearishAlignment and not bearishAlignment[1]
+        alert("EMA Alignment: BEARISH - EMA1 < EMA2 < EMA3", alert.freq_once_per_bar)
+    
+    // Trailing Stop Hit
+    if inLongPosition[1] and not inLongPosition
+        alert("Long Position CLOSED - Trailing Stop Hit @ " + str.tostring(longTrailStop[1], "#.##"), alert.freq_once_per_bar)
+    
+    if inShortPosition[1] and not inShortPosition
+        alert("Short Position CLOSED - Trailing Stop Hit @ " + str.tostring(shortTrailStop[1], "#.##"), alert.freq_once_per_bar)

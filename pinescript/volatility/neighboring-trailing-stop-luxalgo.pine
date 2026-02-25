@@ -1,0 +1,143 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Neighboring Trailing Stop [LuxAlgo]", "LuxAlgo - Neighboring Trailing Stop", overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color NONE       = color.new(color.white, 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int bufferSizeInput    = input.int(200, "Historical Buffer (Bars)", minval = 100, maxval = 20000, tooltip = "Number of historical bars to keep in the price distribution.")
+int kInput             = input.int(50,   "Neighboring Range (K)",   minval = 5,   tooltip = "Number of neighbors to check on each side of the current price position in the sorted distribution.")
+float percentileInput  = input.float(90, "Percentile",               minval = 1,   maxval = 99, tooltip = "Percentile rank used for the bands. 50 is the median. Lower values make the lower band lower and the upper band higher.")
+int smoothInput        = input.int(5,    "Smoothing",               minval = 1,   tooltip = "SMA smoothing applied to the band averages before trailing stop calculation.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> priceArray  = array.new<float>()
+var array<float> sortedArray = array.new<float>()
+
+// Helper to remove a value from the sorted distribution
+removeValue(float val) =>
+    if not na(val) and array.size(sortedArray) > 0
+        int idx = array.binary_search_leftmost(sortedArray, val)
+        if idx < array.size(sortedArray) and array.get(sortedArray, idx) == val
+            array.remove(sortedArray, idx)
+
+// Helper to add a value to the sorted distribution
+addValue(float val) =>
+    if not na(val)
+        int idx = 0
+        if array.size(sortedArray) > 0
+            idx := array.binary_search_leftmost(sortedArray, val)
+            if val > array.get(sortedArray, idx)
+                idx += 1
+        array.insert(sortedArray, idx, val)
+
+// Custom helper to get percentile from an array (assumes array is already sorted)
+getPercentile(float[] arr, float p) =>
+    float result = na
+    int size = array.size(arr)
+    if size > 0
+        float idx = (size - 1) * p / 100
+        int i1 = math.floor(idx)
+        int i2 = math.ceil(idx)
+        if i1 == i2
+            result := array.get(arr, i1)
+        else
+            float v1 = array.get(arr, i1)
+            float v2 = array.get(arr, i2)
+            result := v1 + (v2 - v1) * (idx - i1)
+    result
+
+// 1. Calculate historical neighborhood percentiles (no bias)
+float bearVal = na
+float bullVal = na
+
+if array.size(sortedArray) > 5 
+    int idx = array.binary_search_leftmost(sortedArray, close)
+    // Lower neighborhood (Bearish Band)
+    int bearStart = math.max(0, idx - kInput)
+    if idx > bearStart
+        float[] bearSlice = array.slice(sortedArray, bearStart, idx)
+        // Inverted: higher percentile means further from price (lower value)
+        bearVal := getPercentile(bearSlice, 100 - percentileInput)
+
+    // Higher neighborhood (Bullish Band)
+    int bullEnd = math.min(array.size(sortedArray) - 1, idx + kInput)
+    if bullEnd > idx
+        float[] bullSlice = array.slice(sortedArray, idx, bullEnd + 1)
+        // Upper: higher percentile means further from price (higher value)
+        bullVal := getPercentile(bullSlice, percentileInput)
+
+// 2. Update buffer for next bar
+if array.size(priceArray) >= bufferSizeInput
+    float oldVal = array.shift(priceArray)
+    removeValue(oldVal)
+
+array.push(priceArray, close)
+addValue(close)
+
+// Smoothing
+float finalBull = ta.sma(bullVal, smoothInput)
+float finalBear = ta.sma(bearVal, smoothInput)
+
+// --- Trailing Stop Logic ---
+var int trend = 0
+var float ts  = na
+
+// Discovery states
+bool discoveryBull = na(bullVal) and not na(bearVal)
+bool discoveryBear = na(bearVal) and not na(bullVal)
+
+// User-defined Trend Logic (Discovery Reversals)
+trend := discoveryBull ? 1 : discoveryBear ? -1 : trend
+
+// Trend Reversal Actions
+if trend > trend[1]
+    ts := nz(finalBear, low)
+    label.new(bar_index, ts, "B", color = BULL_COLOR, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+if trend < trend[1]
+    ts := nz(finalBull, high)
+    label.new(bar_index, ts, "S", color = BEAR_COLOR, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+
+// Update trailing stop value
+if trend == 1
+    ts := math.max(nz(finalBear, ts), ts)
+else if trend == -1
+    ts := math.min(nz(finalBull, ts), ts)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plotPrice = plot(close, "Price", display = display.none)
+
+// Trailing Stop Line with Cuts
+tsValue = trend != trend[1] ? na : ts
+plotTS  = plot(tsValue, "Trailing Stop", color = trend == 1 ? BULL_COLOR : BEAR_COLOR, style = plot.style_linebr, linewidth = 2)
+
+// Discovery Dots
+plot(discoveryBull or discoveryBear ? tsValue : na, "Discovery Marker", color = trend == 1 ? BULL_COLOR : BEAR_COLOR, style = plot.style_circles, linewidth = 2)
+
+// Trailing Stop Vertical Gradient: Less transparent near price (50%), more transparent near stop (100%)
+// Use color.gray when price is on the 'wrong' side of the stop
+color bullPriceColor = close < tsValue ? color.gray : BULL_COLOR
+color bearPriceColor = close > tsValue ? color.gray : BEAR_COLOR
+
+fill(plotPrice, plotTS, close, tsValue, 
+     trend == 1 ? color.new(bullPriceColor, 50) : na, 
+     trend == 1 ? color.new(bullPriceColor, 100) : na, "Bullish Trailing Fill")
+
+fill(plotTS, plotPrice, tsValue, close, 
+     trend == -1 ? color.new(bearPriceColor, 100) : na, 
+     trend == -1 ? color.new(bearPriceColor, 50) : na, "Bearish Trailing Fill")
+
+//---------------------------------------------------------------------------------------------------------------------}

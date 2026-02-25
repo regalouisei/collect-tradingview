@@ -1,0 +1,744 @@
+//@version=5
+indicator("AIO Master Suite: Moving Averages & Oscillators", overlay=true) 
+
+sz = input.string("Normal", title = "Table Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], display = display.data_window)
+
+calc_mma(src, len) =>
+    ma = ta.sma(src, len)
+    mma = ((ma[1] * (len - 1)) + src) / len
+    mma
+
+// Kaufman Adaptive MA
+calc_kama(src, len) =>
+    xvnoise = math.abs(src - src[1])
+    nfastend = 0.666
+    nslowend = 0.0645
+    nsignal = math.abs(src - src[len])
+    nnoise = math.sum(xvnoise, len)
+    nefratio = nnoise != 0 ? nsignal / nnoise : 0
+    nsmooth = math.pow(nefratio * (nfastend - nslowend) + nslowend, 2)
+    var float kama = na
+    kama := na(kama[1]) ? src : nz(kama[1]) + nsmooth * (src - nz(kama[1]))
+    kama
+
+// VIDYA
+calc_vidya(src, len) =>
+    mom = ta.change(src)
+    upSum = math.sum(math.max(mom, 0), 9)
+    downSum = math.sum(math.max(-mom, 0), 9)
+    out = downSum == 0 ? 100 : 100 - (100 / (1 + upSum / downSum))
+    cmo = math.abs(out / 100 - 0.5) * 2
+    alpha = 2 / (len + 1)
+    var float vidya = na
+    vidya := na(vidya[1]) ? src : alpha * cmo * src + (1 - alpha * cmo) * nz(vidya[1])
+    vidya
+
+// FRAMA
+calc_frama(src, len, FC, SC) =>
+    len1 = math.floor(len / 2)
+    w = math.log(2 / (SC + 1))
+    H1 = ta.highest(high, len1)
+    L1 = ta.lowest(low, len1)
+    N1 = (H1 - L1) / len1
+    H2 = ta.highest(high, len)[len1]
+    L2 = ta.lowest(low, len)[len1]
+    N2 = (H2 - L2) / len1
+    H3 = ta.highest(high, len)
+    L3 = ta.lowest(low, len)
+    N3 = (H3 - L3) / len
+    dimen1 = (math.log(N1 + N2) - math.log(N3)) / math.log(2)
+    var float dimen = na
+    dimen := (N1 > 0 and N2 > 0 and N3 > 0) ? dimen1 : nz(dimen[1])
+    alpha1 = math.exp(w * (dimen - 1))
+    oldalpha = alpha1 > 1 ? 1 : (alpha1 < 0.01 ? 0.01 : alpha1)
+    oldN = (2 - oldalpha) / oldalpha
+    N = (((SC - FC) * (oldN - 1)) / (SC - 1)) + FC
+    alpha_ = 2 / (N + 1)
+    alpha = alpha_ < 2 / (SC + 1) ? 2 / (SC + 1) : (alpha_ > 1 ? 1 : alpha_)
+    var float out = na
+    out := (1 - alpha) * nz(out[1]) + alpha * src
+    out
+
+// Geometric MA
+calc_gma(src, len) =>
+    log_sum = math.sum(math.log(src), len)
+    math.exp(log_sum / len)
+
+// Tilson T3
+calc_t3(src, len, b) =>
+    c1 = -b*b*b
+    c2 = 3*b*b+3*b*b*b
+    c3 = -6*b*b-3*b-3*b*b*b
+    c4 = 1+3*b+b*b*b+3*b*b
+    e1 = ta.ema(src, len)
+    e2 = ta.ema(e1, len)
+    e3 = ta.ema(e2, len)
+    e4 = ta.ema(e3, len)
+    e5 = ta.ema(e4, len)
+    e6 = ta.ema(e5, len)
+    c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3
+
+// Hull MA
+calc_hma(src, len) =>
+    ta.wma(2 * ta.wma(src, len / 2) - ta.wma(src, len), math.floor(math.sqrt(len)))
+
+// Jurik MA
+calc_jma(src, len, phase, power) =>
+    phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+    beta = 0.45 * (len - 1) / (0.45 * (len - 1) + 2)
+    alpha = math.pow(beta, power)
+    var float e0 = 0.0
+    e0 := (1 - alpha) * src + alpha * nz(e0[1])
+    var float e1 = 0.0
+    e1 := (src - e0) * (1 - beta) + beta * nz(e1[1])
+    var float jma = 0.0
+    var float e2 = 0.0
+    e2 := (e0 + phaseRatio * e1 - nz(jma[1])) * math.pow(1 - alpha, 2) + math.pow(alpha, 2) * nz(e2[1])
+    jma := e2 + nz(jma[1])
+    jma
+
+// McGinley
+calc_mcginley(src, len) =>
+    var float mg = na
+    mg := na(mg[1]) ? src : nz(mg[1]) + (src - nz(mg[1])) / (len * math.pow(src / nz(mg[1]), 4))
+    mg
+
+// LSMA
+calc_lsma(src, len) => ta.linreg(src, len, 0)
+
+// Median
+calc_median(src, len) => ta.median(src, len)
+
+// TMA
+calc_tma(src, len) => ta.sma(ta.sma(src, math.ceil(len / 2)), math.floor(len / 2) + 1)
+
+// Zero Lag EMA
+calc_zlema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    diff = ema1 - ema2
+    ema1 + diff
+
+// Super Smoother
+calc_supersmoother(src, len) =>
+    a1 = math.exp(-1.414 * 3.14159 / len)
+    b1 = 2 * a1 * math.cos(1.414 * 3.14159 / len)
+    c2 = b1
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
+    var float ss = na
+    ss := c1 * (src + nz(src[1])) / 2 + c2 * nz(ss[1]) + c3 * nz(ss[2])
+    ss
+
+// --- Oscillator Helpers ---
+round_(val) => val > .99 ? .999 : val < -.99 ? -.999 : val
+
+updown(s) =>
+    isEqual = s == s[1]
+    isGrowing = s > s[1]
+    ud = 0.0
+    ud := isEqual ? 0 : isGrowing ? (nz(ud[1]) <= 0 ? 1 : nz(ud[1]) + 1) : (nz(ud[1]) >= 0 ? -1 : nz(ud[1]) - 1)
+    ud
+
+uo_avg(l) => ta.sma(close - math.min(low, close[1]), l) / ta.sma(math.max(high, close[1]) - math.min(low, close[1]), l)
+
+calc_cmf(len) =>
+    ad = close == high and close == low or high == low ? 0 : ((2 * close - low - high) / (high - low)) * volume
+    math.sum(ad, len) / math.sum(volume, len)
+
+calc_rvi(len) =>
+    num = (close - open) + 2 * (close[1] - open[1]) + 2 * (close[2] - open[2]) + (close[3] - open[3])
+    den = (high - low) + 2 * (high[1] - low[1]) + 2 * (high[2] - low[2]) + (high[3] - low[3])
+    rvi = ta.sma(num, len) / ta.sma(den, len)
+    sig = (rvi + 2 * rvi[1] + 2 * rvi[2] + rvi[3]) / 6
+    [rvi, sig]
+
+calc_vortex(len) =>
+    vmp = math.abs(high - low[1])
+    vmm = math.abs(low - high[1])
+    str = ta.atr(1)
+    vip = math.sum(vmp, len) / math.sum(str, len)
+    vim = math.sum(vmm, len) / math.sum(str, len)
+    [vip, vim]
+
+// ==============================================================================
+// 2. INPUTS
+// ==============================================================================
+
+// --- Global MA Settings ---
+t3_vfactor = input.float(0.7, "T3 Volume Factor", group="Global MA Params", display=display.none)
+alma_offset = input.float(0.85, "ALMA Offset", group="Global MA Params", display=display.none)
+alma_sigma = input.float(6, "ALMA Sigma", group="Global MA Params", display=display.none)
+jma_phase = input.int(50, "JMA Phase", group="Global MA Params", display=display.none)
+jma_power = input.int(2, "JMA Power", group="Global MA Params", display=display.none)
+frama_FC = input.int(1, "FRAMA Fast Constant", group="Global MA Params", display=display.none)
+frama_SC = input.int(198, "FRAMA Slow Constant", group="Global MA Params", display=display.none)
+
+// --- MA Slots (1-20) ---
+// MA 1
+show_ma1 = input.bool(true, "MA 1", group="Moving Averages", inline="ma1", display=display.none)
+type_ma1 = input.string("Exponential Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma1", display=display.none)
+len_ma1 = input.int(5, "", group="Moving Averages", inline="ma1", display=display.none)
+src_ma1 = input.source(close, "", group="Moving Averages", inline="ma1", display=display.none)
+col_ma1 = input.color(color.yellow, "", group="Moving Averages", inline="ma1", display=display.none)
+
+// MA 2
+show_ma2 = input.bool(true, "MA 2", group="Moving Averages", inline="ma2", display=display.none)
+type_ma2 = input.string("Exponential Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma2", display=display.none)
+len_ma2 = input.int(8, "", group="Moving Averages", inline="ma2", display=display.none)
+src_ma2 = input.source(close, "", group="Moving Averages", inline="ma2", display=display.none)
+col_ma2 = input.color(color.orange, "", group="Moving Averages", inline="ma2", display=display.none)
+
+// MA 3
+show_ma3 = input.bool(true, "MA 3", group="Moving Averages", inline="ma3", display=display.none)
+type_ma3 = input.string("Exponential Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma3", display=display.none)
+len_ma3 = input.int(13, "", group="Moving Averages", inline="ma3", display=display.none)
+src_ma3 = input.source(close, "", group="Moving Averages", inline="ma3", display=display.none)
+col_ma3 = input.color(color.red, "", group="Moving Averages", inline="ma3", display=display.none)
+
+// MA 4
+show_ma4 = input.bool(false, "MA 4", group="Moving Averages", inline="ma4", display=display.none)
+type_ma4 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma4", display=display.none)
+len_ma4 = input.int(50, "", group="Moving Averages", inline="ma4", display=display.none)
+src_ma4 = input.source(close, "", group="Moving Averages", inline="ma4", display=display.none)
+col_ma4 = input.color(color.blue, "", group="Moving Averages", inline="ma4", display=display.none)
+
+// MA 5
+show_ma5 = input.bool(false, "MA 5", group="Moving Averages", inline="ma5", display=display.none)
+type_ma5 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma5", display=display.none)
+len_ma5 = input.int(200, "", group="Moving Averages", inline="ma5", display=display.none)
+src_ma5 = input.source(close, "", group="Moving Averages", inline="ma5", display=display.none)
+col_ma5 = input.color(color.white, "", group="Moving Averages", inline="ma5", display=display.none)
+
+// MA 6
+show_ma6 = input.bool(false, "MA 6", group="Moving Averages", inline="ma6", display=display.none)
+type_ma6 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma6", display=display.none)
+len_ma6 = input.int(21, "", group="Moving Averages", inline="ma6", display=display.none)
+src_ma6 = input.source(close, "", group="Moving Averages", inline="ma6", display=display.none)
+col_ma6 = input.color(color.purple, "", group="Moving Averages", inline="ma6", display=display.none)
+
+// MA 7
+show_ma7 = input.bool(false, "MA 7", group="Moving Averages", inline="ma7", display=display.none)
+type_ma7 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma7", display=display.none)
+len_ma7 = input.int(34, "", group="Moving Averages", inline="ma7", display=display.none)
+src_ma7 = input.source(close, "", group="Moving Averages", inline="ma7", display=display.none)
+col_ma7 = input.color(color.fuchsia, "", group="Moving Averages", inline="ma7", display=display.none)
+
+// MA 8
+show_ma8 = input.bool(false, "MA 8", group="Moving Averages", inline="ma8", display=display.none)
+type_ma8 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma8", display=display.none)
+len_ma8 = input.int(55, "", group="Moving Averages", inline="ma8", display=display.none)
+src_ma8 = input.source(close, "", group="Moving Averages", inline="ma8", display=display.none)
+col_ma8 = input.color(color.green, "", group="Moving Averages", inline="ma8", display=display.none)
+
+// MA 9
+show_ma9 = input.bool(false, "MA 9", group="Moving Averages", inline="ma9", display=display.none)
+type_ma9 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma9", display=display.none)
+len_ma9 = input.int(89, "", group="Moving Averages", inline="ma9", display=display.none)
+src_ma9 = input.source(close, "", group="Moving Averages", inline="ma9", display=display.none)
+col_ma9 = input.color(color.lime, "", group="Moving Averages", inline="ma9", display=display.none)
+
+// MA 10
+show_ma10 = input.bool(false, "MA 10", group="Moving Averages", inline="ma10", display=display.none)
+type_ma10 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma10", display=display.none)
+len_ma10 = input.int(144, "", group="Moving Averages", inline="ma10", display=display.none)
+src_ma10 = input.source(close, "", group="Moving Averages", inline="ma10", display=display.none)
+col_ma10 = input.color(color.maroon, "", group="Moving Averages", inline="ma10", display=display.none)
+
+// MA 11
+show_ma11 = input.bool(false, "MA 11", group="Moving Averages", inline="ma11", display=display.none)
+type_ma11 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma11", display=display.none)
+len_ma11 = input.int(10, "", group="Moving Averages", inline="ma11", display=display.none)
+src_ma11 = input.source(close, "", group="Moving Averages", inline="ma11", display=display.none)
+col_ma11 = input.color(color.navy, "", group="Moving Averages", inline="ma11", display=display.none)
+
+// MA 12
+show_ma12 = input.bool(false, "MA 12", group="Moving Averages", inline="ma12", display=display.none)
+type_ma12 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma12", display=display.none)
+len_ma12 = input.int(20, "", group="Moving Averages", inline="ma12", display=display.none)
+src_ma12 = input.source(close, "", group="Moving Averages", inline="ma12", display=display.none)
+col_ma12 = input.color(color.olive, "", group="Moving Averages", inline="ma12", display=display.none)
+
+// MA 13
+show_ma13 = input.bool(false, "MA 13", group="Moving Averages", inline="ma13", display=display.none)
+type_ma13 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma13", display=display.none)
+len_ma13 = input.int(30, "", group="Moving Averages", inline="ma13", display=display.none)
+src_ma13 = input.source(close, "", group="Moving Averages", inline="ma13", display=display.none)
+col_ma13 = input.color(color.teal, "", group="Moving Averages", inline="ma13", display=display.none)
+
+// MA 14
+show_ma14 = input.bool(false, "MA 14", group="Moving Averages", inline="ma14", display=display.none)
+type_ma14 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma14", display=display.none)
+len_ma14 = input.int(40, "", group="Moving Averages", inline="ma14", display=display.none)
+src_ma14 = input.source(close, "", group="Moving Averages", inline="ma14", display=display.none)
+col_ma14 = input.color(color.aqua, "", group="Moving Averages", inline="ma14", display=display.none)
+
+// MA 15
+show_ma15 = input.bool(false, "MA 15", group="Moving Averages", inline="ma15", display=display.none)
+type_ma15 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma15", display=display.none)
+len_ma15 = input.int(60, "", group="Moving Averages", inline="ma15", display=display.none)
+src_ma15 = input.source(close, "", group="Moving Averages", inline="ma15", display=display.none)
+col_ma15 = input.color(color.silver, "", group="Moving Averages", inline="ma15", display=display.none)
+
+// MA 16
+show_ma16 = input.bool(false, "MA 16", group="Moving Averages", inline="ma16", display=display.none)
+type_ma16 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma16", display=display.none)
+len_ma16 = input.int(70, "", group="Moving Averages", inline="ma16", display=display.none)
+src_ma16 = input.source(close, "", group="Moving Averages", inline="ma16", display=display.none)
+col_ma16 = input.color(color.gray, "", group="Moving Averages", inline="ma16", display=display.none)
+
+// MA 17
+show_ma17 = input.bool(false, "MA 17", group="Moving Averages", inline="ma17", display=display.none)
+type_ma17 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma17", display=display.none)
+len_ma17 = input.int(80, "", group="Moving Averages", inline="ma17", display=display.none)
+src_ma17 = input.source(close, "", group="Moving Averages", inline="ma17", display=display.none)
+col_ma17 = input.color(color.black, "", group="Moving Averages", inline="ma17", display=display.none)
+
+// MA 18
+show_ma18 = input.bool(false, "MA 18", group="Moving Averages", inline="ma18", display=display.none)
+type_ma18 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma18", display=display.none)
+len_ma18 = input.int(90, "", group="Moving Averages", inline="ma18", display=display.none)
+src_ma18 = input.source(close, "", group="Moving Averages", inline="ma18", display=display.none)
+col_ma18 = input.color(color.white, "", group="Moving Averages", inline="ma18", display=display.none)
+
+// MA 19
+show_ma19 = input.bool(false, "MA 19", group="Moving Averages", inline="ma19", display=display.none)
+type_ma19 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma19", display=display.none)
+len_ma19 = input.int(100, "", group="Moving Averages", inline="ma19", display=display.none)
+src_ma19 = input.source(close, "", group="Moving Averages", inline="ma19", display=display.none)
+col_ma19 = input.color(color.yellow, "", group="Moving Averages", inline="ma19", display=display.none)
+
+// MA 20
+show_ma20 = input.bool(false, "MA 20", group="Moving Averages", inline="ma20", display=display.none)
+type_ma20 = input.string("Simple Moving Average", "", options=["Simple Moving Average", "Exponential Moving Average", "Weighted Moving Average", "Rolling Moving Average", "Modified Moving Average", "Kaufman Adaptive Moving Average", "Variable Index Dynamic Average", "Fractal Adaptive Moving Average", "Geometric Moving Average", "Tilson T3", "Hull Moving Average", "Jurik Moving Average", "McGinley Dynamic", "Least Squares Moving Average", "Arnaud Legoux Moving Average", "Median", "Triangular Moving Average", "Zero-Lag Exponential Moving Average", "Super Smoother"], group="Moving Averages", inline="ma20", display=display.none)
+len_ma20 = input.int(120, "", group="Moving Averages", inline="ma20", display=display.none)
+src_ma20 = input.source(close, "", group="Moving Averages", inline="ma20", display=display.none)
+col_ma20 = input.color(color.orange, "", group="Moving Averages", inline="ma20", display=display.none)
+
+
+// --- Oscillator Inputs ---
+// RSI
+show_rsi = input.bool(true, "RSI", group="Oscillators", inline="rsi", display=display.none)
+rsi_len = input.int(14, "Len", group="Oscillators", inline="rsi", display=display.none)
+rsi_src = input.source(close, "Src", group="Oscillators", inline="rsi", display=display.none)
+
+// Stochastic
+show_stoch = input.bool(false, "Stoch", group="Oscillators", inline="stoch", display=display.none)
+stoch_k = input.int(14, "K", group="Oscillators", inline="stoch", display=display.none)
+stoch_d = input.int(3, "D", group="Oscillators", inline="stoch", display=display.none)
+stoch_smooth = input.int(3, "Sm", group="Oscillators", inline="stoch", display=display.none)
+
+// Stoch RSI
+show_stochrsi = input.bool(false, "Stoch RSI", group="Oscillators", inline="stochrsi", display=display.none)
+stochrsi_len = input.int(14, "Len", group="Oscillators", inline="stochrsi", display=display.none)
+stochrsi_k = input.int(3, "K", group="Oscillators", inline="stochrsi", display=display.none)
+stochrsi_d = input.int(3, "D", group="Oscillators", inline="stochrsi", display=display.none)
+stochrsi_stoch_len = input.int(14, "StLen", group="Oscillators", inline="stochrsi", display=display.none)
+
+// CCI
+show_cci = input.bool(false, "CCI", group="Oscillators", inline="cci", display=display.none)
+cci_len = input.int(20, "Len", group="Oscillators", inline="cci", display=display.none)
+
+// Williams %R
+show_wpr = input.bool(false, "Will %R", group="Oscillators", inline="wpr", display=display.none)
+wpr_len = input.int(14, "Len", group="Oscillators", inline="wpr", display=display.none)
+
+// Momentum
+show_mom = input.bool(false, "Momentum", group="Oscillators", inline="mom", display=display.none)
+mom_len = input.int(10, "Len", group="Oscillators", inline="mom", display=display.none)
+
+// PPO
+show_ppo = input.bool(false, "PPO", group="Oscillators", inline="ppo", display=display.none)
+ppo_fast = input.int(12, "Fast", group="Oscillators", inline="ppo", display=display.none)
+ppo_slow = input.int(26, "Slow", group="Oscillators", inline="ppo", display=display.none)
+ppo_sig = input.int(9, "Sig", group="Oscillators", inline="ppo", display=display.none)
+
+// Ultimate
+show_uo = input.bool(false, "Ult Osc", group="Oscillators", inline="uo", display=display.none)
+uo_len1 = input.int(7, "L1", group="Oscillators", inline="uo", display=display.none)
+uo_len2 = input.int(14, "L2", group="Oscillators", inline="uo", display=display.none)
+uo_len3 = input.int(28, "L3", group="Oscillators", inline="uo", display=display.none)
+
+// CMO
+show_cmo = input.bool(false, "CMO", group="Oscillators", inline="cmo", display=display.none)
+cmo_len = input.int(9, "Len", group="Oscillators", inline="cmo", display=display.none)
+
+// Connors RSI
+show_crsi = input.bool(false, "Connors RSI", group="Oscillators", inline="crsi", display=display.none)
+crsi_len = input.int(3, "Len", group="Oscillators", inline="crsi", display=display.none)
+
+// TSI
+show_tsi = input.bool(false, "TSI", group="Oscillators", inline="tsi", display=display.none)
+tsi_long = input.int(25, "L", group="Oscillators", inline="tsi", display=display.none)
+tsi_short = input.int(13, "S", group="Oscillators", inline="tsi", display=display.none)
+
+// MACD
+show_macd = input.bool(true, "MACD", group="Oscillators", inline="macd", display=display.none)
+macd_fast = input.int(12, "F", group="Oscillators", inline="macd", display=display.none)
+macd_slow = input.int(26, "S", group="Oscillators", inline="macd", display=display.none)
+macd_sig = input.int(9, "Sig", group="Oscillators", inline="macd", display=display.none)
+
+// ATR
+show_atr = input.bool(false, "ATR", group="Oscillators", inline="atr", display=display.none)
+atr_len = input.int(14, "Len", group="Oscillators", inline="atr", display=display.none)
+
+// MFI
+show_mfi = input.bool(true, "MFI", group="Oscillators", inline="mfi", display=display.none)
+mfi_len = input.int(14, "Len", group="Oscillators", inline="mfi", display=display.none)
+
+// CMF
+show_cmf = input.bool(true, "CMF", group="Oscillators", inline="cmf", display=display.none)
+cmf_len = input.int(20, "Len", group="Oscillators", inline="cmf", display=display.none)
+
+// ADX
+show_adx = input.bool(true, "ADX", group="Oscillators", inline="adx", display=display.none)
+adx_len = input.int(14, "Len", group="Oscillators", inline="adx", display=display.none)
+
+// RVI
+show_rvi = input.bool(false, "RVI", group="Oscillators", inline="rvi", display=display.none)
+rvi_len = input.int(10, "Len", group="Oscillators", inline="rvi", display=display.none)
+
+// TRIX
+show_trix = input.bool(false, "TRIX", group="Oscillators", inline="trix", display=display.none)
+trix_len = input.int(18, "Len", group="Oscillators", inline="trix", display=display.none)
+
+// Aroon
+show_aroon = input.bool(false, "Aroon", group="Oscillators", inline="aroon", display=display.none)
+aroon_len = input.int(14, "Len", group="Oscillators", inline="aroon", display=display.none)
+
+// Fisher
+show_fisher = input.bool(false, "Fisher", group="Oscillators", inline="fisher", display=display.none)
+fish_len = input.int(9, "Len", group="Oscillators", inline="fisher", display=display.none)
+
+// Vortex
+show_vortex = input.bool(false, "Vortex", group="Oscillators", inline="vortex", display=display.none)
+vi_len = input.int(14, "Len", group="Oscillators", inline="vortex", display=display.none)
+
+// Table Settings
+show_table = input.bool(true, "Show Dashboard", group="Table Settings", display=display.none)
+table_pos = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Center", "Middle Top", "Middle Bottom"], group="Table Settings", display=display.none)
+
+// ==============================================================================
+// 3. CALCULATIONS
+// ==============================================================================
+
+// --- MA Calculations ---
+get_ma(type, len, src) =>
+    float ma_val = na
+    switch type
+        "Simple Moving Average" => ma_val := ta.sma(src, len)
+        "Exponential Moving Average" => ma_val := ta.ema(src, len)
+        "Weighted Moving Average" => ma_val := ta.wma(src, len)
+        "Rolling Moving Average" => ma_val := ta.rma(src, len)
+        "Modified Moving Average" => ma_val := calc_mma(src, len)
+        "Kaufman Adaptive Moving Average" => ma_val := calc_kama(src, len)
+        "Variable Index Dynamic Average" => ma_val := calc_vidya(src, len)
+        "Fractal Adaptive Moving Average" => ma_val := calc_frama(src, len, frama_FC, frama_SC)
+        "Geometric Moving Average" => ma_val := calc_gma(src, len)
+        "Tilson T3" => ma_val := calc_t3(src, len, t3_vfactor)
+        "Hull Moving Average" => ma_val := calc_hma(src, len)
+        "Jurik Moving Average" => ma_val := calc_jma(src, len, jma_phase, jma_power)
+        "McGinley Dynamic" => ma_val := calc_mcginley(src, len)
+        "Least Squares Moving Average" => ma_val := calc_lsma(src, len)
+        "Arnaud Legoux Moving Average" => ma_val := ta.alma(src, len, alma_offset, alma_sigma)
+        "Median" => ma_val := calc_median(src, len)
+        "Triangular Moving Average" => ma_val := calc_tma(src, len)
+        "Zero-Lag Exponential Moving Average" => ma_val := calc_zlema(src, len)
+        "Super Smoother" => ma_val := calc_supersmoother(src, len)
+    ma_val
+
+v1 = show_ma1 ? get_ma(type_ma1, len_ma1, src_ma1) : na
+v2 = show_ma2 ? get_ma(type_ma2, len_ma2, src_ma2) : na
+v3 = show_ma3 ? get_ma(type_ma3, len_ma3, src_ma3) : na
+v4 = show_ma4 ? get_ma(type_ma4, len_ma4, src_ma4) : na
+v5 = show_ma5 ? get_ma(type_ma5, len_ma5, src_ma5) : na
+v6 = show_ma6 ? get_ma(type_ma6, len_ma6, src_ma6) : na
+v7 = show_ma7 ? get_ma(type_ma7, len_ma7, src_ma7) : na
+v8 = show_ma8 ? get_ma(type_ma8, len_ma8, src_ma8) : na
+v9 = show_ma9 ? get_ma(type_ma9, len_ma9, src_ma9) : na
+v10 = show_ma10 ? get_ma(type_ma10, len_ma10, src_ma10) : na
+v11 = show_ma11 ? get_ma(type_ma11, len_ma11, src_ma11) : na
+v12 = show_ma12 ? get_ma(type_ma12, len_ma12, src_ma12) : na
+v13 = show_ma13 ? get_ma(type_ma13, len_ma13, src_ma13) : na
+v14 = show_ma14 ? get_ma(type_ma14, len_ma14, src_ma14) : na
+v15 = show_ma15 ? get_ma(type_ma15, len_ma15, src_ma15) : na
+v16 = show_ma16 ? get_ma(type_ma16, len_ma16, src_ma16) : na
+v17 = show_ma17 ? get_ma(type_ma17, len_ma17, src_ma17) : na
+v18 = show_ma18 ? get_ma(type_ma18, len_ma18, src_ma18) : na
+v19 = show_ma19 ? get_ma(type_ma19, len_ma19, src_ma19) : na
+v20 = show_ma20 ? get_ma(type_ma20, len_ma20, src_ma20) : na
+
+// --- Oscillator Calculations ---
+// RSI
+val_rsi = show_rsi ? ta.rsi(rsi_src, rsi_len) : na
+
+// Stoch
+val_stoch_k = show_stoch ? ta.sma(ta.stoch(close, high, low, stoch_k), stoch_smooth) : na
+val_stoch_d = show_stoch ? ta.sma(val_stoch_k, stoch_d) : na
+
+// Stoch RSI
+rsi_s = show_stochrsi ? ta.rsi(close, stochrsi_len) : na
+val_srsi_k = show_stochrsi ? ta.sma(ta.stoch(rsi_s, rsi_s, rsi_s, stochrsi_stoch_len), stochrsi_k) : na
+val_srsi_d = show_stochrsi ? ta.sma(val_srsi_k, stochrsi_d) : na
+
+// CCI
+val_cci = show_cci ? ta.cci(hlc3, cci_len) : na
+
+// Williams %R
+val_wpr = show_wpr ? ta.wpr(wpr_len) : na
+
+// Momentum
+val_mom = show_mom ? ta.roc(close, mom_len) : na
+
+// PPO
+ema_f_ppo = show_ppo ? ta.ema(close, ppo_fast) : na
+ema_s_ppo = show_ppo ? ta.ema(close, ppo_slow) : na
+val_ppo = show_ppo ? ((ema_f_ppo - ema_s_ppo) / ema_s_ppo) * 100 : na
+val_ppo_sig = show_ppo ? ta.ema(val_ppo, ppo_sig) : na
+
+// Ultimate
+val_uo = show_uo ? 100 * (4 * uo_avg(uo_len1) + 2 * uo_avg(uo_len2) + uo_avg(uo_len3)) / 7 : na
+
+// CMO
+val_cmo = show_cmo ? ta.cmo(close, cmo_len) : na
+
+// Connors RSI
+float val_crsi = na
+if show_crsi
+    rsi_c = ta.rsi(close, crsi_len)
+    streak = updown(close)
+    rsi_streak = ta.rsi(streak, 2)
+    pct_rank = ta.percentrank(ta.roc(close, 1), 100)
+    val_crsi := (rsi_c + rsi_streak + pct_rank) / 3
+
+// TSI
+val_tsi = show_tsi ? ta.tsi(close, tsi_short, tsi_long) : na
+
+// MACD
+[macd_l, macd_s, macd_h] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+val_macd = show_macd ? macd_l : na
+val_macd_sig = show_macd ? macd_s : na
+val_macd_hist = show_macd ? macd_h : na
+
+// ATR
+val_atr = show_atr ? ta.atr(atr_len) : na
+
+// MFI
+val_mfi = show_mfi ? ta.mfi(hlc3, mfi_len) : na
+
+// CMF
+val_cmf = show_cmf ? calc_cmf(cmf_len) : na
+
+// ADX
+[diplus, diminus, adx_val] = ta.dmi(adx_len, 14)
+val_adx = show_adx ? adx_val : na
+val_diplus = show_adx ? diplus : na
+val_diminus = show_adx ? diminus : na
+
+// RVI
+[rvi_val, rvi_sig] = calc_rvi(rvi_len)
+val_rvi = show_rvi ? rvi_val : na
+val_rvi_sig = show_rvi ? rvi_sig : na
+
+// TRIX
+val_trix = show_trix ? 10000 * ta.change(ta.ema(ta.ema(ta.ema(math.log(close), trix_len), trix_len), trix_len)) : na
+
+// Aroon
+aroon_up = show_aroon ? 100 * (ta.highestbars(high, aroon_len) + aroon_len) / aroon_len : na
+aroon_dn = show_aroon ? 100 * (ta.lowestbars(low, aroon_len) + aroon_len) / aroon_len : na
+val_aroon = show_aroon ? aroon_up - aroon_dn : na
+
+// Fisher
+high_f = ta.highest(hl2, fish_len)
+low_f = ta.lowest(hl2, fish_len)
+var value_f = 0.0
+value_f := show_fisher ? round_(.66 * ((hl2 - low_f) / (high_f - low_f) - .5) + .67 * nz(value_f[1])) : na
+var fish1 = 0.0
+fish1 := show_fisher ? .5 * math.log((1 + value_f) / (1 - value_f)) + .5 * nz(fish1[1]) : na
+val_fisher = show_fisher ? fish1 : na
+
+// Vortex
+[vp, vm] = calc_vortex(vi_len)
+val_vortex_p = show_vortex ? vp : na
+val_vortex_m = show_vortex ? vm : na
+
+// ==============================================================================
+// 4. PLOTTING (MAs Only)
+// ==============================================================================
+
+plot(v1, "MA 1", color=col_ma1, linewidth=2)
+plot(v2, "MA 2", color=col_ma2, linewidth=2)
+plot(v3, "MA 3", color=col_ma3, linewidth=2)
+plot(v4, "MA 4", color=col_ma4, linewidth=2)
+plot(v5, "MA 5", color=col_ma5, linewidth=2)
+plot(v6, "MA 6", color=col_ma6, linewidth=2)
+plot(v7, "MA 7", color=col_ma7, linewidth=2)
+plot(v8, "MA 8", color=col_ma8, linewidth=2)
+plot(v9, "MA 9", color=col_ma9, linewidth=2)
+plot(v10, "MA 10", color=col_ma10, linewidth=2)
+plot(v11, "MA 11", color=col_ma11, linewidth=2)
+plot(v12, "MA 12", color=col_ma12, linewidth=2)
+plot(v13, "MA 13", color=col_ma13, linewidth=2)
+plot(v14, "MA 14", color=col_ma14, linewidth=2)
+plot(v15, "MA 15", color=col_ma15, linewidth=2)
+plot(v16, "MA 16", color=col_ma16, linewidth=2)
+plot(v17, "MA 17", color=col_ma17, linewidth=2)
+plot(v18, "MA 18", color=col_ma18, linewidth=2)
+plot(v19, "MA 19", color=col_ma19, linewidth=2)
+plot(v20, "MA 20", color=col_ma20, linewidth=2)
+
+// ==============================================================================
+// 5. TABLE
+// ==============================================================================
+szl = sz == "Tiny" ? size.tiny : sz == "Small" ? size.small : sz == "Normal" ? size.normal : sz == "Large" ? size.large : sz == "Hugr" ? size.huge : sz == "Auto" ? size.auto : na
+if show_table
+    var table_position = position.top_right
+    if table_pos == "Top Left"
+        table_position := position.top_left
+    else if table_pos == "Bottom Right"
+        table_position := position.bottom_right
+    else if table_pos == "Bottom Left"
+        table_position := position.bottom_left
+    else if table_pos == "Middle Center"
+        table_position := position.middle_center
+    else if table_pos == "Middle Top"
+        table_position := position.top_center
+    else if table_pos == "Middle Bottom"
+        table_position := position.bottom_center
+
+    // Create table with enough rows. 
+    var tbl = table.new(table_position, 3, 30, border_width=1)
+    
+    // Header
+    table.cell(tbl, 0, 0, "Indicator", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=szl)
+    table.cell(tbl, 1, 0, "Settings", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=szl)
+    table.cell(tbl, 2, 0, "Value", bgcolor=color.new(color.gray, 80), text_color=color.white, text_size=szl)
+
+    int r = 1 // Row counter
+
+    // --- Oscillator Rows ---
+    if show_rsi
+        table.cell(tbl, 0, r, "RSI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(rsi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_rsi, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+    
+    if show_stoch
+        table.cell(tbl, 0, r, "Stoch", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(stoch_k) + "," + str.tostring(stoch_d), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "K:" + str.tostring(val_stoch_k, "#.##") + "\nD:" + str.tostring(val_stoch_d, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_stochrsi
+        table.cell(tbl, 0, r, "Stoch RSI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(stochrsi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "K:" + str.tostring(val_srsi_k, "#.##") + "\nD:" + str.tostring(val_srsi_d, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_cci
+        table.cell(tbl, 0, r, "CCI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(cci_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_cci, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_wpr
+        table.cell(tbl, 0, r, "Will %R", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(wpr_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_wpr, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_mom
+        table.cell(tbl, 0, r, "Momentum", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(mom_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_mom, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_ppo
+        table.cell(tbl, 0, r, "PPO", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(ppo_fast) + "," + str.tostring(ppo_slow), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "P:" + str.tostring(val_ppo, "#.##") + "\nS:" + str.tostring(val_ppo_sig, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_uo
+        table.cell(tbl, 0, r, "Ult Osc", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(uo_len1) + "," + str.tostring(uo_len2), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_uo, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_cmo
+        table.cell(tbl, 0, r, "CMO", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(cmo_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_cmo, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_crsi
+        table.cell(tbl, 0, r, "Connors RSI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(crsi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_crsi, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_tsi
+        table.cell(tbl, 0, r, "TSI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(tsi_short) + "," + str.tostring(tsi_long), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_tsi, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_macd
+        table.cell(tbl, 0, r, "MACD", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(macd_fast) + "," + str.tostring(macd_slow), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "M:" + str.tostring(val_macd, "#.##") + "\nS:" + str.tostring(val_macd_sig, "#.##") + "\nH:" + str.tostring(val_macd_hist, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_atr
+        table.cell(tbl, 0, r, "ATR", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(atr_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_atr, format.mintick), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_mfi
+        table.cell(tbl, 0, r, "MFI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(mfi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_mfi, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_cmf
+        table.cell(tbl, 0, r, "CMF", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(cmf_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_cmf, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_adx
+        table.cell(tbl, 0, r, "ADX", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(adx_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "ADX:" + str.tostring(val_adx, "#.##") + "\nDI+:" + str.tostring(val_diplus, "#.##") + "\nDI-:" + str.tostring(val_diminus, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_rvi
+        table.cell(tbl, 0, r, "RVI", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(rvi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "R:" + str.tostring(val_rvi, "#.##") + "\nS:" + str.tostring(val_rvi_sig, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_trix
+        table.cell(tbl, 0, r, "TRIX", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(trix_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_trix, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_aroon
+        table.cell(tbl, 0, r, "Aroon", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(aroon_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "Up:" + str.tostring(aroon_up, "#.##") + "\nDn:" + str.tostring(aroon_dn, "#.##") + "\nVal:" + str.tostring(val_aroon, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_fisher
+        table.cell(tbl, 0, r, "Fisher", text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 1, r, str.tostring(fish_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, str.tostring(val_fisher, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1
+
+    if show_vortex
+        table.cell(tbl, 0, r, "Vortex", text_color=color.white, bgcolor=color.black, text_size=szl )
+        table.cell(tbl, 1, r, str.tostring(vi_len), text_color=color.white, bgcolor=color.black, text_size=szl)
+        table.cell(tbl, 2, r, "P:" + str.tostring(val_vortex_p, "#.##") + "\nM:" + str.tostring(val_vortex_m, "#.##"), text_color=color.white, bgcolor=color.black, text_size=szl)
+        r := r + 1

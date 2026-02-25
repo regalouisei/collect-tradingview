@@ -1,0 +1,578 @@
+// Dynamic Range Trader
+// (c) Jason Parker
+
+//@version=6
+indicator("Dynamic Range Trader", shorttitle = "DRT", overlay = true, max_labels_count = 500, max_bars_back = 5000, format = format.inherit)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// -- Band Settings --
+string grpBands     = "Band Settings"
+float  bandSource   = input.source(hlc3, "Source", group = grpBands)
+int    bandLength   = input.int(205, "Smoothing Length", minval = 10, group = grpBands, tooltip = "Length for the Butterworth filter. Higher = smoother bands.")
+float  outerMult    = input.float(2.315, "Outer Band Multiplier", minval = 0.1, step = 0.1, group = grpBands)
+float  gradSize     = input.float(0.1, "Gradient Zone Size", minval = 0.1, step = 0.1, group = grpBands)
+int    zoneTrnsp    = input.int(60, "Zone Transparency", minval = 0, maxval = 100, group = grpBands)
+
+// -- Entry Confirmation --
+string grpEntry     = "Entry Confirmation"
+float  adxThresh    = input.float(38.0, "ADX Threshold (Range < this)", minval = 5, step = 1, group = grpEntry, tooltip = "Market is considered RANGING when ADX is below this value. Signals are blocked when ADX is above.")
+int    adxLen       = input.int(14, "ADX DI Length", minval = 1, group = grpEntry)
+int    adxSmooth    = input.int(16, "ADX Smoothing", minval = 1, group = grpEntry)
+float  entryATRMult = input.float(0.3, "Entry Zone (ATR multiplier)", minval = 0.1, step = 0.1, group = grpEntry, tooltip = "How close price must be to the band to trigger. 2.0 = within 2 ATR of the band edge.")
+bool   useRSI       = input.bool(false, "Require RSI Confirmation", group = grpEntry, tooltip = "When enabled, longs require RSI < Oversold and shorts require RSI > Overbought. Disable for more trades.")
+int    rsiLen       = input.int(14, "RSI Length", minval = 1, group = grpEntry)
+int    rsiOB        = input.int(70, "RSI Overbought", minval = 50, maxval = 95, group = grpEntry)
+int    rsiOS        = input.int(30, "RSI Oversold", minval = 5, maxval = 50, group = grpEntry)
+bool   usePattern   = input.bool(false, "Require Candlestick Pattern", group = grpEntry, tooltip = "When enabled, requires engulfing or pin bar pattern. Disable for more trades (simple reversal candle color is always required).")
+int    cooldownBars = input.int(10, "Min Bars Between Trades", minval = 0, step = 1, group = grpEntry, tooltip = "Minimum number of bars that must pass after a trade entry or exit before a new trade can be taken. Prevents stacking trades.")
+
+// -- Risk & Position Sizing --
+string grpRisk      = "Risk & Position Sizing"
+float  riskPerTrade = input.float(100.0, "Risk Per Trade ($)", minval = 1, step = 10, group = grpRisk, tooltip = "The dollar amount you are willing to lose on a single trade.")
+float  buyingPower  = input.float(10000.0, "Total Buying Power ($)", minval = 1, step = 100, group = grpRisk, tooltip = "Your total available capital for position sizing.")
+
+// -- Session Filter --
+string grpSession       = "Session Filter (Optional)"
+bool   useSessionFilter = input.bool(false, "Enable Session Filter", group = grpSession)
+int    sessionStart     = input.int(930, "Session Start (HHMM)", minval = 0, maxval = 2359, group = grpSession)
+int    sessionEnd       = input.int(1600, "Session End (HHMM)", minval = 0, maxval = 2359, group = grpSession)
+
+// -- Dashboard --
+string grpDash      = "Dashboard"
+bool   showDash     = input.bool(true, "Show Dashboard", group = grpDash)
+int    dashTrades   = input.int(30, "Trades to Track", minval = 5, maxval = 200, group = grpDash)
+string dashSizeIn   = input.string("Large", "Table Size", options = ["Small", "Medium", "Large"], group = grpDash)
+
+// =============================================================================
+// BUTTERWORTH SMOOTHING FUNCTION (from Trend Resistance Bands)
+// =============================================================================
+
+precision_smooth(float _src, int _length) =>
+    float s_a1 = math.exp(-math.sqrt(2) * math.pi / _length)
+    float s_b1 = 2 * s_a1 * math.cos(math.sqrt(2) * math.pi / _length)
+    float s_c3 = -math.pow(s_a1, 2)
+    float s_c2 = s_b1
+    float s_c1 = 1 - s_c2 - s_c3
+    float ss = 0.0
+    ss := s_c1 * _src + s_c2 * nz(ss[1], _src[1]) + s_c3 * nz(ss[2], _src[2])
+    ss
+
+// =============================================================================
+// BAND CALCULATIONS
+// =============================================================================
+
+float mult2       = math.pi * outerMult
+float centerline  = precision_smooth(bandSource, bandLength)
+float windowrange = precision_smooth(ta.tr, bandLength)
+
+float bear_cw = centerline + (windowrange * mult2)
+float bull_cw = centerline - (windowrange * mult2)
+float midpoint = (bear_cw + bull_cw) / 2.0
+
+// -- Gradient Zones (Upper = Red, Lower = Green) --
+var color rColor1 = #B71C1C
+var color rColor2 = #C62828
+var color rColor3 = #D32F2F
+var color rColor4 = #E53935
+var color rColor5 = #EF5350
+var color rColor6 = #E57373
+var color rColor7 = #EF9A9A
+var color rColor8 = #FFCDD2
+
+var color gColor1 = #1B5E20
+var color gColor2 = #2E7D32
+var color gColor3 = #388E3C
+var color gColor4 = #43A047
+var color gColor5 = #66BB6A
+var color gColor6 = #81C784
+var color gColor7 = #A5D6A7
+var color gColor8 = #C8E6C9
+
+// Upper band gradient levels (bear/resistance = RED)
+float bear_g1 = bear_cw + (windowrange * gradSize * 4)
+float bear_g2 = bear_cw + (windowrange * gradSize * 3)
+float bear_g3 = bear_cw + (windowrange * gradSize * 2)
+float bear_g4 = bear_cw + (windowrange * gradSize * 1)
+float bear_g5 = bear_cw
+float bear_g6 = bear_cw - (windowrange * gradSize * 1)
+float bear_g7 = bear_cw - (windowrange * gradSize * 2)
+float bear_g8 = bear_cw - (windowrange * gradSize * 3)
+float bear_g9 = bear_cw - (windowrange * gradSize * 4)
+
+// Lower band gradient levels (bull/support = GREEN)
+float bull_g1 = bull_cw - (windowrange * gradSize * 4)
+float bull_g2 = bull_cw - (windowrange * gradSize * 3)
+float bull_g3 = bull_cw - (windowrange * gradSize * 2)
+float bull_g4 = bull_cw - (windowrange * gradSize * 1)
+float bull_g5 = bull_cw
+float bull_g6 = bull_cw + (windowrange * gradSize * 1)
+float bull_g7 = bull_cw + (windowrange * gradSize * 2)
+float bull_g8 = bull_cw + (windowrange * gradSize * 3)
+float bull_g9 = bull_cw + (windowrange * gradSize * 4)
+
+// -- Plot gradient levels (hidden, used for fills) --
+plot_bear_g1 = plot(bear_g1, color = na, editable = false, display = display.none)
+plot_bear_g2 = plot(bear_g2, color = na, editable = false, display = display.none)
+plot_bear_g3 = plot(bear_g3, color = na, editable = false, display = display.none)
+plot_bear_g4 = plot(bear_g4, color = na, editable = false, display = display.none)
+plot_bear_g5 = plot(bear_g5, color = na, editable = false, display = display.none)
+plot_bear_g6 = plot(bear_g6, color = na, editable = false, display = display.none)
+plot_bear_g7 = plot(bear_g7, color = na, editable = false, display = display.none)
+plot_bear_g8 = plot(bear_g8, color = na, editable = false, display = display.none)
+plot_bear_g9 = plot(bear_g9, color = na, editable = false, display = display.none)
+
+plot_bull_g1 = plot(bull_g1, color = na, editable = false, display = display.none)
+plot_bull_g2 = plot(bull_g2, color = na, editable = false, display = display.none)
+plot_bull_g3 = plot(bull_g3, color = na, editable = false, display = display.none)
+plot_bull_g4 = plot(bull_g4, color = na, editable = false, display = display.none)
+plot_bull_g5 = plot(bull_g5, color = na, editable = false, display = display.none)
+plot_bull_g6 = plot(bull_g6, color = na, editable = false, display = display.none)
+plot_bull_g7 = plot(bull_g7, color = na, editable = false, display = display.none)
+plot_bull_g8 = plot(bull_g8, color = na, editable = false, display = display.none)
+plot_bull_g9 = plot(bull_g9, color = na, editable = false, display = display.none)
+
+// -- Fill gradient zones: Upper = RED --
+fill(plot_bear_g1, plot_bear_g2, color = color.new(rColor1, zoneTrnsp), editable = false)
+fill(plot_bear_g2, plot_bear_g3, color = color.new(rColor2, zoneTrnsp), editable = false)
+fill(plot_bear_g3, plot_bear_g4, color = color.new(rColor3, zoneTrnsp), editable = false)
+fill(plot_bear_g4, plot_bear_g5, color = color.new(rColor4, zoneTrnsp), editable = false)
+fill(plot_bear_g5, plot_bear_g6, color = color.new(rColor5, zoneTrnsp), editable = false)
+fill(plot_bear_g6, plot_bear_g7, color = color.new(rColor6, zoneTrnsp), editable = false)
+fill(plot_bear_g7, plot_bear_g8, color = color.new(rColor7, zoneTrnsp), editable = false)
+fill(plot_bear_g8, plot_bear_g9, color = color.new(rColor8, zoneTrnsp), editable = false)
+
+// -- Fill gradient zones: Lower = GREEN --
+fill(plot_bull_g1, plot_bull_g2, color = color.new(gColor1, zoneTrnsp), editable = false)
+fill(plot_bull_g2, plot_bull_g3, color = color.new(gColor2, zoneTrnsp), editable = false)
+fill(plot_bull_g3, plot_bull_g4, color = color.new(gColor3, zoneTrnsp), editable = false)
+fill(plot_bull_g4, plot_bull_g5, color = color.new(gColor4, zoneTrnsp), editable = false)
+fill(plot_bull_g5, plot_bull_g6, color = color.new(gColor5, zoneTrnsp), editable = false)
+fill(plot_bull_g6, plot_bull_g7, color = color.new(gColor6, zoneTrnsp), editable = false)
+fill(plot_bull_g7, plot_bull_g8, color = color.new(gColor7, zoneTrnsp), editable = false)
+fill(plot_bull_g8, plot_bull_g9, color = color.new(gColor8, zoneTrnsp), editable = false)
+
+// -- Plot centerline --
+plot(centerline, "Centerline", color = color.new(color.white, 40), linewidth = 2)
+plot(midpoint, "Midpoint", color = color.new(color.gray, 70), linewidth = 1, style = plot.style_cross)
+
+// =============================================================================
+// CONFIRMATION INDICATORS
+// =============================================================================
+
+// -- RSI --
+float rsiValue = ta.rsi(close, rsiLen)
+
+// -- ADX / DMI --
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxSmooth)
+
+// -- ATR for entry zone proximity --
+float atrValue = ta.atr(14)
+
+// -- Session Filter --
+int  currentHHMM = hour * 100 + minute
+bool inSession   = not useSessionFilter or (currentHHMM >= sessionStart and currentHHMM <= sessionEnd)
+
+// =============================================================================
+// CANDLESTICK PATTERN DETECTION
+// =============================================================================
+
+// Bullish Engulfing
+bool bullEngulf = close > open[1] and open < close[1] and close > open and close[1] < open[1]
+
+// Bearish Engulfing
+bool bearEngulf = close < open[1] and open > close[1] and close < open and close[1] > open[1]
+
+// Hammer (Pin Bar)
+float bodySize    = math.abs(close - open)
+float upperWick   = high - math.max(close, open)
+float lowerWick   = math.min(close, open) - low
+bool  hammer      = lowerWick >= 2.0 * bodySize and upperWick < bodySize and bodySize > 0
+
+// Shooting Star
+bool  shootStar   = upperWick >= 2.0 * bodySize and lowerWick < bodySize and bodySize > 0
+
+// Specific patterns (used when usePattern is enabled)
+bool bullPattern = bullEngulf or hammer
+bool bearPattern = bearEngulf or shootStar
+
+// Simple reversal candle color (always required as minimum confirmation)
+// Long: bar must close green (bullish). Short: bar must close red (bearish).
+bool greenCandle = close > open
+bool redCandle   = close < open
+
+// =============================================================================
+// SIGNAL LOGIC -- ANTI-REPAINT: barstate.isconfirmed gates all signals
+// =============================================================================
+
+// Market regime: ranging when ADX < threshold
+bool isRanging = adxValue < adxThresh
+
+// Proximity to bands
+bool nearLowerBand = low <= (bull_cw + entryATRMult * atrValue)
+bool nearUpperBand = high >= (bear_cw - entryATRMult * atrValue)
+
+// Midpoint rule: never buy above midpoint, never sell below midpoint
+bool belowMidpoint = close < midpoint
+bool aboveMidpoint = close > midpoint
+
+// RSI filter (optional)
+bool rsiLongOK  = not useRSI or rsiValue < rsiOS
+bool rsiShortOK = not useRSI or rsiValue > rsiOB
+
+// Candle confirmation: if usePattern is on, require specific pattern; otherwise just reversal candle color
+bool candleLongOK  = usePattern ? bullPattern : greenCandle
+bool candleShortOK = usePattern ? bearPattern : redCandle
+
+// =============================================================================
+// TRADE STATE VARIABLES (declared before signal logic so they are accessible)
+// =============================================================================
+
+var float entryPrice      = na
+var float stopLoss        = na
+var float takeProfit      = na
+var float initialRiskDist = na
+var float posSize         = na
+var float expProfit       = na
+var float rrRatio         = na
+var int   tradeDir        = 0
+var bool  inTrade         = false
+var int   lastTradeBar    = na
+
+// =============================================================================
+// SIGNAL LOGIC -- ANTI-REPAINT + COOLDOWN + NOT-IN-TRADE
+// Signals only fire on confirmed bars, when not already in a trade,
+// and when the cooldown period has elapsed since the last trade.
+// =============================================================================
+
+// Full entry conditions
+bool longConditions  = isRanging and nearLowerBand and belowMidpoint and candleLongOK and rsiLongOK and inSession
+bool shortConditions = isRanging and nearUpperBand and aboveMidpoint and candleShortOK and rsiShortOK and inSession
+
+// Cooldown check: must wait N bars after last trade entry or exit
+bool cooldownOK = na(lastTradeBar) or (bar_index - lastTradeBar >= cooldownBars)
+
+// Final signals: confirmed bar + not in trade + cooldown passed
+bool longSignal  = longConditions and barstate.isconfirmed and not inTrade and cooldownOK
+bool shortSignal = shortConditions and barstate.isconfirmed and not inTrade and cooldownOK
+
+// =============================================================================
+// STOP LOSS & TAKE PROFIT CALCULATIONS
+// =============================================================================
+
+// Long: SL = 1 tick below outermost lower gradient (bull_g1), TP = innermost upper gradient (bear_g9)
+// Short: SL = 1 tick above outermost upper gradient (bear_g1), TP = innermost lower gradient (bull_g9)
+
+float longSL  = bull_g1 - syminfo.mintick
+float longTP  = bear_g9
+float shortSL = bear_g1 + syminfo.mintick
+float shortTP = bull_g9
+
+// Risk distances
+float longRiskDist   = math.max(close - longSL, syminfo.mintick)
+float longRewardDist = math.max(longTP - close, syminfo.mintick)
+float longRR         = longRewardDist / longRiskDist
+
+float shortRiskDist   = math.max(shortSL - close, syminfo.mintick)
+float shortRewardDist = math.max(close - shortTP, syminfo.mintick)
+float shortRR         = shortRewardDist / shortRiskDist
+
+// Position sizing
+float longPosSize  = math.min(riskPerTrade / longRiskDist, buyingPower / close)
+float shortPosSize = math.min(riskPerTrade / shortRiskDist, buyingPower / close)
+
+// Expected $ profit and $ loss
+float longExpProfit  = longRewardDist * longPosSize
+float longExpLoss    = riskPerTrade
+float shortExpProfit = shortRewardDist * shortPosSize
+float shortExpLoss   = riskPerTrade
+
+// =============================================================================
+// TRADE MANAGEMENT -- ANTI-REPAINT: exits only on confirmed bars
+// Only CLOSED trades are counted in stats. Open trades are never credited.
+// =============================================================================
+
+// -- Trade Result Tracking (CLOSED trades only) --
+var array<float> arrPnL     = array.new_float(0)
+var array<int>   arrWinLoss = array.new_int(0)
+var array<float> arrRMult   = array.new_float(0)
+
+// -- Close existing trade -- ONLY on confirmed bars
+if inTrade and barstate.isconfirmed
+    bool  exitNow        = false
+    float exitPnlPerUnit = 0.0
+
+    if tradeDir == 1
+        if low <= stopLoss
+            exitNow        := true
+            exitPnlPerUnit := stopLoss - entryPrice
+        else if high >= takeProfit
+            exitNow        := true
+            exitPnlPerUnit := takeProfit - entryPrice
+
+    else if tradeDir == -1
+        if high >= stopLoss
+            exitNow        := true
+            exitPnlPerUnit := entryPrice - stopLoss
+        else if low <= takeProfit
+            exitNow        := true
+            exitPnlPerUnit := entryPrice - takeProfit
+
+    if exitNow
+        float dollarPnL = exitPnlPerUnit * posSize
+        float rMult     = initialRiskDist > 0 ? exitPnlPerUnit / initialRiskDist : 0.0
+
+        array.push(arrPnL, dollarPnL)
+        array.push(arrRMult, rMult)
+        array.push(arrWinLoss, dollarPnL > 0 ? 1 : 0)
+
+        if array.size(arrPnL) > dashTrades
+            array.shift(arrPnL)
+            array.shift(arrRMult)
+            array.shift(arrWinLoss)
+
+        inTrade         := false
+        tradeDir        := 0
+        lastTradeBar    := bar_index
+        entryPrice      := na
+        stopLoss        := na
+        takeProfit      := na
+        initialRiskDist := na
+        posSize         := na
+        expProfit       := na
+        rrRatio         := na
+
+// -- Open new trade --
+if longSignal and not inTrade
+    entryPrice      := close
+    stopLoss        := longSL
+    takeProfit      := longTP
+    initialRiskDist := longRiskDist
+    posSize         := longPosSize
+    expProfit       := longExpProfit
+    rrRatio         := longRR
+    tradeDir        := 1
+    inTrade         := true
+    lastTradeBar    := bar_index
+
+if shortSignal and not inTrade
+    entryPrice      := close
+    stopLoss        := shortSL
+    takeProfit      := shortTP
+    initialRiskDist := shortRiskDist
+    posSize         := shortPosSize
+    expProfit       := shortExpProfit
+    rrRatio         := shortRR
+    tradeDir        := -1
+    inTrade         := true
+    lastTradeBar    := bar_index
+
+// =============================================================================
+// LABELS -- GREEN PINE TAGS (BULL) / RED PINE TAGS (BEAR)
+// Label placement logic:
+//   LONG:  Entry tag points UP from below price. SL tag points UP from below SL. TP tag points DOWN from above TP.
+//   SHORT: Entry tag points DOWN from above price. SL tag points DOWN from above SL. TP tag points UP from below TP.
+// =============================================================================
+
+if longSignal
+    // Entry: green tag pointing up at the low of the signal bar
+    label.new(bar_index, low, "ENTRY " + str.tostring(close, format.mintick) + "\nSize: " + str.tostring(longPosSize, "#.##"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.normal)
+    // SL: green tag pointing up, placed below at the SL level (SL is below entry for longs)
+    label.new(bar_index, longSL, "SL " + str.tostring(longSL, format.mintick) + "\nRisk: -$" + str.tostring(riskPerTrade, "#.##"), style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small)
+    // TP: green tag pointing down, placed above at the TP level (TP is above entry for longs)
+    label.new(bar_index, longTP, "TP " + str.tostring(longTP, format.mintick) + "\n+" + str.tostring(longRR, "#.#") + "R | +$" + str.tostring(longExpProfit, "#.##"), style = label.style_label_down, color = color.green, textcolor = color.white, size = size.small)
+
+if shortSignal
+    // Entry: red tag pointing down at the high of the signal bar
+    label.new(bar_index, high, "ENTRY " + str.tostring(close, format.mintick) + "\nSize: " + str.tostring(shortPosSize, "#.##"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.normal)
+    // SL: red tag pointing up, placed ABOVE at the SL level (SL is ABOVE entry for shorts)
+    label.new(bar_index, shortSL, "SL " + str.tostring(shortSL, format.mintick) + "\nRisk: -$" + str.tostring(riskPerTrade, "#.##"), style = label.style_label_up, color = color.red, textcolor = color.white, size = size.small)
+    // TP: red tag pointing down, placed BELOW at the TP level (TP is BELOW entry for shorts)
+    label.new(bar_index, shortTP, "TP " + str.tostring(shortTP, format.mintick) + "\n+" + str.tostring(shortRR, "#.#") + "R | +$" + str.tostring(shortExpProfit, "#.##"), style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+
+// Background flash on signal
+bgcolor(longSignal  ? color.new(#1B5E20, 92) : na, title = "Long Signal Flash")
+bgcolor(shortSignal ? color.new(#B71C1C, 92) : na, title = "Short Signal Flash")
+
+// =============================================================================
+// UNIFIED ALERT SYSTEM -- ONE ALERT COVERS ALL
+// =============================================================================
+
+if longSignal
+    alert("LONG -- " + syminfo.ticker + " | Entry: " + str.tostring(close, format.mintick) + " | SL: " + str.tostring(longSL, format.mintick) + " | TP: " + str.tostring(longTP, format.mintick) + " | Size: " + str.tostring(longPosSize, "#.##") + " | Risk: $" + str.tostring(riskPerTrade, "#.##") + " | R:R 1:" + str.tostring(longRR, "#.#"), alert.freq_once_per_bar_close)
+
+if shortSignal
+    alert("SHORT -- " + syminfo.ticker + " | Entry: " + str.tostring(close, format.mintick) + " | SL: " + str.tostring(shortSL, format.mintick) + " | TP: " + str.tostring(shortTP, format.mintick) + " | Size: " + str.tostring(shortPosSize, "#.##") + " | Risk: $" + str.tostring(riskPerTrade, "#.##") + " | R:R 1:" + str.tostring(shortRR, "#.#"), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// DASHBOARD TABLE -- BOTTOM RIGHT -- WHITE BG, BLACK TEXT, ADJUSTABLE SIZE
+// =============================================================================
+
+if showDash and barstate.islast
+
+    // -- Resolve table text size --
+    string tSize      = dashSizeIn == "Small" ? size.small : dashSizeIn == "Large" ? size.large : size.normal
+    string tSizeSmall = dashSizeIn == "Small" ? size.tiny  : dashSizeIn == "Large" ? size.normal : size.small
+    string tSizeTiny  = dashSizeIn == "Small" ? size.tiny  : dashSizeIn == "Large" ? size.small  : size.tiny
+
+    // -- Color constants --
+    color cWhite   = color.new(#FFFFFF, 0)
+    color cBlack   = color.new(#000000, 0)
+    color cGray    = color.new(#666666, 0)
+    color cLtGray  = color.new(#F5F5F5, 0)
+    color cGreen   = color.new(#2E7D32, 0)
+    color cRed     = color.new(#C62828, 0)
+    color cBlue    = color.new(#1565C0, 0)
+    color cAmber   = color.new(#E65100, 0)
+    color cBorder  = color.new(#CCCCCC, 0)
+
+    // -- Calculate stats from CLOSED trades only --
+    int   nTrades     = array.size(arrPnL)
+    int   nWins       = 0
+    int   nLosses     = 0
+    float grossProfit = 0.0
+    float grossLoss   = 0.0
+    float sumR        = 0.0
+
+    if nTrades > 0
+        for i = 0 to nTrades - 1
+            float pnl = array.get(arrPnL, i)
+            int   wl  = array.get(arrWinLoss, i)
+            float rm  = array.get(arrRMult, i)
+            sumR += rm
+            if wl == 1
+                nWins       += 1
+                grossProfit += pnl
+            else
+                nLosses  += 1
+                grossLoss += math.abs(pnl)
+
+    float nWinsF       = nWins
+    float nTradesF     = nTrades
+    float winRate      = nTradesF > 0 ? (nWinsF / nTradesF) * 100.0 : 0.0
+    float profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? 999.99 : 0.0)
+    float netPnL       = grossProfit - grossLoss
+    float avgR         = nTradesF > 0 ? sumR / nTradesF : 0.0
+
+    // -- Current/next setup info --
+    string setupDir     = inTrade ? (tradeDir == 1 ? "OPEN LONG" : "OPEN SHORT") : "FLAT"
+    float  setupEntry   = entryPrice
+    float  setupSL      = stopLoss
+    float  setupTP      = takeProfit
+    float  setupSize    = posSize
+    float  setupRR      = rrRatio
+    float  setupExpProf = expProfit
+    float  setupExpLoss = riskPerTrade
+
+    if not inTrade
+        float distToLower = math.abs(close - bull_cw)
+        float distToUpper = math.abs(close - bear_cw)
+        if distToLower < distToUpper
+            setupDir     := "NEXT: LONG"
+            setupEntry   := bull_cw
+            setupSL      := longSL
+            setupTP      := longTP
+            setupSize    := longPosSize
+            setupRR      := longRR
+            setupExpProf := longExpProfit
+            setupExpLoss := riskPerTrade
+        else
+            setupDir     := "NEXT: SHORT"
+            setupEntry   := bear_cw
+            setupSL      := shortSL
+            setupTP      := shortTP
+            setupSize    := shortPosSize
+            setupRR      := shortRR
+            setupExpProf := shortExpProfit
+            setupExpLoss := riskPerTrade
+
+    // -- Build table --
+    var table dash = table.new(position.bottom_right, 2, 19, bgcolor = cWhite, frame_color = cBorder, frame_width = 2, border_color = cBorder, border_width = 1)
+
+    // Row 0: Header
+    table.cell(dash, 0, 0, "  DYNAMIC RANGE  ", text_color = cBlue, text_size = tSize, bgcolor = cLtGray, text_halign = text.align_center)
+    table.cell(dash, 1, 0, "  TRADER  ", text_color = cBlue, text_size = tSize, bgcolor = cLtGray, text_halign = text.align_center)
+
+    // Row 1: Closed Trades
+    table.cell(dash, 0, 1, "  Closed Trades  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 1, "  " + str.tostring(nTrades) + " / " + str.tostring(dashTrades) + "  ", text_color = cBlack, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 2: Win Rate
+    color wrClr = winRate >= 50 ? cGreen : cRed
+    table.cell(dash, 0, 2, "  Win Rate  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 2, "  " + str.tostring(winRate, "#.#") + "%  ", text_color = wrClr, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 3: Profit Factor
+    color pfClr = profitFactor >= 1.0 ? cGreen : cRed
+    table.cell(dash, 0, 3, "  Profit Factor  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 3, "  " + str.tostring(profitFactor, "#.##") + "  ", text_color = pfClr, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 4: Wins / Losses
+    table.cell(dash, 0, 4, "  Wins / Losses  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 4, "  " + str.tostring(nWins) + " / " + str.tostring(nLosses) + "  ", text_color = cBlack, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 5: Gross Profit
+    table.cell(dash, 0, 5, "  Gross Profit  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 5, "  +$" + str.tostring(grossProfit, "#.##") + "  ", text_color = cGreen, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 6: Gross Loss
+    table.cell(dash, 0, 6, "  Gross Loss  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 6, "  -$" + str.tostring(grossLoss, "#.##") + "  ", text_color = cRed, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 7: Net P&L
+    color  netClr = netPnL >= 0 ? cGreen : cRed
+    string netStr = netPnL >= 0 ? "  +$" + str.tostring(netPnL, "#.##") + "  " : "  -$" + str.tostring(math.abs(netPnL), "#.##") + "  "
+    table.cell(dash, 0, 7, "  Net P&L  ", text_color = cBlack, text_size = tSize, bgcolor = cLtGray, text_halign = text.align_left)
+    table.cell(dash, 1, 7, netStr, text_color = netClr, text_size = tSize, bgcolor = cLtGray, text_halign = text.align_right)
+
+    // Row 8: Avg R Multiple
+    color avgRClr = avgR >= 0 ? cGreen : cRed
+    table.cell(dash, 0, 8, "  Avg R Multiple  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 8, "  " + str.tostring(avgR, "#.##") + "R  ", text_color = avgRClr, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 9: Separator
+    table.cell(dash, 0, 9, "  -- SETUP INFO --  ", text_color = cBlue, text_size = tSizeTiny, bgcolor = cLtGray, text_halign = text.align_center)
+    table.cell(dash, 1, 9, "", bgcolor = cLtGray)
+
+    // Row 10: Status
+    color  statClr = inTrade ? (tradeDir == 1 ? cGreen : cRed) : cGray
+    table.cell(dash, 0, 10, "  Status  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 10, "  " + setupDir + "  ", text_color = statClr, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 11: Risk Per Trade
+    table.cell(dash, 0, 11, "  Risk Per Trade  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 11, "  $" + str.tostring(riskPerTrade, "#.##") + "  ", text_color = cAmber, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 12: Position Size
+    table.cell(dash, 0, 12, "  Position Size  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 12, "  " + str.tostring(setupSize, "#.##") + "  ", text_color = cAmber, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 13: Entry
+    table.cell(dash, 0, 13, "  Entry  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 13, "  " + str.tostring(setupEntry, format.mintick) + "  ", text_color = cBlack, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 14: Stop Loss
+    table.cell(dash, 0, 14, "  Stop Loss  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 14, "  " + str.tostring(setupSL, format.mintick) + "  ", text_color = cRed, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 15: Take Profit
+    table.cell(dash, 0, 15, "  Take Profit  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 15, "  " + str.tostring(setupTP, format.mintick) + "  ", text_color = cGreen, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 16: R:R Ratio
+    table.cell(dash, 0, 16, "  R:R Ratio  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 16, "  1:" + str.tostring(setupRR, "#.#") + "  ", text_color = cBlack, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 17: Expected Profit / Loss
+    table.cell(dash, 0, 17, "  Exp Profit / Loss  ", text_color = cGray, text_size = tSizeSmall, text_halign = text.align_left)
+    table.cell(dash, 1, 17, "  +$" + str.tostring(setupExpProf, "#.##") + " / -$" + str.tostring(setupExpLoss, "#.##") + "  ", text_color = cBlack, text_size = tSizeSmall, text_halign = text.align_right)
+
+    // Row 18: Copyright Footer
+    table.cell(dash, 0, 18, "", bgcolor = cLtGray)
+    table.cell(dash, 1, 18, "  (c) tradinghabits.com  ", text_color = cGray, text_size = tSizeTiny, bgcolor = cLtGray, text_halign = text.align_right)
+
+// =============================================================================
+// END
+// =============================================================================

@@ -1,0 +1,334 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=5
+indicator("Sync Frame [Kioseff Trading]", overlay = true, max_boxes_count = 500, max_lines_count = 500)
+
+import RicardoSantos/MathOperator/2
+import HeWhoMustNotBeNamed/arraymethods/1
+
+
+HA       = input.string(defval = "Traditional", title = "Candle Type", options = ["Traditional", "Heikin Ashi", "Baseline"])
+autox    = input.bool  (defval = true, title = "Auto Scale X-Axis")
+lin      = input.bool  (defval = true, title = "Show Lin Reg")
+len      = input.int   (defval = 90, minval = 3, maxval = 90, title = "Intrabars")
+upcol    = input.color (defval = #14D990, title = "Up Color", inline = "C")
+dncol    = input.color (defval = #F24968, title = "Up Color", inline = "C")
+
+usert    = input.bool  (defval = false, title = "Use Custom Timeframes", group = "Custom Timeframes")
+usert1   = input.int   (defval = 1, minval = 1, title = "TF 1", group = "Custom Timeframes")
+usert2   = input.int   (defval = 2, minval = 1, title = "TF 2", group = "Custom Timeframes")
+usert3   = input.int   (defval = 3, minval = 1, title = "TF 3", group = "Custom Timeframes")
+usert4   = input.int   (defval = 4, minval = 1, title = "TF 4", group = "Custom Timeframes"), var shif    = 25
+usert5   = input.int   (defval = 5, minval = 1, title = "TF 5", group = "Custom Timeframes"), var counter = 0
+
+
+roundedCountRaw = int(counter * .01)
+roundedCount    = switch autox 
+
+    true => math.max(math.min(roundedCountRaw, math.floor(475 / len)), 2)
+    =>      2
+
+method float(int int) => float(int)
+
+strMax( float , userTime) =>
+
+    seconds = timeframe.in_seconds(timeframe.period)
+
+    mult = seconds / 6
+
+    switch 
+
+        not usert => timeframe.from_seconds(seconds - mult * float)
+        =>           str.tostring(userTime)
+
+
+req(autoTime, userTime) => 
+
+    modify = switch HA 
+
+        "Heikin Ashi"  => ticker.heikinashi(syminfo.tickerid)
+        =>                syminfo.tickerid 
+
+    [o, h, l, c] = request.security_lower_tf(modify, strMax(autoTime, userTime), [open, high, low, close], ignore_invalid_timeframe = true)
+
+[o1, h1, l1, c1]     = req(1, usert1), [o2, h2, l2, c2]     = req(2, usert2)
+[o3, h3, l3, c3]     = req(3, usert3), [o4, h4, l4, c4]     = req(4, usert4),
+                     [o5, h5, l5, c5]     = req(5, usert5)
+
+
+type lowTFs 
+
+    matrix<float> lowTF1
+    matrix<float> lowTF2 
+    matrix<float> lowTF3 
+    matrix<float> lowTF4
+    matrix<float> lowTF5
+    box  candles 
+    line HlWick
+
+var HlMat = matrix.new<float>(2, 1)
+
+switch 
+
+    barstate.isfirst                                                             =>  HlMat.set(0, 0, -1e8),      HlMat.set(1, 0, 1e8)
+    time >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time =>  HlMat.set(0, 0, math.max(high, HlMat.get(0, 0))), 
+                                                                                     HlMat.set(1, 0, math.min(low , HlMat.get(1, 0)))
+
+
+method matrixApp(matrix<float> id, Close, High, Low, Open, autoTime, userTime) => 
+
+    timeNeeded = math.ceil(len / (timeframe.in_seconds(timeframe.period) / timeframe.in_seconds(strMax(autoTime, userTime))))
+
+    if last_bar_index - bar_index <= timeNeeded * 4 // multiplied for non-24 hour markets
+
+        for i = 0 to Close.size() - 1 
+
+            id.add_col(0, array.from(Close.get(i), High.get(i), Low.get(i), Open.get(i)))
+    
+    id
+
+method sliceFun(matrix<float> id) => 
+
+    all = array.new_float()
+
+    c = id.row(0).slice(0, len), h = id.row(1).slice(0, len)
+    l = id.row(2).slice(0, len), o = id.row(3).slice(0, len)
+
+    for i = 0 to c.size() - 1 
+
+        all.push(c.get(i)), all.push(h.get(i))
+        all.push(l.get(i)), all.push(o.get(i))
+
+    [c, h, l, o, all]
+
+method normalize(array<float> id, i, newMin, newMax, idMax, idMin) => 
+
+    id.set(i, newMin + ((id.get(i) - idMin) * (newMax - newMin)) / (idMax - idMin))
+
+
+method norm(matrix<float> id, int mult) => 
+
+    rang = (HlMat.get(0, 0) - HlMat.get(1, 0)) / 5
+
+    newMin = HlMat.get(1, 0) + rang * mult 
+    newMax = HlMat.get(1, 0) + rang * (mult + 1)
+
+    [closes, highs, lows, opens, all] = id.sliceFun()
+
+    allMax = all.max(), allMin = all.min()
+
+    for i = 0 to closes.size() - 1 
+
+        closes.normalize(i, newMin, newMax, allMax, allMin)
+        opens .normalize(i, newMin, newMax, allMax, allMin)
+        highs .normalize(i, newMin, newMax, allMax, allMin)
+        lows  .normalize(i, newMin, newMax, allMax, allMin)
+
+    [closes, opens, highs, lows]
+
+var allSlopes = array.new_float(), var linRegLine = array.new_line(), var fillLine = array.new_line()
+
+method linReg(matrix<float> id, mult, mult2, userTime, autoTime) => 
+
+    if barstate.islast and lin and HA != "Baseline" 
+
+        [clo, ope, hi, lo] = id.norm(mult2 - 1)
+
+        linReg = matrix.new<float>(4, clo.size())
+
+        for i = 0 to clo.size() - 1
+
+            linReg.set(0, i, i + 1), linReg.set(1, i, clo.get(i))
+
+        b = linReg.row(0)
+
+        for i = 0 to clo.size() - 1
+
+            linReg.set(2, i, math.pow(b.get(i) - b.avg(), 2))
+            linReg.set(3, i, (b.get(i) - b.avg()) * (linReg.row(1).get(i) - linReg.row(1).avg()))
+
+        bx = linReg.row(3).sum() / linReg.row(2).sum() 
+        mx = linReg.row(1).avg() - (bx * b.avg())
+
+        coord = switch bx.over_equal(0)
+
+            true => hi.max() 
+            =>      lo.min()
+
+        fillLine.push  (line.new(bar_index + shif, coord,   bar_index + shif +  clo.size() * roundedCount + 5, coord, color = #00000000))
+        linRegLine.push(line.new(bar_index + shif, (bx * clo.size() + mx), bar_index + shif +  clo.size() * roundedCount + 5, bx + mx, 
+                                             width = 1, style = line.style_solid))  
+
+        allSlopes.push(bx * -1)
+
+
+method draw(matrix<float> id, mult, userTime) => 
+
+    if barstate.islast
+
+        [clo, ope, hi, lo] = id.norm(mult - 1)
+
+        baseline = math.avg(hi.max(), lo.min()), baseLine = array.new_line()
+
+        candleDraw = matrix.new<lowTFs>(2, 0)
+
+        trueClo = id.row(0).slice(0, len)
+
+        val = switch 
+
+            hi.max().subtract(clo.first()).over_equal(clo.first().subtract(lo.min())) => text.align_bottom
+            =>                                                                           text.align_top
+    
+
+        box.new(bar_index + shif, hi.max(), bar_index + len * roundedCount + shif + 5, lo.min(), bgcolor = HA == "Baseline" ? na : color.new(#000eff, 90),
+                                                             border_color = #363843,
+             text = strMax(mult, userTime) + " (" + str.tostring((trueClo.first() / trueClo.last() - 1) * 100, format.percent) + ")",
+             text_color = color.white, text_valign = val, text_halign = text.align_left, text_size = size.tiny)
+
+        if HA == "Baseline" 
+
+            bl = line.new(bar_index + shif, baseline, bar_index + len * roundedCount + shif + 5, baseline, color = color.white, 
+                                                     style = line.style_dashed)
+
+            ul = line.new(bar_index + shif, hi.max(), bar_index + len * roundedCount + shif + 5, hi.max(), color = #00000000)
+            ll = line.new(bar_index + shif, lo.min(), bar_index + len * roundedCount + shif + 5, lo.min(), color = #00000000)
+        
+            linefill.new(ul, bl, color.new(upcol, 90))
+            linefill.new(ll, bl, color.new(dncol, 90))
+
+
+
+        if HA != "Baseline"
+
+            initialCol = switch id.get(0, 0).over_equal(id.get(3, 0))
+
+                true  =>  upcol
+                false =>  dncol
+
+
+            candleDraw.add_col(candleDraw.columns(), array.from(
+
+                 lowTFs.new(candles = box.new(bar_index + shif + 2 + len * roundedCount, clo.first(), bar_index + shif + 4 + len * roundedCount, ope.first(), 
+                             bgcolor = initialCol , border_color = na)),
+                        
+                 lowTFs.new(HlWick = line.new(bar_index + shif + 3 + len * roundedCount, hi.first(), bar_index + shif + 3 + len * roundedCount, lo.first (), 
+                             color = initialCol))
+                 
+                     ))
+
+            for i = 1 to len - 1
+
+                col = switch id.get(0, i).over_equal(id.get(3, i)) 
+
+                    true  =>  upcol
+                    false =>  dncol
+
+                
+                getLeft  = candleDraw.get(0, candleDraw.columns() - 1).candles.get_left()
+                pAvg     = math.round(math.avg(getLeft - roundedCount, getLeft))
+
+                candleDraw.add_col(candleDraw.columns(), array.from(
+
+                         lowTFs.new(candles = box.new(getLeft - roundedCount, clo.get(i), getLeft,
+                                             ope.get(i), bgcolor = col , border_color = na)), 
+
+                         lowTFs.new(HlWick  = line.new(pAvg, hi.get(i), pAvg, lo.get(i), color = col))
+
+                     ))
+
+                if box.all.size() > 499
+                    box.all.remove(1).delete()
+
+                if line.all.size() > 490
+
+                    count = 0.
+
+                    for x = 0 to line.all.size() - 1
+
+                        if count.equal(2) 
+                            break
+
+                        else 
+
+                            if not linRegLine.includes(line.all.get(x)) 
+                                if not fillLine.includes(line.all.get(x))
+
+                                    line.all.remove(x).delete()
+                                    count += 1 
+
+        else 
+
+            baseLine.push(line.new(bar_index + shif + 2 + len * roundedCount, clo.get(1), bar_index + shif + 4 + len * roundedCount, clo.first(), 
+                             color = clo.first() > baseline ? upcol : dncol))
+
+            for i = 1 to len - 2
+
+                if clo.get(i).over(baseline) and clo.get(i + 1).under(baseline) 
+                  or clo.get(i).under(baseline) and clo.get(i + 1).over(baseline)
+
+                    [col1, col2] = switch 
+                        
+                        clo.get(i) >= baseline => [upcol, dncol]
+                        =>                        [dncol, upcol]
+
+                    baseLine.push(line.new(baseLine.last().get_x1() - math.round(roundedCount / 2), baseline, baseLine.last().get_x1(),
+                      clo.get(i), color =col1))
+
+                    baseLine.push(line.new(baseLine.last().get_x1() - math.round(roundedCount / 2), clo.get(i + 1), baseLine.last().get_x1(),
+                      baseline, color =  col2))
+
+                else 
+
+                    baseLine.push(line.new(baseLine.last().get_x1() - roundedCount, clo.get(i + 1), baseLine.last().get_x1(),
+                          clo.get(i), color = clo.get(i) >= baseline ? upcol : dncol))
+
+        id
+
+if last_bar_index - bar_index <= 500
+
+    box.all.flush(), label.all.flush(), line.all.flush()
+
+    var ltf = lowTFs.new(matrix.new<float>(4, 0), matrix.new<float>(4, 0), matrix.new<float>(4, 0), matrix.new<float>(4, 0), matrix.new<float>(4, 0)) 
+
+    ltf.lowTF1.matrixApp(c1, h1, l1, o1, 1, usert1).draw(1, usert1).linReg(1, 1, usert1, 1) 
+    ltf.lowTF2.matrixApp(c2, h2, l2, o2, 2, usert2).draw(2, usert2).linReg(1, 2, usert2, 2)     
+    ltf.lowTF3.matrixApp(c3, h3, l3, o3, 3, usert3).draw(3, usert3).linReg(1, 3, usert3, 3) 
+    ltf.lowTF4.matrixApp(c4, h4, l4, o4, 4, usert4).draw(4, usert4).linReg(1, 4, usert4, 4) 
+    ltf.lowTF5.matrixApp(c5, h5, l5, o5, 5, usert5).draw(5, usert5).linReg(1, 5, usert5, 5)
+
+    if lin 
+
+        if barstate.islast
+
+            copySlope = allSlopes.copy()
+
+            copySlope.sort(order.ascending)
+
+            var float [] ups = na, var float [] dns = na
+
+            if allSlopes.max().over_equal(0)
+
+                ups := copySlope.slice(copySlope.binary_search_rightmost(0), copySlope.size())
+
+                for i = 0 to ups.size() - 1
+
+                    col = color.from_gradient(ups.get(i), 0, ups.max(), color.white, upcol)
+
+                    linRegLine.get(allSlopes.indexof(ups.get(i))).set_color(col)
+                    linefill.new(linRegLine.get(allSlopes.indexof(ups.get(i))), fillLine.get(allSlopes.indexof(ups.get(i))), color.new(col, 75))
+
+            if allSlopes.min().under(0) 
+
+                dns := copySlope.slice(0, copySlope.binary_search_rightmost(0))
+
+                for i = 0 to dns.size() - 1
+
+                    col = color.from_gradient(dns.get(i), dns.min(), 0, dncol, color.white)
+
+                    linRegLine.get(allSlopes.indexof(dns.get(i))).set_color(col)
+                    linefill.new(linRegLine.get(allSlopes.indexof(dns.get(i))), fillLine.get(allSlopes.indexof(dns.get(i))), color.new(col, 75))
+
+
+if time >= chart.left_visible_bar_time
+    counter += 1

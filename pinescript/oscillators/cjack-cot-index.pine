@@ -1,0 +1,153 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Cjackjamie
+
+//@version=6
+indicator("Cjack COT Index")
+import TradingView/LibraryCOT/4 as cot
+
+// Inputs
+shiftIndex = input.bool(defval = false, title = "Shift index to only see last week's index above bars", tooltip = "The index above bar is testable this way, as it shows COT that was available at the time. Shows current index based on last week's report (shifts 1 week back)")
+setUpCondition = input.string(defval = "BOTH", title = "Specs to use for Crowded setup", tooltip = "Background shows setup. Which specs need to be Crowded to show it?", options = ["BOTH", "Large Specs", "Small Specs", "EITHER"])
+lookbackPeriod = input.int(26, title='Lookback (Weeks!)', tooltip = "Most common are [13, 26, 39, 52, 65, 78]")
+enable_name = input.bool(false, "Show Contract name & code")
+cotCodeInput = input.string('', title='Custom COT Code (Leave blank for Auto)', tooltip='Enter a custom COT Code or leave blank to auto-detect.')
+lowerZoneThreshold = input.int(5, title='Lower Zone Threshold', minval=0, maxval=50, step=5)
+upperZoneThreshold = input.int(95, title='Upper Zone Threshold', minval=50, maxval=100, step=5)
+customColorLarge = input.color(color.rgb(29, 220, 197), title='Color for Large Traders')
+customColorSmall = input.color(color.rgb(209, 255, 82), title='Color for Small Traders')
+customColorCommercial = input.color(color.rgb(255, 0, 0), title='Color for Commercial Hedgers')
+
+var smallNets = array.new<float>()
+var largeNets = array.new<float>()
+var commNets = array.new<float>()
+
+// Helper Function to Request COT Data
+requestCOTData(cotCode, metricName, isLong) =>
+    string direction = isLong ? 'Long' : 'Short'
+    if cotCodeInput != ''
+        request.security(syminfo.tickerid, timeframe.period, cot.requestCommitmentOfTraders("Legacy", cotCode, false, metricName, direction, 'All'))
+    else
+        cot.requestCommitmentOfTraders("Legacy", cotCode, false, metricName, direction, 'All')
+
+
+// Calculate Net Positions
+netMetric(cotCode, metricName) =>
+    requestCOTData(cotCode, metricName, true) - requestCOTData(cotCode, metricName, false)
+
+// COT Index Calculation
+cotIndex(netPosition, highestPos, lowestPos) =>
+    valueRange = highestPos - lowestPos
+    valueRange <= 0 ? na : (netPosition - lowestPos) / valueRange * 100
+
+var float shiftedIndexLarge = 0
+var float shiftedIndexSmall = 0
+var float shiftedIndexCommercial = 0
+
+// Fetch COT Symbol and Name
+cotCode = (cotCodeInput == '' ? cot.convertRootToCOTCode('Auto') : cotCodeInput)
+cotName = cot.convertRootToCOTCode('Auto', false)
+
+// Fetch Net Positions for Large, Small, and Commercial Traders
+netLargeTraders = netMetric(cotCode, 'Noncommercial Positions')
+netSmallTraders = netMetric(cotCode, 'Nonreportable Positions')
+netCommercialHedgers = netMetric(cotCode, 'Commercial Positions')
+
+// COT Index for Each Trader Type
+
+var float indexLarge = 0
+var float indexSmall = 0
+var float indexCommercial = 0
+
+tfLowerThanWeekly = timeframe.in_seconds(timeframe.period) < timeframe.in_seconds("W") ? true : false
+// likely changes every report week by week but safer later to add other 2 trader types into criteria
+positionsChanged = netMetric(cotCode, "Noncommercial Positions") != netMetric(cotCode, "Noncommercial Positions")[1]
+
+if positionsChanged
+    if array.size(smallNets) >= lookbackPeriod
+        array.shift(smallNets)
+        array.shift(largeNets)
+        array.shift(commNets)
+    array.push(smallNets, netSmallTraders)
+    array.push(largeNets, netLargeTraders)
+    array.push(commNets, netCommercialHedgers)
+    indexLarge := cotIndex(netLargeTraders, array.max(largeNets), array.min(largeNets))
+    indexSmall := cotIndex(netSmallTraders, array.max(smallNets), array.min(smallNets))
+    indexCommercial := cotIndex(netCommercialHedgers, array.max(commNets), array.min(commNets))
+
+if tfLowerThanWeekly
+    if timeframe.change("W")
+        shiftedIndexLarge := indexLarge[1]
+        shiftedIndexSmall := indexSmall[1]
+        shiftedIndexCommercial := indexCommercial[1]
+    
+else
+    shiftedIndexLarge := indexLarge
+    shiftedIndexSmall := indexSmall
+    shiftedIndexCommercial := indexCommercial
+
+
+tfHigherThanWeekly = timeframe.in_seconds(timeframe.period) > timeframe.in_seconds("W") ? true : false
+if tfHigherThanWeekly
+    indexCommercial := na
+    indexLarge := na
+    indexSmall := na
+    shiftedIndexCommercial := na
+    shiftedIndexLarge := na
+    shiftedIndexSmall := na
+
+plot(shiftIndex ? shiftedIndexLarge : indexLarge, color=customColorLarge, linewidth=1, title="Index Large Traders (0-100)", precision = 1, style = plot.style_stepline, offset = shiftIndex == false and tfLowerThanWeekly == false ? -1 : 0)
+plot(shiftIndex ? shiftedIndexSmall : indexSmall, color=customColorSmall, linewidth=1, title="Index Small Traders (0-100)", precision = 1, style = plot.style_stepline, offset = shiftIndex == false and tfLowerThanWeekly == false ? -1 : 0)
+plot(shiftIndex ? shiftedIndexCommercial : indexCommercial, color=customColorCommercial, linewidth=1, title="Index Commercial Hedgers (0-100)", precision = 1, style = plot.style_stepline, offset = shiftIndex == false and tfLowerThanWeekly == false ? -1 : 0)
+
+if tfHigherThanWeekly
+    errorTable = table.new(position.bottom_center, 1, 1, color.red)
+    table.cell(errorTable, 0, 0, "Choose Lower Time frame for consistency. Weekly or lower", text_size = size.large, text_color = color.white)
+
+// Debugging Label for Name and Symbol Only
+if barstate.islast and enable_name
+    table_id = table.new(position.top_right, 1, 2, border_width=1, border_color=color.gray)
+    table.cell(table_id, 0, 0, "COT Name: " + cotName, text_color=color.white, bgcolor=color.new(color.blue, 90))
+    table.cell(table_id, 0, 1, "COT Code: " + cotCode, text_color=color.white, bgcolor=color.new(color.blue, 90))
+
+
+// Horizontal Lines for Zones
+hline(upperZoneThreshold, 'Upper Zone', color=color.yellow, linestyle=hline.style_dotted)
+hline(lowerZoneThreshold, 'Lower Zone', color=color.yellow, linestyle=hline.style_dotted)
+
+bool setUpLong = false
+bool setUpShort = false
+
+
+if shiftIndex
+    setUpLong := switch setUpCondition
+        "BOTH" => shiftedIndexCommercial >= upperZoneThreshold and shiftedIndexLarge <= lowerZoneThreshold and shiftedIndexSmall <= lowerZoneThreshold
+        "Large Specs" => shiftedIndexCommercial >= upperZoneThreshold and shiftedIndexLarge <= lowerZoneThreshold
+        "Small Specs" => shiftedIndexCommercial >= upperZoneThreshold and shiftedIndexSmall <= lowerZoneThreshold
+        "EITHER" => shiftedIndexCommercial >= upperZoneThreshold and (shiftedIndexLarge >= lowerZoneThreshold or shiftedIndexSmall <= lowerZoneThreshold)
+    
+    setUpShort := switch setUpCondition
+        "BOTH" => shiftedIndexCommercial <= lowerZoneThreshold and shiftedIndexLarge >= upperZoneThreshold and shiftedIndexSmall >= upperZoneThreshold
+        "Large Specs" => shiftedIndexCommercial <= lowerZoneThreshold and shiftedIndexLarge >= upperZoneThreshold
+        "Small Specs" => shiftedIndexCommercial <= lowerZoneThreshold and shiftedIndexSmall >= upperZoneThreshold
+        "EITHER" => shiftedIndexCommercial <= lowerZoneThreshold and (shiftedIndexLarge >= upperZoneThreshold or shiftedIndexSmall >= upperZoneThreshold)
+
+else
+    setUpLong := switch setUpCondition
+        "BOTH" => indexCommercial >= upperZoneThreshold and indexLarge <= lowerZoneThreshold and indexSmall <= lowerZoneThreshold
+        "Large Specs" => indexCommercial >= upperZoneThreshold and indexLarge <= lowerZoneThreshold
+        "Small Specs" => indexCommercial >= upperZoneThreshold and indexSmall <= lowerZoneThreshold
+        "EITHER" => indexCommercial >= upperZoneThreshold and (indexLarge <= lowerZoneThreshold or indexSmall <= lowerZoneThreshold)
+    
+    setUpShort := switch setUpCondition
+        "BOTH" => indexCommercial <= lowerZoneThreshold and indexLarge >= upperZoneThreshold and indexSmall >= upperZoneThreshold
+        "Large Specs" => indexCommercial <= lowerZoneThreshold and indexLarge >= upperZoneThreshold
+        "Small Specs" => indexCommercial <= lowerZoneThreshold and indexSmall >= upperZoneThreshold
+        "EITHER" => indexCommercial <= lowerZoneThreshold and (indexLarge >= upperZoneThreshold or indexSmall >= upperZoneThreshold)
+
+
+setupBgColor = color(na)
+if setUpLong
+    setupBgColor := color.rgb(0,250,0,70)
+if setUpShort
+    setupBgColor := color.rgb(250,0,0,70)
+bgcolor(setupBgColor,offset = shiftIndex == false and tfLowerThanWeekly == false ? -1 : 0)

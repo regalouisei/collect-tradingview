@@ -1,0 +1,141 @@
+//@version=6
+indicator("xATR Exhaustion Meter (Zones) — Table Only", overlay=true)
+
+//==================== Inputs ====================
+// ATR
+atrTFMode = input.string("1H", "ATR Timeframe", options=["Chart", "1H", "4H", "Daily"])
+atrLen = input.int(14, "ATR Length", minval=1)
+
+// Zones (manual)
+showZones = input.bool(true, "Plot Zones on Chart")
+
+demandLow = input.float(0.0, "Demand Low (0 disables)")
+demandHigh = input.float(0.0, "Demand High (0 disables)")
+supplyLow = input.float(0.0, "Supply Low (0 disables)")
+supplyHigh = input.float(0.0, "Supply High (0 disables)")
+
+zoneTouchMode = input.string("Wick Touch", "Zone Touch Rule", options=["Close Inside", "Wick Touch"])
+zoneBufferPts = input.float(0.0, "Zone Buffer (points)", minval=0.0)
+
+// Exhaustion
+lookbackLeg = input.int(20, "Approach Lookback (bars)", minval=5)
+exhaustedATR = input.float(2.0, "EXHAUSTED if approach ≥ xATR", step=0.1)
+energeticBodyMult= input.float(1.3, "ENERGETIC if body ≥ avgBody×", step=0.05)
+bodyAvgLen = input.int(20, "Avg Body Length", minval=2)
+
+useRSI = input.bool(true, "Use RSI slope filter")
+rsiLen = input.int(14, "RSI Length", minval=2)
+
+// Alerts
+useAlerts = input.bool(false, "Enable Alerts")
+
+// Table
+showTable = input.bool(true, "Show Table (Top Right)")
+
+//==================== ATR Fetch ====================
+string atrTF = atrTFMode == "Chart" ? timeframe.period :
+     atrTFMode == "1H" ? "60" :
+     atrTFMode == "4H" ? "240" : "D"
+
+atrVal = request.security(syminfo.tickerid, atrTF, ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+//==================== Normalize zones ====================
+dLow = math.min(demandLow, demandHigh)
+dHigh = math.max(demandLow, demandHigh)
+sLow = math.min(supplyLow, supplyHigh)
+sHigh = math.max(supplyLow, supplyHigh)
+
+validDemand = (demandLow != 0.0 and demandHigh != 0.0)
+validSupply = (supplyLow != 0.0 and supplyHigh != 0.0)
+
+dLowB = dLow - zoneBufferPts
+dHighB = dHigh + zoneBufferPts
+sLowB = sLow - zoneBufferPts
+sHighB = sHigh + zoneBufferPts
+
+//==================== Zone touch ====================
+inDemand = validDemand and (
+     zoneTouchMode == "Close Inside"
+     ? (close >= dLowB and close <= dHighB)
+     : (low <= dHighB and high >= dLowB)
+)
+
+inSupply = validSupply and (
+     zoneTouchMode == "Close Inside"
+     ? (close >= sLowB and close <= sHighB)
+     : (low <= sHighB and high >= sLowB)
+)
+
+//==================== Approach strength (xATR) ====================
+hh = ta.highest(high, lookbackLeg)
+ll = ta.lowest(low, lookbackLeg)
+
+approachToDemandPts = hh - close // fall into demand
+approachToSupplyPts = close - ll // rise into supply
+
+approachToDemandX = (na(atrVal) or atrVal == 0) ? na : approachToDemandPts / atrVal
+approachToSupplyX = (na(atrVal) or atrVal == 0) ? na : approachToSupplyPts / atrVal
+
+//==================== Arrival momentum proxy ====================
+body = math.abs(close - open)
+avgBody = ta.sma(body, bodyAvgLen)
+
+bullBodyStrong = close > open and body >= avgBody * energeticBodyMult
+bearBodyStrong = close < open and body >= avgBody * energeticBodyMult
+
+rsi = ta.rsi(close, rsiLen)
+rsiSlopeUp = rsi > rsi[1]
+rsiSlopeDown = rsi < rsi[1]
+
+// Into demand = bearish arrival
+strongIntoDemand = bearBodyStrong and (not useRSI or rsiSlopeDown)
+// Into supply = bullish arrival
+strongIntoSupply = bullBodyStrong and (not useRSI or rsiSlopeUp)
+
+fadingIntoDemand = (not bearBodyStrong) and (not useRSI or not rsiSlopeDown)
+fadingIntoSupply = (not bullBodyStrong) and (not useRSI or not rsiSlopeUp)
+
+//==================== Exhaustion states ====================
+string demandState = "—"
+string supplyState = "—"
+
+if inDemand and validDemand
+    bool exhausted = not na(approachToDemandX) and approachToDemandX >= exhaustedATR and fadingIntoDemand
+    bool energetic = strongIntoDemand
+    demandState := exhausted ? "EXHAUSTED (react)" : energetic ? "ENERGETIC (break)" : "NEUTRAL"
+
+if inSupply and validSupply
+    bool exhausted = not na(approachToSupplyX) and approachToSupplyX >= exhaustedATR and fadingIntoSupply
+    bool energetic = strongIntoSupply
+    supplyState := exhausted ? "EXHAUSTED (react)" : energetic ? "ENERGETIC (break)" : "NEUTRAL"
+
+//==================== Plot zones ====================
+plot(showZones and validDemand ? dLow : na, "Demand Low", color=color.new(color.lime, 20), style=plot.style_linebr)
+plot(showZones and validDemand ? dHigh : na, "Demand High", color=color.new(color.lime, 20), style=plot.style_linebr)
+
+plot(showZones and validSupply ? sLow : na, "Supply Low", color=color.new(color.red, 20), style=plot.style_linebr)
+plot(showZones and validSupply ? sHigh : na, "Supply High", color=color.new(color.red, 20), style=plot.style_linebr)
+
+//==================== Table ====================
+f_fmt(x) => na(x) ? "na" : str.tostring(x, "#.##")
+
+var table t = table.new(position.top_right, 1, 8, frame_color=color.new(color.white, 100), force_overlay=true)
+
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "Exhaustion Meter (xATR Arrival)", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 1, "ATR(" + atrTFMode + "," + str.tostring(atrLen) + "): " + f_fmt(atrVal), text_color=color.white, bgcolor=color.black)
+
+    table.cell(t, 0, 2, "Touch Demand: " + (inDemand ? "YES" : "NO"), text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 3, "Demand State: " + demandState, text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 4, "Approach→Demand: " + f_fmt(approachToDemandX) + "x", text_color=color.white, bgcolor=color.black)
+
+    table.cell(t, 0, 5, "Touch Supply: " + (inSupply ? "YES" : "NO"), text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 6, "Supply State: " + supplyState, text_color=color.white, bgcolor=color.black)
+    table.cell(t, 0, 7, "Approach→Supply: " + f_fmt(approachToSupplyX) + "x", text_color=color.white, bgcolor=color.black)
+
+//==================== Alerts (optional) ====================
+alertcondition(useAlerts and inDemand and demandState == "EXHAUSTED (react)", title="Demand Exhausted", message="Demand exhausted (react likely)")
+alertcondition(useAlerts and inDemand and demandState == "ENERGETIC (break)", title="Demand Energetic", message="Demand energetic (break likely)")
+
+alertcondition(useAlerts and inSupply and supplyState == "EXHAUSTED (react)", title="Supply Exhausted", message="Supply exhausted (react likely)")
+alertcondition(useAlerts and inSupply and supplyState == "ENERGETIC (break)", title="Supply Energetic", message="Supply energetic (break likely)")

@@ -1,0 +1,268 @@
+//@version=5
+// EMA RSI VOL ATR Strategy VC2.51.14 - alertfix + optional emergency SL (strategy.close)
+
+strategy("EMA RSI VOL ATR Strategy VC2.51.14",
+     overlay=true,
+     initial_capital=1000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     pyramiding=0,
+     commission_type=strategy.commission.percent,
+     commission_value=0.08,
+     slippage=20,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     margin_long=0,
+     margin_short=0)
+
+// ── State ─────────────────────────────────────────────────────────────────────
+var bool in_long  = false
+var bool in_short = false
+var int  last_alert_time = 0
+var float long_entry_price  = na
+var float short_entry_price = na
+
+// One-action-per-candle guard (ENTRIES ONLY)
+var int last_action_bar = na
+can_act() =>
+    na(last_action_bar) or bar_index > last_action_bar
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+entry_ema_length            = input.int(7,  "Entry EMA Length")
+exit_ema_length             = input.int(21, "Exit EMA Length")
+// this is the normal SL used only when trailing is OFF (same as original)
+stop_loss_pct               = input.float(2.2, "Stop Loss % (no trailing)", minval=0.1, maxval=20.0)
+
+// trailing config (unchanged)
+trail_mode = input.string("Legacy (close-ATR)", "Trailing Stop Mode",
+     options=["Legacy (close-ATR)", "True ATR", "Fixed USD", "Percent of Price"])
+use_trailing_stop           = input.bool(true, "Use Trailing Stop")
+atrLookback                 = input.int(14, "ATR Lookback")
+atrMultiplier               = input.float(2, "ATR Multiplier", minval=0.5, step=0.1)
+fixed_usd                   = input.float(40.0, "Fixed USD Distance", minval=0.01)
+trail_pct_of_price          = input.float(2.6, "% of Price (for Percent mode)", minval=0.05, maxval=10.0)
+init_offset_usd             = input.float(2.0, "Initial Offset USD", minval=0.00)
+show_trail_usd              = input.bool(false, "Show Trail Distance (USD)")
+
+breakeven_pct               = input.float(3, "Breakeven Trigger %", minval=0.5, step=0.1)
+
+// NEW: emergency hard SL that always works on top of everything
+use_emergency_sl            = input.bool(true, "Use Emergency Hard SL")
+emergency_sl_pct            = input.float(14.0, "Emergency Hard SL %", minval=0.5, maxval=50.0)
+
+rsi_length                  = input.int(14, "RSI Length")
+rsi_long_threshold          = input.int(55, "RSI Long Threshold")
+rsi_short_threshold         = input.int(51, "RSI Short Threshold")
+use_volume_filter           = input.bool(true, "Use Volume Filter")
+volume_sma_length           = input.int(14, "Volume SMA Length")
+min_bars_between_trades     = input.int(1, "Min Bars Between Trades")
+min_minutes_between_signals = input.int(10, "Min Minutes Between Signals")
+min_amount                  = 0.05
+show_rsi                    = input.bool(false, title="Show RSI on Chart")
+show_rsi_levels             = input.bool(true,  title="Show RSI Levels")
+rsi_level_dash_interval     = input.int(3, "RSI Level Dash Interval", minval=1)
+rsi_lookback                = input.int(200, "RSI Overlay Lookback", minval=50)
+rsi_bottom_buffer           = input.float(5.0, "RSI Bottom Buffer %", minval=0.0, maxval=20.0) / 100
+rsi_height_pct              = input.float(20.0, "RSI Height %", minval=10.0, maxval=50.0) / 100
+start_time                  = input.time(1735689600000, "Start Date")  // 2025-01-01
+allow_shorts                = input.bool(true, title="Allow Shorts")
+show_labels                 = input.bool(false, title="Show Signal Labels")
+show_quantity               = input.bool(false, title="Show Quantity")
+use_ema200_short            = input.bool(true, "Use EMA200 for Shorts")
+adx_length                  = input.int(14, "ADX Length for Trend Confirm (Shorts)")
+adx_threshold               = input.int(20, "ADX Threshold for Shorts")
+secret_code                 = input.string("secret.code.xxx", title="Secret Code")
+bot_uuid                    = input.string("bot.uuid.xxx",   title="Bot UUID")
+
+// ── Filters & calcs ──────────────────────────────────────────────────────────
+ema200        = ta.ema(close, 200)
+ema_entry     = ta.ema(close, entry_ema_length)
+ema_exit      = ta.ema(close, exit_ema_length)
+ascending_entry  = ema_entry > ema_entry[1]
+descending_entry = ema_entry < ema_entry[1] and ema_entry[1] < ema_entry[2]
+rsi           = ta.rsi(close, rsi_length)
+atr           = ta.atr(atrLookback)
+volume_sma    = ta.sma(volume, volume_sma_length)
+adx           = ta.ema(ta.tr(true), adx_length)  // preserved behavior
+
+// Bar spacing & time spacing
+var int bars_since_last_exit = 0
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    bars_since_last_exit := 0
+else
+    bars_since_last_exit := nz(bars_since_last_exit[1]) + 1
+
+var int last_signal_time = 0
+time_cond_time = time - last_signal_time >= min_minutes_between_signals * 60000
+
+// RSI overlay visuals
+price_high    = ta.highest(high, rsi_lookback)
+price_low     = ta.lowest(low,  rsi_lookback)
+price_range   = price_high - price_low
+rsi_height    = price_range * rsi_height_pct
+rsi_bottom    = price_low - price_range * rsi_bottom_buffer
+rsi_scaled    = rsi_bottom + (rsi / 100) * rsi_height
+rsi_30_scaled = rsi_bottom + 0.3 * rsi_height
+rsi_50_scaled = rsi_bottom + 0.5 * rsi_height
+rsi_70_scaled = rsi_bottom + 0.7 * rsi_height
+
+// Conditions
+volume_cond = not use_volume_filter or volume > volume_sma
+time_cond   = bars_since_last_exit >= min_bars_between_trades
+long_cond_base  = ascending_entry and close > ema_entry and rsi > rsi_long_threshold and close > ema200 and time >= start_time and volume_cond and time_cond and time_cond_time
+short_cond_base = allow_shorts and descending_entry and close < ema_entry and rsi < rsi_short_threshold and (not use_ema200_short or close < ema200) and adx > adx_threshold and time >= start_time and volume_cond and time_cond and time_cond_time
+
+// ── Alert helpers ────────────────────────────────────────────────────────────
+iso_ts() =>
+    t = time_close
+    str.tostring(year(t)) + "-" + str.tostring(month(t), "00") + "-" + str.tostring(dayofmonth(t), "00") + "T" + str.tostring(hour(t), "00") + ":" + str.tostring(minute(t), "00") + ":" + str.tostring(second(t), "00") + "Z"
+
+build_payload(_action) =>
+    act = _action
+    if _action == "exit_long"
+        act := "exit_long"
+    else if _action == "exit_short"
+        act := "exit_short"
+    s1 = "{" + "\"secret\":\"" + secret_code + "\"," + "\"max_lag\":\"300\"," + "\"timestamp\":\"" + iso_ts() + "\"," 
+    s2 = "\"trigger_price\":\"" + str.tostring(close, format.mintick) + "\"," + "\"tv_exchange\":\"" + syminfo.prefix + "\"," + "\"tv_instrument\":\"" + syminfo.ticker + "\"," 
+    s3 = "\"action\":\"" + act + "\"," + "\"bot_uuid\":\"" + bot_uuid + "\"" + "}"
+    s1 + s2 + s3
+
+send_alert(_action) =>
+    alert(build_payload(_action), alert.freq_once_per_bar)
+
+// ── Entries (BAR CLOSE ONLY, ONE ACTION PER BAR) ─────────────────────────────
+if barstate.isconfirmed and can_act()
+    // LONG branch
+    if long_cond_base
+        if strategy.position_size < 0
+            send_alert("exit_short")
+            strategy.close("Short")
+        strategy.entry("Long", strategy.long)
+        long_entry_price := close
+        last_signal_time := time
+        if strategy.position_size <= 0 and not in_long
+            send_alert("enter_long")
+            last_alert_time := timenow
+        in_long  := true
+        in_short := false
+        last_action_bar := bar_index
+
+    // SHORT branch
+    else if short_cond_base
+        if strategy.position_size > 0
+            send_alert("exit_long")
+            strategy.close("Long")
+        strategy.entry("Short", strategy.short)
+        short_entry_price := close
+        last_signal_time  := time
+        if strategy.position_size >= 0 and not in_short
+            send_alert("enter_short")
+            last_alert_time := timenow
+        in_short := true
+        in_long  := false
+        last_action_bar := bar_index
+
+// ── Breakeven (same logic as before, no can_act guard) ───────────────────────
+if barstate.isconfirmed
+    if strategy.position_size > 0 and not na(long_entry_price) and close > long_entry_price * (1 + breakeven_pct / 100)
+        strategy.exit("BE Long", "Long", stop = long_entry_price)
+    if strategy.position_size < 0 and not na(short_entry_price) and close < short_entry_price * (1 - breakeven_pct / 100)
+        strategy.exit("BE Short", "Short", stop = short_entry_price)
+
+// ── Trailing exits (original logic) ──────────────────────────────────────────
+mintick = syminfo.mintick
+to_ticks(usd) => int(math.max(1, math.round(usd / mintick)))
+
+legacy_points     = int(close - atr * atrMultiplier)
+legacy_offset     = int(atr * atrMultiplier)
+true_atr_ticks    = to_ticks(atr * atrMultiplier)
+fixed_usd_ticks   = to_ticks(fixed_usd)
+percent_ticks     = to_ticks(close * (trail_pct_of_price / 100.0))
+init_offset_ticks = to_ticks(init_offset_usd)
+
+trail_ticks  = 0
+offset_ticks = 0
+if trail_mode == "True ATR"
+    trail_ticks  := true_atr_ticks
+    offset_ticks := true_atr_ticks
+else if trail_mode == "Fixed USD"
+    trail_ticks  := fixed_usd_ticks
+    offset_ticks := init_offset_ticks
+else if trail_mode == "Percent of Price"
+    trail_ticks  := percent_ticks
+    offset_ticks := init_offset_ticks
+else
+    trail_ticks  := legacy_points
+    offset_ticks := legacy_offset
+
+current_trail_usd = trail_ticks * mintick
+legacy_trail_usd  = legacy_points * mintick
+plot(show_trail_usd ? current_trail_usd : na, title="Trail Distance (USD)", color=color.new(color.teal, 0))
+plot(show_trail_usd and trail_mode == "Legacy (close-ATR)" ? legacy_trail_usd : na, title="Legacy Trail (USD)", color=color.new(color.orange, 0))
+
+if use_trailing_stop and barstate.isconfirmed
+    if strategy.position_size > 0
+        strategy.exit("Trail Long", "Long",  trail_points = trail_ticks, trail_offset = offset_ticks)
+    else if strategy.position_size < 0
+        strategy.exit("Trail Short", "Short", trail_points = trail_ticks, trail_offset = offset_ticks)
+
+// ── Fixed SL if trailing OFF (same as original) ──────────────────────────────
+if not use_trailing_stop and barstate.isconfirmed and can_act()
+    if strategy.position_size > 0 and not na(long_entry_price)
+        strategy.exit("SL Long", "Long", stop = long_entry_price * (1 - stop_loss_pct / 100))
+        last_action_bar := bar_index
+    else if strategy.position_size < 0 and not na(short_entry_price)
+        strategy.exit("SL Short", "Short", stop = short_entry_price * (1 + stop_loss_pct / 100))
+        last_action_bar := bar_index
+
+// ── EMERGENCY HARD SL (independent, optional) ────────────────────────────────
+if barstate.isconfirmed and strategy.position_size != 0 and use_emergency_sl
+    float emergency_long_entry  = na(long_entry_price)  ? strategy.position_avg_price : long_entry_price
+    float emergency_short_entry = na(short_entry_price) ? strategy.position_avg_price : short_entry_price
+
+    // Long: if low pierces emergency SL
+    if strategy.position_size > 0 and not na(emergency_long_entry)
+        float long_em_sl = emergency_long_entry * (1 - emergency_sl_pct / 100)
+        if low <= long_em_sl
+            strategy.close("Long")
+
+    // Short: if high pierces emergency SL
+    if strategy.position_size < 0 and not na(emergency_short_entry)
+        float short_em_sl = emergency_short_entry * (1 + emergency_sl_pct / 100)
+        if high >= short_em_sl
+            strategy.close("Short")
+
+// ── Exit alerts when flat ────────────────────────────────────────────────────
+if strategy.position_size[1] != 0 and strategy.position_size == 0 and barstate.isconfirmed
+    send_alert(strategy.position_size[1] > 0 ? "exit_long" : "exit_short")
+    last_alert_time := timenow
+    if strategy.position_size[1] > 0
+        in_long := false
+        long_entry_price := na
+    else
+        in_short := false
+        short_entry_price := na
+
+// ── Plots ────────────────────────────────────────────────────────────────────
+plot(ema_entry, "EMA Entry", color=color.blue,   linewidth=1)
+plot(ema_exit,  "EMA Exit",  color=color.yellow, linewidth=1)
+plot(ema200,    "EMA 200 (Trend Filter)", color=color.gray, linewidth=2)
+plot(show_rsi ? rsi_scaled : na, "RSI Overlay", color=color.purple, linewidth=1)
+plot(show_rsi and show_rsi_levels and bar_index % rsi_level_dash_interval == 0 ? rsi_30_scaled : na, "RSI 30", color=color.gray, style=plot.style_circles, linewidth=1)
+plot(show_rsi and show_rsi_levels and bar_index % rsi_level_dash_interval == 0 ? rsi_50_scaled : na, "RSI 50", color=color.gray, style=plot.style_circles, linewidth=1)
+plot(show_rsi and show_rsi_levels and bar_index % rsi_level_dash_interval == 0 ? rsi_70_scaled : na, "RSI 70", color=color.gray, style=plot.style_circles, linewidth=1)
+
+buy_signal        = long_cond_base  and strategy.position_size[1] == 0
+exit_long_signal  = not long_cond_base  and strategy.position_size[1] > 0
+short_signal      = short_cond_base and strategy.position_size[1] == 0
+exit_short_signal = not short_cond_base and strategy.position_size[1] < 0
+reverse_to_long   = long_cond_base  and strategy.position_size[1] < 0
+reverse_to_short  = short_cond_base and strategy.position_size[1] > 0
+
+plotshape(show_labels and buy_signal and not reverse_to_long ? true : na,  title="Buy",         style=shape.circle, location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(show_labels and short_signal and not reverse_to_short ? true : na, title="Short",     style=shape.circle, location=location.abovebar, color=color.red,   size=size.tiny)
+plotshape(show_labels and exit_long_signal and not reverse_to_short ? true : na, title="Exit Long",  style=shape.circle, location=location.abovebar, color=color.orange, size=size.tiny)
+plotshape(show_labels and exit_short_signal and not reverse_to_long ? true : na, title="Exit Short", style=shape.circle, location=location.belowbar, color=color.orange, size=size.tiny)
+plotshape(show_labels and reverse_to_long ? true : na,  title="Exit -> Buy",   style=shape.circle, location=location.belowbar, color=color.green, size=size.tiny, offset=-1)
+plotshape(show_labels and reverse_to_short ? true : na, title="Exit -> Short", style=shape.circle, location=location.abovebar, color=color.red,   size=size.tiny, offset=-1)

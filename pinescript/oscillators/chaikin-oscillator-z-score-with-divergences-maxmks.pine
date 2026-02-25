@@ -1,0 +1,345 @@
+// ------------------------------------------------------------------------------------
+// Copyright © 2026 MAXmks
+// Licensed under CC BY-NC-SA 4.0: you may share/modify with attribution,
+// for non-commercial use only, and you must license derivatives under CC BY-NC-SA 4.0.
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// Author: MAXmks — https://www.tradingview.com/u/MAXmks/
+// ------------------------------------------------------------------------------------
+// Disclaimer: Educational purposes only. Not financial advice. Use at your own risk.
+// ------------------------------------------------------------------------------------
+//@version=6
+indicator("Chaikin Oscillator Z-Score With Divergences [MAXmks]", shorttitle="Chaikin Z-Score [MAXmks]", overlay=false, precision=2, max_lines_count=500, max_labels_count=500)
+
+// CONSTANTS / SAFETY FLOORS
+float EPSILON = 1e-10
+float K_MIN_FLOOR = 1e-6
+float VAR_FLOOR = 1e-6
+
+// TYPES
+type BundleResult
+    float z
+    bool regBull
+    bool regBear
+    bool hidBull
+    bool hidBear
+    int t1_bull
+    float y1_bull
+    int t2_bull
+    float y2_bull
+    int t1_bear
+    float y1_bear
+    int t2_bear
+    float y2_bear
+
+type PivotPoint
+    int idx
+    int t
+    float osc
+    float price
+
+// CONSTANTS
+var string DIV_CLOSE  = "Close"
+
+f_validateZ(float x) =>
+    na(x) or math.abs(x) > 1.0e10 ? na : x
+
+f_asinh(float x) =>
+    na(x) ? na : math.log(x + math.sqrt(x * x + 1.0))
+
+// INPUTS
+string GR_CHO = "Chaikin Oscillator"
+int i_choFastLen = input.int(3, "Chaikin Fast EMA Length", minval=1, group=GR_CHO, tooltip="Classic Chaikin fast EMA length.\nDefault: 3.")
+int i_choSlowLen = input.int(10, "Chaikin Slow EMA Length", minval=2, group=GR_CHO, tooltip="Classic Chaikin slow EMA length.\nDefault: 10.")
+
+string GR_ZON = "Zones"
+float i_obLevel = input.float(2.0, "OB Level", minval=0.1, step=0.1, group=GR_ZON, tooltip="Overbought threshold for Z.\nDefault: 2.0.")
+float i_osLevel = input.float(-2.0, "OS Level", maxval=-0.1, step=0.1, group=GR_ZON, tooltip="Oversold threshold for Z.\nDefault: -2.0.")
+bool i_showExtreme = input.bool(false, "Show Extreme Levels", group=GR_ZON, tooltip="Optional ±Extreme lines.\nDefault: OFF.")
+float i_extLevel = input.float(3.0, "Extreme Level (±)", minval=1, step=0.1, group=GR_ZON, tooltip="Extreme threshold magnitude (used when enabled).\nDefault: 3.0.")
+
+string GR_DIV = "Divergences"
+bool i_showDivergences = input.bool(true, "Show Divergences", group=GR_DIV, tooltip="Draw divergence lines/labels in this pane.\nDefault: ON.")
+bool i_showHiddenDivergences = input.bool(false, "Show Hidden Divergences", group=GR_DIV, tooltip="When ON, also detect/draw hidden divergences.\nDefault: OFF.")
+string i_divSource = input.string("High/Low", "Divergence Source", options=["High/Low","Close"], group=GR_DIV, tooltip="Price source for divergence detection.\nHigh/Low: lows for bullish, highs for bearish.\nClose: close for both.\n\nDefault: High/Low.")
+int i_pivotLeftBars = input.int(6, "Pivot Left Bars", minval=1, group=GR_DIV, tooltip="Smaller values = faster detection but more false signals.\nLarger values = more reliable but increased lag.\n\nDefault: 6.")
+int i_pivotRightBars = input.int(3, "Pivot Right Bars", minval=1, group=GR_DIV, tooltip="Smaller values = faster confirmation but more noise.\nLarger values = more reliable but increased lag.\n\nDefault: 3.")
+int i_minBarsBetween = input.int(5, "Min Bars Between Pivots", minval=1, group=GR_DIV, tooltip="Minimum distance (in bars) between compared pivots.\nDefault: 5.")
+int i_maxBarsBetween = input.int(60, "Max Bars Between Pivots", minval=2, group=GR_DIV, tooltip="Maximum distance (in bars) between compared pivots.\nDefault: 60.")
+int i_maxDivMarks = input.int(50, "Max Divergence Marks", minval=0, maxval=200, group=GR_DIV, tooltip="Max number of divergence lines/labels kept on chart. Older marks are deleted.\n\nDefault: 50.")
+
+string GR_Z = "Z-Score Settings"
+int i_kLookback = input.int(200, "Adaptive Normalization Lookback", minval=5, group=GR_Z, tooltip="Defines how quickly the oscillator adapts to volume changes.\n\n• Lower (e.g., 50): Adapts fast to recent volatility spikes.\n• Higher (e.g., 200): More stable Z-Score, better for long-term analysis.\n\nDefault: 200.")
+int i_zLen = input.int(200, "Z-Score EMA Length", minval=5, group=GR_Z, tooltip="EMA length used for Z-score mean/variance.\nDefault: 200.")
+
+string GR_VIS = "Visual"
+bool i_enableGradient = input.bool(true, "Enable Gradient Coloring", group=GR_VIS, tooltip="When ON: Changes line color intensity based on Z-Score magnitude.\n\nDefault: ON.")
+int i_lineWidth = input.int(2, "Z Line Width", minval=1, maxval=4, group=GR_VIS, tooltip="Line width for the Z plot.\nDefault: 2.")
+string i_textSize = input.string("Normal", "Dashboard Size", options=["Tiny", "Small", "Normal", "Large"], group=GR_VIS, tooltip="Size of the text in the table.\nDefault: Normal.")
+
+//Core Logic
+f_bundle() =>
+    float hlRange = high - low
+    float mfm = hlRange == 0.0 ? 0.0 : ((close - low) - (high - close)) / hlRange
+    float mfv = (na(volume) or volume == 0.0) ? 0.0 : (mfm * volume)
+    float adl = ta.cum(mfv)
+    float cho = ta.ema(adl, i_choFastLen) - ta.ema(adl, i_choSlowLen)
+    float kRaw = ta.ema(nz(math.abs(cho)), i_kLookback)
+    float kFloor = math.max(K_MIN_FLOOR, EPSILON)
+    float k = math.max(kRaw, kFloor)
+    float xComp = f_asinh(cho / k)
+    float mean = ta.ema(nz(xComp), i_zLen)
+    float dev  = xComp - mean
+    float vRaw = ta.ema(nz(dev * dev), i_zLen)
+    float vFloor = math.max(VAR_FLOOR, EPSILON)
+    float v = math.max(vRaw, vFloor)
+    float z = dev / math.sqrt(v)
+    float zChecked = f_validateZ(z)
+    int warmupBars = math.max(i_kLookback, i_zLen)
+    float zFinal = (bar_index < warmupBars) ? na : zChecked
+
+    BundleResult res = BundleResult.new()
+    res.z := zFinal
+
+    int L = i_pivotLeftBars
+    int R = i_pivotRightBars
+    float zPiv = (i_showDivergences and not na(zFinal)) ? zFinal : na
+    float pl = ta.pivotlow(zPiv, L, R)
+    float ph = ta.pivothigh(zPiv, L, R)
+    
+    if i_showDivergences and not na(zFinal)
+        var PivotPoint prevLow = PivotPoint.new()
+
+        if barstate.isconfirmed and not na(pl)
+
+            float bestPrice = (i_divSource == DIV_CLOSE) ? close[R] : low[R]
+            int idxCurr = (bar_index - R)
+            int timeCurr = time[R]
+            float oscCurr = pl
+            float priceCurr = bestPrice
+            bool hasPrev = not na(prevLow.idx)
+            if hasPrev
+                int barsBetween = idxCurr - prevLow.idx
+                bool inRange = barsBetween >= i_minBarsBetween and barsBetween <= i_maxBarsBetween
+                if inRange and not na(prevLow.osc) and not na(prevLow.price) and not na(priceCurr)
+                    bool segOk = true
+                    if barsBetween > 1
+                        for kk = 1 to i_maxBarsBetween
+                            if kk < barsBetween
+                                float vMid = zPiv[R + kk]
+                                if not na(vMid)
+                                    float yLine = oscCurr + (prevLow.osc - oscCurr) * (float(kk) / float(barsBetween))
+                                    if vMid < (yLine - EPSILON)
+                                        segOk := false
+                                        break
+                            else
+                                break
+                    res.regBull := segOk and (priceCurr < prevLow.price) and (oscCurr > prevLow.osc)
+                    res.hidBull := segOk and i_showHiddenDivergences and (priceCurr > prevLow.price) and (oscCurr < prevLow.osc)
+
+            if res.regBull or res.hidBull
+                res.t1_bull := prevLow.t
+                res.y1_bull := prevLow.osc
+                res.t2_bull := timeCurr
+                res.y2_bull := oscCurr
+
+            prevLow.osc   := oscCurr
+            prevLow.price := priceCurr
+            prevLow.idx   := idxCurr
+            prevLow.t     := timeCurr
+
+        var PivotPoint prevHigh = PivotPoint.new()
+
+        if barstate.isconfirmed and not na(ph)
+            
+            float bestPriceH = (i_divSource == DIV_CLOSE) ? close[R] : high[R]
+            int idxCurrH = (bar_index - R)
+            int timeCurrH = time[R]
+            float oscCurrH = ph
+            float priceCurrH = bestPriceH
+            bool hasPrevH = not na(prevHigh.idx)
+            if hasPrevH
+                int barsBetweenH = idxCurrH - prevHigh.idx
+                bool inRangeH = barsBetweenH >= i_minBarsBetween and barsBetweenH <= i_maxBarsBetween
+                if inRangeH and not na(prevHigh.osc) and not na(prevHigh.price) and not na(priceCurrH)
+                    bool segOkH = true
+                    if barsBetweenH > 1
+                        for kkH = 1 to i_maxBarsBetween
+                            if kkH < barsBetweenH
+                                float vMidH = zPiv[R + kkH]
+                                if not na(vMidH)
+                                    float yLineH = oscCurrH + (prevHigh.osc - oscCurrH) * (float(kkH) / float(barsBetweenH))
+                                    if vMidH > (yLineH + EPSILON)
+                                        segOkH := false
+                                        break
+                            else
+                                break
+                    res.regBear := segOkH and (priceCurrH > prevHigh.price) and (oscCurrH < prevHigh.osc)
+                    res.hidBear := segOkH and i_showHiddenDivergences and (priceCurrH < prevHigh.price) and (oscCurrH > prevHigh.osc)
+
+            if res.regBear or res.hidBear
+                res.t1_bear := prevHigh.t
+                res.y1_bear := prevHigh.osc
+                res.t2_bear := timeCurrH
+                res.y2_bear := oscCurrH
+
+            prevHigh.osc   := oscCurrH
+            prevHigh.price := priceCurrH
+            prevHigh.idx   := idxCurrH
+            prevHigh.t     := timeCurrH
+    res
+
+// No-volume guard
+float cumVol = ta.cum(nz(volume))
+bool noVolData = barstate.islast and cumVol == 0
+
+BundleResult res = f_bundle()
+
+float zRaw     = res.z
+bool regBull   = res.regBull
+bool regBear   = res.regBear
+bool hidBull   = res.hidBull
+bool hidBear   = res.hidBear
+
+int bull_t1  = res.t1_bull
+float bull_y1  = res.y1_bull
+int bull_t2  = res.t2_bull
+float bull_y2  = res.y2_bull
+int bear_t1  = res.t1_bear
+float bear_y1  = res.y1_bear
+int bear_t2  = res.t2_bear
+float bear_y2  = res.y2_bear
+
+float Z_final = zRaw
+float Z_plot = Z_final
+float obGrad = i_obLevel > 0 ? i_obLevel : 2.0
+float osGrad = i_osLevel < 0 ? i_osLevel : -2.0
+float obMid = obGrad * 0.75
+float osMid = osGrad * 0.75
+
+color zColor = color.gray
+if i_enableGradient and not na(Z_plot)
+    if Z_plot >= 0
+        if Z_plot < obMid
+            zColor := color.from_gradient(Z_plot, 0, obMid, color.gray, color.green)
+        else
+            zColor := color.from_gradient(Z_plot, obMid, obGrad, color.green, color.red)
+    else
+        if Z_plot > osMid
+            zColor := color.from_gradient(Z_plot, osMid, 0, color.red, color.gray)
+        else
+            zColor := color.from_gradient(Z_plot, osGrad, osMid, color.green, color.red)
+
+hline(0, "Zero", color=color.new(color.gray, 0))
+hline(i_obLevel, "OB", color=color.new(color.red, 0), linestyle=hline.style_dotted, linewidth=1)
+hline(i_osLevel, "OS", color=color.new(color.green, 0), linestyle=hline.style_dotted, linewidth=1)
+hline(i_extLevel, "Extreme +", color=i_showExtreme ? color.new(color.red, 60) : color.new(color.red, 100), linestyle=hline.style_dotted, linewidth=1)
+hline(-i_extLevel, "Extreme -", color=i_showExtreme ? color.new(color.green, 60) : color.new(color.green, 100), linestyle=hline.style_dotted, linewidth=1)
+
+plot(Z_plot, "ChO Z-Score", color=zColor, linewidth=i_lineWidth)
+
+float zAbove = (not na(Z_plot) and Z_plot > i_obLevel) ? Z_plot : na
+float obBand = (not na(Z_plot) and Z_plot > i_obLevel) ? i_obLevel : na
+pZA = plot(zAbove, display=display.none)
+pOB = plot(obBand, display=display.none)
+fill(pZA, pOB, color=color.new(color.red, 55), title="OB Fill")
+
+float zBelow = (not na(Z_plot) and Z_plot < i_osLevel) ? Z_plot : na
+float osBand = (not na(Z_plot) and Z_plot < i_osLevel) ? i_osLevel : na
+pZB = plot(zBelow, display=display.none)
+pOS = plot(osBand, display=display.none)
+fill(pZB, pOS, color=color.new(color.green, 55), title="OS Fill")
+
+var line[]  g_divLines  = array.new_line()
+var label[] g_divLabels = array.new_label()
+
+f_pushMark(line ln, label lb) =>
+    array.push(g_divLines, ln)
+    array.push(g_divLabels, lb)
+    while array.size(g_divLines) > i_maxDivMarks
+        line.delete(array.shift(g_divLines))
+    while array.size(g_divLabels) > i_maxDivMarks
+        label.delete(array.shift(g_divLabels))
+
+int rb = regBull ? 1 : 0
+int rB = regBear ? 1 : 0
+int hb = hidBull ? 1 : 0
+int hB = hidBear ? 1 : 0
+bool trigRegBull = rb == 1 and nz(rb[1]) == 0
+bool trigRegBear = rB == 1 and nz(rB[1]) == 0
+bool trigHidBull = hb == 1 and nz(hb[1]) == 0
+bool trigHidBear = hB == 1 and nz(hB[1]) == 0
+bool canDraw = i_showDivergences and i_maxDivMarks > 0
+
+if canDraw and trigRegBull and not na(bull_t1) and not na(bull_t2) and not na(bull_y1) and not na(bull_y2)
+    line ln = line.new(x1=bull_t1, y1=bull_y1, x2=bull_t2, y2=bull_y2, xloc=xloc.bar_time,
+        color=color.new(color.green, 10), width=1, style=line.style_solid)
+    label lb = label.new(x=bull_t2, y=bull_y2, xloc=xloc.bar_time, text="Bull", style=label.style_label_up,
+       textcolor=color.white, color=color.new(color.green, 10), size=size.tiny)
+    f_pushMark(ln, lb)
+
+if canDraw and trigRegBear and not na(bear_t1) and not na(bear_t2) and not na(bear_y1) and not na(bear_y2)
+    line ln = line.new(x1=bear_t1, y1=bear_y1, x2=bear_t2, y2=bear_y2, xloc=xloc.bar_time,
+        color=color.new(color.red, 10), width=1, style=line.style_solid)
+    label lb = label.new(x=bear_t2, y=bear_y2, xloc=xloc.bar_time, text="Bear", style=label.style_label_down,
+        textcolor=color.white, color=color.new(color.red, 10), size=size.tiny)
+    f_pushMark(ln, lb)
+
+if canDraw and trigHidBull and not na(bull_t1) and not na(bull_t2) and not na(bull_y1) and not na(bull_y2)
+    line ln = line.new(x1=bull_t1, y1=bull_y1, x2=bull_t2, y2=bull_y2, 
+xloc=xloc.bar_time,
+        color=color.new(color.green, 35), width=1, style=line.style_dashed)
+    label lb = label.new(x=bull_t2, y=bull_y2, xloc=xloc.bar_time, text="H Bull", style=label.style_label_up,
+        textcolor=color.white, color=color.new(color.green, 35), size=size.tiny)
+    f_pushMark(ln, lb)
+
+if canDraw and trigHidBear and not na(bear_t1) and not na(bear_t2) and not na(bear_y1) and not na(bear_y2)
+    line ln = line.new(x1=bear_t1, y1=bear_y1, x2=bear_t2, y2=bear_y2, xloc=xloc.bar_time,
+        color=color.new(color.red, 35), width=1, style=line.style_dashed)
+    label lb = label.new(x=bear_t2, y=bear_y2, xloc=xloc.bar_time, text="H Bear", style=label.style_label_down,
+        textcolor=color.white, color=color.new(color.red, 35), size=size.tiny)
+    f_pushMark(ln, lb)
+
+bool zOk = not na(Z_final)
+bool crossIntoOB = ta.crossover(Z_final, i_obLevel)
+bool crossIntoOS = ta.crossunder(Z_final, i_osLevel)
+bool crossOutOB  = ta.crossunder(Z_final, i_obLevel)
+bool crossOutOS  = ta.crossover(Z_final, i_osLevel)
+
+alertcondition(zOk and crossIntoOB, title="Entered Overbought", message="ChO Z-Score crossed above OB level ({{ticker}})")
+alertcondition(zOk and crossIntoOS, title="Entered Oversold",  message="ChO Z-Score crossed below OS level ({{ticker}})")
+alertcondition(zOk and crossOutOB, title="Exited Overbought", message="ChO Z-Score crossed below OB level ({{ticker}})")
+alertcondition(zOk and crossOutOS, title="Exited Oversold",  message="ChO Z-Score crossed above OS level ({{ticker}})")
+alertcondition(trigRegBull, title="Bullish Divergence", message="Regular bullish divergence detected ({{ticker}})")
+alertcondition(trigRegBear, title="Bearish Divergence", message="Regular bearish divergence detected ({{ticker}})")
+alertcondition(trigHidBull, title="Hidden Bullish Divergence", message="Hidden bullish divergence detected ({{ticker}})")
+alertcondition(trigHidBear, title="Hidden Bearish Divergence", message="Hidden bearish divergence detected ({{ticker}})")
+
+// DASHBOARD TABLE
+var table infoTable = table.new(position.top_right, 2, 2, border_width=0, frame_color=color.new(color.black, 100), border_color=color.new(color.black, 100))
+
+if barstate.islast
+    table.set_position(infoTable, position.top_right)
+    string sizeInput = i_textSize
+    string txtSize = sizeInput == "Tiny" ? size.tiny : sizeInput == "Small" ? size.small : sizeInput == "Normal" ? size.normal : size.large
+
+    string brandName = "𝑪𝒉𝒂𝒊𝒌𝒊𝒏 𝑶𝒔𝒄 𝒁"
+    table.cell(infoTable, 0, 0, brandName, text_color=color.fuchsia, text_halign=text.align_right, text_size=txtSize, bgcolor=color.new(color.black, 100))
+
+    string valStr = noVolData ? "N/A" : str.tostring(Z_plot, "#.##")
+    color valColor = noVolData ? color.gray : zColor
+    table.cell(infoTable, 1, 0, valStr, text_color=valColor, text_halign=text.align_left, text_size=txtSize, bgcolor=color.new(color.black, 100))
+
+    int requiredBars = math.max(i_kLookback, i_zLen)
+    bool lowHistory = bar_index < requiredBars
+
+    if noVolData
+        table.merge_cells(infoTable, 0, 1, 1, 1)
+        table.cell(infoTable, 0, 1, "⚠ No Volume Data", text_color=color.new(color.orange, 0), text_halign=text.align_center, text_size=txtSize, bgcolor=color.new(color.black, 100))
+    else if lowHistory
+        table.merge_cells(infoTable, 0, 1, 1, 1)
+        string warnText = "⚠ Need " + str.tostring(requiredBars) + "+ bars"
+        table.cell(infoTable, 0, 1, warnText, text_color=color.new(color.yellow, 0), text_halign=text.align_center, text_size=txtSize, bgcolor=color.new(color.black, 100))
+    else
+        table.cell(infoTable, 0, 1, "", bgcolor=color.new(color.black, 100))
+        table.cell(infoTable, 1, 1, "", bgcolor=color.new(color.black, 100))

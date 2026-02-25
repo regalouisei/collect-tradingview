@@ -1,0 +1,255 @@
+//@version=5
+// Moving Regression Prediction Bands (MRBands)
+//
+// © tbiktag
+//
+// The indicator is based on a Moving Regression procedure, as implemented 
+// in the recently published script:
+//
+// https://www.tradingview.com/script/0GhsW1KR-Moving-Regression/
+//
+// Its upper and lower bands define an interval in which the current price 
+// was expected to fall with a prescribed probability, as predicted by 
+// the previous-step Moving Regression result.
+// 
+//
+
+indicator('Moving Regression Prediction Bands', shorttitle='MRBands', overlay=true)
+
+// define color scheme
+color COL_NEUT = #3c94b8
+color COL_UP   = #76ccb3
+color COL_DOWN = #d1807c
+
+// input parameters
+src       = input(title='Source', defval=close)
+degree    = input.int(title='Polynomial Order', defval=2, minval=0)
+window    = input.int(title='Length (must be greater than Order)', defval=100, minval=2)
+mult      = input.float(title='Multiplier', defval=2.0, minval=0.0)
+issignal  = input(title='Show Breakout Signals', defval=true)
+clinetype = input.string(title='Show Central Line As', defval='Ribbon', options=['Ribbon', 'MR', 'Previous-Period MR Prediction'])
+
+// functions 
+//
+matrix_get(A, i, j, nrows) =>
+    // Get the value of the element of an implied 2d matrix
+    //input: 
+    // A :: array: pseudo 2d matrix A = [[column_0],[column_1],...,[column_(n-1)]]
+    // i :: integer: row number
+    // j :: integer: column number
+    // nrows :: integer: number of rows in the implied 2d matrix
+    array.get(A, i + nrows * j)
+//
+matrix_set(A, value, i, j, nrows) =>
+    // Set a value to the element of an implied 2d matrix
+    //input: 
+    // A :: array, changed on output: pseudo 2d matrix A = [[column_0],[column_1],...,[column_(n-1)]]
+    // value :: float: the new value to be set
+    // i :: integer: row number
+    // j :: integer: column number
+    // nrows :: integer: number of rows in the implied 2d matrix
+    array.set(A, i + nrows * j, value)
+//
+transpose(A, nrows, ncolumns) =>
+    // Transpose an implied 2d matrix
+    // input:
+    // A :: array: pseudo 2d matrix A = [[column_0],[column_1],...,[column_(n-1)]]
+    // nrows :: integer: number of rows in A
+    // ncolumns :: integer: number of columns in A
+    // output:
+    // AT :: array: pseudo 2d matrix with implied dimensions: _ncolums x _nrows
+    var AT = array.new_float(nrows * ncolumns, 0)
+    for i = 0 to nrows - 1 by 1
+        for j = 0 to ncolumns - 1 by 1
+            matrix_set(AT, matrix_get(A, i, j, nrows), j, i, ncolumns)
+    AT
+//
+multiply(A, B, nrowsA, ncolumnsA, ncolumnsB) =>
+    // Calculate scalar product of two matrices
+    // input: 
+    // A :: array: pseudo 2d matrix
+    // B :: array: pseudo 2d matrix
+    // nrowsA :: integer: number of rows in A
+    // ncolumnsA :: integer: number of columns in A
+    // ncolumnsB :: integer: number of columns in B
+    // output:
+    // C:: array: pseudo 2d matrix with implied dimensions nrowsA x ncolumnsB
+    var C = array.new_float(nrowsA * ncolumnsB, 0)
+    int   nrowsB   = ncolumnsA
+    float elementC = 0.0
+    for i     = 0 to nrowsA - 1    by 1
+        for j = 0 to ncolumnsB - 1 by 1
+            elementC     := 0
+            for k = 0 to ncolumnsA - 1 by 1
+                elementC += matrix_get(A, i, k, nrowsA) * matrix_get(B, k, j, nrowsB)
+            matrix_set(C, elementC, i, j, nrowsA)
+    C
+//
+vnorm(X, n) =>
+    //Square norm of vector X with size n
+    float norm = 0.0
+    for i = 0 to n - 1 by 1
+        norm += math.pow(array.get(X, i), 2)
+    math.sqrt(norm)
+//
+qr_diag(A, nrows, ncolumns) =>
+    //QR Decomposition with Modified Gram-Schmidt Algorithm (Column-Oriented)
+    // input:
+    // A :: array: pseudo 2d matrix A = [[column_0],[column_1],...,[column_(n-1)]]
+    // nrows :: integer: number of rows in A
+    // ncolumns :: integer: number of columns in A
+    // output:
+    // Q: unitary matrix, implied dimenstions nrows x ncolumns
+    // R: upper triangular matrix, implied dimansions ncolumns x ncolumns
+    var Q     = array.new_float(nrows    * ncolumns, 0)
+    var R     = array.new_float(ncolumns * ncolumns, 0)
+    var a     = array.new_float(nrows, 0)
+    var q     = array.new_float(nrows, 0)
+    float r   = 0.0
+    float aux = 0.0
+    //get first column of A and its norm:
+    for i = 0 to nrows - 1 by 1
+        array.set(a, i, matrix_get(A, i, 0, nrows))
+    r := vnorm(a, nrows)
+    //assign first diagonal element of R and first column of Q
+    matrix_set(R, r, 0, 0, ncolumns)
+    for i = 0 to nrows - 1 by 1
+        matrix_set(Q, array.get(a, i) / r, i, 0, nrows)
+    if  ncolumns != 1
+        //repeat for the rest of the columns
+        for k = 1     to ncolumns - 1 by 1
+            for i = 0 to nrows - 1    by 1
+                array.set(a, i, matrix_get(A, i, k, nrows))
+            for j = 0 to k - 1        by 1
+                //get R_jk as scalar product of Q_j column and A_k column:
+                r := 0
+                for i  = 0 to nrows - 1 by 1
+                    r += matrix_get(Q, i, j, nrows) * array.get(a, i)
+                matrix_set(R, r, j, k, ncolumns)
+                //update vector _a
+                for i = 0 to nrows - 1 by 1
+                    aux := array.get(a, i) - r * matrix_get(Q, i, j, nrows)
+                    array.set(a, i, aux)
+            //get diagonal R_kk and Q_k column
+            r := vnorm(a, nrows)
+            matrix_set(R, r, k, k, ncolumns)
+            for i = 0 to nrows - 1 by 1
+                matrix_set(Q, array.get(a, i) / r, i, k, nrows)
+    [Q, R]
+//
+pinv(A, nrows, ncolumns) =>
+//Pseudoinverse of matrix A calculated using QR decomposition
+// Input: 
+// A:: array: implied as a (nrows x ncolumns) matrix A = [[column_0],[column_1],...,[column_(ncolumns-1)]]
+// Output: 
+// Ainv:: array implied as a (ncolumns x nrows) matrix A = [[row_0],[row_1],...,[row_(nrows-1)]]
+// ----
+// First find the QR factorization of A: A = QR,
+// where R is upper triangular matrix.
+// Then Ainv = R^-1*Q^T.
+// ----
+    [Q, R] = qr_diag(A, nrows, ncolumns)
+    QT = transpose(Q, nrows, ncolumns)
+    // Calculate Rinv:
+    var Rinv = array.new_float(ncolumns * ncolumns, 0)
+    float r = 0.0
+    matrix_set(Rinv, 1 / matrix_get(R, 0, 0, ncolumns), 0, 0, ncolumns)
+    if ncolumns != 1
+        for j = 1 to ncolumns - 1 by 1
+            for i = 0 to j - 1 by 1
+                r := 0.0
+                for k = i to j - 1 by 1
+                    r += matrix_get(Rinv, i, k, ncolumns) * matrix_get(R, k, j, ncolumns)
+                matrix_set(Rinv, r, i, j, ncolumns)
+            for k = 0 to j - 1 by 1
+                matrix_set(Rinv, -matrix_get(Rinv, k, j, ncolumns) / matrix_get(R, j, j, ncolumns), k, j, ncolumns)
+            matrix_set(Rinv, 1 / matrix_get(R, j, j, ncolumns), j, j, ncolumns)
+    //
+    Ainv = multiply(Rinv, QT, ncolumns, ncolumns, nrows)
+    Ainv
+//
+mae(x, xhat) =>
+    // Mean Average Error
+    // x    :: array float, original data
+    // xhat :: array float, model estimate
+    // output
+    // nrmse:: float
+    float mae = 0.0
+    if array.size(x) != array.size(xhat)
+        mae := na
+    else
+        int N = array.size(x)
+        for i = 0 to N - 1 by 1
+            mae += math.abs(array.get(x, i) - array.get(xhat, i)) / N
+    mae
+//
+mr(src, window, degree) =>
+    // Vandermonde matrix with implied dimensions (window x degree+1)
+    // Linear form: J = [ [z]^0, [z]^1, ... [z]^degree], with z = [ (1-window)/2 to (window-1)/2 ] 
+    J = array.new_float(window * (degree + 1), 0)
+    for i = 0 to window - 1 by 1
+        for j = 0 to degree by 1
+            matrix_set(J, math.pow(i, j), i, j, window)
+    // Vector of raw datapoints:
+    var Y_raw = array.new_float(window, na)
+    for j = 0 to window - 1 by 1
+        array.set(Y_raw, j, src[window - 1 - j])
+    // Calculate polynomial coefficients which minimize the loss function
+    C = pinv(J, window, degree + 1)
+    a_coef = multiply(C, Y_raw, degree + 1, window, 1)
+    // For smoothing, approximate the last point (i.e. z=window-1) by a0
+    float Y = 0.0
+    for i = 0 to degree by 1
+        Y += array.get(a_coef, i) * math.pow(window - 1, i)
+    // Trend Direction Forecast
+    float Y_f = 0.0
+    for i = 0 to degree by 1
+        Y_f += array.get(a_coef, i) * math.pow(window, i)
+    // Calculates data estimate (needed for rmse)
+    Y_hat = multiply(J, a_coef, window, degree + 1, 1)
+    err  = mae(Y_raw, Y_hat)
+    [Y, Y_f, err]
+
+
+// apply Moving Regression and calculate bands
+[MR, MR_f, div] = mr(src, window, degree)
+div            *= mult
+float highband  = MR_f[1] + div[1]
+float lowband   = MR_f[1] - div[1]
+
+//
+// specify plot color
+color plt_color  = COL_NEUT
+if      MR_f[1] < MR
+    plt_color   := COL_UP
+else if MR_f[1] > MR
+    plt_color   := COL_DOWN
+
+// plot bands
+hbplt  = plot(highband, title='Upper Band',    color=color.new(COL_NEUT, 50), linewidth=2)
+lbplt  = plot(lowband,  title='Lower Band',    color=color.new(COL_NEUT, 50), linewidth=2)
+fill(hbplt, lbplt,                             color=color.new(COL_NEUT, 90))
+//
+// plot central line
+mrplt  = plot(MR,       title='MR',            color=color.new(plt_color, transp=clinetype == 'Previous-Period MR Prediction' ? 100 : 20), linewidth=1)
+mrfplt = plot(MR_f[1],  title='MR Prediction', color=color.new(plt_color, transp=clinetype == 'MR' ? 100 : 20),                            linewidth=1)
+fill(mrplt, mrfplt,                            color=color.new(plt_color, transp=clinetype != 'Ribbon' ? 100 : 20))
+
+// signals and alerts
+bool Breakout         = ta.crossover(src,  highband)
+bool Breakdown        = ta.crossunder(src, lowband)
+plotshape(Breakout  and issignal ? high : na, location=location.abovebar, style=shape.triangleup,   color=color.new(#88d4ca, 0), size=size.tiny, title='Breakout')
+plotshape(Breakdown and issignal ? low  : na, location=location.belowbar, style=shape.triangledown, color=color.new(#f67e7d, 0), size=size.tiny, title='Breakdown')
+bool BandCrossOver    = ta.crossover(src,  lowband)
+bool BandCrossUnder   = ta.crossunder(src, highband)
+bool CentralLineCross = ta.cross(src,      MR)
+bool ColorChange2Grn  = plt_color == COL_UP   and plt_color[1] != COL_UP
+bool ColorChange2Red  = plt_color == COL_DOWN and plt_color[1] != COL_DOWN
+//
+alertcondition(Breakout,         title='Breakout Signal',        message='MR Upper Band Breakout')
+alertcondition(Breakdown,        title='Breakdown Signal',       message='MR Lower Band Breakdown')
+alertcondition(BandCrossUnder,   title='Upper Band Crossunder',  message='MR has crossed under the Upper Band')
+alertcondition(BandCrossOver,    title='Lower Band Crossover',   message='MR has crossed over the Lower Band')
+alertcondition(CentralLineCross, title='Central Line Crossing',  message='MR has crossed the Central Line')
+alertcondition(ColorChange2Grn,  title='MR Color Change: Green', message='MR Color has changed to Green')
+alertcondition(ColorChange2Red,  title='MR Color Change: Red',   message='MR Color has changed to Red')

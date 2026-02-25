@@ -1,0 +1,361 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mentalExpert19609
+
+//@version=6
+indicator('Quantum RCI Fusion', shorttitle = 'Quantum RCI Fusion', overlay = false)
+
+// ==========================================
+// 1. INPUT SETTINGS
+// ==========================================
+grp_rci = 'Quantum Engine (RCI)'
+src_input = input.source(close, title='Source Data', group=grp_rci, tooltip='Use hl2 or open for variations, or standard close.')
+len_s = input.int(13, title = 'RCI Signal (Fast)', group = grp_rci)
+len_m = input.int(18, title = 'RCI Confirm (Mid)', group = grp_rci)
+len_l = input.int(30, title = 'RCI Baseline (Slow)', group = grp_rci)
+smooth_f = input.int(3, title = 'Noise Filter (HMA)', minval=1, group = grp_rci)
+
+grp_levels = 'Trigger Levels'
+lvl_ob = input.int(80, title='Overbought Level', group=grp_levels)
+lvl_os = input.int(-80, title='Oversold Level', group=grp_levels)
+
+grp_logic = 'Logic & Filters'
+use_trend_hold = input.bool(true, title = 'Trend Shield (RCI 30)', group = grp_logic)
+use_adx_filter = input.bool(true, title = 'ADX Filter', group = grp_logic)
+adx_threshold = input.int(20, title = 'ADX Threshold', group = grp_logic)
+use_impulse_filter = input.bool(true, title = 'Momentum Filter', group = grp_logic)
+min_rci_delta = input.int(5, title = 'Min RCI Delta', group = grp_logic)
+
+grp_risk = 'Money Management (Simulation)'
+atr_period = input.int(14, title = 'ATR Period', group = grp_risk)
+sl_mult = input.float(1.5, title = 'SL Multiplier', step = 0.1, group = grp_risk)
+tp_mult = input.float(2.0, title = 'TP Multiplier', step = 0.1, group = grp_risk)
+
+grp_vis = 'Visuals'
+show_exits = input.bool(true, title = 'Show Exit Icons', group = grp_vis)
+table_pos = input.string('Top Right', 'Dashboard Position', options = ['Top Right', 'Bottom Right', 'Top Left', 'Bottom Left'], group = grp_vis)
+table_size_input = input.string('Small', 'Dashboard Size', options = ['Tiny', 'Small', 'Normal', 'Large'], group = grp_vis)
+
+grp_debug = 'Debug & Tools'
+reset_stats = input.bool(false, title='Reset Statistics', tooltip='Enable to reset. Disable to resume counting.', group=grp_debug)
+
+// ==========================================
+// 2. RCI PRO FUNCTION (Array + Smooth)
+// ==========================================
+f_rci_pro(src, len, smooth) =>
+    float s_src = smooth > 1 ? ta.hma(src, smooth) : src
+    float[] data_arr = array.new_float(len)
+    for i = 0 to len - 1
+        array.set(data_arr, i, s_src[i])
+    
+    float sum_d2 = 0.0
+    for i = 0 to len - 1
+        float rank = 1.0
+        float current_val = array.get(data_arr, i)
+        for j = 0 to len - 1
+            if array.get(data_arr, j) > current_val
+                rank := rank + 1.0
+        float d = rank - (i + 1)
+        sum_d2 := sum_d2 + (d * d)
+        
+    100.0 * (1.0 - 6.0 * sum_d2 / (len * (len * len - 1.0)))
+
+// ==========================================
+// 3. INDICATOR CALCULATIONS
+// ==========================================
+rci_s = f_rci_pro(src_input, len_s, smooth_f)
+rci_m = f_rci_pro(src_input, len_m, smooth_f)
+rci_l = f_rci_pro(src_input, len_l, smooth_f)
+
+[diplus, diminus, adx_val] = ta.dmi(14, 14)
+adx_ok = use_adx_filter ? adx_val > adx_threshold : true
+
+slope_s_up = rci_s > rci_s[1]
+slope_m_up = rci_m > rci_m[1]
+slope_l_up = rci_l > rci_l[1]
+slope_l_dn = rci_l < rci_l[1]
+
+rci_delta_val = math.abs(rci_s - rci_s[1])
+impulse_ok = use_impulse_filter ? rci_delta_val > min_rci_delta : true
+
+// ==========================================
+// 4. ENTRY LOGIC
+// ==========================================
+cross_up = ta.crossover(rci_s, rci_m)
+cross_down = ta.crossunder(rci_s, rci_m)
+
+oversold_area = rci_s < lvl_os
+overbought_area = rci_s > lvl_ob
+
+buy_signal = cross_up and oversold_area and adx_ok and impulse_ok
+sell_signal = cross_down and overbought_area and adx_ok and impulse_ok
+
+// State & Stats Management
+var int tradeState = 0
+var float entry_price = 0.0
+var float sl_level = 0.0
+var float tp_level = 0.0
+
+// Stats Counters
+var int cnt_win = 0
+var int cnt_loss = 0
+var int cnt_total = 0
+
+// RESET LOGIC
+if reset_stats
+    cnt_win := 0
+    cnt_loss := 0
+    cnt_total := 0
+
+atr_val = ta.atr(atr_period)
+
+if buy_signal
+    tradeState := 1
+    entry_price := close
+    sl_level := close - atr_val * sl_mult
+    tp_level := close + atr_val * tp_mult
+
+if sell_signal
+    tradeState := -1
+    entry_price := close
+    sl_level := close + atr_val * sl_mult
+    tp_level := close - atr_val * tp_mult
+
+// ==========================================
+// 5. EXIT LOGIC & TRACKING
+// ==========================================
+std_exit_long = ta.crossunder(rci_s, rci_m)
+std_exit_short = ta.crossover(rci_s, rci_m)
+zero_cross_dn = ta.crossunder(rci_s, 0)
+zero_cross_up = ta.crossover(rci_s, 0)
+
+is_holding_long = use_trend_hold and slope_l_up
+is_holding_short = use_trend_hold and slope_l_dn
+
+exit_tp_long = tradeState == 1 and high >= tp_level
+exit_sl_long = tradeState == 1 and low <= sl_level
+exit_shield_long = tradeState == 1 and use_trend_hold and slope_l_dn 
+exit_emerg_long = tradeState == 1 and zero_cross_dn
+exit_tech_long = tradeState == 1 and std_exit_long and not is_holding_long
+
+exit_tp_short = tradeState == -1 and low <= tp_level
+exit_sl_short = tradeState == -1 and high >= sl_level
+exit_shield_short = tradeState == -1 and use_trend_hold and slope_l_up
+exit_emerg_short = tradeState == -1 and zero_cross_up
+exit_tech_short = tradeState == -1 and std_exit_short and not is_holding_short
+
+do_exit_long = exit_tp_long or exit_sl_long or exit_shield_long or exit_emerg_long or exit_tech_long
+do_exit_short = exit_tp_short or exit_sl_short or exit_shield_short or exit_emerg_short or exit_tech_short
+
+// ==========================================
+// 6. ALERTS & STATS UPDATE
+// ==========================================
+f_msg(type, reason, exit_p, entry_p) =>
+    diff = type == 'LONG' ? exit_p - entry_p : entry_p - exit_p
+    icon = diff > 0 ? '💰' : '🛑'
+    str.format('{0} {1}: {2} {3} | Diff: {4}', reason, type, reason == 'TP HIT' ? 'PROFIT' : 'CLOSE', icon, str.tostring(diff, format.mintick))
+
+if do_exit_long
+    // Stats Update (Only if not resetting)
+    if not reset_stats
+        if exit_tp_long
+            cnt_win += 1
+            cnt_total += 1
+        else if exit_sl_long
+            cnt_loss += 1
+            cnt_total += 1
+        else
+            float pnl = close - entry_price
+            if pnl > 0 
+                cnt_win += 1 
+            else 
+                cnt_loss += 1
+            cnt_total += 1
+        
+    float final_exit_price = close
+    string reason = 'TECH EXIT'
+    if exit_tp_long
+        final_exit_price := tp_level
+        reason := 'TP HIT'
+    else if exit_sl_long
+        final_exit_price := sl_level
+        reason := 'SL HIT'
+    else if exit_shield_long
+        reason := 'SHIELD BREAK'
+    else if exit_emerg_long
+        reason := 'EMERGENCY'
+    alert(f_msg('LONG', reason, final_exit_price, entry_price), alert.freq_once_per_bar_close)
+    tradeState := 0
+
+if do_exit_short
+    // Stats Update (Only if not resetting)
+    if not reset_stats
+        if exit_tp_short
+            cnt_win += 1
+            cnt_total += 1
+        else if exit_sl_short
+            cnt_loss += 1
+            cnt_total += 1
+        else
+            float pnl = entry_price - close
+            if pnl > 0 
+                cnt_win += 1 
+            else 
+                cnt_loss += 1
+            cnt_total += 1
+
+    float final_exit_price = close
+    string reason = 'TECH EXIT'
+    if exit_tp_short
+        final_exit_price := tp_level
+        reason := 'TP HIT'
+    else if exit_sl_short
+        final_exit_price := sl_level
+        reason := 'SL HIT'
+    else if exit_shield_short
+        reason := 'SHIELD BREAK'
+    else if exit_emerg_short
+        reason := 'EMERGENCY'
+    alert(f_msg('SHORT', reason, final_exit_price, entry_price), alert.freq_once_per_bar_close)
+    tradeState := 0
+
+// ENTRY ALERTS (Rich Format)
+if buy_signal
+    alert(str.format('QUANTUM BUY @ {0} | TP: {1} | SL: {2}', str.tostring(close, format.mintick), str.tostring(tp_level, format.mintick), str.tostring(sl_level, format.mintick)), alert.freq_once_per_bar_close)
+if sell_signal
+    alert(str.format('QUANTUM SELL @ {0} | TP: {1} | SL: {2}', str.tostring(close, format.mintick), str.tostring(tp_level, format.mintick), str.tostring(sl_level, format.mintick)), alert.freq_once_per_bar_close)
+
+// ==========================================
+// 7. PLOTTING
+// ==========================================
+col_s = rci_s > rci_s[1] ? #00bcd4 : #006064
+col_m = rci_m > rci_m[1] ? #ff4081 : #880e4f
+col_l = slope_l_up ? #00e676 : #1b5e20
+
+plot(rci_s, color = col_s, title = 'RCI Signal', linewidth = 2)
+plot(rci_m, color = col_m, title = 'RCI Confirm', linewidth = 2)
+is_holding = tradeState != 0 and use_trend_hold and (tradeState == 1 and slope_l_up or tradeState == -1 and slope_l_dn)
+plot(rci_l, color = col_l, title = 'RCI Baseline', linewidth = 2)
+plot(is_holding ? rci_l : na, color = col_l, title = 'Shield Active', linewidth = 4, style = plot.style_line)
+
+hline(0, 'Zero Line', color = color.new(color.white, 70), linestyle = hline.style_dashed)
+h_up = hline(lvl_ob, 'Overbought', color = color.new(color.red, 50))
+h_dn = hline(lvl_os, 'Oversold', color = color.new(color.green, 50))
+fill(h_up, h_dn, color = color.new(#311b92, 92), title="Quantum Zone")
+
+plotshape(buy_signal, style = shape.triangleup, location = location.bottom, color = #00e676, size = size.small, title = 'BUY')
+plotshape(sell_signal, style = shape.triangledown, location = location.top, color = #ff4081, size = size.small, title = 'SELL')
+
+// Exit Icons
+plotshape(show_exits and exit_tech_long ? rci_s : na, style = shape.xcross, location = location.absolute, color = color.white, size = size.tiny, title = 'Exit')
+plotshape(show_exits and exit_shield_long ? rci_s : na, style = shape.circle, location = location.absolute, color = color.yellow, size = size.tiny, title = 'Shield Break')
+plotshape(show_exits and exit_emerg_long ? rci_s : na, style = shape.flag, location = location.absolute, color = color.orange, size = size.tiny, title = 'Emergency')
+plotshape(show_exits and exit_tech_short ? rci_s : na, style = shape.xcross, location = location.absolute, color = color.white, size = size.tiny, title = 'Exit')
+plotshape(show_exits and exit_shield_short ? rci_s : na, style = shape.circle, location = location.absolute, color = color.yellow, size = size.tiny, title = 'Shield Break')
+plotshape(show_exits and exit_emerg_short ? rci_s : na, style = shape.flag, location = location.absolute, color = color.orange, size = size.tiny, title = 'Emergency')
+
+bgcolor(buy_signal ? color.new(#00e676, 90) : sell_signal ? color.new(#ff4081, 90) : na)
+
+// ==========================================
+// 8. DASHBOARD ULTIMATE (COMPACT)
+// ==========================================
+t_final_pos = table_pos == 'Top Right' ? position.top_right : table_pos == 'Bottom Right' ? position.bottom_right : table_pos == 'Top Left' ? position.top_left : position.bottom_left
+// Reduced total rows to 13 (0 to 12)
+var tbl = table.new(t_final_pos, 3, 13, frame_color = #263238, frame_width = 1, border_width = 0, border_color = #263238)
+
+if barstate.islast
+    // ------------------------------------------
+    // SIZE LOGIC
+    // ------------------------------------------
+    string txt_size = size.small // Default
+    if table_size_input == 'Tiny'
+        txt_size := size.tiny
+    else if table_size_input == 'Small'
+        txt_size := size.small
+    else if table_size_input == 'Normal'
+        txt_size := size.normal
+    else if table_size_input == 'Large'
+        txt_size := size.large
+    
+    // ------------------------------------------
+    // COLORS
+    // ------------------------------------------
+    color c_txt = color.white
+    color c_bg = #10151c
+    color c_neon_blue = #00bcd4
+    color c_neon_pink = #ff4081
+    color c_neon_green = #00e676
+    color c_neon_red = #ff1744
+    
+    // HEADER
+    table.merge_cells(tbl, 0, 0, 2, 0)
+    table.cell(tbl, 0, 0, 'Quantum RCI Fusion', bgcolor = c_bg, text_color = c_neon_blue, text_size = txt_size)
+
+    // FILTERS
+    string adx_txt = adx_ok ? 'READY' : 'WAIT'
+    table.cell(tbl, 0, 1, 'ADX Filter', bgcolor = c_bg, text_color = color.gray, text_halign = text.align_left, text_size = txt_size)
+    table.merge_cells(tbl, 1, 1, 2, 1)
+    table.cell(tbl, 1, 1, adx_txt, bgcolor = c_bg, text_color = adx_ok ? c_neon_green : color.gray, text_size = txt_size)
+
+    // RCI VALUES
+    table.cell(tbl, 0, 2, 'RCI 13', bgcolor = c_bg, text_color = c_neon_blue, text_halign = text.align_left, text_size = txt_size)
+    table.cell(tbl, 1, 2, str.tostring(rci_s, '#.0'), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+    table.cell(tbl, 2, 2, slope_s_up ? '▲' : '▼', bgcolor = c_bg, text_color = slope_s_up ? c_neon_green : c_neon_red, text_size = txt_size)
+
+    table.cell(tbl, 0, 3, 'RCI 18', bgcolor = c_bg, text_color = c_neon_pink, text_halign = text.align_left, text_size = txt_size)
+    table.cell(tbl, 1, 3, str.tostring(rci_m, '#.0'), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+    table.cell(tbl, 2, 3, slope_m_up ? '▲' : '▼', bgcolor = c_bg, text_color = slope_m_up ? c_neon_green : c_neon_red, text_size = txt_size)
+
+    table.cell(tbl, 0, 4, 'RCI 30', bgcolor = c_bg, text_color = color.yellow, text_halign = text.align_left, text_size = txt_size)
+    table.cell(tbl, 1, 4, str.tostring(rci_l, '#.0'), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+    table.cell(tbl, 2, 4, slope_l_up ? '▲' : '▼', bgcolor = c_bg, text_color = slope_l_up ? c_neon_green : c_neon_red, text_size = txt_size)
+
+    // TRADE STATUS
+    string st_txt = tradeState == 1 ? 'LONG' : tradeState == -1 ? 'SHORT' : 'SCANNING'
+    color st_col = tradeState == 1 ? c_neon_green : tradeState == -1 ? c_neon_red : color.gray
+    table.cell(tbl, 0, 5, 'STATUS', bgcolor = c_bg, text_color = color.white, text_halign = text.align_left, text_size = txt_size)
+    table.merge_cells(tbl, 1, 5, 2, 5)
+    table.cell(tbl, 1, 5, st_txt, bgcolor = st_col, text_color = #000000, text_size = txt_size)
+    
+    // LIVE DATA
+    if tradeState != 0
+        float pnl = tradeState == 1 ? close - entry_price : entry_price - close
+        color pnl_c = pnl >= 0 ? c_neon_green : c_neon_red
+        table.cell(tbl, 0, 6, 'Target', bgcolor = c_bg, text_color = c_neon_green, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 6, 2, 6)
+        table.cell(tbl, 1, 6, str.tostring(tp_level, format.mintick), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+        table.cell(tbl, 0, 7, 'PnL', bgcolor = c_bg, text_color = pnl_c, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 7, 2, 7)
+        table.cell(tbl, 1, 7, str.tostring(pnl, format.mintick), bgcolor = c_bg, text_color = pnl_c, text_size = txt_size)
+    else
+        table.cell(tbl, 0, 6, '', bgcolor = color.new(color.black, 100))
+        table.cell(tbl, 1, 6, '', bgcolor = color.new(color.black, 100))
+        table.cell(tbl, 0, 7, '', bgcolor = color.new(color.black, 100))
+        table.cell(tbl, 1, 7, '', bgcolor = color.new(color.black, 100))
+
+    // PERFORMANCE SECTION (Shifted UP)
+    float win_rate = cnt_total > 0 ? (cnt_win / cnt_total) * 100 : 0
+    color wr_col = win_rate > 50 ? c_neon_green : win_rate > 30 ? color.orange : c_neon_red
+    
+    table.cell(tbl, 0, 8, 'PERFORMANCE', bgcolor = c_bg, text_color = color.silver, text_halign = text.align_left, text_size = txt_size)
+    table.merge_cells(tbl, 1, 8, 2, 8) 
+    
+    // Display Stats or Reset Message
+    if reset_stats
+        table.cell(tbl, 0, 9, 'RESETTING', bgcolor = c_neon_red, text_color = color.white, text_size = txt_size)
+        table.merge_cells(tbl, 0, 9, 2, 12) // Merge all cells below
+    else
+        table.cell(tbl, 0, 9, 'Trades', bgcolor = c_bg, text_color = c_neon_blue, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 9, 2, 9)
+        table.cell(tbl, 1, 9, str.tostring(cnt_total), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+
+        table.cell(tbl, 0, 10, 'Wins', bgcolor = c_bg, text_color = c_neon_green, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 10, 2, 10)
+        table.cell(tbl, 1, 10, str.tostring(cnt_win), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+
+        table.cell(tbl, 0, 11, 'Losses', bgcolor = c_bg, text_color = c_neon_red, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 11, 2, 11)
+        table.cell(tbl, 1, 11, str.tostring(cnt_loss), bgcolor = c_bg, text_color = c_txt, text_size = txt_size)
+
+        table.cell(tbl, 0, 12, 'Win Rate', bgcolor = c_bg, text_color = #FFD700, text_halign = text.align_left, text_size = txt_size)
+        table.merge_cells(tbl, 1, 12, 2, 12)
+        table.cell(tbl, 1, 12, str.tostring(win_rate, '#.0') + '%', bgcolor = c_bg, text_color = wr_col, text_size = txt_size)

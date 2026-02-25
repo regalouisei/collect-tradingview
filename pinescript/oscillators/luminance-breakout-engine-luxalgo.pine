@@ -1,0 +1,306 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Luminance Breakout Engine [LuxAlgo]", "LuxAlgo - Luminance Breakout Engine", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types
+//---------------------------------------------------------------------------------------------------------------------{
+type OrderBlock
+    float top = na
+    float btm = na
+    int   startTime = na
+    box   boxId = na
+    box   bullVolBox = na
+    box   bearVolBox = na
+    line  dividerLine = na
+    label statsLabel = na
+    bool  isBull = false
+    bool  isMitigated = false
+    float intensity = 0.0
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+// Default Colors
+color DEF_BULL      = #089981
+color DEF_BEAR      = #f23645
+color DEF_BULL_GLOW = #00ffbb
+color DEF_BEAR_GLOW = #ff5252
+
+// Size Constants
+TINY    = 'Tiny'
+SMALL   = 'Small'
+NORMAL  = 'Normal'
+LARGE   = 'Large'
+
+// Tooltips
+TT_OSC      = "Period settings for the composite multi-timeframe ROC calculation."
+TT_THRESH   = "Controls how sensitive the breakout 'Glow' zones are. Higher values require more extreme momentum."
+TT_VISUAL   = "Toggle various heatmap and glow effects."
+TT_OB       = "Order Blocks are identified at the start of 'Glow' breakouts. They represent the institutional origin of the move."
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+groupOscInput      = "Oscillator Settings"
+length1Input       = input.int(5,   "Fast Period",      minval = 1, group = groupOscInput, tooltip = TT_OSC)
+length2Input       = input.int(13,  "Medium Period",    minval = 1, group = groupOscInput)
+length3Input       = input.int(21,  "Slow Period",      minval = 1, group = groupOscInput)
+length4Input       = input.int(34,  "Macro Period",     minval = 1, group = groupOscInput)
+smoothingInput     = input.int(5,   "Smoothing",        minval = 1, group = groupOscInput)
+
+groupVisualInput   = "Visual Settings"
+multInput          = input.float(2.0, "Threshold Multiplier", minval = 0.1, step = 0.1, group = groupVisualInput, tooltip = TT_THRESH)
+showBaseHeatmap    = input.bool(true, "Show Base Heatmap", group = groupVisualInput, tooltip = TT_VISUAL)
+showThresholdGlow  = input.bool(true, "Show Threshold Glow", group = groupVisualInput)
+
+groupObInput       = "Order Blocks"
+showObInput        = input.bool(true, "Show Luminance OBs", group = groupObInput, tooltip = TT_OB)
+obLimitInput       = input.int(3, "Max OBs per Side", minval = 1, maxval = 10, group = groupObInput)
+showObStatsInput   = input.bool(true, "Show Volume Stats", group = groupObInput)
+labelOffsetInput   = input.int(5, "Label Offset", minval = 0, group = groupObInput, tooltip = "Shift labels to the right to avoid overlap.")
+labelSizeInput     = input.string(NORMAL, "Label Size", options = [TINY, SMALL, NORMAL, LARGE], group = groupObInput)
+
+groupColorInput    = "Color Settings"
+bullColorInput     = input.color(DEF_BULL,      "Bullish Momentum", inline = "mom", group = groupColorInput)
+bearColorInput     = input.color(DEF_BEAR,      "Bearish Momentum", inline = "mom", group = groupColorInput)
+bullGlowColorInput = input.color(DEF_BULL_GLOW, "Bullish Glow",     inline = "glow", group = groupColorInput)
+bearGlowColorInput = input.color(DEF_BEAR_GLOW, "Bearish Glow",     inline = "glow", group = groupColorInput)
+zeroLineColorInput = input.color(#808080,       "Zero Line Color",  group = groupColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Helper Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Size Mapping
+parsedLabelSize = switch labelSizeInput
+    TINY    => size.tiny
+    SMALL   => size.small
+    NORMAL  => size.normal
+    LARGE   => size.large
+
+// Helper to create internal boxes
+createVolBox(int startTime, float top, float btm, color barColor, int transparency, bool isTop) =>
+    float mid = btm + (top - btm) / 2
+    float boxTop = isTop ? top : mid
+    float boxBtm = isTop ? mid : btm
+    box.new(startTime, boxTop, time, boxBtm, na, bgcolor = color.new(barColor, transparency), xloc = xloc.bar_time, force_overlay = true)
+
+// Consolidated Label for both Bull/Bear stats
+createConsolidatedLabel(float top, float btm, float bullPct, float bearPct, string lblSize) =>
+    float mid = btm + (top - btm) / 2
+    string lblText = str.format("B: {0,number,#.##}% ┃ S: {1,number,#.##}%", bullPct, bearPct)
+    label.new(time + (labelOffsetInput * (time - time[1])), mid, lblText, 
+         xloc         = xloc.bar_time, 
+         color        = color.new(chart.bg_color, 20), 
+         textcolor    = color.white, 
+         style        = label.style_label_left, 
+         size         = lblSize, 
+         force_overlay = true)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Composite Rate of Change (ROC) calculation
+roc1 = ta.roc(close, length1Input)
+roc2 = ta.roc(close, length2Input)
+roc3 = ta.roc(close, length3Input)
+roc4 = ta.roc(close, length4Input)
+
+// Average ROC to capture multi-timeframe momentum
+compositeRoc = (roc1 + roc2 + roc3 + roc4) / 4
+smoothedOsc  = ta.ema(compositeRoc, smoothingInput)
+
+// Adaptive thresholds based on recent oscillator volatility
+volatility   = ta.stdev(smoothedOsc, 100)
+upperThresh  = volatility * multInput
+lowerThresh  = -volatility * multInput
+
+// States
+isOverUpper  = smoothedOsc > upperThresh
+isOverLower  = smoothedOsc < lowerThresh
+isBullish    = smoothedOsc > 0
+
+// Luminance Mapping
+luminance    = math.min(1.0, math.abs(smoothedOsc) / math.max(1e-6, upperThresh))
+
+// Final Dynamic Color Logic
+baseColor    = isBullish ? bullColorInput : bearColorInput
+glowColor    = isBullish ? bullGlowColorInput : bearGlowColorInput
+dynamicColor = (isOverUpper or isOverLower) ? glowColor : color.from_gradient(luminance, 0, 1, color.new(baseColor, 70), baseColor)
+
+// Order Block Logic
+var bullObs = array.new<OrderBlock>()
+var bearObs = array.new<OrderBlock>()
+
+// Volume Breakdown Calculation (Last 5 Bars)
+float totalVol = math.max(1e-6, ta.sma(volume, 5) * 5)
+float bullVol  = 0.0
+float bearVol  = 0.0
+for i = 0 to 4
+    if close[i] >= open[i]
+        bullVol += volume[i]
+    else
+        bearVol += volume[i]
+
+float bullVolPct = (bullVol / totalVol) * 100
+float bearVolPct = (bearVol / totalVol) * 100
+
+// Trigger OB on breakout into "Glow" zone
+if showObInput
+    // Bullish OB Trigger
+    if isOverUpper and not isOverUpper[1]
+        int obIndex = 1
+        for i = 1 to 5
+            if close[i] < open[i]
+                obIndex := i
+                break
+        
+        OrderBlock newOb = OrderBlock.new(high[obIndex], low[obIndex], time[obIndex], na, na, na, na, na, true, false, luminance * 100)
+        newOb.boxId := box.new(newOb.startTime, newOb.top, time, newOb.btm, color.new(bullColorInput, 60), bgcolor = na, xloc = xloc.bar_time, force_overlay = true)
+        
+        if showObStatsInput
+            newOb.bullVolBox := createVolBox(newOb.startTime, newOb.top, newOb.btm, bullColorInput, 40, true)
+            newOb.bearVolBox := createVolBox(newOb.startTime, newOb.top, newOb.btm, bearColorInput, 40, false)
+            newOb.statsLabel := createConsolidatedLabel(newOb.top, newOb.btm, bullVolPct, bearVolPct, parsedLabelSize)
+            float mid = newOb.btm + (newOb.top - newOb.btm) / 2
+            newOb.dividerLine := line.new(newOb.startTime, mid, time, mid, xloc = xloc.bar_time, color = color.new(chart.bg_color, 40), force_overlay = true)
+             
+        bullObs.unshift(newOb)
+        if bullObs.size() > obLimitInput
+            OrderBlock popped = bullObs.pop()
+            popped.boxId.delete()
+            popped.dividerLine.delete()
+            popped.bullVolBox.delete()
+            popped.bearVolBox.delete()
+            popped.statsLabel.delete()
+
+    // Bearish OB Trigger
+    if isOverLower and not isOverLower[1]
+        int obIndex = 1
+        for i = 1 to 5
+            if close[i] > open[i]
+                obIndex := i
+                break
+        
+        OrderBlock newOb = OrderBlock.new(high[obIndex], low[obIndex], time[obIndex], na, na, na, na, na, false, false, luminance * 100)
+        newOb.boxId := box.new(newOb.startTime, newOb.top, time, newOb.btm, color.new(bearColorInput, 60), bgcolor = na, xloc = xloc.bar_time, force_overlay = true)
+        
+        if showObStatsInput
+            newOb.bullVolBox := createVolBox(newOb.startTime, newOb.top, newOb.btm, bullColorInput, 40, true)
+            newOb.bearVolBox := createVolBox(newOb.startTime, newOb.top, newOb.btm, bearColorInput, 40, false)
+            newOb.statsLabel := createConsolidatedLabel(newOb.top, newOb.btm, bullVolPct, bearVolPct, parsedLabelSize)
+            float mid = newOb.btm + (newOb.top - newOb.btm) / 2
+            newOb.dividerLine := line.new(newOb.startTime, mid, time, mid, xloc = xloc.bar_time, color = color.new(chart.bg_color, 40), force_overlay = true)
+             
+        bearObs.unshift(newOb)
+        if bearObs.size() > obLimitInput
+            OrderBlock popped = bearObs.pop()
+            popped.boxId.delete()
+            popped.dividerLine.delete()
+            popped.bullVolBox.delete()
+            popped.bearVolBox.delete()
+            popped.statsLabel.delete()
+
+// Manage OB Mitigation & Extensions
+if showObInput
+    // Manage Bullish OBs
+    if bullObs.size() > 0
+        for i = bullObs.size() - 1 to 0
+            ob = bullObs.get(i)
+            if not ob.isMitigated
+                ob.boxId.set_right(time)
+                if not na(ob.bullVolBox)
+                    ob.bullVolBox.set_right(time)
+                    ob.bearVolBox.set_right(time)
+                    ob.dividerLine.set_x2(time)
+                    ob.statsLabel.set_x(time + (labelOffsetInput * (time - time[1])))
+                
+                if close < ob.btm
+                    ob.isMitigated := true
+                    ob.boxId.set_border_style(line.style_dotted)
+                    ob.boxId.set_border_color(color.new(bullColorInput, 80))
+                    if not na(ob.bullVolBox)
+                        ob.bullVolBox.delete()
+                        ob.bearVolBox.delete()
+                        ob.dividerLine.delete()
+                        ob.statsLabel.delete()
+
+    // Manage Bearish OBs
+    if bearObs.size() > 0
+        for i = bearObs.size() - 1 to 0
+            ob = bearObs.get(i)
+            if not ob.isMitigated
+                ob.boxId.set_right(time)
+                if not na(ob.bullVolBox)
+                    ob.bullVolBox.set_right(time)
+                    ob.bearVolBox.set_right(time)
+                    ob.dividerLine.set_x2(time)
+                    ob.statsLabel.set_x(time + (labelOffsetInput * (time - time[1])))
+                
+                if close > ob.top
+                    ob.isMitigated := true
+                    ob.boxId.set_border_style(line.style_dotted)
+                    ob.boxId.set_border_color(color.new(bearColorInput, 80))
+                    if not na(ob.bullVolBox)
+                        ob.bullVolBox.delete()
+                        ob.bearVolBox.delete()
+                        ob.dividerLine.delete()
+                        ob.statsLabel.delete()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+// Base Zero Line
+zeroPlotId = plot(0, "Zero Line", color.new(zeroLineColorInput, 80), 1, linestyle = plot.linestyle_dashed)
+
+// Adaptive Threshold Plots
+upperPlotId = plot(upperThresh, "Upper Threshold", color.new(bullColorInput, 60), 1, linestyle = plot.linestyle_dotted)
+lowerPlotId = plot(lowerThresh, "Lower Threshold", color.new(bearColorInput, 60), 1, linestyle = plot.linestyle_dotted)
+
+// Main Oscillator Signal Line
+signalPlotId = plot(smoothedOsc, "Luminance Signal", dynamicColor, 2, plot.style_line)
+
+// 1. Base Gradient Fill (Zero to Signal)
+topBaseColor    = isBullish ? color.new(dynamicColor, 85) : color.new(dynamicColor, 100)
+bottomBaseColor = not isBullish ? color.new(dynamicColor, 85) : color.new(dynamicColor, 100)
+
+fill(signalPlotId, zeroPlotId, 
+     top_value    = math.max(smoothedOsc, 0), 
+     bottom_value = math.min(smoothedOsc, 0), 
+     top_color    = topBaseColor, 
+     bottom_color = bottomBaseColor, 
+     title        = "Base Heatmap",
+     display      = showBaseHeatmap ? display.all : display.none)
+
+// 2. Threshold Breakout Glow (Signal to Threshold)
+fill(signalPlotId, upperPlotId, 
+     top_value    = isOverUpper ? smoothedOsc : na, 
+     bottom_value = isOverUpper ? upperThresh : na, 
+     top_color    = color.new(bullGlowColorInput, 40), 
+     bottom_color = color.new(bullGlowColorInput, 90), 
+     title        = "Upper Glow Breakout",
+     display      = showThresholdGlow ? display.all : display.none)
+
+fill(signalPlotId, lowerPlotId, 
+     top_value    = isOverLower ? lowerThresh : na, 
+     bottom_value = isOverLower ? smoothedOsc  : na, 
+     top_color    = color.new(bearGlowColorInput, 90), 
+     bottom_color = color.new(bearGlowColorInput, 40), 
+     title        = "Lower Glow Breakout",
+     display      = showThresholdGlow ? display.all : display.none)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Alerts
+//---------------------------------------------------------------------------------------------------------------------{
+if ta.cross(smoothedOsc, 0)
+    alert("Luminance Oscillator: Zero Line Cross (" + (isBullish ? "Bullish" : "Bearish") + ")", alert.freq_once_per_bar)
+
+if isOverUpper and not isOverUpper[1]
+    alert("Luminance Oscillator: Bullish Glow Breakout", alert.freq_once_per_bar)
+
+if isOverLower and not isOverLower[1]
+    alert("Luminance Oscillator: Bearish Glow Breakout", alert.freq_once_per_bar)
+
+//---------------------------------------------------------------------------------------------------------------------}

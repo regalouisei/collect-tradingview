@@ -1,0 +1,157 @@
+//@version=5
+indicator("LL + RSI Bounce (Watchlist Alerts)", overlay=true, max_labels_count=500)
+
+// ---------- Inputs ----------
+pivotLeft   = input.int(4, "Pivot Left", minval=1)
+pivotRight  = input.int(4, "Pivot Right", minval=1)
+
+rsiLen      = input.int(14, "RSI Length", minval=2)
+rsiZoneMax  = input.float(35.0, "RSI 'Oversold Zone' Max", step=0.5)
+rsiBouncePts= input.float(3.0, "RSI Bounce (points up from local min)", step=0.5)
+rsiLookFwd  = input.int(8, "RSI Bounce Window (bars after LL)", minval=2)
+
+minRallyPct = input.float(0.6, "Min rally % (L -> interim high)", step=0.1) / 100.0
+minLLDropPct= input.float(0.2, "Min lower-low drop % (LL < L)", step=0.1) / 100.0
+minBouncePct= input.float(0.4, "Min price bounce % (close > LL)", step=0.1) / 100.0
+
+requireRsiCross = input.bool(false, "Require RSI cross up through Zone Max?")
+requirePriceBounce = input.bool(true, "Require price bounce off LL?")
+debug = input.bool(true, "DEBUG: show gate status")
+
+// ---------- Series ----------
+rsi = ta.rsi(close, rsiLen)
+
+// Pivots (confirmed after pivotRight bars)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+
+// ---------- State tracking ----------
+var float L_price = na
+var int   L_bar   = na
+var float H_price = na
+var int   H_bar   = na
+var float LL_price = na
+var int   LL_bar   = na
+
+var float rsi_min_after_ll = na
+var int   bars_since_ll = na
+var bool  patternArmed = false
+
+// Helper: percent checks
+pctUp(fromVal, toVal) => (toVal - fromVal) / fromVal
+
+// ---------- Pivot updates ----------
+// When a pivot low prints, it's located at bar_index - pivotRight
+if not na(pl)
+    int pivotBar = bar_index - pivotRight
+    float pivotPrice = pl
+
+    // If we don't have L yet, set L
+    if na(L_bar)
+        L_bar := pivotBar
+        L_price := pivotPrice
+        H_bar := na
+        H_price := na
+        LL_bar := na
+        LL_price := na
+        patternArmed := false
+        rsi_min_after_ll := na
+        bars_since_ll := na
+    else
+        // If we already have an interim high, this new pivot low might be LL
+        if not na(H_bar) and pivotBar > H_bar
+            bool isLowerLow = pivotPrice < L_price * (1.0 - minLLDropPct)
+            if isLowerLow
+                LL_bar := pivotBar
+                LL_price := pivotPrice
+
+                // Arm the RSI-bounce watcher
+                patternArmed := true
+
+                // Seed RSI min with RSI at the actual LL pivot bar (pivotRight bars ago)
+                rsi_min_after_ll := rsi[pivotRight]
+
+                // bars_since_ll counts bars since the LL bar
+                bars_since_ll := pivotRight
+
+        // If we don't have H yet, only replace L if this pivot is lower (prevents constant resets in chop)
+        if na(H_bar) and pivotPrice < L_price
+            L_bar := pivotBar
+            L_price := pivotPrice
+
+// When a pivot high prints, it can become the interim high between L and LL
+if not na(ph) and not na(L_bar)
+    int pivotBarH = bar_index - pivotRight
+    float pivotHigh = ph
+
+    if pivotBarH > L_bar
+        if na(H_bar)
+            H_bar := pivotBarH
+            H_price := pivotHigh
+        else
+            if pivotHigh > H_price
+                H_bar := pivotBarH
+                H_price := pivotHigh
+
+// ---------- Validate rally requirement ----------
+hasRally = not na(L_price) and not na(H_price) and pctUp(L_price, H_price) >= minRallyPct
+
+// ---------- RSI bounce watcher ----------
+signal = false
+
+if patternArmed and not na(LL_bar)
+    bars_since_ll += 1
+
+    // Track RSI min as we progress forward in time
+    rsi_min_after_ll := na(rsi_min_after_ll) ? rsi : math.min(rsi_min_after_ll, rsi)
+
+    rsiZoneOk = rsi_min_after_ll <= rsiZoneMax
+    rsiBounceOk = rsi >= (rsi_min_after_ll + rsiBouncePts)
+    rsiCrossOk = not requireRsiCross or ta.crossover(rsi, rsiZoneMax)
+    priceBounceOk = not requirePriceBounce or close >= LL_price * (1.0 + minBouncePct)
+
+    // Still close enough in time to LL
+    inWindow = bars_since_ll <= (pivotRight + rsiLookFwd)
+
+    signal := hasRally and rsiZoneOk and rsiBounceOk and rsiCrossOk and priceBounceOk and inWindow
+
+    if signal
+        patternArmed := false
+
+    // If window expired, disarm (use the same window definition as inWindow)
+    if not signal and bars_since_ll > (pivotRight + rsiLookFwd)
+        patternArmed := false
+
+// ---------- Plotting ----------
+plotshape(signal, title="LL + RSI Bounce Signal", style=shape.labelup, location=location.belowbar, text="LL+RSI", size=size.small)
+
+plotshape(not na(pl), title="Pivot Low", style=shape.triangleup, location=location.belowbar,
+     size=size.tiny, text="PivLow", color=color.new(color.lime, 0), offset=-pivotRight)
+
+plotshape(not na(ph), title="Pivot High", style=shape.triangledown, location=location.abovebar,
+     size=size.tiny, text="PivHigh", color=color.new(color.red, 0), offset=-pivotRight)
+
+// ---------- Alerts ----------
+alertcondition(signal, title="LL + RSI Bounce", message="LL + RSI Bounce detected on {{ticker}} ({{interval}}).")
+
+// ---- Debug table (no overlap) ----
+var table dbg = table.new(position.top_right, 2, 6, border_width=1)
+
+if debug and barstate.islast
+    table.cell(dbg, 0, 0, "Gate", text_color=color.white)
+    table.cell(dbg, 1, 0, "OK?",  text_color=color.white)
+
+    table.cell(dbg, 0, 1, "Have L")
+    table.cell(dbg, 1, 1, not na(L_bar) ? "YES" : "no", text_color=not na(L_bar) ? color.lime : color.gray)
+
+    table.cell(dbg, 0, 2, "Have H")
+    table.cell(dbg, 1, 2, not na(H_bar) ? "YES" : "no", text_color=not na(H_bar) ? color.orange : color.gray)
+
+    table.cell(dbg, 0, 3, "Have LL (W)")
+    table.cell(dbg, 1, 3, not na(LL_bar) ? "YES" : "no", text_color=not na(LL_bar) ? color.red : color.gray)
+
+    table.cell(dbg, 0, 4, "Rally OK")
+    table.cell(dbg, 1, 4, hasRally ? "YES" : "no", text_color=hasRally ? color.aqua : color.gray)
+
+    table.cell(dbg, 0, 5, "Armed")
+    table.cell(dbg, 1, 5, patternArmed ? "YES" : "no", text_color=patternArmed ? color.fuchsia : color.gray)

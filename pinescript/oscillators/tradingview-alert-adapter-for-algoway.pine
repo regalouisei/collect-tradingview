@@ -1,0 +1,557 @@
+//@version=6
+
+strategy('TradingView Alert Adapter for AlgoWay', 
+         shorttitle='TRALADAL', 
+         overlay=true, 
+         format=format.price, 
+         precision=2, 
+         pyramiding=0, 
+         process_orders_on_close=true, 
+         commission_value=0.08, 
+         slippage=15,
+         currency=currency.USD, 
+         default_qty_type=strategy.percent_of_equity, 
+         default_qty_value=10, 
+         initial_capital=100000
+         )
+
+//====================
+// PROVIDER (AlgoWay only)
+//====================
+provider = input.string("AlgoWay", "Automation Provider",
+     options=["Off","AlgoWay"],
+     tooltip="Off = no alerts.\nAlgoWay = send JSON via alert().")
+aw_enabled = provider == "AlgoWay"
+
+//====================
+// PLATFORM (AlgoWay)
+//====================
+platform = input.string("metatrader5", "Trading Platform",
+     options=["metatrader5","tradelocker","matchtrader","dxtrade","ctrader","capitalcom","alpaca","tradovate","bybit","binance","okx","bitmex","bitmart","bitget","bingx"],
+     tooltip="Sent as platform_name in AlgoWay JSON.")
+
+//====================
+// SL/TP/TRAIL MODE (Off / Strategy / Alert)
+//====================
+rm_mode = input.string("Off", "SL/TP/TRAIL Mode",
+     options=["Off","Strategy","Alert"],
+     tooltip="Off      = no SL/TP/TRAIL in strategy and no SL/TP/TRAIL in JSON.\nStrategy  = apply SL/TP/TRAIL inside TradingView strategy only (JSON without SL/TP/TRAIL).\nAlert     = include SL/TP/TRAIL in AlgoWay JSON only (strategy does not apply SL/TP/TRAIL).")
+
+rm_off      = rm_mode == "Off"
+rm_strategy = rm_mode == "Strategy"
+rm_alert    = rm_mode == "Alert"
+
+//====================
+// SL/TP/TRAIL inputs
+//====================
+sl_pips    = input.int(50,  "Stop Loss (pips)",
+     tooltip="Used when SL/TP/TRAIL Mode is Strategy or Alert.")
+tp_pips    = input.int(100, "Take Profit (pips)",
+     tooltip="Used when SL/TP/TRAIL Mode is Strategy or Alert.")
+trail_pips = input.int(100, "Trailing (pips)",
+     tooltip="Used when SL/TP/TRAIL Mode is Strategy or Alert.\nIf 0 -> trailing disabled.")
+
+//====================
+// ORDER SIZE (TradingView-style, for alerts + strategy.entry sync)
+//====================
+os_group = "ORDER SIZE (for alerts & entries)"
+os_type  = input.string("Percent of equity", "Order size type",
+     options=["Percent of equity","Cash","Contracts"],
+     group=os_group)
+
+os_value = input.float(10.0, "Order size value", step=0.01, group=os_group,
+     tooltip="Percent of equity = %; Cash = account currency; Contracts = contracts quantity.")
+
+f_calc_contracts() =>
+    float qty = na
+    if os_type == "Percent of equity"
+        qty := (strategy.equity * (os_value / 100.0)) / close
+    else if os_type == "Cash"
+        qty := os_value / close
+    else
+        qty := os_value
+
+    // Safety
+    qty := na(qty) or close <= 0 ? 0.0 : qty
+    qty
+
+f_contracts_str(qty) =>
+    str.format("{0,number,0.000}", qty)
+
+
+// Price helpers (from entry price, not from close)
+f_entry_price() =>
+    strategy.position_size != 0 ? strategy.position_avg_price : close
+
+entry_price = f_entry_price()
+
+sl_price_long  = entry_price - sl_pips * syminfo.mintick
+tp_price_long  = entry_price + tp_pips * syminfo.mintick
+sl_price_short = entry_price + sl_pips * syminfo.mintick
+tp_price_short = entry_price - tp_pips * syminfo.mintick
+
+
+//====================
+// JSON BUILDERS (AlgoWay)
+//====================
+algoway_entry_full(id, action, qty, sl, tp, trail) =>
+    '{ "platform_name":"' + platform + '","ticker":"' + syminfo.ticker + '","order_id":"' + id + '","order_action":"' + action + '","order_contracts":"' + qty + '","stop_loss":"' + sl + '","take_profit":"' + tp + '","trailing_pips":"' + trail + '" }'
+
+algoway_entry_basic(id, action, qty, price) =>
+    '{ "platform_name":"' + platform + '","ticker":"' + syminfo.ticker + '","order_id":"' + id + '","order_action":"' + action + '","order_contracts":"' + qty + '","price":"' + price + '" }'
+
+algoway_exit_full(id, qty) =>
+    '{ "platform_name":"' + platform + '","ticker":"' + syminfo.ticker + '","order_id":"' + id + '","order_action":"flat","order_contracts":"' + qty + '" }'
+
+algoway_exit_basic(id, qty) =>
+    '{ "platform_name":"' + platform + '","ticker":"' + syminfo.ticker + '","order_id":"' + id + '","order_action":"flat","order_contracts":"' + qty + '" }'
+
+// Keep the same simplistic support flag (as before)
+supports_risk = platform != "ctrader"
+
+//====================
+// Condition engine (3 conditions per side)
+//====================
+f_is_event(x) =>
+    not na(x) and x != 0
+
+f_eval(mode, a, b, lvl) =>
+    switch mode
+        "Event (non-zero)"     => f_is_event(a)
+        "A CrossOver B"        => ta.crossover(a, b)
+        "A CrossUnder B"       => ta.crossunder(a, b)
+        "A > B"                => a > b
+        "A < B"                => a < b
+        "A >= B"               => a >= b
+        "A <= B"               => a <= b
+        "A CrossOver Level"    => ta.crossover(a, lvl)
+        "A CrossUnder Level"   => ta.crossunder(a, lvl)
+        "A > Level"            => a > lvl
+        "A < Level"            => a < lvl
+        "A >= Level"           => a >= lvl
+        "A <= Level"           => a <= lvl
+        => false
+
+f_3(logic, en1, m1, a1, b1, l1,
+            en2, m2, a2, b2, l2,
+            en3, m3, a3, b3, l3) =>
+    bool hasAny = false
+    bool acc = false
+
+    if en1
+        c1 = f_eval(m1, a1, b1, l1)
+        acc := hasAny ? (logic == "AND" ? (acc and c1) : (acc or c1)) : c1
+        hasAny := true
+
+    if en2
+        c2 = f_eval(m2, a2, b2, l2)
+        acc := hasAny ? (logic == "AND" ? (acc and c2) : (acc or c2)) : c2
+        hasAny := true
+
+    if en3
+        c3 = f_eval(m3, a3, b3, l3)
+        acc := hasAny ? (logic == "AND" ? (acc and c3) : (acc or c3)) : c3
+        hasAny := true
+
+    hasAny ? acc : false
+
+//====================
+// LONG (3 conditions)
+//====================
+lg = "LONG (3 conditions)"
+longLogic = input.string("AND", "Logic", options=["AND","OR"], group=lg,
+     tooltip="AND = all enabled conditions must be TRUE.\nOR = any enabled condition can be TRUE.")
+
+// #1
+l1_en = input.bool(false, "Long Enable #1 (Signal)", group=lg)
+l1_mode = input.string("Event (non-zero)", "Mode #1",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=lg,
+     tooltip="Use Event for shapes/pulses (1/0).\nUse comparisons for lines (RSI/EMA/VWAP/etc).")
+l1_a = input.source(close, "A #1", group=lg, tooltip="Source A for condition #1.")
+l1_b = input.source(close, "B #1", group=lg, tooltip="Source B for condition #1 (only used in ...B modes).")
+l1_lvl = input.float(0.0, "Level #1", step=0.1, group=lg, tooltip="Level for condition #1 (only used in ...Level modes).")
+
+// #2
+l2_en = input.bool(false, "Long Enable #2 (Confirm)", group=lg)
+l2_mode = input.string("Event (non-zero)", "Mode #2",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=lg)
+l2_a = input.source(close, "A #2", group=lg)
+l2_b = input.source(close, "B #2", group=lg)
+l2_lvl = input.float(0.0, "Level #2", step=0.1, group=lg)
+
+// #3
+l3_en = input.bool(false, "Long Enable #3 (Filter)", group=lg)
+l3_mode = input.string("Event (non-zero)", "Mode #3",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=lg)
+l3_a = input.source(close, "A #3", group=lg)
+l3_b = input.source(close, "B #3", group=lg)
+l3_lvl = input.float(0.0, "Level #3", step=0.1, group=lg)
+
+//====================
+// SHORT (3 conditions)
+//====================
+sg = "SHORT (3 conditions)"
+shortLogic = input.string("AND", "Logic", options=["AND","OR"], group=sg,
+     tooltip="AND = all enabled conditions must be TRUE.\nOR = any enabled condition can be TRUE.")
+
+// #1
+s1_en = input.bool(false, "Short Enable #1 (Signal)", group=sg)
+s1_mode = input.string("Event (non-zero)", "Mode #1",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=sg,
+     tooltip="Use Event for shapes/pulses (1/0).\nUse comparisons for lines (RSI/EMA/VWAP/etc).")
+s1_a = input.source(close, "A #1", group=sg)
+s1_b = input.source(close, "B #1", group=sg)
+s1_lvl = input.float(0.0, "Level #1", step=0.1, group=sg)
+
+// #2
+s2_en = input.bool(false, "Short Enable #2 (Confirm)", group=sg)
+s2_mode = input.string("Event (non-zero)", "Mode #2",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=sg)
+s2_a = input.source(close, "A #2", group=sg)
+s2_b = input.source(close, "B #2", group=sg)
+s2_lvl = input.float(0.0, "Level #2", step=0.1, group=sg)
+
+// #3
+s3_en = input.bool(false, "Short Enable #3 (Filter)", group=sg)
+s3_mode = input.string("Event (non-zero)", "Mode #3",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=sg)
+s3_a = input.source(close, "A #3", group=sg)
+s3_b = input.source(close, "B #3", group=sg)
+s3_lvl = input.float(0.0, "Level #3", step=0.1, group=sg)
+
+
+
+//====================
+// EXITS (optional) — ONE condition only (no #2/#3)
+//====================
+
+// ----- EXIT LONG -----
+elg = "EXIT LONG (1 condition)"
+exitLongEnable = input.bool(false, "Enable Exit Long", group=elg)
+
+exitLongMode = input.string("Event (non-zero)", "Mode",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=elg)
+
+exitLongA = input.source(close, "A", group=elg)
+exitLongB = input.source(close, "B", group=elg)
+exitLongLvl = input.float(0.0, "Level", step=0.1, group=elg)
+
+
+// ----- EXIT SHORT -----
+esg = "EXIT SHORT (1 condition)"
+exitShortEnable = input.bool(false, "Enable Exit Short", group=esg)
+
+exitShortMode = input.string("Event (non-zero)", "Mode",
+     options=["Event (non-zero)","A CrossOver B","A CrossUnder B","A > B","A < B","A >= B","A <= B","A CrossOver Level","A CrossUnder Level","A > Level","A < Level","A >= Level","A <= Level"],
+     group=esg)
+
+exitShortA = input.source(close, "A", group=esg)
+exitShortB = input.source(close, "B", group=esg)
+exitShortLvl = input.float(0.0, "Level", step=0.1, group=esg)
+
+
+
+// оставляем как было (пока не трогаем)
+flip_on_opposite = input.bool(true, "Flip on opposite entry signal", group="EXITS (optional)",
+     tooltip="ON: opposite entry closes current position and opens the other direction.")
+
+
+//====================
+// Build conditions (NO short-circuit warnings) + ONE-condition exits
+//====================
+
+// --- ENTRIES raw (always evaluated) ---
+longCond = f_3(longLogic,
+     l1_en, l1_mode, l1_a, l1_b, l1_lvl,
+     l2_en, l2_mode, l2_a, l2_b, l2_lvl,
+     l3_en, l3_mode, l3_a, l3_b, l3_lvl
+)
+
+shortCond = f_3(shortLogic,
+     s1_en, s1_mode, s1_a, s1_b, s1_lvl,
+     s2_en, s2_mode, s2_a, s2_b, s2_lvl,
+     s3_en, s3_mode, s3_a, s3_b, s3_lvl
+)
+
+// Fire only on edge
+longFire  = longCond  and not longCond[1]
+shortFire = shortCond and not shortCond[1]
+
+// --- EXITS raw (always evaluated) ---
+exitLongRaw  = f_eval(exitLongMode,  exitLongA,  exitLongB,  exitLongLvl)
+exitShortRaw = f_eval(exitShortMode, exitShortA, exitShortB, exitShortLvl)
+
+// Enable gate AFTER calculation (removes warning)
+exitLongCond  = exitLongEnable  ? exitLongRaw  : false
+exitShortCond = exitShortEnable ? exitShortRaw : false
+
+// Fire only on edge
+exitLongFire  = exitLongCond  and not exitLongCond[1]
+exitShortFire = exitShortCond and not exitShortCond[1]
+
+
+
+
+//====================
+// Alert senders (synced contracts)
+//====================
+f_send_entry(id, action, isLong) =>
+    if aw_enabled
+        float qtyContracts = f_calc_contracts()
+        string qtyStr = f_contracts_str(qtyContracts)
+
+        if rm_alert and supports_risk
+            trailStr = (trail_pips > 0) ? str.tostring(trail_pips) : ""
+            if isLong
+                alert(algoway_entry_full(id, action, qtyStr,
+                     str.tostring(sl_price_long),
+                     str.tostring(tp_price_long),
+                     trailStr),
+                     freq=alert.freq_once_per_bar_close)
+            else
+                alert(algoway_entry_full(id, action, qtyStr,
+                     str.tostring(sl_price_short),
+                     str.tostring(tp_price_short),
+                     trailStr),
+                     freq=alert.freq_once_per_bar_close)
+        else
+            alert(algoway_entry_basic(id, action, qtyStr, str.tostring(close)),
+                 freq=alert.freq_once_per_bar_close)
+
+f_send_flat(id, qtyContracts) =>
+    if aw_enabled
+        string qtyStr = f_contracts_str(math.abs(qtyContracts))
+        if supports_risk
+            alert(algoway_exit_full(id, qtyStr), freq=alert.freq_once_per_bar_close)
+        else
+            alert(algoway_exit_basic(id, qtyStr), freq=alert.freq_once_per_bar_close)
+
+
+//====================
+// STRATEGY RISK MANAGEMENT (Strategy mode only)
+//====================
+var float trailStopLong  = na
+var float trailStopShort = na
+trail_step = trail_pips * syminfo.mintick
+
+if rm_strategy and trail_pips > 0
+    if strategy.position_size > 0
+        newTrail = close - trail_step
+        trailStopLong := na(trailStopLong) ? newTrail : math.max(trailStopLong, newTrail)
+    else
+        trailStopLong := na
+
+    if strategy.position_size < 0
+        newTrail = close + trail_step
+        trailStopShort := na(trailStopShort) ? newTrail : math.min(trailStopShort, newTrail)
+    else
+        trailStopShort := na
+else
+    trailStopLong := na
+    trailStopShort := na
+
+if rm_strategy
+    if strategy.position_size > 0
+        stopL = (trail_pips > 0 and not na(trailStopLong)) ? math.max(sl_price_long, trailStopLong) : sl_price_long
+        strategy.exit("Long RM", from_entry="Long", stop=stopL, limit=tp_price_long)
+
+    if strategy.position_size < 0
+        stopS = (trail_pips > 0 and not na(trailStopShort)) ? math.min(sl_price_short, trailStopShort) : sl_price_short
+        strategy.exit("Short RM", from_entry="Short", stop=stopS, limit=tp_price_short)
+
+//====================
+// STRATEGY ACTIONS + AlgoWay alerts (synced contracts)
+//====================
+
+var bool flippedThisBar = false
+flippedThisBar := false
+
+// --- ENTRIES ---
+// LONG
+if longFire
+    float prePos = strategy.position_size
+
+    // if flip OFF: do NOT reverse an existing short
+    bool allowLong = flip_on_opposite or prePos >= 0
+
+    if allowLong
+        if flip_on_opposite and prePos < 0
+            flippedThisBar := true
+
+        float qtyL = f_calc_contracts()
+        if qtyL > 0
+            strategy.entry("Long", strategy.long, qty=qtyL)
+            f_send_entry("Long", "buy", true)
+
+// SHORT
+if shortFire
+    float prePos = strategy.position_size
+
+    // if flip OFF: do NOT reverse an existing long
+    bool allowShort = flip_on_opposite or prePos <= 0
+
+    if allowShort
+        if flip_on_opposite and prePos > 0
+            flippedThisBar := true
+
+        float qtyS = f_calc_contracts()
+        if qtyS > 0
+            strategy.entry("Short", strategy.short, qty=qtyS)
+            f_send_entry("Short", "sell", false)
+
+
+// --- OPTIONAL EXITS (manual/event-driven) ---
+if strategy.position_size > 0 and exitLongFire
+    float q = strategy.position_size
+    strategy.close("Long")
+    f_send_flat("Long", q)
+
+if strategy.position_size < 0 and exitShortFire
+    float q = strategy.position_size
+    strategy.close("Short")
+    f_send_flat("Short", q)
+
+
+// --- AUTO-FLAT ALERT for RM exits (SL/TP/TSL), but NOT when flipped ---
+var int lastClosedTradesCount = 0
+float pos_now_flat  = strategy.position_size
+float pos_prev_flat = strategy.position_size[1]
+
+if rm_strategy and aw_enabled and pos_prev_flat != 0 and pos_now_flat == 0 and not flippedThisBar
+    if strategy.closedtrades > lastClosedTradesCount
+        lastClosedTradesCount := strategy.closedtrades
+        f_send_flat(pos_prev_flat > 0 ? "Long" : "Short", pos_prev_flat)
+
+
+
+
+//====================
+// TP/SL/FL labels (custom)
+// TP = lime, SL/TSL = fuchsia, FL = blue
+// FL appears ONLY when exit happened via your Exit Event (strategy.close)
+// FIX: handle reversals (Long->Short / Short->Long) when flip is enabled
+//====================
+
+var float g_stop_active = na
+var float g_tp_active   = na
+var int   g_dir         = 0        // 1 = long, -1 = short
+var float g_entry_price = na
+
+pos_now_lbl  = strategy.position_size
+pos_prev_lbl = strategy.position_size[1]
+
+// === ENTRY OR REVERSAL DETECT ===
+// entry: flat -> position
+// reversal: position sign changed without going flat
+bool is_new_trade = (pos_prev_lbl == 0 and pos_now_lbl != 0) or (pos_prev_lbl > 0 and pos_now_lbl < 0) or (pos_prev_lbl < 0 and pos_now_lbl > 0)
+
+if is_new_trade
+    g_dir := pos_now_lbl > 0 ? 1 : -1
+    g_entry_price := strategy.position_avg_price
+
+    // TP from entry
+    g_tp_active := g_dir == 1
+         ? (g_entry_price + tp_pips * syminfo.mintick)
+         : (g_entry_price - tp_pips * syminfo.mintick)
+
+// While position open — update active STOP (base SL + trailing if enabled)
+if pos_now_lbl != 0
+    base_sl = g_dir == 1
+         ? (g_entry_price - sl_pips * syminfo.mintick)
+         : (g_entry_price + sl_pips * syminfo.mintick)
+
+    if rm_strategy and trail_pips > 0
+        g_stop_active := g_dir == 1
+             ? (not na(trailStopLong)  ? math.max(base_sl, trailStopLong)  : base_sl)
+             : (not na(trailStopShort) ? math.min(base_sl, trailStopShort) : base_sl)
+    else
+        g_stop_active := base_sl
+
+// Exit (position -> flat)
+if pos_prev_lbl != 0 and pos_now_lbl == 0 and strategy.closedtrades > 0
+    int bx = bar_index - 1  // draw on real exit bar (previous bar)
+
+    // If exit was triggered by your Exit Event (strategy.close), show FL only
+    bool was_manual_close = (pos_prev_lbl > 0 and exitLongFire[1]) or (pos_prev_lbl < 0 and exitShortFire[1])
+
+    if was_manual_close
+        yloc_fl = pos_prev_lbl > 0 ? yloc.abovebar : yloc.belowbar
+        label.new(bx, na, "● FL", yloc=yloc_fl, style=label.style_none, textcolor=color.blue, size=size.normal)
+    else
+        // Otherwise it's RM exit (TP/SL/TSL)
+        last = strategy.closedtrades - 1
+        exit_px = strategy.closedtrades.exit_price(last)
+        tol = syminfo.mintick * 2.0
+
+        // Correct TP detect for both directions
+        is_tp = g_dir == 1 ? (exit_px >= (g_tp_active - tol)) : (exit_px <= (g_tp_active + tol))
+
+        txt_final = is_tp ? "TP" : "SL"
+        if not is_tp
+            is_tsl = g_dir == 1 ? (g_stop_active > g_entry_price) : (g_stop_active < g_entry_price)
+            txt_final := is_tsl ? "TSL" : "SL"
+
+        txt_yloc = is_tp ? yloc.abovebar : yloc.belowbar
+        txt_col  = is_tp ? color.lime : color.fuchsia
+        label.new(bx, na, txt_final, yloc=txt_yloc, style=label.style_none, textcolor=txt_col, size=size.normal)
+
+    // reset
+    g_stop_active := na
+    g_tp_active   := na
+    g_dir         := 0
+    g_entry_price := na
+
+
+
+//-----------------------------------------------------
+colorresult = strategy.netprofit > 0 ? color.new(color.green, 50) : color.new(color.fuchsia, 50)
+profitprc = math.round(strategy.netprofit)
+
+WinRate(includeEvens = false) =>
+    winTradeCount = strategy.wintrades + (includeEvens ? strategy.eventrades : 0)
+    winTradeCount / strategy.closedtrades * 100
+win = math.round(WinRate() * 10) / 10
+ProfitFactor() =>
+    strategy.grossprofit / strategy.grossloss
+prf = math.round(ProfitFactor() * 100) / 100
+// Get the current Pessimistic Profit Factor
+PessimisticProfitFactor() =>
+    adjustedGrossProfit = strategy.grossprofit / strategy.wintrades * (strategy.wintrades - math.sqrt(strategy.wintrades))
+    adjustedGrossLoss = strategy.grossloss / strategy.losstrades * (strategy.losstrades + math.sqrt(strategy.losstrades))
+    adjustedGrossProfit / adjustedGrossLoss
+ppfResult = math.round(PessimisticProfitFactor() * 100000 / 100000, 3)
+
+var float maxDrawdown = 0
+for i = 0 to strategy.closedtrades - 1 by 1
+    drawdown = strategy.closedtrades.max_drawdown(i)
+    if drawdown > maxDrawdown
+        maxDrawdown := math.round(drawdown)
+        maxDrawdown
+
+strategy_returns = strategy.netprofit / strategy.equity
+strategy_stddev = ta.stdev(strategy_returns, 2)
+risk_free_rate = 0.02 // 2% annual
+sharpe_ratio = math.round((strategy_returns - risk_free_rate) / strategy_stddev, 2) / 100000
+
+var tbl = table.new(position.top_right, 8, 2, border_width = 3)
+
+table.cell(tbl, 0, 0, 'Net Profit', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+table.cell(tbl, 1, 0, 'Trades', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+table.cell(tbl, 2, 0, 'Win Rate', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+table.cell(tbl, 3, 0, 'Profit Factor', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+table.cell(tbl, 5, 0, 'Pessimistic PF', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+table.cell(tbl, 6, 0, 'Max Drawdown', bgcolor = color.new(#9B9B9B, 50), text_color = color.white, width = 8, height = 4)
+
+table.cell(tbl, 0, 1, str.tostring(profitprc), bgcolor = colorresult, width = 8, height = 4)
+table.cell(tbl, 1, 1, str.tostring(strategy.closedtrades), bgcolor = colorresult, width = 8, height = 4)
+table.cell(tbl, 2, 1, str.tostring(win) + ' %', bgcolor = colorresult, width = 8, height = 4)
+table.cell(tbl, 3, 1, str.tostring(prf), bgcolor = colorresult, width = 8, height = 4)
+table.cell(tbl, 5, 1, str.tostring(ppfResult), bgcolor = colorresult, width = 8, height = 4)
+table.cell(tbl, 6, 1, str.tostring(maxDrawdown), bgcolor = colorresult, text_color = color.red, width = 8, height = 4)

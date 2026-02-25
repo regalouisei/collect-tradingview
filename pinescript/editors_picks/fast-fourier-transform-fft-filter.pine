@@ -1,0 +1,147 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © tbiktag
+//
+// This tool computes the one-dimensional N-point discrete Fourier Transform 
+// (DFT) with the efficient Fast Fourier Transform (FFT) algorithm.
+// 
+// The tool uses FFT to decompose the input time series into its 
+// periodic constituents and seasonalities, in other words, its frequency 
+// components. 
+//
+// Subsequently it allows reconstructing the time-domain data while using 
+// only the frequency components within a user-defined range (band-pass filtering). 
+// Thereby, this tool can reveal the cyclical characteristics of the studied market,
+// and also remove high-frequency noise from the time series.
+//
+//@version=5
+indicator('Fast Fourier Transform (FFT) Filter', shorttitle='FFT', overlay=false, max_bars_back=5000, max_lines_count=500)
+//
+import tbiktag/FFTLibrary/1 as fft
+//
+//
+// --- main --- 
+src = input.source(title='Source', defval=close, group='Input', inline='linei1')
+N = input.int(title='Lenth', defval=256, options=[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096], group='Input', tooltip='Source and number of elements in the input dataset', inline='linei1')
+ispp = input.bool(title='Standardize Input Dataset', defval=false, group='Input', tooltip='Subtracts the mean of the data set from each element and normalizes the result ' + 'by the standard deviation')
+freqdomain = input.bool(title='Show Frequency-Domain Power Spectrum', defval=true, group='Output', tooltip='Plots the frequency spectrum of the squared magnitudes ' + 'of the Fourier coefficients (which are a measure of spectral power). ' + 'Zero frequency is omitted.')
+istable = input.bool(title='Dominant Cycles, Rows:', defval=true, group='Output', inline='lineo1')
+ntabfreqs = input.int(title='', defval=5, minval=1, group='Output', inline='lineo1', tooltip='Shows the table with the info about N most significant freqeuncy components. \n' + '-1st column: component number (N) \n' + '-2nd column: period of the component (in the units of input data resolution)  \n' + '-3d column:  relative power (normalized to the maximum power)')
+timedomain = input.bool(title='Show Inverse Fourier Transform (Filtered)', defval=false, group='Output', tooltip='Reconstructs and plots the dataset in the time domain, blocking ' + 'frequency components outside of the cutoff frequencies defined below.')
+ismoving = input.bool(title='Apply FFT Filter in a Moving Window', defval=false, group='Output', tooltip='Applies the filter for each bar within ' + 'the time range defined below.')
+islowthrs = input.bool(title='', defval=true, group='Filtered Fourier Components', inline='linef1')
+N_first = input.int(title='Lowest Allowed N', defval=0, minval=0, group='Filtered Fourier Components', tooltip='The number of the lowest frequency component allowed to pass. ' + 'Frequency components above it will be blocked.', inline='linef1')
+ishghthrs = input.bool(title='', defval=true, group='Filtered Fourier Components', inline='linef2')
+N_last = input.int(title='Highest Allowed N ', defval=10, minval=0, group='Filtered Fourier Components', tooltip='The number of the highest frequency component allowed to pass. ' + 'Frequency components above it will be blocked.', inline='linef2')
+fixedstart = input.bool(title='', group='Filtering Time Range', inline='linebac1', defval=true)
+filter_start = input.time(title='', inline='linebac1', group='Filtering Time Range', defval=timestamp('01 Jan 2020 13:30 +0000'), tooltip='If deactivated, filtering stars from the first available bar.')
+fixedend = input.bool(title='', group='Filtering Time Range', inline='linebac2', defval=false)
+filter_end = input.time(title='', inline='linebac2', group='Filtering Time Range', defval=timestamp('30 Dec 2080 23:30 +0000'), tooltip='If deactivated, filtering ends at the last available bar.')
+//
+//
+// --- Initialiation ---
+bool    isinrange = (fixedstart ? time >= filter_start : true) and (fixedend ? time <= filter_end : true)
+var line[] tLines = array.new_line(N-1)
+var line[] fLines = array.new_line(N/2-2)
+//
+// Look back and see how many datapoints are available
+int m    = int(math.log(N)/math.log(2)) // approximate log2
+int newM = 0
+for j = 1 to m
+    if na(src[math.pow(2, j)])
+        break
+    newM := j
+// Use fewer datapoints, if there is not enough
+m := newM
+N := int(math.pow(2, newM))
+//
+//
+// -- Collect the data and apply FFT---
+float[] dat_re = array.new_float(na)
+float[] dat_im = array.new_float(na)
+if  N > 1 and (isinrange and ismoving or barstate.islast)
+    for i = 0 to N - 1
+        array.push(dat_re, src[i])
+        array.push(dat_im, 0.0)
+    if ispp
+        dat_re := array.standardize(dat_re)
+        dat_re
+    // forward FFT
+    fft.fft(dat_re, dat_im, "Forward")
+//
+//
+// Collect Fourier amplitudes squared (powers)
+float[] power = array.new_float(na)
+if barstate.islast and N > 1
+    for i = 0 to N-1
+        array.push(power,math.pow(array.get(dat_re,i),2) + math.pow(array.get(dat_im,i),2))
+    array.set(power,0,0.0) // make sure that the 0th component doesn't affect the power spectrum
+//
+//
+// -- Apply inverse FFT using selected frequency components --
+float[] dat_re_filt = array.new_float(N)
+float[] dat_im_filt = array.new_float(N)
+N_first := islowthrs ? math.min(math.min(N_first, N_last), N / 2) : 0
+N_last  := ishghthrs ? math.min(N_last, N / 2) : N / 2
+// Apply the bandpass filter
+if N > 1 and (isinrange and ismoving or barstate.islast)
+    array.fill(dat_re_filt, 0.0)
+    array.fill(dat_im_filt, 0.0)
+    for i = N_first to N_last by 1
+        array.set(dat_re_filt, i, array.get(dat_re, i))
+        array.set(dat_im_filt, i, array.get(dat_im, i))
+        if i != 0
+            array.set(dat_re_filt, N - i, array.get(dat_re, N - i))
+            array.set(dat_im_filt, N - i, array.get(dat_im, N - i))
+    //inverse FFT
+    fft.fft(dat_re_filt, dat_im_filt, "Inverse")
+//
+// Apply the filter to real-time data
+float src_filtered = ismoving and isinrange ? array.get(dat_re_filt, 0) : na
+//
+//
+// --- Plotting --- 
+// Time-domain subplot
+if barstate.islast and timedomain and N > 1
+    for i = 1 to N - 1
+        float y_plt1 = array.get(dat_re_filt, i)
+        float y_plt2 = array.get(dat_re_filt, i - 1)
+        array.push(tLines, line.new(bar_index[i], y_plt1, bar_index[i - 1], y_plt2, width=2, color=#DE3163))
+        line.delete(array.shift(tLines))
+plot(ispp and ismoving and N > 1 ? 0.0 : na, color=color.new(color.silver, 0), title='zero', linewidth=1)
+plot(src_filtered, color=color.new(#DE3163, 0), title='filtered', linewidth=2)
+// 
+// Frequency-domain subplot
+if barstate.islast and freqdomain and N > 1
+    float y_zero  = array.max(dat_re_filt)
+    float y_scale = (array.max(dat_re_filt) - array.min(dat_re_filt)) / array.max(power)
+    line  yax = line.new(bar_index, y_zero, bar_index[int(N / 2) + 5], y_zero, style=line.style_arrow_right, color=color.silver)
+    label ylb = label.new(bar_index[int(N / 2) + 6], y_zero, text='f', style=label.style_none, textcolor=color.silver)
+    line.delete( yax[1])
+    label.delete(ylb[1])
+    for i = 0 to int(N / 2)-2
+        isinwindow = i >= N_first and i <= N_last
+        float y_plt = array.get(power, i)
+        array.push(fLines, line.new(bar_index[i], y_zero, bar_index[i], y_plt * y_scale + y_zero, width=3, color=isinwindow ? #DE3163 : #AED6F1) )
+        line.delete(array.shift(fLines))
+//
+//
+// --- Table ---
+var table panel = table.new(position.top_right, 3, ntabfreqs + 1)
+if barstate.islast and istable and N > 1
+    ntabfreqs := math.min(ntabfreqs, N / 2)
+    // Table header
+    table.cell(panel, 0, 0, 'N', bgcolor=#AED6F1, text_size=size.small)
+    table.cell(panel, 1, 0, 'Cycle Period', bgcolor=#AED6F1, text_size=size.small)
+    table.cell(panel, 2, 0, 'Rel. Power', bgcolor=#AED6F1, text_size=size.small)
+    // drop zero frequency from power array and sort it
+    power_sorted = array.copy(power)
+    array.remove(power_sorted, 0)
+    array.sort(power_sorted, order.descending)
+    //
+    for i = 0 to ntabfreqs - 1 by 1
+        // Period in left column
+        id = array.indexof(power, array.get(power_sorted, 2 * i))
+        table.cell(panel, 0, i + 1, str.format("{0,number,#}",id), bgcolor=#DFEEF7, text_size=size.small)
+        table.cell(panel, 1, i + 1, str.format("{0,number,#.#}",float(N) / float(id)), text_color=color.black, bgcolor=#DFEEF7, text_size=size.small)
+        table.cell(panel, 2, i + 1, str.format("{0,number,#.####}", array.get(power_sorted, 2 * i) / array.get(power_sorted, 0)), text_color=color.black, bgcolor=#DFEEF7, text_size=size.small)
+//

@@ -1,0 +1,121 @@
+//@version=6
+strategy("Futures Regime Break Strategy [KedArcQuant]", overlay=true, pyramiding=0, calc_on_every_tick=false)
+
+//====================
+// INPUTS (Core)
+//====================
+emaLen   = input.int(50, "Trend EMA Length", minval=1)
+rsiLen   = input.int(14, "RSI Length", minval=1)
+swingLen = input.int(10, "Structure Length", minval=2)
+
+//====================
+// INPUTS (Add-ons)
+//====================
+// 1) ADX Strength Filter (DMI requires smoothing in your build)
+useADX        = input.bool(true, "Enable ADX Strength Filter")
+adxLen        = input.int(14, "ADX Length", minval=1)
+adxSmoothing  = input.int(14, "ADX Smoothing", minval=1)
+adxMin        = input.float(18.0, "Min ADX to Trade", step=0.5)
+
+// 2) VWAP Distance Filter (avoid chasing)
+useVwapDist = input.bool(true, "Enable VWAP Distance Filter")
+vwapDistPct = input.float(0.30, "Max Distance from VWAP (%)", step=0.05)
+
+// 3) Entry Cooldown (avoid repeated signals)
+useCooldown  = input.bool(true, "Enable Entry Cooldown")
+cooldownBars = input.int(6, "Cooldown Bars After Entry", minval=0)
+
+// 4) Trend Lock (don’t flip until regime changes)
+useTrendLock = input.bool(true, "Enable Trend Lock (No Flip Until Regime Change)")
+
+//====================
+// CORE CALCULATIONS (Unchanged)
+//====================
+vwapValue = ta.vwap(close)
+emaTrend  = ta.ema(close, emaLen)
+rsiValue  = ta.rsi(close, rsiLen)
+
+swingHigh = ta.highest(high, swingLen)
+swingLow  = ta.lowest(low, swingLen)
+
+// Core Regime (unchanged)
+bullRegime = close > vwapValue and close > emaTrend
+bearRegime = close < vwapValue and close < emaTrend
+
+// Core Momentum (unchanged)
+bullMomentum = rsiValue > 55
+bearMomentum = rsiValue < 45
+
+// Core Breakout (unchanged)
+bullBreak = close > swingHigh[1]
+bearBreak = close < swingLow[1]
+
+//====================
+// ADD-ON FILTERS (New)
+//====================
+
+// (1) ADX strength filter (via ta.dmi with smoothing)
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxSmoothing)
+adxOK = not useADX or (adxValue >= adxMin)
+
+// (2) VWAP distance filter
+vwapDist = math.abs(close - vwapValue) / vwapValue * 100.0
+vwapDistOK = not useVwapDist or (vwapDist <= vwapDistPct)
+
+// (3) Cooldown tracking
+var int lastEntryBar = na
+cooldownOK = not useCooldown or na(lastEntryBar) or (bar_index - lastEntryBar > cooldownBars)
+
+//====================
+// CORE SIGNALS (Unchanged) + FILTER GATES
+//====================
+longCore  = bullRegime and bullMomentum and bullBreak and barstate.isconfirmed
+shortCore = bearRegime and bearMomentum and bearBreak and barstate.isconfirmed
+
+longFiltered  = longCore  and adxOK and vwapDistOK and cooldownOK
+shortFiltered = shortCore and adxOK and vwapDistOK and cooldownOK
+
+//====================
+// TREND LOCK (New)
+//====================
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+bullRegimeConfirmed = bullRegime and barstate.isconfirmed
+bearRegimeConfirmed = bearRegime and barstate.isconfirmed
+
+allowLong  = not useTrendLock or (not inShort) or (inShort and bullRegimeConfirmed)
+allowShort = not useTrendLock or (not inLong)  or (inLong  and bearRegimeConfirmed)
+
+// Final entries
+longSignal  = longFiltered  and allowLong
+shortSignal = shortFiltered and allowShort
+
+//====================
+// EXECUTION (Alerts via Order Fills)
+//====================
+if longSignal
+    strategy.entry("LONG FUT", strategy.long, alert_message="KedArcQuant LONG Futures Signal")
+    lastEntryBar := bar_index
+
+if shortSignal
+    strategy.entry("SHORT FUT", strategy.short, alert_message="KedArcQuant SHORT Futures Signal")
+    lastEntryBar := bar_index
+
+//====================
+// PLOTS / VISUALS
+//====================
+plot(emaTrend, color=color.orange, title="EMA Trend", linewidth=2)
+plot(vwapValue, color=color.blue, title="VWAP", linewidth=2)
+
+plotshape(longSignal,  title="LONG",  location=location.belowbar, color=color.green, style=shape.triangleup,   size=size.normal, text="LONG")
+plotshape(shortSignal, title="SHORT", location=location.abovebar, color=color.red,   style=shape.triangledown, size=size.normal, text="SHORT")
+
+// Optional debug
+showDebug = input.bool(false, "Show Debug (Filters)")
+if showDebug and barstate.isconfirmed
+    label.new(bar_index, high,
+      "ADX=" + str.tostring(adxValue, "#.0") +
+      "\nVWAPdist%=" + str.tostring(vwapDist, "#.00") +
+      "\nCooldownOK=" + str.tostring(cooldownOK),
+      style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 0))

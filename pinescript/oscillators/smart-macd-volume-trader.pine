@@ -1,0 +1,273 @@
+//@version=6
+indicator('Smart MACD Volume Trader', shorttitle = 'SMVT', overlay = false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART MACD VOLUME TRADER
+// ═══════════════════════════════════════════════════════════════════════════════
+// This indicator combines MACD (Moving Average Convergence Divergence) with a 
+// high volume filter to reduce false signals and improve trading accuracy.
+// Signals are only generated when MACD crosses occur during periods of 
+// significant volume activity, confirming momentum strength.
+//
+// AUTOMATIC FOREX VOLUME: When applied to forex pairs, the indicator automatically
+// uses CME futures data for accurate volume analysis instead of unreliable spot FX volume.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// === INPUT PARAMETERS ===
+
+// Volume Analysis Settings
+symbol = input('', title = 'Volume Symbol (Leave blank for chart symbol)', 
+     tooltip = 'Specify a different symbol for volume analysis, or leave blank to use the current chart symbol')
+sess = input.session('1530-2200', title = 'Alert Session', 
+     tooltip = 'Define the trading session for alert generation')
+timezone = input('UTC+1', title = 'Timezone', 
+     tooltip = 'Set your preferred timezone for session-based alerts')
+movingaverageinput = input(20, title = 'Volume MA Period', 
+     tooltip = 'Number of periods for calculating the volume moving average')
+highVolumeRatio = input.float(2.0, title = 'High Volume Ratio', step = 0.1, 
+     tooltip = 'Multiplier for average volume to identify high volume bars (2.0 = 200% of average)')
+barsLookback = input(5, title = 'Volume Lookback Bars', 
+     tooltip = 'Number of recent bars to check for high volume before generating signals')
+
+// Visual Settings for High Volume Candles
+highVolumeCandleColorUp = input.color(color.new(color.green, 0), title = 'High Volume Candle (Bullish)', 
+     tooltip = 'Color for bullish high volume candles')
+highVolumeCandleColorDown = input.color(color.new(color.red, 0), title = 'High Volume Candle (Bearish)', 
+     tooltip = 'Color for bearish high volume candles')
+
+// MACD Settings
+fastLength = input(12, title = 'MACD Fast EMA Length', 
+     tooltip = 'Period for the fast exponential moving average (standard: 12)')
+slowLength = input(26, title = 'MACD Slow EMA Length', 
+     tooltip = 'Period for the slow exponential moving average (standard: 26)')
+signalLength = input(9, title = 'MACD Signal SMA Length', 
+     tooltip = 'Period for the signal line simple moving average (standard: 9)')
+
+// Signal Direction Filters
+onlyBuy = input.bool(false, title = 'Show Only Buy Signals', 
+     tooltip = 'Enable to display only buy signals and hide sell signals')
+onlySell = input.bool(false, title = 'Show Only Sell Signals', 
+     tooltip = 'Enable to display only sell signals and hide buy signals')
+
+// Display Options
+showSignals = input.bool(true, title = 'Show Buy/Sell Labels', 
+     tooltip = 'Toggle visibility of buy/sell signal labels on the price chart')
+
+// === HELPER FUNCTIONS ===
+
+// Automatically maps forex pairs to their corresponding CME futures contracts
+// This function detects if current chart is a forex pair and returns appropriate futures symbol
+futuresSymbol(fullTicker) =>
+    // Extract exchange and currency pair
+    tickerParts = str.split(fullTicker, ":")
+    exchange = array.size(tickerParts) > 1 ? array.get(tickerParts, 0) : ""
+    currencyPair = array.size(tickerParts) > 1 ? array.get(tickerParts, 1) : fullTicker
+    
+    // Check if this is a forex exchange
+    isForexExchange = exchange == "FX" or exchange == "OANDA" or exchange == "FOREX" or 
+                      exchange == "FXCM" or exchange == "SAXO" or exchange == "FOREXCOM" or
+                      exchange == "PEPPERSTONE" or exchange == "EASYMARKETS" or exchange == "FX_IDC"
+    
+    // Check if this is a commodity exchange
+    isCommodityExchange = exchange == "TVC" or exchange == "COMEX" or exchange == "NYMEX" or 
+                          exchange == "ICEUS" or str.contains(exchange, "GOLD") or str.contains(exchange, "OIL")
+    
+    // Check if currency pair matches forex pattern (6 letters with major currencies)
+    isForexPair = str.length(currencyPair) == 6 and 
+                  (str.contains(currencyPair, "USD") or str.contains(currencyPair, "EUR") or 
+                   str.contains(currencyPair, "GBP") or str.contains(currencyPair, "JPY") or
+                   str.contains(currencyPair, "AUD") or str.contains(currencyPair, "NZD") or
+                   str.contains(currencyPair, "CAD") or str.contains(currencyPair, "CHF"))
+    
+    // Check if it's a commodity (gold, silver, oil, etc)
+    isCommodity = str.contains(currencyPair, "XAU") or str.contains(currencyPair, "GOLD") or
+                  str.contains(currencyPair, "XAG") or str.contains(currencyPair, "SILVER") or
+                  str.contains(currencyPair, "OIL") or str.contains(currencyPair, "WTI") or
+                  str.contains(currencyPair, "BRENT") or str.contains(currencyPair, "COPPER") or
+                  str.contains(currencyPair, "NATGAS") or currencyPair == "CL" or currencyPair == "GC" or
+                  currencyPair == "SI" or currencyPair == "HG" or currencyPair == "NG"
+    
+    // It's forex/commodity if exchange matches OR pair pattern matches
+    isForex = isForexExchange or isCommodityExchange or isForexPair or isCommodity
+    
+    // Map specific forex pairs to CME futures
+    futuresMap = switch currencyPair
+        // Major Forex Pairs
+        'EURUSD' => 'CME:6E1!'        // Euro FX Futures
+        'GBPUSD' => 'CME:6B1!'        // British Pound Futures
+        'AUDUSD' => 'CME:6A1!'        // Australian Dollar Futures
+        'USDJPY' => 'CME:6J1!'        // Japanese Yen Futures
+        'USDCAD' => 'CME:6C1!'        // Canadian Dollar Futures
+        'USDCHF' => 'CME:6S1!'        // Swiss Franc Futures
+        'NZDUSD' => 'CME:6N1!'        // New Zealand Dollar Futures
+        // Exotic Forex Pairs
+        'USDMXN' => 'CME:6M1!'        // Mexican Peso Futures
+        'USDRUB' => 'CME:6R1!'        // Russian Ruble Futures
+        'USDBRL' => 'CME:6L1!'        // Brazilian Real Futures
+        'USDZAR' => 'CME:6Z1!'        // South African Rand Futures
+        // Cross Pairs
+        'EURJPY' => 'CME:6E1!'        // Use Euro futures for cross pairs
+        'GBPJPY' => 'CME:6B1!'        // Use GBP futures for cross pairs
+        'EURGBP' => 'CME:6E1!'        // Use Euro futures
+        'AUDJPY' => 'CME:6A1!'        // Use AUD futures
+        'EURAUD' => 'CME:6E1!'        // Use Euro futures
+        'GBPAUD' => 'CME:6B1!'        // Use GBP futures
+        // Commodities - Gold
+        'XAUUSD' => 'COMEX:GC1!'      // Gold Futures
+        'GOLD' => 'COMEX:GC1!'        // Gold Futures (alternative ticker)
+        // Commodities - Silver  
+        'XAGUSD' => 'COMEX:SI1!'      // Silver Futures
+        'SILVER' => 'COMEX:SI1!'      // Silver Futures (alternative ticker)
+        // Commodities - Oil
+        'USOIL' => 'NYMEX:CL1!'       // Crude Oil Futures
+        'UKOIL' => 'NYMEX:BZ1!'       // Brent Oil Futures
+        'WTIUSD' => 'NYMEX:CL1!'      // WTI Crude Oil
+        // Commodities - Others
+        'COPPER' => 'COMEX:HG1!'      // Copper Futures
+        'NATGAS' => 'NYMEX:NG1!'      // Natural Gas Futures
+        => fullTicker                 // Return original if no specific mapping
+    
+    // Return futures if forex, otherwise return original
+    result = isForex ? futuresMap : fullTicker
+    result
+
+// === VOLUME ANALYSIS ===
+
+// Determine which symbol to use for volume data
+// Automatically uses CME futures for forex pairs, or user-specified symbol if provided
+actualSymbol = symbol == '' ? futuresSymbol(syminfo.tickerid) : symbol
+
+// Fetch volume data from the specified symbol
+volumeData = request.security(actualSymbol, '', volume)
+
+// Calculate exponential moving average of volume
+var float movingaverage = na
+movingaverage := na(movingaverage[1]) ? volumeData : 
+                 nz(movingaverage[1]) + (volumeData - nz(movingaverage[1])) / movingaverageinput
+
+// Determine high volume threshold and current bar status
+highVolumeThreshold = movingaverage * highVolumeRatio
+ishighVolume = volumeData >= highVolumeThreshold
+
+// Check if high volume occurred in recent lookback period
+highVolumeInLookback = ta.highest(ishighVolume ? 1 : 0, barsLookback) > 0
+
+// Display info table showing which symbol is used for volume (for debugging)
+var table infoTable = table.new(position.top_right, 2, 5, bgcolor = color.new(color.gray, 85), border_width = 1)
+if barstate.islast
+    // Extract parts for debugging
+    tickerParts = str.split(syminfo.tickerid, ":")
+    exchange = array.size(tickerParts) > 1 ? array.get(tickerParts, 0) : ""
+    pair = array.size(tickerParts) > 1 ? array.get(tickerParts, 1) : syminfo.tickerid
+    
+    isFutures = actualSymbol != syminfo.tickerid
+    
+    table.cell(infoTable, 0, 0, 'Chart:', text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 1, 0, syminfo.tickerid, text_color = color.white, text_size = size.tiny)
+    
+    table.cell(infoTable, 0, 1, 'Exchange:', text_color = color.gray, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTable, 1, 1, exchange, text_color = color.gray, text_size = size.tiny)
+    
+    table.cell(infoTable, 0, 2, 'Pair:', text_color = color.gray, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTable, 1, 2, pair, text_color = color.gray, text_size = size.tiny)
+    
+    table.cell(infoTable, 0, 3, 'Volume From:', text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 1, 3, actualSymbol, 
+               text_color = isFutures ? color.orange : color.yellow, 
+               text_size = size.tiny,
+               tooltip = isFutures ? 'Using CME Futures (Auto)' : 'Using Original Volume')
+    
+    table.cell(infoTable, 0, 4, 'High Volume:', text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTable, 1, 4, ishighVolume ? 'YES' : 'NO', 
+               text_color = ishighVolume ? color.lime : color.gray, text_size = size.small)
+
+// === MACD CALCULATION ===
+
+// Calculate MACD components
+fastMA = ta.ema(close, fastLength)      // Fast exponential moving average
+slowMA = ta.ema(close, slowLength)      // Slow exponential moving average
+macd = fastMA - slowMA                  // MACD line (difference between EMAs)
+signal = ta.sma(macd, signalLength)     // Signal line (SMA of MACD)
+
+// Detect MACD crossovers
+macdCrossUp = ta.crossover(macd, signal)    // MACD crosses above signal = bullish
+macdCrossDown = ta.crossunder(macd, signal) // MACD crosses below signal = bearish
+
+// === SIGNAL GENERATION WITH VOLUME FILTER ===
+
+// Generate signals only when:
+// 1. MACD crossover/crossunder occurs
+// 2. High volume detected in lookback period
+// 3. Direction filter is enabled (if applicable)
+
+macdSignalBuy = macdCrossUp and highVolumeInLookback and (not onlySell)
+macdSignalSell = macdCrossDown and highVolumeInLookback and (not onlyBuy)
+
+// Apply "only" filters if enabled
+finalBuySignal = onlyBuy ? (macdSignalBuy and onlyBuy) : macdSignalBuy
+finalSellSignal = onlySell ? (macdSignalSell and onlySell) : macdSignalSell
+
+// === PLOTTING ===
+
+// Volume Histogram and Moving Average
+plot(volumeData, title = 'Volume', 
+     color = ishighVolume ? color.red : color.gray, 
+     style = plot.style_columns, 
+     linewidth = 1)
+plot(movingaverage, title = 'Volume MA', 
+     color = color.new(color.green, 30), 
+     linewidth = 2)
+
+// MACD Lines
+plot(macd, title = 'MACD Line', 
+     color = color.blue, 
+     linewidth = 2)
+plot(signal, title = 'Signal Line', 
+     color = color.orange, 
+     linewidth = 1)
+hline(0, 'Zero Line', 
+      color = color.gray, 
+      linestyle = hline.style_dotted)
+
+// Highlight MACD crossover areas with histogram
+histogram = macd - signal
+plot(histogram, title = 'MACD Histogram', 
+     color = histogram >= 0 ? color.new(color.green, 50) : color.new(color.red, 50), 
+     style = plot.style_columns)
+
+// Display buy/sell signals with BUY/SELL labels
+plotshape(showSignals and finalBuySignal, 
+          style = shape.labelup, 
+          location = location.bottom, 
+          color = color.new(color.green, 0), 
+          size = size.small, 
+          text = 'BUY',
+          textcolor = color.white,
+          title = 'Buy Signal')
+
+plotshape(showSignals and finalSellSignal, 
+          style = shape.labeldown, 
+          location = location.top, 
+          color = color.new(color.red, 0), 
+          size = size.small, 
+          text = 'SELL',
+          textcolor = color.white,
+          title = 'Sell Signal')
+
+// Color candles on main chart based on high volume
+barcolor(ishighVolume ? (close >= open ? highVolumeCandleColorUp : highVolumeCandleColorDown) : na, 
+         title = 'High Volume Candle Color')
+
+// === ALERTS ===
+
+alertcondition(finalBuySignal, 
+               title = 'Buy Signal Alert', 
+               message = 'Smart MACD Volume Trader: BUY signal triggered with high volume confirmation')
+
+alertcondition(finalSellSignal, 
+               title = 'Sell Signal Alert', 
+               message = 'Smart MACD Volume Trader: SELL signal triggered with high volume confirmation')
+
+alertcondition(ishighVolume, 
+               title = 'High Volume Alert', 
+               message = 'High volume detected: {{ticker}} volume is {{plot_0}} (threshold: {{plot_1}})')

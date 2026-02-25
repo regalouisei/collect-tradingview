@@ -1,0 +1,200 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © WalrusQuant
+
+//@version=6
+indicator(title="Flow Control Oscillator (FCO)", shorttitle="FCO", overlay=false)
+
+// === INPUTS ===
+// Core Settings
+grp1 = "Core Settings"
+mfiLen     = input.int(14, title="MFI Length",     minval=1, group=grp1)
+cmfLen     = input.int(20, title="CMF Length",     minval=1, group=grp1)
+src        = input.source(hlc3, title="Price Source", group=grp1)
+
+// Weighting Settings
+grp1b = "Component Weighting"
+weightMode = input.string("Equal", title="Weighting Mode", options=["Equal", "MFI Heavy", "CMF Heavy", "Custom"], group=grp1b)
+customMFIWeight = input.float(0.5, title="Custom MFI Weight", minval=0.0, maxval=1.0, step=0.1, group=grp1b, tooltip="Only used when Weighting Mode is set to Custom. 0.0 = 100% CMF (volume focus), 0.5 = Equal weight, 1.0 = 100% MFI (money flow focus)")
+
+// Smoothing Settings
+grp1c = "Smoothing Options"
+smoothType = input.string("SMA", title="FCO Smoothing Type", options=["SMA", "EMA", "WMA", "RMA", "TEMA", "DEMA", "VWMA"], group=grp1c)
+smoothLen  = input.int(3,  title="FCO Smoothing Length",  minval=1, maxval=20, group=grp1c)
+signalType = input.string("WMA", title="Signal Type", options=["EMA", "WMA", "HMA", "TEMA", "DEMA", "VWMA"], group=grp1c)
+signalLen  = input.int(6,  title="Signal Line Length", minval=1, group=grp1c)
+momentumLen = input.int(3, title="Momentum Length", minval=1, maxval=10, group=grp1c)
+
+// ADX Settings
+grp2 = "ADX Strength Filter"
+useADX = input.bool(true, title="Use ADX for Momentum Strength", group=grp2)
+adxLen = input.int(14, title="ADX Length", minval=1, group=grp2)
+adxSmooth = input.int(14, title="ADX Smoothing", minval=1, group=grp2)
+showADX = input.bool(false, title="Show ADX Line", group=grp2)
+
+// Color Settings
+grp3 = "Color Settings"
+FCOColor = input.color(color.white, title="FCO Line Color", group=grp3)
+signalColor = input.color(#5b9cf6, title="Signal Line Color", group=grp3)
+bullMomentumColor = input.color(color.green, title="Bullish Momentum Color", group=grp3)
+bearMomentumColor = input.color(color.red, title="Bearish Momentum Color", group=grp3)
+useMomentumGradient = input.bool(true, title="Use Gradient for Momentum", group=grp3)
+adxColor = input.color(color.yellow, title="ADX Line Color", group=grp3)
+
+// Display Settings
+grp4 = "Display Settings"
+showFCO = input.bool(true, title="Show FCO Line", group=grp4)
+showSignal = input.bool(true, title="Show Signal Line", group=grp4)
+showMomentum = input.bool(true, title="Show Momentum Histogram", group=grp4)
+showExtremeZones = input.bool(true, title="Show Extreme Zone Background", group=grp4)
+
+// === SMOOTHING FUNCTIONS ===
+// Triple EMA
+tema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    ema3 = ta.ema(ema2, len)
+    3 * ema1 - 3 * ema2 + ema3
+
+// Double EMA
+dema(src, len) =>
+    ema1 = ta.ema(src, len)
+    ema2 = ta.ema(ema1, len)
+    2 * ema1 - ema2
+
+// Apply smoothing based on type
+applySmoothing(src, type, len) =>
+    type == "EMA" ? ta.ema(src, len) : type == "WMA" ? ta.wma(src, len) : type == "RMA" ? ta.rma(src, len) : type == "TEMA" ? tema(src, len) : type == "DEMA" ? dema(src, len) : type == "VWMA" ? ta.vwma(src, len) : ta.sma(src, len)
+
+// === FCO CALCULATION ===
+// MFI scaled to –1…+1
+mfi_raw = ta.mfi(src, mfiLen)
+mfi     = (mfi_raw - 50) / 50
+
+// CMF (–1…+1)
+ad = high == low ? 0 : ((2 * close - high - low) / (high - low)) * volume
+cmf = math.sum(ad, cmfLen) / math.sum(volume, cmfLen)
+
+// Apply weighting
+mfiWeight = weightMode == "MFI Heavy" ? 0.7 : weightMode == "CMF Heavy" ? 0.3 : weightMode == "Custom" ? customMFIWeight : 0.5
+cmfWeight = 1 - mfiWeight
+
+// Composite with weighting & smoothing
+FCO_raw = weightMode == "Equal" ? (cmf + mfi) : ((cmf * cmfWeight) + (mfi * mfiWeight)) * 2
+FCO     = smoothLen > 1 ? applySmoothing(FCO_raw, smoothType, smoothLen) : FCO_raw
+
+// Signal line with advanced smoothing options
+signal = signalType == "HMA" ? ta.hma(FCO, signalLen) : applySmoothing(FCO, signalType, signalLen)
+
+// === ADX CALCULATION ===
+// Calculate ADX and scale to 0-1 range for weighting
+[diPlus, diMinus, adxRaw] = ta.dmi(adxLen, adxSmooth)
+adx = adxRaw / 100
+
+// Scale ADX to fit on chart with FCO (for display purposes)
+adxScaled = (adx * 2) - 1
+
+// === MOMENTUM CALCULATION ===
+// Base momentum (rate of change)
+momentumBase = ta.change(FCO, momentumLen)
+
+// ATR Normalization Option
+useATRNorm = input.bool(false, "Normalize Momentum by ATR", group=grp1c)
+atr_norm = ta.atr(14)
+
+// BUG FIX: momentumAdjusted is now actually used
+momentumAdjusted = useATRNorm ? momentumBase / atr_norm : momentumBase
+
+// ADX-weighted momentum (now uses momentumAdjusted instead of momentumBase)
+momentum = useADX ? momentumAdjusted * (0.3 + adx * 0.7) : momentumAdjusted
+
+// Color based on momentum direction and intensity
+momentumColor = if useMomentumGradient
+    if momentum > 0
+        color.from_gradient(momentum, 0, 0.3, color.new(bullMomentumColor, 60), color.new(bullMomentumColor, 0))
+    else
+        color.from_gradient(momentum, -0.3, 0, color.new(bearMomentumColor, 0), color.new(bearMomentumColor, 60))
+else
+    momentum > 0 ? color.new(bullMomentumColor, 20) : color.new(bearMomentumColor, 20)
+
+// === ENHANCED ALERT CONDITIONS ===
+
+// Existing alerts
+bullMomentum = ta.crossover(momentum, 0)
+bearMomentum = ta.crossunder(momentum, 0)
+extremeHigh = FCO > 1.0
+extremeLow = FCO < -1.0
+FCOBullCross = ta.crossover(FCO, 0)
+FCOBearCross = ta.crossunder(FCO, 0)
+strongTrend = adx > 0.25
+
+// FCO/Signal Crossovers
+FCOCrossOverSignal = ta.crossover(FCO, signal)
+FCOCrossUnderSignal = ta.crossunder(FCO, signal)
+
+// Reversal Setup Alerts (FCO in extreme + crosses signal + weakening momentum)
+momentumWeakening = math.abs(momentum) < math.abs(momentum[1])
+bullishReversal = extremeLow and FCOCrossOverSignal and momentumWeakening
+bearishReversal = extremeHigh and FCOCrossUnderSignal and momentumWeakening
+
+// Trend Strength Setup Alerts (FCO crosses zero + growing momentum)
+momentumGrowing = math.abs(momentum) > math.abs(momentum[1])
+bullishTrendStrength = FCOBullCross and momentum > 0 and momentumGrowing and strongTrend
+bearishTrendStrength = FCOBearCross and momentum < 0 and momentumGrowing and strongTrend
+
+// Signal Confirmation (FCO crosses zero AND signal follows same direction)
+signalBullConfirm = FCOBullCross and signal > signal[1]
+signalBearConfirm = FCOBearCross and signal < signal[1]
+
+// All Alert Conditions
+alertcondition(bullishReversal, title="Bullish Reversal Setup", message="REVERSAL: FCO crossing up from extreme oversold with weakening momentum!")
+alertcondition(bearishReversal, title="Bearish Reversal Setup", message="REVERSAL: FCO crossing down from extreme overbought with weakening momentum!")
+
+alertcondition(bullishTrendStrength, title="Strong Bullish Trend", message="TREND: Buyers taking control with growing momentum and strong ADX!")
+alertcondition(bearishTrendStrength, title="Strong Bearish Trend", message="TREND: Sellers taking control with growing momentum and strong ADX!")
+
+alertcondition(FCOCrossOverSignal, title="FCO Crossed Above Signal", message="FCO crossed above Signal line - bullish momentum shift")
+alertcondition(FCOCrossUnderSignal, title="FCO Crossed Below Signal", message="FCO crossed below Signal line - bearish momentum shift")
+
+alertcondition(signalBullConfirm, title="Confirmed Bullish Signal", message="FCO crossed zero UP and Signal confirms - strong buy signal!")
+alertcondition(signalBearConfirm, title="Confirmed Bearish Signal", message="FCO crossed zero DOWN and Signal confirms - strong sell signal!")
+
+alertcondition(FCOBullCross, title="Buyers Take Control", message="Buyers Now in Control!")
+alertcondition(FCOBearCross, title="Sellers Take Control", message="Sellers Now in Control!")
+
+alertcondition(extremeHigh, title="Extreme Overbought", message="Buyers Exhausted - Watch for reversal!")
+alertcondition(extremeLow, title="Extreme Oversold", message="Sellers Exhausted - Watch for reversal!")
+
+alertcondition(bullMomentum and strongTrend, title="Strong Bullish Momentum", message="Strong Buyers Gaining Strength!")
+alertcondition(bearMomentum and strongTrend, title="Strong Bearish Momentum", message="Strong Sellers Gaining Strength!")
+
+// === PLOTTING ===
+hline(0, "Zero", color.gray, linestyle=hline.style_solid, linewidth=1)
+
+// MOMENTUM HISTOGRAM (ADX-weighted)
+plot(showMomentum ? momentum : na, title="Momentum (ADX-Weighted)", style=plot.style_columns, color=momentumColor, linewidth=2)
+
+// FCO Line - shows who's actually in control
+plot(showFCO ? FCO : na, title="FCO (Control)", color=FCOColor, linewidth=2)
+
+// Signal line
+plot(showSignal ? signal : na, title="Signal Line", color=signalColor, linewidth=2, style=plot.style_line)
+
+// ADX Line (optional display, scaled to chart)
+plot(showADX ? adxScaled : na, title="ADX (Scaled)", color=color.new(adxColor, 50), linewidth=2, style=plot.style_line)
+
+// Reference levels
+hline(0.7, "Upper", color.new(color.gray, 70))
+hline(-0.7, "Lower", color.new(color.gray, 70))
+hline(1.0, "Extreme High", color.new(color.red, 80), linestyle=hline.style_dashed)
+hline(-1.0, "Extreme Low", color.new(color.green, 80), linestyle=hline.style_dashed)
+
+// Extreme zones background
+bgcolor(showExtremeZones and math.abs(FCO) > 1.0 ? color.new(color.gray, 95) : na, title="Extreme Zones")
+
+// Weak trend warning (low ADX = choppy conditions)
+bgcolor(useADX and adx < 0.20 ? color.new(color.orange, 97) : na, title="Weak Trend Zone")
+
+// Component plots (hidden)
+plot(cmf, title="CMF", color=color.new(color.blue, 70), linewidth=1, display=display.none)
+plot(mfi, title="MFI Scaled", color=color.new(color.orange, 70), linewidth=1, display=display.none)
+plot(adx, title="ADX Raw", color=color.new(color.yellow, 70), linewidth=1, display=display.none)

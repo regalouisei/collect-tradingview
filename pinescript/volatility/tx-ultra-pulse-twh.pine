@@ -1,0 +1,123 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Tonzlnxz
+
+//@version=6
+indicator("TX Ultra Pulse TWH — Multi [v1.0]", shorttitle="TXU-Pulse-TWH", overlay=false, precision=2)
+
+// 1.0 ENGINE CORE
+// -----------------------------------------------------------------------------
+formulaType = input.string("Composite", "Engine Mode", options=["Deviation", "Composite", "Momentum", "RS Index"], group="1.0 Engine Core", tooltip="Select the calculation logic:\n• Deviation: Distance from Mean\n• Composite: Blended Momentum (RSI+Stoch+CCI)\n• Momentum: Rate of Change\n• RS Index: Relative Strength vs Benchmark")
+
+// 2.0 SIGNAL TUNING
+// -----------------------------------------------------------------------------
+maPeriod = input.int(20, "Wave Baseline", minval=5, maxval=100, group="2.0 Signal Tuning", tooltip="The core lookback period. Higher values = Slower, more reliable trends.")
+smoothPeriod = input.int(15, "Noise Filter", minval=1, maxval=50, group="2.0 Signal Tuning", tooltip="Smoothing factor to eliminate false signals. Increase this if the histogram is too choppy.")
+
+// 3.0 RELATIVE STRENGTH (Conditional)
+// -----------------------------------------------------------------------------
+rsSymbol = input.symbol("IDX:COMPOSITE", "Benchmark Symbol", group="3.0 Relative Strength", tooltip="The index/asset to compare against when 'RS Index' mode is active.")
+rsPeriod = input.int(14, "Comparison Lookback", minval=5, maxval=50, group="3.0 Relative Strength", tooltip="Period for performance comparison.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🧮 CALCULATION LOGIC (UNCHANGED)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// FORMULA 1: DEVIATION
+smaValue = ta.sma(close, maPeriod)
+deviation = ((close - smaValue) / smaValue) * 100
+deviationSmooth = ta.ema(deviation, smoothPeriod)
+devStd = ta.stdev(deviationSmooth, 50)
+devScaled = devStd > 0 ? deviationSmooth / (devStd * 2) * 1.5 : 0
+
+// FORMULA 2: COMPOSITE
+rsiCentered = (ta.rsi(close, 14) - 50) / 50
+stochCentered = (ta.stoch(close, high, low, 14) - 50) / 50
+cciNorm = ta.cci(close, 20) / 150
+composite = (rsiCentered + stochCentered * 2 + cciNorm) / 3
+compositeSmoothed = ta.ema(composite, smoothPeriod) * 2
+
+// FORMULA 3: MOMENTUM
+roc = (close - close[maPeriod]) / close[maPeriod] * 100
+rocSmooth = ta.ema(roc, smoothPeriod)
+rocStd = ta.stdev(rocSmooth, 50)
+rocScaled = rocStd > 0 ? rocSmooth / (rocStd * 2) * 1.5 : 0
+
+// FORMULA 4: RS INDEX
+indexClose = request.security(rsSymbol, timeframe.period, close)
+stockPerf = (close - close[rsPeriod]) / close[rsPeriod] * 100
+indexPerf = (indexClose - indexClose[rsPeriod]) / indexClose[rsPeriod] * 100
+rsRatio = stockPerf - indexPerf
+rsSmooth = ta.ema(rsRatio, smoothPeriod)
+rsStd = ta.stdev(rsSmooth, 50)
+rsScaled = rsStd > 0 ? rsSmooth / (rsStd * 2) * 1.5 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🎯 OSCILLATOR SELECTION & COLOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+oscillator = switch formulaType
+    "Deviation" => devScaled
+    "Composite" => compositeSmoothed
+    "Momentum" => rocScaled
+    "RS Index" => rsScaled
+    => compositeSmoothed
+
+isRising = oscillator > oscillator[1]
+
+getHistogramColor(float value, bool rising) =>
+    color barColor = color.gray
+    if value > 0
+        if rising
+            barColor := value >= 1.0 ? #00C853 : value >= 0.5 ? #00E676 : #69F0AE
+        else
+            barColor := value >= 0.5 ? #C6FF00 : #FFEB3B
+    else
+        if rising
+            barColor := value >= -0.5 ? #FFB74D : #FF9800
+        else
+            barColor := value <= -1.0 ? #D32F2F : value <= -0.5 ? #F44336 : #FF7043
+    barColor
+
+histColor = getHistogramColor(oscillator, isRising)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📈 VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plot(oscillator, title="Pulse Histogram", color=histColor, style=plot.style_histogram, linewidth=4)
+
+// Zero Line & Levels
+hline(0, "Equilibrium", color=color.new(color.gray, 50))
+hline(1.0, "High Momentum", color=color.new(color.gray, 85), linestyle=hline.style_dotted)
+hline(-1.0, "Low Momentum", color=color.new(color.gray, 85), linestyle=hline.style_dotted)
+
+// Dashboard
+var table dashboard = table.new(position.top_right, 2, 5, border_width=1)
+if barstate.islast
+    table.cell(dashboard, 0, 0, "TX PULSE", text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
+    table.cell(dashboard, 1, 0, formulaType, text_color=color.white, bgcolor=color.new(color.blue, 30), text_size=size.small)
+    
+    table.cell(dashboard, 0, 1, "Value", text_size=size.small)
+    table.cell(dashboard, 1, 1, str.tostring(oscillator, "#.###"), text_color=histColor, text_size=size.small)
+    
+    dirStr = isRising ? "RISING" : "FALLING"
+    dirColor = isRising ? color.green : color.red
+    table.cell(dashboard, 0, 2, "Direction", text_size=size.small)
+    table.cell(dashboard, 1, 2, dirStr, text_color=dirColor, text_size=size.small)
+    
+    signalStr = oscillator > 0.5 ? "BULLISH" : oscillator > 0 ? "Weak Bull" : oscillator > -0.5 ? "Weak Bear" : "BEARISH"
+    signalColor = oscillator > 0 ? color.green : color.red
+    table.cell(dashboard, 0, 3, "Signal", text_size=size.small)
+    table.cell(dashboard, 1, 3, signalStr, text_color=signalColor, text_size=size.small)
+    
+    if formulaType == "RS Index"
+        rsInfo = rsRatio > 0 ? "Outperform" : "Underperform"
+        rsColor = rsRatio > 0 ? color.green : color.red
+        table.cell(dashboard, 0, 4, "vs Index", text_size=size.small)
+        table.cell(dashboard, 1, 4, rsInfo, text_color=rsColor, text_size=size.small)
+
+// Alerts
+crossAboveZero = ta.crossover(oscillator, 0)
+crossBelowZero = ta.crossunder(oscillator, 0)
+alertcondition(crossAboveZero, title="TX Pulse: Bullish Cross", message="{{ticker}}: Momentum Pulse turned POSITIVE")
+alertcondition(crossBelowZero, title="TX Pulse: Bearish Cross", message="{{ticker}}: Momentum Pulse turned NEGATIVE")

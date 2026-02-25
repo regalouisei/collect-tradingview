@@ -1,0 +1,384 @@
+//@version=5
+indicator("MTF Pullback - Conditions Panel", overlay=true, max_labels_count=500, max_lines_count=100)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+htf = input.timeframe("240", "Higher Timeframe (4H)", group="Timeframes")
+emaLength = input.int(50, "EMA Length", group="Trend Filter")
+
+// RSI Settings
+rsiLength = input.int(14, "RSI Length", group="RSI")
+rsiOversold = input.int(30, "RSI Oversold Level", group="RSI")
+rsiOverbought = input.int(70, "RSI Overbought Level", group="RSI")
+
+// Divergence Settings
+pivotLookback = input.int(3, "Pivot Lookback (for 1st ref)", minval=1, maxval=10, group="Divergence")
+divLookbackRange = input.int(60, "Max Bars Between Pivots", minval=20, maxval=100, group="Divergence")
+minRsiDiff = input.float(3.0, "Min RSI Difference", minval=1.0, maxval=20.0, group="Divergence")
+divActiveWindow = input.int(15, "Divergence Active Window (bars)", minval=5, maxval=30, group="Divergence")
+
+// Panel Settings
+panelPosition = input.string("Bottom Right", "Panel Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Panel")
+showDebugPanel = input.bool(true, "Show Debug Panel", group="Panel")
+
+// Debug
+showDivLines = input.bool(true, "Show Divergence Lines", group="Debug")
+showEngulfing = input.bool(true, "Show Engulfing Candles", group="Debug")
+showPricePivots = input.bool(true, "Show Price Pivots", group="Debug")
+
+// Trade Type Toggles
+showTrendTrades = input.bool(true, "Show Trend Trades", group="Trade Types")
+showCounterTrades = input.bool(true, "Show Counter Trades", group="Trade Types")
+
+// ============================================================================
+// HIGHER TIMEFRAME DATA (4H)
+// ============================================================================
+ema50_htf = request.security(syminfo.tickerid, htf, ta.ema(close, emaLength), lookahead=barmerge.lookahead_off)
+ema50_htf_prev = request.security(syminfo.tickerid, htf, ta.ema(close[1], emaLength), lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+
+htfUptrend = htfClose > ema50_htf and ema50_htf > ema50_htf_prev
+htfDowntrend = htfClose < ema50_htf and ema50_htf < ema50_htf_prev
+
+priceAboveEma = close > ema50_htf
+priceBelowEma = close < ema50_htf
+
+// ============================================================================
+// RSI
+// ============================================================================
+rsi = ta.rsi(close, rsiLength)
+rsiOversoldCond = rsi < rsiOversold
+rsiOverboughtCond = rsi > rsiOverbought
+
+// ============================================================================
+// CANDLESTICK PATTERNS
+// ============================================================================
+isGreenCandle = close > open
+isRedCandle = close < open
+bodySize = math.abs(close - open)
+candleRange = high - low
+bodyRatio = candleRange > 0 ? bodySize / candleRange : 0
+
+prevIsGreen = close[1] > open[1]
+prevIsRed = close[1] < open[1]
+prevBodySize = math.abs(close[1] - open[1])
+
+bullishEngulfing = isGreenCandle and prevIsRed and close >= open[1] and open <= close[1] and bodySize > prevBodySize * 0.5
+bearishEngulfing = isRedCandle and prevIsGreen and close <= open[1] and open >= close[1] and bodySize > prevBodySize * 0.5
+
+strongBullish = isGreenCandle and bodyRatio > 0.5
+strongBearish = isRedCandle and bodyRatio > 0.5
+
+bullPattern = bullishEngulfing or strongBullish
+bearPattern = bearishEngulfing or strongBearish
+
+// ============================================================================
+// DIVERGENCE DETECTION
+// ============================================================================
+pricePivotLow = ta.pivotlow(low, pivotLookback, pivotLookback)
+pricePivotHigh = ta.pivothigh(high, pivotLookback, pivotLookback)
+
+// 1st reference storage
+var float firstRsiAtPriceLow = na
+var float firstPriceLow = na
+var int firstLowBar = na
+var bool firstLowRsiWasOversold = false
+
+var float firstRsiAtPriceHigh = na
+var float firstPriceHigh = na
+var int firstHighBar = na
+var bool firstHighRsiWasOverbought = false
+
+// Divergence state
+var bool bullDivActive = false
+var bool bearDivActive = false
+var int bullDivBar = 0
+var int bearDivBar = 0
+
+// Track if signal already fired
+var bool bearSignalFired = false
+var bool bullSignalFired = false
+
+// 2nd point storage
+var float secondPriceHigh = na
+var float secondRsiAtHigh = na
+var float secondPriceLow = na
+var float secondRsiAtLow = na
+
+// Flags
+bullDivJustDetected = false
+bearDivJustDetected = false
+
+// Line storage
+var line bullDivLine = na
+var line bearDivLine = na
+
+// When PRICE makes a confirmed pivot low (for 1st reference)
+if not na(pricePivotLow)
+    float pivotPrice = low[pivotLookback]
+    float rsiAtPivot = rsi[pivotLookback]
+    bool rsiWasOversold = rsiAtPivot < rsiOversold
+    
+    if rsiWasOversold
+        firstRsiAtPriceLow := rsiAtPivot
+        firstPriceLow := pivotPrice
+        firstLowBar := bar_index - pivotLookback
+        firstLowRsiWasOversold := true
+        bullDivActive := false
+        bullSignalFired := false
+
+// When PRICE makes a confirmed pivot high (for 1st reference)
+if not na(pricePivotHigh)
+    float pivotPrice = high[pivotLookback]
+    float rsiAtPivot = rsi[pivotLookback]
+    bool rsiWasOverbought = rsiAtPivot > rsiOverbought
+    
+    if rsiWasOverbought
+        firstRsiAtPriceHigh := rsiAtPivot
+        firstPriceHigh := pivotPrice
+        firstHighBar := bar_index - pivotLookback
+        firstHighRsiWasOverbought := true
+        bearDivActive := false
+        bearSignalFired := false
+
+// IMMEDIATE CHECK for 2nd point (bullish divergence)
+if firstLowRsiWasOversold and not na(firstPriceLow) and not na(firstRsiAtPriceLow) and not bullDivActive
+    if low < firstPriceLow
+        float currentRsi = rsi
+        bool rsiHL = currentRsi > firstRsiAtPriceLow
+        bool rsiDiffOk = (currentRsi - firstRsiAtPriceLow) >= minRsiDiff
+        int barsDiff = bar_index - firstLowBar
+        bool inRange = barsDiff <= divLookbackRange and barsDiff > 0
+        
+        if rsiHL and rsiDiffOk and inRange
+            bullDivActive := true
+            bullDivBar := bar_index
+            bullDivJustDetected := true
+            bullSignalFired := false
+            secondPriceLow := low
+            secondRsiAtLow := currentRsi
+            
+            if showDivLines
+                if not na(bullDivLine)
+                    line.delete(bullDivLine)
+                bullDivLine := line.new(firstLowBar, firstPriceLow, bar_index, low, color=color.lime, width=2, style=line.style_solid)
+
+// IMMEDIATE CHECK for 2nd point (bearish divergence)
+if firstHighRsiWasOverbought and not na(firstPriceHigh) and not na(firstRsiAtPriceHigh) and not bearDivActive
+    if high > firstPriceHigh
+        float currentRsi = rsi
+        bool rsiLH = currentRsi < firstRsiAtPriceHigh
+        bool rsiDiffOk = (firstRsiAtPriceHigh - currentRsi) >= minRsiDiff
+        int barsDiff = bar_index - firstHighBar
+        bool inRange = barsDiff <= divLookbackRange and barsDiff > 0
+        
+        if rsiLH and rsiDiffOk and inRange
+            bearDivActive := true
+            bearDivBar := bar_index
+            bearDivJustDetected := true
+            bearSignalFired := false
+            secondPriceHigh := high
+            secondRsiAtHigh := currentRsi
+            
+            if showDivLines
+                if not na(bearDivLine)
+                    line.delete(bearDivLine)
+                bearDivLine := line.new(firstHighBar, firstPriceHigh, bar_index, high, color=color.fuchsia, width=2, style=line.style_solid)
+
+// Expire divergence after window
+if bar_index - bullDivBar > divActiveWindow
+    bullDivActive := false
+if bar_index - bearDivBar > divActiveWindow
+    bearDivActive := false
+
+barsSinceBullDiv = bar_index - bullDivBar
+barsSinceBearDiv = bar_index - bearDivBar
+
+// ============================================================================
+// ENTRY CONDITIONS - FIRE ONCE ONLY
+// ============================================================================
+bearDivEngulf = bearDivActive and not bearSignalFired and bearPattern
+bullDivEngulf = bullDivActive and not bullSignalFired and bullPattern
+
+// Mark signal as fired
+if bearDivEngulf
+    bearSignalFired := true
+if bullDivEngulf
+    bullSignalFired := true
+
+// ============================================================================
+// 4 TRADE TYPES
+// ============================================================================
+longTrendtrade = htfUptrend and priceAboveEma and bullDivEngulf
+longCountertrend = htfDowntrend and bullDivEngulf
+shortTrendtrade = htfDowntrend and priceBelowEma and bearDivEngulf
+shortCountertrend = htfUptrend and bearDivEngulf
+
+// ============================================================================
+// DEBUG VISUALS
+// ============================================================================
+plotshape(showEngulfing and bullishEngulfing, "Bull Engulf", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(showEngulfing and bearishEngulfing, "Bear Engulf", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(showEngulfing and strongBullish and not bullishEngulfing, "Strong Bull", shape.triangleup, location.belowbar, color.new(color.green, 50), size=size.tiny)
+plotshape(showEngulfing and strongBearish and not bearishEngulfing, "Strong Bear", shape.triangledown, location.abovebar, color.new(color.red, 50), size=size.tiny)
+
+// 1st reference points
+plotshape(showPricePivots and not na(pricePivotLow) and rsi[pivotLookback] < rsiOversold, "1st Low", shape.diamond, location.belowbar, color.lime, size=size.normal, offset=-pivotLookback, text="1st")
+plotshape(showPricePivots and not na(pricePivotHigh) and rsi[pivotLookback] > rsiOverbought, "1st High", shape.diamond, location.abovebar, color.fuchsia, size=size.normal, offset=-pivotLookback, text="1st")
+
+// Divergence detected
+plotshape(bullDivJustDetected, "Bull Div", shape.labelup, location.belowbar, color.lime, size=size.small, text="DIV!")
+plotshape(bearDivJustDetected, "Bear Div", shape.labeldown, location.abovebar, color.fuchsia, size=size.small, text="DIV!")
+
+// Background when divergence active and waiting
+bgcolor(bullDivActive and not bullSignalFired ? color.new(color.lime, 92) : bearDivActive and not bearSignalFired ? color.new(color.fuchsia, 92) : na)
+
+// ============================================================================
+// SIGNAL LABELS
+// ============================================================================
+if longTrendtrade and showTrendTrades
+    label.new(bar_index, low, "LONG\nTREND", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.normal)
+
+if longCountertrend and showCounterTrades
+    label.new(bar_index, low, "LONG\nCOUNTER", color=color.lime, textcolor=color.black, style=label.style_label_up, size=size.normal)
+
+if shortTrendtrade and showTrendTrades
+    label.new(bar_index, high, "SHORT\nTREND", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+if shortCountertrend and showCounterTrades
+    label.new(bar_index, high, "SHORT\nCOUNTER", color=color.orange, textcolor=color.black, style=label.style_label_down, size=size.normal)
+
+// Signal background flash
+sigBg = longTrendtrade and showTrendTrades ? color.new(color.green, 70) : longCountertrend and showCounterTrades ? color.new(color.lime, 70) : shortTrendtrade and showTrendTrades ? color.new(color.red, 70) : shortCountertrend and showCounterTrades ? color.new(color.orange, 70) : na
+bgcolor(sigBg)
+
+// ============================================================================
+// MAIN PANEL
+// ============================================================================
+var table panel = table.new(panelPosition == "Top Right" ? position.top_right : panelPosition == "Top Left" ? position.top_left : panelPosition == "Bottom Right" ? position.bottom_right : position.bottom_left, 5, 8, bgcolor=color.new(color.black, 85), border_width=1, border_color=color.gray)
+
+checkmark = "✓"
+crossmark = "✗"
+
+if barstate.islast
+    table.cell(panel, 0, 0, "", bgcolor=color.new(color.gray, 70))
+    table.cell(panel, 1, 0, "LONG\nTREND", text_color=color.white, text_size=size.small, bgcolor=color.green)
+    table.cell(panel, 2, 0, "LONG\nCOUNTER", text_color=color.black, text_size=size.small, bgcolor=color.lime)
+    table.cell(panel, 3, 0, "SHORT\nTREND", text_color=color.white, text_size=size.small, bgcolor=color.red)
+    table.cell(panel, 4, 0, "SHORT\nCOUNTER", text_color=color.black, text_size=size.small, bgcolor=color.orange)
+    
+    table.cell(panel, 0, 1, "4H Trend", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 1, htfUptrend ? checkmark : crossmark, text_color=htfUptrend ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 2, 1, htfDowntrend ? checkmark : crossmark, text_color=htfDowntrend ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 3, 1, htfDowntrend ? checkmark : crossmark, text_color=htfDowntrend ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 4, 1, htfUptrend ? checkmark : crossmark, text_color=htfUptrend ? color.lime : color.gray, text_size=size.normal)
+    
+    table.cell(panel, 0, 2, "Price vs EMA", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 2, priceAboveEma ? checkmark : crossmark, text_color=priceAboveEma ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 2, 2, "-", text_color=color.gray, text_size=size.normal)
+    table.cell(panel, 3, 2, priceBelowEma ? checkmark : crossmark, text_color=priceBelowEma ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 4, 2, "-", text_color=color.gray, text_size=size.normal)
+    
+    table.cell(panel, 0, 3, "RSI Divergence", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 3, bullDivActive ? checkmark : crossmark, text_color=bullDivActive ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 2, 3, bullDivActive ? checkmark : crossmark, text_color=bullDivActive ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 3, 3, bearDivActive ? checkmark : crossmark, text_color=bearDivActive ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 4, 3, bearDivActive ? checkmark : crossmark, text_color=bearDivActive ? color.lime : color.gray, text_size=size.normal)
+    
+    table.cell(panel, 0, 4, "Engulf/Strong", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 4, bullPattern ? checkmark : crossmark, text_color=bullPattern ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 2, 4, bullPattern ? checkmark : crossmark, text_color=bullPattern ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 3, 4, bearPattern ? checkmark : crossmark, text_color=bearPattern ? color.lime : color.gray, text_size=size.normal)
+    table.cell(panel, 4, 4, bearPattern ? checkmark : crossmark, text_color=bearPattern ? color.lime : color.gray, text_size=size.normal)
+    
+    table.cell(panel, 0, 5, "", bgcolor=color.new(color.gray, 70))
+    table.cell(panel, 1, 5, "", bgcolor=color.new(color.gray, 70))
+    table.cell(panel, 2, 5, "", bgcolor=color.new(color.gray, 70))
+    table.cell(panel, 3, 5, "", bgcolor=color.new(color.gray, 70))
+    table.cell(panel, 4, 5, "", bgcolor=color.new(color.gray, 70))
+    
+    table.cell(panel, 0, 6, "SIGNAL", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 6, longTrendtrade ? "GO!" : "-", text_color=longTrendtrade ? color.black : color.gray, text_size=size.normal, bgcolor=longTrendtrade ? color.green : color.new(color.black, 85))
+    table.cell(panel, 2, 6, longCountertrend ? "GO!" : "-", text_color=longCountertrend ? color.black : color.gray, text_size=size.normal, bgcolor=longCountertrend ? color.lime : color.new(color.black, 85))
+    table.cell(panel, 3, 6, shortTrendtrade ? "GO!" : "-", text_color=shortTrendtrade ? color.white : color.gray, text_size=size.normal, bgcolor=shortTrendtrade ? color.red : color.new(color.black, 85))
+    table.cell(panel, 4, 6, shortCountertrend ? "GO!" : "-", text_color=shortCountertrend ? color.black : color.gray, text_size=size.normal, bgcolor=shortCountertrend ? color.orange : color.new(color.black, 85))
+    
+    table.cell(panel, 0, 7, "RSI: " + str.tostring(rsi, "#.#"), text_color=rsiOversoldCond ? color.green : rsiOverboughtCond ? color.red : color.white, text_size=size.small)
+    table.cell(panel, 1, 7, bullSignalFired ? "FIRED" : "", text_color=color.lime, text_size=size.tiny)
+    table.cell(panel, 2, 7, "", text_size=size.tiny)
+    table.cell(panel, 3, 7, "4H: " + (htfUptrend ? "UP" : htfDowntrend ? "DN" : "--"), text_color=htfUptrend ? color.green : htfDowntrend ? color.red : color.gray, text_size=size.small)
+    table.cell(panel, 4, 7, bearSignalFired ? "FIRED" : "", text_color=color.lime, text_size=size.tiny)
+
+// ============================================================================
+// DEBUG PANEL
+// ============================================================================
+var table debugPanel = table.new(position.top_left, 2, 18, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+
+if barstate.islast and showDebugPanel
+    table.cell(debugPanel, 0, 0, "=== STATUS ===", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.yellow, 85))
+    table.cell(debugPanel, 1, 0, "", bgcolor=color.new(color.yellow, 85))
+    
+    table.cell(debugPanel, 0, 1, "RSI Now", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 1, str.tostring(rsi, "#.#"), text_color=rsiOversoldCond ? color.lime : rsiOverboughtCond ? color.red : color.white, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 2, "--- BEAR DIV ---", text_color=color.fuchsia, text_size=size.tiny, bgcolor=color.new(color.fuchsia, 85))
+    table.cell(debugPanel, 1, 2, "", bgcolor=color.new(color.fuchsia, 85))
+    
+    table.cell(debugPanel, 0, 3, "1st High", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 3, not na(firstPriceHigh) ? str.tostring(firstPriceHigh, "#.#") + " @ RSI " + str.tostring(firstRsiAtPriceHigh, "#.#") : "none", text_color=firstHighRsiWasOverbought ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 4, "2nd High", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 4, bearDivActive ? str.tostring(secondPriceHigh, "#.#") + " @ RSI " + str.tostring(secondRsiAtHigh, "#.#") : "waiting...", text_color=bearDivActive ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 5, "Bear Div Active", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 5, bearDivActive ? "YES (" + str.tostring(barsSinceBearDiv) + "/" + str.tostring(divActiveWindow) + ")" : "NO", text_color=bearDivActive ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 6, "Bear Signal Fired", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 6, bearSignalFired ? "YES (done)" : "NO (waiting)", text_color=bearSignalFired ? color.orange : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 7, "--- BULL DIV ---", text_color=color.lime, text_size=size.tiny, bgcolor=color.new(color.lime, 85))
+    table.cell(debugPanel, 1, 7, "", bgcolor=color.new(color.lime, 85))
+    
+    table.cell(debugPanel, 0, 8, "1st Low", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 8, not na(firstPriceLow) ? str.tostring(firstPriceLow, "#.#") + " @ RSI " + str.tostring(firstRsiAtPriceLow, "#.#") : "none", text_color=firstLowRsiWasOversold ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 9, "Bull Div Active", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 9, bullDivActive ? "YES (" + str.tostring(barsSinceBullDiv) + "/" + str.tostring(divActiveWindow) + ")" : "NO", text_color=bullDivActive ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 10, "Bull Signal Fired", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 10, bullSignalFired ? "YES (done)" : "NO (waiting)", text_color=bullSignalFired ? color.orange : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 11, "--- CANDLE ---", text_color=color.aqua, text_size=size.tiny, bgcolor=color.new(color.aqua, 85))
+    table.cell(debugPanel, 1, 11, "", bgcolor=color.new(color.aqua, 85))
+    
+    table.cell(debugPanel, 0, 12, "Bear Pattern", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 12, bearPattern ? (bearishEngulfing ? "ENGULF!" : "STRONG!") : "no", text_color=bearPattern ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 13, "Bull Pattern", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 13, bullPattern ? (bullishEngulfing ? "ENGULF!" : "STRONG!") : "no", text_color=bullPattern ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 14, "--- SIGNALS ---", text_color=color.orange, text_size=size.tiny, bgcolor=color.new(color.orange, 85))
+    table.cell(debugPanel, 1, 14, "", bgcolor=color.new(color.orange, 85))
+    
+    table.cell(debugPanel, 0, 15, "bearDivEngulf", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 15, bearDivEngulf ? "YES!" : "no", text_color=bearDivEngulf ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 16, "bullDivEngulf", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 16, bullDivEngulf ? "YES!" : "no", text_color=bullDivEngulf ? color.lime : color.gray, text_size=size.tiny)
+    
+    table.cell(debugPanel, 0, 17, "SHORT COUNTER", text_color=color.white, text_size=size.tiny)
+    table.cell(debugPanel, 1, 17, shortCountertrend ? "SIGNAL!" : "no", text_color=shortCountertrend ? color.orange : color.gray, text_size=size.tiny)
+
+// ============================================================================
+// PLOT EMA
+// ============================================================================
+plot(ema50_htf, "50 EMA 4H", color=color.blue, linewidth=2)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(longTrendtrade, "Long Trendtrade", "Long Trendtrade signal!")
+alertcondition(longCountertrend, "Long Countertrend", "Long Countertrend signal!")
+alertcondition(shortTrendtrade, "Short Trendtrade", "Short Trendtrade signal!")
+alertcondition(shortCountertrend, "Short Countertrend", "Short Countertrend signal!")

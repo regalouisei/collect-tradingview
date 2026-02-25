@@ -1,0 +1,480 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © [Your Username]
+
+//@version=6
+indicator("Magnificent 7 Oscillator", shorttitle="MAG7", overlay=false, precision=2, max_lines_count=500)
+
+// =====================================================
+// SCIENTIFIC BASIS AND LITERATURE REFERENCES
+// =====================================================
+// This oscillator is based on momentum analysis and relative performance studies:
+// - Jegadeesh & Titman (1993): "Returns to Buying Winners and Selling Losers"
+// - Carhart (1997): "On Persistence in Mutual Fund Performance" (Momentum Factor)
+// - Fama & French (2015): "A Five-Factor Asset Pricing Model"
+//
+// The Magnificent 7 stocks (AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META) represent
+// a significant portion of market capitalization and often lead market trends.
+// This oscillator analyzes their momentum relative to broader market indices.
+
+// =====================================================
+// INPUT PARAMETERS
+// =====================================================
+
+// Core Parameters
+momentum_length = input.int(14, "Momentum Period", minval=5, maxval=100, 
+                           tooltip="Lookback period for momentum calculation (Jegadeesh & Titman used 3-12 months)", 
+                           group="Core Parameters")
+smoothing_length = input.int(5, "Smoothing Period", minval=1, maxval=50, 
+                           tooltip="Moving average smoothing for noise reduction", 
+                           group="Core Parameters")
+
+// Signal Thresholds
+bullish_threshold = input.float(2.0, "Bullish Threshold (%)", minval=0.1, maxval=10.0, step=0.1, 
+                               tooltip="Threshold for bullish momentum signals", group="Core Parameters")
+bearish_threshold = input.float(-2.0, "Bearish Threshold (%)", maxval=-0.1, minval=-10.0, step=0.1, 
+                               tooltip="Threshold for bearish momentum signals", group="Core Parameters")
+
+// Divergence Analysis
+divergence_threshold = input.float(1.0, "Divergence Threshold (%)", minval=0.1, maxval=5.0, step=0.1, 
+                                 tooltip="Threshold for relative performance divergence", group="Core Parameters")
+
+// Stock Selection (Magnificent 7 + Additional)
+ticker1 = input.string("AAPL", "Stock 1", group="Stock Selection", tooltip="Apple Inc.")
+ticker2 = input.string("MSFT", "Stock 2", group="Stock Selection", tooltip="Microsoft Corporation")
+ticker3 = input.string("GOOGL", "Stock 3", group="Stock Selection", tooltip="Alphabet Inc.")
+ticker4 = input.string("AMZN", "Stock 4", group="Stock Selection", tooltip="Amazon.com Inc.")
+ticker5 = input.string("NVDA", "Stock 5", group="Stock Selection", tooltip="NVIDIA Corporation")
+ticker6 = input.string("TSLA", "Stock 6", group="Stock Selection", tooltip="Tesla Inc.")
+ticker7 = input.string("META", "Stock 7", group="Stock Selection", tooltip="Meta Platforms Inc.")
+ticker8 = input.string("", "Additional Stock 1", group="Stock Selection", tooltip="Optional additional stock")
+ticker9 = input.string("", "Additional Stock 2", group="Stock Selection", tooltip="Optional additional stock")
+
+// Weighting Method
+equal_weight = input.bool(true, "Equal Weight Calculation", group="Stock Selection", 
+                         tooltip="Equal weight vs market cap weighted (when available)")
+
+// Oscillator Mode Selection
+oscillator_mode = input.string("Magnificent 7", "Oscillator Mode", 
+                              options=["Magnificent 7", "S&P 500 EW", "Relative Performance"], 
+                              group="Oscillator Settings",
+                              tooltip="Magnificent 7 = MAG7 momentum | S&P 500 EW = Equal weight momentum | Relative Performance = MAG7 vs S&P 500 EW")
+
+// S&P 500 Equal Weight Reference
+sp500_ew_ticker = input.string("RSP", "S&P 500 EW Ticker", group="Oscillator Settings",
+                              tooltip="S&P 500 Equal Weight ETF (RSP) or Index (SPXEW)")
+
+// =====================================================
+// OSCILLATOR TYPE SELECTION
+// =====================================================
+
+oscillator_type = input.string("Momentum", "Oscillator Type", 
+                               options=["Momentum", "RSI", "Stochastic", "Williams %R", "CCI"], 
+                               group="Oscillator Settings",
+                               tooltip="Momentum = Price rate of change | RSI = Relative Strength Index | Stochastic = %K oscillator | Williams %R = Larry Williams' %R | CCI = Commodity Channel Index")
+
+// =====================================================
+// DISPLAY OPTIONS
+// =====================================================
+show_table = input.bool(true, "Show Data Table", group="Display")
+show_signals = input.bool(true, "Show Trading Signals", group="Display") 
+show_background = input.bool(true, "Show Background Colors", group="Display")
+
+// =====================================================
+// APPEARANCE SETTINGS
+// =====================================================
+use_dark_mode = input.bool(true, "Dark Mode", group="Appearance", 
+                          tooltip="Optimized for dark backgrounds")
+
+// Color Configuration
+neutral_color = use_dark_mode ? #2196F3 : #1976D2  // Material Blue
+bullish_color = use_dark_mode ? #4CAF50 : #388E3C  // Material Green
+bearish_color = use_dark_mode ? #FF5252 : #D32F2F  // Material Red
+
+// Custom Color Override
+enable_custom_colors = input.bool(false, "Custom Colors", group="Appearance")
+custom_neutral = input.color(#2196F3, "Neutral", group="Appearance", inline="colors")
+custom_bullish = input.color(#4CAF50, "Bullish", group="Appearance", inline="colors") 
+custom_bearish = input.color(#FF5252, "Bearish", group="Appearance", inline="colors")
+
+// Apply color selection
+final_neutral_color = enable_custom_colors ? custom_neutral : neutral_color
+final_bullish_color = enable_custom_colors ? custom_bullish : bullish_color
+final_bearish_color = enable_custom_colors ? custom_bearish : bearish_color
+
+// Visual Settings
+background_transparency = use_dark_mode ? 85 : 92
+zone_transparency = use_dark_mode ? 90 : 95
+table_transparency = use_dark_mode ? 80 : 15
+
+// Line Configuration
+main_line_width = input.int(2, "Main Line Width", minval=1, maxval=5, group="Line Styles")
+threshold_line_width = input.int(1, "Threshold Line Width", minval=1, maxval=3, group="Line Styles")
+
+// =====================================================
+// DATA COLLECTION AND MOMENTUM CALCULATION
+// =====================================================
+
+// Momentum calculation function with error handling
+get_momentum(symbol) =>
+    if symbol != ""
+        current_price = request.security(symbol, timeframe.period, close, ignore_invalid_symbol=true)
+        historical_price = request.security(symbol, timeframe.period, close[momentum_length], ignore_invalid_symbol=true)
+        
+        // Calculate momentum as percentage change
+        if not na(current_price) and not na(historical_price) and historical_price != 0
+            momentum = ((current_price - historical_price) / historical_price) * 100
+            momentum
+        else
+            0.0
+    else
+        0.0
+
+// Calculate momentum for all tickers
+momentum1 = get_momentum(ticker1)
+momentum2 = get_momentum(ticker2)
+momentum3 = get_momentum(ticker3)
+momentum4 = get_momentum(ticker4)
+momentum5 = get_momentum(ticker5)
+momentum6 = get_momentum(ticker6)
+momentum7 = get_momentum(ticker7)
+momentum8 = get_momentum(ticker8)
+momentum9 = get_momentum(ticker9)
+
+// Count active tickers for proper averaging
+active_count = (ticker1 != "" ? 1 : 0) + (ticker2 != "" ? 1 : 0) + (ticker3 != "" ? 1 : 0) + 
+               (ticker4 != "" ? 1 : 0) + (ticker5 != "" ? 1 : 0) + (ticker6 != "" ? 1 : 0) + 
+               (ticker7 != "" ? 1 : 0) + (ticker8 != "" ? 1 : 0) + (ticker9 != "" ? 1 : 0)
+
+// Calculate S&P 500 Equal Weight momentum for comparison
+sp500_ew_momentum = if oscillator_mode == "S&P 500 EW" or oscillator_mode == "Relative Performance"
+    get_momentum(sp500_ew_ticker)
+else
+    0.0
+
+// =====================================================
+// COMPOSITE OSCILLATOR CALCULATION
+// =====================================================
+
+// Calculate raw composite momentum
+raw_oscillator = if equal_weight and active_count > 0
+    // Equal weight calculation (Fama-French factor construction method)
+    total_momentum = momentum1 + momentum2 + momentum3 + momentum4 + momentum5 + momentum6 + momentum7 + momentum8 + momentum9
+    total_momentum / active_count
+else
+    // Market cap weighting could be implemented here for future enhancement
+    total_momentum = momentum1 + momentum2 + momentum3 + momentum4 + momentum5 + momentum6 + momentum7 + momentum8 + momentum9
+    active_count > 0 ? total_momentum / active_count : 0.0
+
+// =====================================================
+// OSCILLATOR TRANSFORMATION FUNCTIONS
+// =====================================================
+
+// Transform raw momentum into different oscillator types
+transform_oscillator(raw_value) =>
+    smoothed_value = ta.sma(raw_value, smoothing_length)
+    
+    if oscillator_type == "Momentum"
+        // Simple momentum oscillator (Jegadeesh & Titman methodology)
+        smoothed_value
+        
+    else if oscillator_type == "RSI"
+        // RSI transformation (Wilder's Relative Strength Index)
+        // Convert momentum to RSI-like scale (0-100)
+        rsi_source = smoothed_value + 50  // Shift to positive values
+        ta.rsi(rsi_source, 14) - 50  // Center around 0
+        
+    else if oscillator_type == "Stochastic"
+        // Stochastic oscillator (%K methodology by George Lane)
+        lookback_period = momentum_length
+        highest_value = ta.highest(smoothed_value, lookback_period)
+        lowest_value = ta.lowest(smoothed_value, lookback_period)
+        range_value = highest_value - lowest_value
+        
+        if range_value != 0
+            stoch_k = ((smoothed_value - lowest_value) / range_value) * 100
+            stoch_k - 50  // Center around 0
+        else
+            0.0
+            
+    else if oscillator_type == "Williams %R"
+        // Williams %R (Larry Williams' %R)
+        lookback_period = momentum_length
+        highest_value = ta.highest(smoothed_value, lookback_period)
+        lowest_value = ta.lowest(smoothed_value, lookback_period)
+        range_value = highest_value - lowest_value
+        
+        if range_value != 0
+            williams_r = ((highest_value - smoothed_value) / range_value) * 100
+            williams_r - 50  // Center around 0
+        else
+            0.0
+            
+    else if oscillator_type == "CCI"
+        // Commodity Channel Index (Donald Lambert)
+        typical_price = smoothed_value
+        sma_tp = ta.sma(typical_price, 20)
+        mean_deviation = ta.sma(math.abs(typical_price - sma_tp), 20)
+        
+        if mean_deviation != 0
+            cci = (typical_price - sma_tp) / (0.015 * mean_deviation)
+            cci / 5  // Scale down for better visualization
+        else
+            0.0
+    else
+        smoothed_value
+
+// =====================================================
+// MODE-SPECIFIC CALCULATIONS
+// =====================================================
+
+// Calculate oscillators for different modes
+mag7_oscillator = transform_oscillator(raw_oscillator)
+sp500_ew_oscillator = transform_oscillator(sp500_ew_momentum)
+relative_performance_oscillator = mag7_oscillator - sp500_ew_oscillator
+
+// Select current oscillator based on mode
+current_oscillator = if oscillator_mode == "Magnificent 7"
+    mag7_oscillator
+else if oscillator_mode == "S&P 500 EW"  
+    sp500_ew_oscillator
+else  // Relative Performance
+    relative_performance_oscillator
+
+// =====================================================
+// SIGNAL GENERATION
+// =====================================================
+
+// Generate trading signals based on thresholds
+is_bullish = current_oscillator > bullish_threshold
+is_bearish = current_oscillator < bearish_threshold
+is_neutral = not is_bullish and not is_bearish
+
+// Signal triggers
+buy_signal = ta.crossover(current_oscillator, bullish_threshold)
+sell_signal = ta.crossunder(current_oscillator, bearish_threshold)
+
+// Relative performance crossover calculations (must be calculated on every bar)
+div_outperform_cross = ta.crossover(current_oscillator, divergence_threshold)
+div_underperform_cross = ta.crossunder(current_oscillator, -divergence_threshold)
+
+// Apply mode condition to relative performance signals
+div_outperform_signal = oscillator_mode == "Relative Performance" and div_outperform_cross
+div_underperform_signal = oscillator_mode == "Relative Performance" and div_underperform_cross
+
+// =====================================================
+// BREADTH ANALYSIS
+// =====================================================
+
+// Calculate breadth metrics (percentage of stocks with positive momentum)
+bullish_count = (momentum1 > 0 ? 1 : 0) + (momentum2 > 0 ? 1 : 0) + (momentum3 > 0 ? 1 : 0) + 
+                 (momentum4 > 0 ? 1 : 0) + (momentum5 > 0 ? 1 : 0) + (momentum6 > 0 ? 1 : 0) + 
+                 (momentum7 > 0 ? 1 : 0) + (momentum8 > 0 ? 1 : 0) + (momentum9 > 0 ? 1 : 0)
+
+breadth_percentage = active_count > 0 ? (bullish_count / active_count) * 100 : 0
+
+// =====================================================
+// DYNAMIC COLOR CALCULATION
+// =====================================================
+
+// Calculate line color based on oscillator value and mode
+oscillator_color = if is_bullish
+    final_bullish_color
+else if is_bearish
+    final_bearish_color
+else
+    final_neutral_color
+
+// Background color with gradient effect
+bg_color = if is_bullish
+    color.new(final_bullish_color, background_transparency)
+else if is_bearish
+    color.new(final_bearish_color, background_transparency)
+else
+    color.new(final_neutral_color, background_transparency + 5)
+
+// =====================================================
+// PLOTTING AND VISUALIZATION
+// =====================================================
+
+// Main oscillator plot
+plot(current_oscillator, title="Oscillator", color=oscillator_color, linewidth=main_line_width)
+
+// Zero line
+zero_line_plot = plot(0, title="Zero Line", color=color.new(color.gray, 30), linewidth=threshold_line_width)
+
+// Dynamic threshold lines based on oscillator mode
+plot(oscillator_mode == "Magnificent 7" ? bullish_threshold : na, 
+     title="MAG7 Bullish Threshold", color=color.new(final_bullish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+plot(oscillator_mode == "Magnificent 7" ? bearish_threshold : na, 
+     title="MAG7 Bearish Threshold", color=color.new(final_bearish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+
+plot(oscillator_mode == "S&P 500 EW" ? bullish_threshold : na, 
+     title="S&P500 EW Bullish Threshold", color=color.new(final_bullish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+plot(oscillator_mode == "S&P 500 EW" ? bearish_threshold : na, 
+     title="S&P500 EW Bearish Threshold", color=color.new(final_bearish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+
+plot(oscillator_mode == "Relative Performance" ? divergence_threshold : na, 
+     title="Relative Performance Upper Threshold", color=color.new(final_bullish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+plot(oscillator_mode == "Relative Performance" ? -divergence_threshold : na, 
+     title="Relative Performance Lower Threshold", color=color.new(final_bearish_color, zone_transparency), 
+     linewidth=threshold_line_width, style=plot.style_line)
+
+// Background shading
+bgcolor(show_background ? bg_color : na, title="Oscillator Background")
+
+// =====================================================
+// PROFESSIONAL DATA TABLE
+// =====================================================
+
+if show_table and barstate.islast
+    // Theme-adaptive table
+    table_bg_color = use_dark_mode ? color.new(#000000, table_transparency) : color.new(#FFFFFF, table_transparency)
+    var table oscillator_table = table.new(position.top_right, 2, 9, border_width=1, bgcolor=table_bg_color)
+    
+    table.clear(oscillator_table, 0, 0)
+    
+    // Header
+    header_text_color = use_dark_mode ? color.white : color.black
+    table.cell(oscillator_table, 0, 0, "MAG7 Oscillator", text_color=header_text_color, bgcolor=table_bg_color, text_size=size.normal)
+    table.cell(oscillator_table, 1, 0, "Values", text_color=header_text_color, bgcolor=table_bg_color, text_size=size.normal)
+    
+    // Core metrics
+    label_text_color = use_dark_mode ? color.white : color.black
+    
+    table.cell(oscillator_table, 0, 1, "Value", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 1, str.tostring(current_oscillator, "#.##") + "%", text_color=oscillator_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Mode
+    mode_display = oscillator_mode == "Magnificent 7" ? "MAG7" : 
+                   oscillator_mode == "S&P 500 EW" ? "S&P EW" : "Relative"
+    table.cell(oscillator_table, 0, 2, "Mode", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 2, mode_display, text_color=final_neutral_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Status
+    status_text = oscillator_mode == "Relative Performance" ? 
+                  (is_bullish ? "OUTPERFORM" : is_bearish ? "UNDERPERFORM" : "NEUTRAL") :
+                  (is_bullish ? "BULLISH" : is_bearish ? "BEARISH" : "NEUTRAL")
+    table.cell(oscillator_table, 0, 3, "Signal", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 3, status_text, text_color=oscillator_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Oscillator type
+    type_display = oscillator_type
+    table.cell(oscillator_table, 0, 4, "Type", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 4, type_display, text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Component details for relative performance mode
+    if oscillator_mode == "Relative Performance"
+        mag7_color = mag7_oscillator > 0 ? final_bullish_color : final_bearish_color
+        table.cell(oscillator_table, 0, 5, "MAG7", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+        table.cell(oscillator_table, 1, 5, str.tostring(mag7_oscillator, "#.##") + "%", text_color=mag7_color, bgcolor=table_bg_color, text_size=size.small)
+        
+        sp500_color = sp500_ew_oscillator > 0 ? final_bullish_color : final_bearish_color
+        table.cell(oscillator_table, 0, 6, "S&P EW", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+        table.cell(oscillator_table, 1, 6, str.tostring(sp500_ew_oscillator, "#.##") + "%", text_color=sp500_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Breadth analysis (using pre-calculated values)
+    breadth_color = breadth_percentage > 60 ? final_bullish_color : 
+                     breadth_percentage < 40 ? final_bearish_color : final_neutral_color
+    
+    table.cell(oscillator_table, 0, 7, "Breadth", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 7, str.tostring(breadth_percentage, "#") + "%", text_color=breadth_color, bgcolor=table_bg_color, text_size=size.small)
+    
+    // Threshold information
+    threshold_display = oscillator_mode == "Relative Performance" ? 
+                       "±" + str.tostring(divergence_threshold, "#.#") + "%" :
+                       "±" + str.tostring(math.abs(bullish_threshold), "#.#") + "%"
+    table.cell(oscillator_table, 0, 8, "Threshold", text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+    table.cell(oscillator_table, 1, 8, threshold_display, text_color=label_text_color, bgcolor=table_bg_color, text_size=size.small)
+
+// =====================================================
+// ALERT CONDITIONS
+// =====================================================
+
+// Mode-specific alerts for trading systems
+alertcondition(oscillator_mode == "Magnificent 7" and buy_signal, 
+               title="MAG7 Bullish Signal", 
+               message="Magnificent 7 Oscillator: Bullish momentum signal triggered")
+               
+alertcondition(oscillator_mode == "Magnificent 7" and sell_signal, 
+               title="MAG7 Bearish Signal", 
+               message="Magnificent 7 Oscillator: Bearish momentum signal triggered")
+
+alertcondition(oscillator_mode == "S&P 500 EW" and buy_signal, 
+               title="S&P 500 EW Bullish Signal", 
+               message="S&P 500 Equal Weight: Bullish momentum signal triggered")
+               
+alertcondition(oscillator_mode == "S&P 500 EW" and sell_signal, 
+               title="S&P 500 EW Bearish Signal", 
+               message="S&P 500 Equal Weight: Bearish momentum signal triggered")
+
+alertcondition(oscillator_mode == "Relative Performance" and div_outperform_signal, 
+               title="MAG7 Outperformance Signal", 
+               message="Magnificent 7 vs S&P 500 EW: Relative outperformance detected")
+               
+alertcondition(oscillator_mode == "Relative Performance" and div_underperform_signal, 
+               title="MAG7 Underperformance Signal", 
+               message="Magnificent 7 vs S&P 500 EW: Relative underperformance detected")
+
+// Zero line crosses for momentum shifts
+alertcondition(ta.cross(current_oscillator, 0), 
+               title="Momentum Shift", 
+               message="Oscillator crossed zero line - momentum direction change")
+
+// =====================================================
+// PERFORMANCE METRICS (Hidden Plots for Backtesting)
+// =====================================================
+
+// Individual stock momentum (for strategy development)
+plot(momentum1, title="Stock 1 Momentum", display=display.none)
+plot(momentum2, title="Stock 2 Momentum", display=display.none)
+plot(momentum3, title="Stock 3 Momentum", display=display.none)
+plot(momentum4, title="Stock 4 Momentum", display=display.none)
+plot(momentum5, title="Stock 5 Momentum", display=display.none)
+plot(momentum6, title="Stock 6 Momentum", display=display.none)
+plot(momentum7, title="Stock 7 Momentum", display=display.none)
+
+// Composite metrics
+plot(breadth_percentage, title="Bullish Breadth Percentage", display=display.none)
+plot(sp500_ew_momentum, title="S&P 500 EW Momentum", display=display.none)
+plot(relative_performance_oscillator, title="Relative Performance", display=display.none)
+
+// =====================================================
+// INTERPRETATION GUIDE
+// =====================================================
+//
+// OSCILLATOR MODES:
+// 1. Magnificent 7: Tracks momentum of the seven largest tech stocks
+// 2. S&P 500 EW: Tracks momentum of equal-weighted S&P 500 index
+// 3. Relative Performance: MAG7 momentum relative to S&P 500 EW
+//
+// OSCILLATOR TYPES:
+// - Momentum: Simple rate of change (Jegadeesh & Titman methodology)
+// - RSI: Relative Strength Index transformation
+// - Stochastic: %K oscillator (George Lane)
+// - Williams %R: Larry Williams' %R
+// - CCI: Commodity Channel Index (Donald Lambert)
+//
+// SIGNAL INTERPRETATION:
+// - Bullish: Oscillator above upper threshold (strong momentum)
+// - Bearish: Oscillator below lower threshold (weak momentum)  
+// - Neutral: Oscillator between thresholds (sideways momentum)
+//
+// RELATIVE PERFORMANCE MODE:
+// - Positive values: MAG7 outperforming S&P 500 EW
+// - Negative values: MAG7 underperforming S&P 500 EW
+// - Used for sector rotation and style analysis
+//
+// BREADTH ANALYSIS:
+// - >60%: Strong breadth (most stocks positive)
+// - <40%: Weak breadth (most stocks negative)
+// - 40-60%: Mixed/neutral breadth
+//
+// ACADEMIC REFERENCES:
+// - Jegadeesh, N., & Titman, S. (1993). Returns to buying winners and selling losers
+// - Carhart, M. M. (1997). On persistence in mutual fund performance
+// - Fama, E. F., & French, K. R. (2015). A five-factor asset pricing model

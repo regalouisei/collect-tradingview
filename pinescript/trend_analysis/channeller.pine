@@ -1,0 +1,700 @@
+//@version=6
+indicator("Trend Corridor Pro", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+//=============================================================================
+// CONFIGURATION
+//=============================================================================
+
+// Detection Settings
+grpDetect = "Detection Settings"
+leftBars  = input.int(10, "Pivot Lookback Left", minval=1, group=grpDetect, tooltip="Increase this to find larger, more significant 'Major' pivots.")
+rightBars = input.int(5, "Pivot Lookback Right", minval=1, group=grpDetect, tooltip="The number of bars to wait before confirming a pivot. Lower = Faster signals, but potentially more false positives.")
+minPivots = input.int(2, "Min Pivots for Channel", minval=2, maxval=10, group=grpDetect, tooltip="Minimum pivot points to form channel. Lower = faster channels.")
+maxPivots = input.int(5, "Max Pivots to Track", minval=3, maxval=10, group=grpDetect)
+
+// Trend Filters
+grpTrend = "Trend Filters"
+useADX = input.bool(true, "Use ADX Filter", group=grpTrend)
+adxLen = input.int(14, "ADX Length", minval=5, maxval=50, group=grpTrend)
+adxThreshold = input.float(15.0, "ADX Threshold", minval=5, maxval=50, group=grpTrend, tooltip="Only show channels when ADX > this value")
+requireHLLH = input.bool(false, "Require HL/LH Pattern", group=grpTrend, tooltip="Bull: Higher Lows required. Bear: Lower Highs required")
+
+// Volume Analysis
+grpVolume = "Volume Analysis"
+showHighVolPivots = input.bool(true, "Highlight High Vol Pivots", group=grpVolume, tooltip="Visually mark pivots that formed with high volume")
+volLen = input.int(50, "Volume MA Length", minval=5, maxval=100, group=grpVolume)
+volThreshold = input.float(1.5, "High Vol Threshold (x avg)", minval=0.5, maxval=5.0, step=0.1, group=grpVolume)
+
+// Quality Settings
+grpQuality = "Channel Quality"
+minR2 = input.float(0.5, "Min R² Score", minval=0.0, maxval=1.0, step=0.05, group=grpQuality, tooltip="Minimum regression fit quality (0-1, higher = better fit)")
+showR2 = input.bool(true, "Show R² in Label", group=grpQuality)
+
+// Display Settings
+grpDisplay = "Display Settings"
+extendLen = input.int(50, "Channel Projection Length", minval=10, maxval=500, group=grpDisplay)
+showFill  = input.bool(true, "Show Channel Fill", group=grpDisplay)
+showMidLine = input.bool(true, "Show Mid-Line", group=grpDisplay)
+showPivots = input.bool(true, "Show Pivot Markers", group=grpDisplay)
+showEarlyPivots = input.bool(true, "Show Early (Unconfirmed) Pivots", group=grpDisplay, tooltip="Shows potential pivots immediately after 1 bar, before full confirmation")
+// Signal visibility toggles
+showSignalEarlyBuy = input.bool(true, "Show Early Buy (Unconfirmed)", group=grpDisplay)
+showSignalEarlySell = input.bool(true, "Show Early Sell (Unconfirmed)", group=grpDisplay)
+showSignalWeakBuy = input.bool(true, "Show Weak Buy (Confirmed, Tiny)", group=grpDisplay, tooltip="Lower-confidence pivot low marker.")
+showSignalStrongBuy = input.bool(true, "Show Strong Buy (Confirmed, Larger)", group=grpDisplay, tooltip="Higher-confidence pivot low marker (high volume).")
+showSignalWeakSell = input.bool(true, "Show Weak Sell (Confirmed, Tiny)", group=grpDisplay, tooltip="Lower-confidence pivot high marker.")
+showSignalStrongSell = input.bool(true, "Show Strong Sell (Confirmed, Larger)", group=grpDisplay, tooltip="Higher-confidence pivot high marker (high volume).")
+showLabels = input.bool(true, "Show Channel Labels", group=grpDisplay)
+showBullChannel = input.bool(true, "Show Bullish Channel", group=grpDisplay)
+showBearChannel = input.bool(true, "Show Bearish Channel", group=grpDisplay)
+showHistory = input.bool(true, "Show Historical Channels", group=grpDisplay, tooltip="Keep channels on chart even after they are invalidated")
+
+// Alert Settings
+grpAlerts = "Alert Settings"
+alertSignalEarlyBuy = input.bool(true, "Alert: Early Buy (Unconfirmed)", group=grpAlerts)
+alertSignalEarlySell = input.bool(true, "Alert: Early Sell (Unconfirmed)", group=grpAlerts)
+alertSignalWeakBuy = input.bool(true, "Alert: Weak Buy (Confirmed)", group=grpAlerts)
+alertSignalStrongBuy = input.bool(true, "Alert: Strong Buy (Confirmed)", group=grpAlerts)
+alertSignalWeakSell = input.bool(true, "Alert: Weak Sell (Confirmed)", group=grpAlerts)
+alertSignalStrongSell = input.bool(true, "Alert: Strong Sell (Confirmed)", group=grpAlerts)
+
+// Color Settings
+grpColors = "Colors"
+colBullLine = input.color(color.green, "Bullish Lines", group=grpColors)
+colBearLine = input.color(color.red, "Bearish Lines", group=grpColors)
+colMidLine = input.color(color.gray, "Mid-Line", group=grpColors)
+colWeak = input.color(color.orange, "Weak Channel", group=grpColors)
+fillTransparency = input.int(85, "Fill Transparency", minval=50, maxval=95, group=grpColors)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=4, group=grpColors)
+
+//=============================================================================
+// COLORS (Derived)
+//=============================================================================
+colFillBull = color.new(colBullLine, fillTransparency)
+colFillBear = color.new(colBearLine, fillTransparency)
+colBullMid = color.new(colMidLine, 50)
+colBearMid = color.new(colMidLine, 50)
+
+//=============================================================================
+// GLOBAL CALCULATIONS (Must be called every bar)
+//=============================================================================
+
+// Standard Pivot Detection (Confirmed)
+ph = ta.pivothigh(high, leftBars, rightBars)
+pl = ta.pivotlow(low, leftBars, rightBars)
+bool phFound = not na(ph)
+bool plFound = not na(pl)
+
+// Early Pivot Detection (Fast - 1 bar wait)
+// Only calculated if necessary
+phEarly = ta.pivothigh(high, leftBars, 1)
+plEarly = ta.pivotlow(low, leftBars, 1)
+bool phEarlyFound = not na(phEarly)
+bool plEarlyFound = not na(plEarly)
+
+// ADX Calculation
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+bool adxConfirmed = not useADX or adxValue > adxThreshold
+
+// Volume Calculation
+volMA = ta.sma(volume, volLen)
+// Get volume at the time of the pivot. If analyzing current bar, use volume. 
+// For historical checks, we will look back.
+bool isHighVol = volume > volMA * volThreshold 
+
+//=============================================================================
+// PIVOT STORAGE ARRAYS
+//=============================================================================
+
+// Bullish pivots (lows)
+var array<float> bullPivotPrices = array.new_float(0)
+var array<int> bullPivotBars = array.new_int(0)
+var array<bool> bullPivotHighVol = array.new_bool(0)
+
+// Bearish pivots (highs)  
+var array<float> bearPivotPrices = array.new_float(0)
+var array<int> bearPivotBars = array.new_int(0)
+var array<bool> bearPivotHighVol = array.new_bool(0)
+
+//=============================================================================
+// CHANNEL DRAWING OBJECTS
+//=============================================================================
+
+var line bullSupLine = na
+var line bullResLine = na
+var line bullMidLine = na
+var linefill bullFill = na
+var label bullLabel = na
+
+var line bearResLine = na
+var line bearSupLine = na
+var line bearMidLine = na
+var linefill bearFill = na
+var label bearLabel = na
+
+//=============================================================================
+// CHANNEL STATE
+//=============================================================================
+
+var bool bullChannelValid = false
+var bool bearChannelValid = false
+var float bullR2 = 0.0
+var float bearR2 = 0.0
+var int bullBounces = 0
+var int bullPierces = 0
+var int bearBounces = 0
+var int bearPierces = 0
+var float bullSlope = na
+var float bullIntercept = na
+var float bullWidth = na
+var float bearSlope = na
+var float bearIntercept = na
+var float bearWidth = na
+
+// Track pivot changes for optimization
+var int lastBullPivotCount = 0
+var int lastBearPivotCount = 0
+var float lastBullSlope = na
+var float lastBearSlope = na
+
+//=============================================================================
+// HELPER FUNCTIONS
+//=============================================================================
+
+// Linear regression on arrays - returns [slope, intercept, r2]
+calcLinearRegression(array<float> prices, array<int> bars) =>
+    int n = array.size(prices)
+    float slope = 0.0
+    float intercept = 0.0
+    float r2 = 0.0
+    
+    if n >= 2
+        float sumX = 0.0
+        float sumY = 0.0
+        float sumXY = 0.0
+        float sumX2 = 0.0
+        
+        for i = 0 to n - 1
+            float x = float(array.get(bars, i))
+            float y = array.get(prices, i)
+            sumX += x
+            sumY += y
+            sumXY += x * y
+            sumX2 += x * x
+        
+        float meanX = sumX / n
+        float meanY = sumY / n
+        
+        float numerator = sumXY - n * meanX * meanY
+        float denominator = sumX2 - n * meanX * meanX
+        
+        if denominator != 0
+            slope := numerator / denominator
+            intercept := meanY - slope * meanX
+            
+            // Calculate R²
+            float ssRes = 0.0
+            float ssTot = 0.0
+            for i = 0 to n - 1
+                float x = float(array.get(bars, i))
+                float y = array.get(prices, i)
+                float predicted = slope * x + intercept
+                ssRes += math.pow(y - predicted, 2)
+                ssTot += math.pow(y - meanY, 2)
+            
+            r2 := ssTot != 0 ? 1 - (ssRes / ssTot) : 0
+    
+    [slope, intercept, r2]
+
+// Get price on regression line at given bar
+getPriceOnLine(float slope, float intercept, int barIdx) =>
+    slope * barIdx + intercept
+
+// Check if array forms higher-lows pattern
+isHigherLows(array<float> prices) =>
+    bool valid = true
+    int n = array.size(prices)
+    if n >= 2
+        for i = 1 to n - 1
+            if array.get(prices, i) <= array.get(prices, i - 1)
+                valid := false
+                break
+    valid
+
+// Check if array forms lower-highs pattern
+isLowerHighs(array<float> prices) =>
+    bool valid = true
+    int n = array.size(prices)
+    if n >= 2
+        for i = 1 to n - 1
+            if array.get(prices, i) >= array.get(prices, i - 1)
+                valid := false
+                break
+    valid
+
+// Find highest high in bar range
+findHighestInRange(int startBar, int endBar) =>
+    float maxVal = na
+    int maxBar = na
+    int lookback = bar_index - startBar
+    int lookbackEnd = bar_index - endBar
+    
+    for i = math.max(0, lookbackEnd) to math.max(0, lookback)
+        if i >= 0 and i < bar_index
+            float val = high[i]
+            if na(maxVal) or val > maxVal
+                maxVal := val
+                maxBar := bar_index - i
+    [maxVal, maxBar]
+
+// Find lowest low in bar range
+findLowestInRange(int startBar, int endBar) =>
+    float minVal = na
+    int minBar = na
+    int lookback = bar_index - startBar
+    int lookbackEnd = bar_index - endBar
+    
+    for i = math.max(0, lookbackEnd) to math.max(0, lookback)
+        if i >= 0 and i < bar_index
+            float val = low[i]
+            if na(minVal) or val < minVal
+                minVal := val
+                minBar := bar_index - i
+    [minVal, minBar]
+
+// Reset bull channel drawings (preserve if history on)
+resetBullChannel(line supLine, line resLine, line midLine, linefill fillObj, label lbl, bool forceDelete) =>
+    if forceDelete
+        line.delete(supLine)
+        line.delete(resLine)
+        line.delete(midLine)
+        linefill.delete(fillObj)
+        label.delete(lbl)
+
+    // Return cleared references; caller assigns to globals.
+    line newSupLine = na
+    line newResLine = na
+    line newMidLine = na
+    linefill newFillObj = na
+    label newLbl = na
+    [newSupLine, newResLine, newMidLine, newFillObj, newLbl]
+
+// Reset bear channel drawings (preserve if history on)
+resetBearChannel(line resLine, line supLine, line midLine, linefill fillObj, label lbl, bool forceDelete) =>
+    if forceDelete
+        line.delete(resLine)
+        line.delete(supLine)
+        line.delete(midLine)
+        linefill.delete(fillObj)
+        label.delete(lbl)
+
+    // Return cleared references; caller assigns to globals.
+    line newResLine = na
+    line newSupLine = na
+    line newMidLine = na
+    linefill newFillObj = na
+    label newLbl = na
+    [newResLine, newSupLine, newMidLine, newFillObj, newLbl]
+
+// Calculate channel respect score
+calcRespectScore(int bounces, int pierces) =>
+    int total = bounces + pierces
+    total > 0 ? float(bounces) / float(total) * 100 : 0.0
+
+//=============================================================================
+// BULLISH CHANNEL LOGIC
+//=============================================================================
+
+if plFound and showBullChannel
+    int pivotBar = bar_index - rightBars
+    float pivotPrice = pl
+    bool pivotVol = isHighVol[rightBars] // Check volume AT the pivot bar
+    
+    // Add new pivot to arrays
+    array.push(bullPivotPrices, pivotPrice)
+    array.push(bullPivotBars, pivotBar)
+    array.push(bullPivotHighVol, pivotVol)
+    
+    // Trim to max size
+    while array.size(bullPivotPrices) > maxPivots
+        array.shift(bullPivotPrices)
+        array.shift(bullPivotBars)
+        array.shift(bullPivotHighVol)
+
+// Check if pivots changed
+int currentBullPivotCount = array.size(bullPivotPrices)
+bool bullPivotsChanged = currentBullPivotCount != lastBullPivotCount
+lastBullPivotCount := currentBullPivotCount
+
+// Validate and draw bull channel
+if showBullChannel and currentBullPivotCount >= minPivots and adxConfirmed
+    
+    // Early exit: if pivots haven't changed and channel is already valid with same slope, skip recalculation
+    if not bullPivotsChanged and bullChannelValid and not na(bullSlope)
+        // Just update the projection end point
+        int firstBar = array.get(bullPivotBars, 0)
+        int futureBar = bar_index + extendLen
+        float supEnd = getPriceOnLine(bullSlope, bullIntercept, futureBar)
+        float resEnd = supEnd + bullWidth
+        
+        line.set_x2(bullSupLine, futureBar)
+        line.set_y2(bullSupLine, supEnd)
+        line.set_x2(bullResLine, futureBar)
+        line.set_y2(bullResLine, resEnd)
+        if showMidLine
+            line.set_x2(bullMidLine, futureBar)
+            line.set_y2(bullMidLine, supEnd + bullWidth / 2)
+        if showLabels
+            label.set_x(bullLabel, futureBar)
+            label.set_y(bullLabel, resEnd)
+    else
+        // Check higher-lows pattern
+        bool hlValid = not requireHLLH or isHigherLows(bullPivotPrices)
+        
+        // Calculate regression only if pivots changed or channel not valid
+        [slope, intercept, r2] = calcLinearRegression(bullPivotPrices, bullPivotBars)
+        
+        // Check all validity conditions
+        bool slopeValid = slope > 0
+        bool r2Valid = r2 >= minR2
+        bool isValid = hlValid and slopeValid and r2Valid
+        
+        if isValid
+            // Only redraw if slope changed significantly or channel was invalid
+            bool shouldRedraw = not bullChannelValid or na(bullSlope) or math.abs(slope - bullSlope) > 0.0001
+            
+            if shouldRedraw
+                // Clear old drawings (delete if just refining, keep if invalid before)
+                bool deleteStale = true 
+                [newBullSupLine, newBullResLine, newBullMidLine, newBullFill, newBullLabel] = resetBullChannel(bullSupLine, bullResLine, bullMidLine, bullFill, bullLabel, deleteStale)
+                bullSupLine := newBullSupLine
+                bullResLine := newBullResLine
+                bullMidLine := newBullMidLine
+                bullFill := newBullFill
+                bullLabel := newBullLabel
+                
+                // Store values
+                bullSlope := slope
+                bullIntercept := intercept
+                bullR2 := r2
+                bullChannelValid := true
+                
+                // Get channel bounds
+                int firstBar = array.get(bullPivotBars, 0)
+                int lastBar = array.get(bullPivotBars, array.size(bullPivotBars) - 1)
+                int futureBar = bar_index + extendLen
+                
+                // Draw support line (regression line)
+                float supStart = getPriceOnLine(slope, intercept, firstBar)
+                float supEnd = getPriceOnLine(slope, intercept, futureBar)
+                bullSupLine := line.new(firstBar, supStart, futureBar, supEnd,
+                     style=line.style_solid, color=colBullLine, width=lineWidth)
+                
+                // Find channel width (highest high above regression line)
+                [highestHigh, barOfMax] = findHighestInRange(firstBar, lastBar)
+                float priceAtMax = getPriceOnLine(slope, intercept, barOfMax)
+                bullWidth := highestHigh - priceAtMax
+                
+                // Draw resistance line (parallel)
+                float resStart = supStart + bullWidth
+                float resEnd = supEnd + bullWidth
+                bullResLine := line.new(firstBar, resStart, futureBar, resEnd,
+                     style=line.style_solid, color=colBullLine, width=lineWidth)
+                
+                // Draw mid-line
+                if showMidLine
+                    float midStart = supStart + bullWidth / 2
+                    float midEnd = supEnd + bullWidth / 2
+                    bullMidLine := line.new(firstBar, midStart, futureBar, midEnd,
+                         style=line.style_dashed, color=colBullMid, width=1)
+                
+                // Fill
+                if showFill
+                    bullFill := linefill.new(bullSupLine, bullResLine, colFillBull)
+                
+                // Label with quality info
+                if showLabels
+                    string info = "BULL"
+                    if showR2
+                        info += " R²:" + str.tostring(r2, "#.##")
+                    info += " (" + str.tostring(currentBullPivotCount) + " pivots)"
+                    
+                    bullLabel := label.new(futureBar, resEnd, info,
+                         style=label.style_label_left, 
+                         color=r2 >= 0.85 ? colBullLine : colWeak,
+                         textcolor=color.white, size=size.small)
+        
+        else if bullChannelValid
+            // Channel became invalid - clear it
+            // Only delete if NOT showing history
+            [newBullSupLine, newBullResLine, newBullMidLine, newBullFill, newBullLabel] = resetBullChannel(bullSupLine, bullResLine, bullMidLine, bullFill, bullLabel, not showHistory)
+            bullSupLine := newBullSupLine
+            bullResLine := newBullResLine
+            bullMidLine := newBullMidLine
+            bullFill := newBullFill
+            bullLabel := newBullLabel
+            bullChannelValid := false
+            bullSlope := na
+
+// If ADX drops, invalidate channel
+if useADX and adxValue < adxThreshold and bullChannelValid
+    [newBullSupLine, newBullResLine, newBullMidLine, newBullFill, newBullLabel] = resetBullChannel(bullSupLine, bullResLine, bullMidLine, bullFill, bullLabel, not showHistory)
+    bullSupLine := newBullSupLine
+    bullResLine := newBullResLine
+    bullMidLine := newBullMidLine
+    bullFill := newBullFill
+    bullLabel := newBullLabel
+    bullChannelValid := false
+    bullSlope := na
+
+// Track bounces and pierces for bull channel
+if bullChannelValid and not na(bullSlope)
+    float supLevel = getPriceOnLine(bullSlope, bullIntercept, bar_index)
+    float resLevel = supLevel + bullWidth
+    
+    // Check for bounce off support
+    if low <= supLevel * 1.002 and close > supLevel
+        bullBounces += 1
+    
+    // Check for pierce through support
+    if close < supLevel * 0.99
+        bullPierces += 1
+        // Too many pierces = invalidate
+        if bullPierces > 2
+            [newBullSupLine, newBullResLine, newBullMidLine, newBullFill, newBullLabel] = resetBullChannel(bullSupLine, bullResLine, bullMidLine, bullFill, bullLabel, not showHistory)
+            bullSupLine := newBullSupLine
+            bullResLine := newBullResLine
+            bullMidLine := newBullMidLine
+            bullFill := newBullFill
+            bullLabel := newBullLabel
+            bullChannelValid := false
+            bullPierces := 0
+            bullBounces := 0
+
+//=============================================================================
+// BEARISH CHANNEL LOGIC
+//=============================================================================
+
+if phFound and showBearChannel
+    int pivotBar = bar_index - rightBars
+    float pivotPrice = ph
+    bool pivotVol = isHighVol[rightBars] // Check volume AT the pivot bar
+    
+    // Add new pivot to arrays
+    array.push(bearPivotPrices, pivotPrice)
+    array.push(bearPivotBars, pivotBar)
+    array.push(bearPivotHighVol, pivotVol)
+    
+    // Trim to max size
+    while array.size(bearPivotPrices) > maxPivots
+        array.shift(bearPivotPrices)
+        array.shift(bearPivotBars)
+        array.shift(bearPivotHighVol)
+
+// Check if pivots changed
+int currentBearPivotCount = array.size(bearPivotPrices)
+bool bearPivotsChanged = currentBearPivotCount != lastBearPivotCount
+lastBearPivotCount := currentBearPivotCount
+
+// Validate and draw bear channel
+if showBearChannel and currentBearPivotCount >= minPivots and adxConfirmed
+    
+    // Early exit: if pivots haven't changed and channel is already valid with same slope, skip recalculation
+    if not bearPivotsChanged and bearChannelValid and not na(bearSlope)
+        // Just update the projection end point
+        int firstBar = array.get(bearPivotBars, 0)
+        int futureBar = bar_index + extendLen
+        float resEnd = getPriceOnLine(bearSlope, bearIntercept, futureBar)
+        float supEnd = resEnd + bearWidth
+        
+        line.set_x2(bearResLine, futureBar)
+        line.set_y2(bearResLine, resEnd)
+        line.set_x2(bearSupLine, futureBar)
+        line.set_y2(bearSupLine, supEnd)
+        if showMidLine
+            line.set_x2(bearMidLine, futureBar)
+            line.set_y2(bearMidLine, resEnd + bearWidth / 2)
+        if showLabels
+            label.set_x(bearLabel, futureBar)
+            label.set_y(bearLabel, supEnd)
+    else
+        // Check lower-highs pattern
+        bool lhValid = not requireHLLH or isLowerHighs(bearPivotPrices)
+        
+        // Calculate regression only if pivots changed or channel not valid
+        [slope, intercept, r2] = calcLinearRegression(bearPivotPrices, bearPivotBars)
+        
+        // Check all validity conditions
+        bool slopeValid = slope < 0
+        bool r2Valid = r2 >= minR2
+        bool isValid = lhValid and slopeValid and r2Valid
+        
+        if isValid
+            // Only redraw if slope changed significantly or channel was invalid
+            bool shouldRedraw = not bearChannelValid or na(bearSlope) or math.abs(slope - bearSlope) > 0.0001
+            
+            if shouldRedraw
+                // Clear old drawings (delete if just refining, keep if invalid before)
+                bool deleteStale = true 
+                [newBearResLine, newBearSupLine, newBearMidLine, newBearFill, newBearLabel] = resetBearChannel(bearResLine, bearSupLine, bearMidLine, bearFill, bearLabel, deleteStale)
+                bearResLine := newBearResLine
+                bearSupLine := newBearSupLine
+                bearMidLine := newBearMidLine
+                bearFill := newBearFill
+                bearLabel := newBearLabel
+                
+                // Store values
+                bearSlope := slope
+                bearIntercept := intercept
+                bearR2 := r2
+                bearChannelValid := true
+                
+                // Get channel bounds
+                int firstBar = array.get(bearPivotBars, 0)
+                int lastBar = array.get(bearPivotBars, array.size(bearPivotBars) - 1)
+                int futureBar = bar_index + extendLen
+                
+                // Draw resistance line (regression line)
+                float resStart = getPriceOnLine(slope, intercept, firstBar)
+                float resEnd = getPriceOnLine(slope, intercept, futureBar)
+                bearResLine := line.new(firstBar, resStart, futureBar, resEnd,
+                     style=line.style_solid, color=colBearLine, width=lineWidth)
+                
+                // Find channel width (lowest low below regression line)
+                [lowestLow, barOfMin] = findLowestInRange(firstBar, lastBar)
+                float priceAtMin = getPriceOnLine(slope, intercept, barOfMin)
+                bearWidth := lowestLow - priceAtMin  // Negative value
+                
+                // Draw support line (parallel)
+                float supStart = resStart + bearWidth
+                float supEnd = resEnd + bearWidth
+                bearSupLine := line.new(firstBar, supStart, futureBar, supEnd,
+                     style=line.style_solid, color=colBearLine, width=lineWidth)
+                
+                // Draw mid-line
+                if showMidLine
+                    float midStart = resStart + bearWidth / 2
+                    float midEnd = resEnd + bearWidth / 2
+                    bearMidLine := line.new(firstBar, midStart, futureBar, midEnd,
+                         style=line.style_dashed, color=colBearMid, width=1)
+                
+                // Fill
+                if showFill
+                    bearFill := linefill.new(bearSupLine, bearResLine, colFillBear)
+                
+                // Label with quality info
+                if showLabels
+                    string info = "BEAR"
+                    if showR2
+                        info += " R²:" + str.tostring(r2, "#.##")
+                    info += " (" + str.tostring(currentBearPivotCount) + " pivots)"
+                    
+                    bearLabel := label.new(futureBar, supEnd, info,
+                         style=label.style_label_left,
+                         color=r2 >= 0.85 ? colBearLine : colWeak,
+                         textcolor=color.white, size=size.small)
+        
+        else if bearChannelValid
+            // Channel became invalid
+            [newBearResLine, newBearSupLine, newBearMidLine, newBearFill, newBearLabel] = resetBearChannel(bearResLine, bearSupLine, bearMidLine, bearFill, bearLabel, not showHistory)
+            bearResLine := newBearResLine
+            bearSupLine := newBearSupLine
+            bearMidLine := newBearMidLine
+            bearFill := newBearFill
+            bearLabel := newBearLabel
+            bearChannelValid := false
+            bearSlope := na
+
+// If ADX drops, invalidate channel
+if useADX and adxValue < adxThreshold and bearChannelValid
+    [newBearResLine, newBearSupLine, newBearMidLine, newBearFill, newBearLabel] = resetBearChannel(bearResLine, bearSupLine, bearMidLine, bearFill, bearLabel, not showHistory)
+    bearResLine := newBearResLine
+    bearSupLine := newBearSupLine
+    bearMidLine := newBearMidLine
+    bearFill := newBearFill
+    bearLabel := newBearLabel
+    bearChannelValid := false
+    bearSlope := na
+
+// Track bounces and pierces for bear channel
+if bearChannelValid and not na(bearSlope)
+    float resLevel = getPriceOnLine(bearSlope, bearIntercept, bar_index)
+    float supLevel = resLevel + bearWidth
+    
+    // Check for bounce off resistance
+    if high >= resLevel * 0.998 and close < resLevel
+        bearBounces += 1
+    
+    // Check for pierce through resistance
+    if close > resLevel * 1.01
+        bearPierces += 1
+        // Too many pierces = invalidate
+        if bearPierces > 2
+            [newBearResLine, newBearSupLine, newBearMidLine, newBearFill, newBearLabel] = resetBearChannel(bearResLine, bearSupLine, bearMidLine, bearFill, bearLabel, not showHistory)
+            bearResLine := newBearResLine
+            bearSupLine := newBearSupLine
+            bearMidLine := newBearMidLine
+            bearFill := newBearFill
+            bearLabel := newBearLabel
+            bearChannelValid := false
+            bearPierces := 0
+            bearBounces := 0
+
+//=============================================================================
+// PIVOT MARKERS
+//=============================================================================
+
+// Determine if pivot had high volume (based on lookback)
+// Note: for standard pivots, we use the standard rightBars offset.
+bool phHighVol = phFound and isHighVol[rightBars]
+bool plHighVol = plFound and isHighVol[rightBars]
+
+//--- EARLY PIVOTS (UNCONFIRMED) ---
+// Show these first/underneath. They are fainter/smaller.
+bool showEarlyPivotHigh = showEarlyPivots and showSignalEarlySell and rightBars > 1 and phEarlyFound
+bool showEarlyPivotLow = showEarlyPivots and showSignalEarlyBuy and rightBars > 1 and plEarlyFound
+
+plotshape(showEarlyPivotHigh, "Early Pivot High", shape.triangledown, location.abovebar, 
+     color.new(colBearLine, 50), size=size.tiny, offset=-1)
+plotshape(showEarlyPivotLow, "Early Pivot Low", shape.triangleup, location.belowbar, 
+     color.new(colBullLine, 50), size=size.tiny, offset=-1)
+
+//--- STANDARD PIVOTS (CONFIRMED) ---
+// These are the "Real" ones used for channel calc.
+bool showWeakSellPivot = showPivots and showSignalWeakSell and phFound and not phHighVol
+bool showStrongSellPivot = showPivots and showSignalStrongSell and showHighVolPivots and phFound and phHighVol
+bool showWeakBuyPivot = showPivots and showSignalWeakBuy and plFound and not plHighVol
+bool showStrongBuyPivot = showPivots and showSignalStrongBuy and showHighVolPivots and plFound and plHighVol
+
+// Highs - Low Vol (Tiny)
+plotshape(showWeakSellPivot, "Pivot High (Low Vol)", shape.triangledown, location.abovebar, 
+     colBearLine, size=size.tiny, offset=-rightBars)
+// Highs - High Vol (Small + Halo)
+plotshape(showStrongSellPivot, "Pivot High (High Vol)", shape.triangledown, location.abovebar, 
+     colBearLine, size=size.small, offset=-rightBars)
+plotshape(showStrongSellPivot, "Vol Pivot High Halo", shape.circle, location.abovebar, 
+     color.new(colBearLine, 70), size=size.small, offset=-rightBars)
+
+// Lows - Low Vol (Tiny)
+plotshape(showWeakBuyPivot, "Pivot Low (Low Vol)", shape.triangleup, location.belowbar, 
+     colBullLine, size=size.tiny, offset=-rightBars)
+// Lows - High Vol (Small + Halo)
+plotshape(showStrongBuyPivot, "Pivot Low (High Vol)", shape.triangleup, location.belowbar, 
+     colBullLine, size=size.small, offset=-rightBars)
+plotshape(showStrongBuyPivot, "Vol Pivot Low Halo", shape.circle, location.belowbar, 
+     color.new(colBullLine, 70), size=size.small, offset=-rightBars)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+alertcondition(bullChannelValid and not bullChannelValid[1], "Bull Channel Formed", "New valid bullish channel detected")
+alertcondition(bearChannelValid and not bearChannelValid[1], "Bear Channel Formed", "New valid bearish channel detected")
+alertcondition(not bullChannelValid and bullChannelValid[1], "Bull Channel Broken", "Bullish channel invalidated")
+alertcondition(not bearChannelValid and bearChannelValid[1], "Bear Channel Broken", "Bearish channel invalidated")
+alertcondition(alertSignalWeakBuy and showWeakBuyPivot, "Weak Buy Pivot (Confirmed)", "Weak buy pivot detected (confirmed low, low volume)")
+alertcondition(alertSignalStrongBuy and showStrongBuyPivot, "Strong Buy Pivot (Confirmed)", "Strong buy pivot detected (confirmed low, high volume)")
+alertcondition(alertSignalWeakSell and showWeakSellPivot, "Weak Sell Pivot (Confirmed)", "Weak sell pivot detected (confirmed high, low volume)")
+alertcondition(alertSignalStrongSell and showStrongSellPivot, "Strong Sell Pivot (Confirmed)", "Strong sell pivot detected (confirmed high, high volume)")
+alertcondition(alertSignalEarlySell and showEarlyPivotHigh, "Early Sell Pivot", "Potential sell pivot detected (early/unconfirmed high)")
+alertcondition(alertSignalEarlyBuy and showEarlyPivotLow, "Early Buy Pivot", "Potential buy pivot detected (early/unconfirmed low)")

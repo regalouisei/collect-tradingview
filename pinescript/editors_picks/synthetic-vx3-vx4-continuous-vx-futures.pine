@@ -1,0 +1,77 @@
+//@version=5
+indicator("Synthetic VX3! & VX4! continuous /VX futures",
+     overlay=false, precision=2, max_lines_count=500, max_labels_count=500)
+
+// ========= Config =========
+data_tf   = input.timeframe("D", "Data TF for VIX / VX1! / VX2!")
+var float T1 = 1.0, T2 = 2.0, T3 = 3.0, T4 = 4.0, TINY = 1e-10
+minTheta  = input.float(5.0),  maxTheta = input.float(80.0)
+maxK      = input.float(3.0),  maxJump  = input.float(15.0)
+maxVX     = input.float(80.0), minVX    = input.float(5.0)
+use_ffill_inputs = input.bool(true,  "Forward‑fill inputs?")
+show_flag        = input.bool(true,  "Show regime flag on last bar?")
+
+// ========= Helpers =========
+clean(x)=> (na(x) or x<=0)? na:x
+pick(a,b)=> na(a) or a==0? b:a
+choose_with_ref(a,b,r)=> not na(r)? (not na(a) and (na(b) or math.abs(a-r)<=math.abs(b-r))? a:b) : not na(a)? a:b
+in_range(v)=> not na(v) and v>=minVX and v<=maxVX
+
+// ========= Data =========
+gMode = use_ffill_inputs? barmerge.gaps_off: barmerge.gaps_on
+vix  = clean(pick(request.security("CBOE:VIX",data_tf,close,gaps=gMode), request.security("VIX",data_tf,close,gaps=gMode)))
+vx1  = clean(choose_with_ref(request.security("CBOE:VX1!",data_tf,close,gaps=gMode),
+                             request.security("VX1!",     data_tf,close,gaps=gMode),
+                             clean(request.security("VX1!",data_tf,close,gaps=barmerge.gaps_on))))
+vx2  = clean(choose_with_ref(request.security("CBOE:VX2!",data_tf,close,gaps=gMode),
+                             request.security("VX2!",     data_tf,close,gaps=gMode), vx1))
+
+// ========= Exponential fit =========
+num   = not na(vix) and not na(vx1) and not na(vx2)? vx1*vx1 - vx2*vix: na
+denom = not na(vix) and not na(vx1) and not na(vx2)? 2.*vx1 - vx2 - vix: na
+theta_raw = na(num) or na(denom) or math.abs(denom)<TINY? na: num/denom
+r_raw     = na(theta_raw) or na(vix) or math.abs(vix-theta_raw)<TINY? na: (vx1-theta_raw)/(vix-theta_raw)
+valid0    = not na(theta_raw) and not na(r_raw) and r_raw>0
+theta = valid0? theta_raw: na
+k     = valid0? -math.log(r_raw)/T1: na
+vx3_exp0 = valid0? theta + (vix-theta)*math.exp(-k*T3): na
+vx4_exp0 = valid0? theta + (vix-theta)*math.exp(-k*T4): na
+valid_exp = valid0 and theta>=minTheta and theta<=maxTheta and k>0 and k<=maxK
+vx3_exp = valid_exp and in_range(vx3_exp0)? vx3_exp0: na
+vx4_exp = valid_exp and in_range(vx4_exp0) and (na(vx2) or math.abs(vx4_exp0-vx2)<=maxJump)? vx4_exp0: na
+
+// ========= Linear‑variance fallback =========
+lin_ok  = not na(vx1) and not na(vx2)
+vx3_lin = lin_ok? math.sqrt(math.max(2.*vx2*vx2 - vx1*vx1,0)): na
+vx4_lin = lin_ok? math.sqrt(math.max(3.*vx2*vx2 - 2.*vx1*vx1,0)): na
+vx3_lin := in_range(vx3_lin)? vx3_lin: na
+vx4_lin := in_range(vx4_lin)? vx4_lin: na
+
+// ========= Final series =========
+vx3 = not na(vx3_exp)? vx3_exp: vx3_lin
+vx4 = not na(vx4_exp)? vx4_exp: vx4_lin
+
+// ========= Plots (ascending maturity, linewidth = 2) =========
+plot(vix, title="VIX spot",      color=color.new(color.gray,85), linewidth=2)
+plot(vx1, title="VX1! (used)",   color=color.new(color.red,70),  linewidth=2)
+plot(vx2, title="VX2! (used)",   color=color.new(color.blue,70), linewidth=2)
+plot(vx3, title="Synthetic ~3M", color=color.aqua,               linewidth=2)
+plot(vx4, title="Synthetic ~4M", color=color.teal,               linewidth=2)
+
+// ========= Diagnostics label (single‑line) =========
+var label lb = na
+if barstate.islast
+    label.delete(lb)
+    txt = "θ=" + (not na(theta)?str.tostring(theta):"na") + "  k=" + (not na(k)?str.tostring(k):"na") +
+          "\nVX3=" + (not na(vx3)?str.tostring(vx3):"na") + "  VX4=" + (not na(vx4)?str.tostring(vx4):"na") +
+          "\nTF=" + data_tf
+    anchor = na(vx4)? na(vx3)? nz(vix,na):vx3: vx4
+    if not na(anchor)
+        lb := label.new(bar_index, anchor, txt, xloc=xloc.bar_index, yloc=yloc.price, textcolor=color.white, style=label.style_label_left, color=color.new(color.black,0))
+
+// ========= Regime flag (single‑line) =========
+if show_flag and barstate.islast
+    flag = not na(vx3_exp) or not na(vx4_exp)? "E": not na(vx3_lin) or not na(vx4_lin)? "F":"×"
+    col  = flag=="E"? color.teal: flag=="F"? color.orange: color.red
+    anchor2 = na(vx4)? na(vx3)? nz(vix,0):vx3: vx4
+    label.new(bar_index, anchor2, flag, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_center, textcolor=color.white, color=color.new(col,0), size=size.tiny)

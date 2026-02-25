@@ -1,0 +1,274 @@
+//@version=6
+strategy("Oleg_Aryukov_Strategy", overlay=true, initial_capital=1000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ============================================================================
+// индюки
+// ============================================================================
+use_rsi = input.bool(true, "Использовать RSI", group="Активация индикаторов")
+use_williams = input.bool(true, "Использовать Williams %R", group="Активация индикаторов")
+use_tsi = input.bool(true, "Использовать TSI", group="Активация индикаторов")
+use_kdj = input.bool(true, "Использовать KDJ", group="Активация индикаторов")
+use_bb_percent = input.bool(true, "Использовать %BB", group="Активация индикаторов")
+use_nadaraya = input.bool(true, "Использовать Nadaraya-Watson", group="Активация индикаторов")
+
+// RSI 
+rsi_length = input.int(12, "RSI Период", minval=2, group="RSI")
+rsi_oversold = input.float(30, "RSI Перепроданность", minval=0, maxval=100, group="RSI")
+rsi_overbought = input.float(70, "RSI Перекупленность", minval=0, maxval=100, group="RSI")
+
+// Williams 
+williams_length_6 = input.int(6, "Williams %R Период 6", minval=2, group="Williams %R")
+williams_length_12 = input.int(12, "Williams %R Период 12", minval=2, group="Williams %R")
+williams_oversold = input.float(-80, "Williams Перепроданность", minval=-100, maxval=0, group="Williams %R")
+williams_overbought = input.float(-20, "Williams Перекупленность", minval=-100, maxval=0, group="Williams %R")
+
+// TSI 
+tsi_long = input.int(25, "TSI Длинный период", minval=2, group="TSI")
+tsi_short = input.int(13, "TSI Короткий период", minval=2, group="TSI")
+tsi_signal = input.int(13, "TSI Сигнальная линия", minval=1, group="TSI")
+tsi_divergence = input.float(15, "TSI Расхождение для сигнала", minval=0, group="TSI")
+
+// KDJ 
+kdj_length = input.int(9, "KDJ Период", minval=1, group="KDJ")
+kdj_signal_k = input.int(3, "KDJ Сигнал K", minval=1, group="KDJ")
+kdj_signal_d = input.int(3, "KDJ Сигнал D", minval=1, group="KDJ")
+kdj_divergence = input.float(20, "KDJ Расхождение", minval=0, group="KDJ")
+
+// Bollinger 
+bb_length = input.int(20, "BB Период", minval=1, group="Bollinger Bands %B")
+bb_mult = input.float(2.0, "BB Множитель", minval=0.1, group="Bollinger Bands %B")
+
+// Nadaraya-Watson 
+nw_bandwidth = input.float(3.0, "NW Bandwidth", minval=0.1, group="Nadaraya-Watson")
+nw_lookback = input.int(50, "NW Lookback", minval=10, maxval=200, group="Nadaraya-Watson")
+
+// RCI Ribbon
+rci_fast = input.int(9, "RCI Быстрый период", minval=1, group="RCI Ribbon")
+rci_medium = input.int(26, "RCI Средний период", minval=1, group="RCI Ribbon")
+rci_slow = input.int(52, "RCI Медленный период", minval=1, group="RCI Ribbon")
+rci_oversold = input.float(-80, "RCI Перепроданность", minval=-100, maxval=100, group="RCI Ribbon")
+rci_overbought = input.float(80, "RCI Перекупленность", minval=-100, maxval=100, group="RCI Ribbon")
+
+// ============================================================================
+// риски
+// ============================================================================
+stop_loss_percent = input.float(2.0, "Стоп-лосс %", minval=0.1, maxval=10, step=0.1, group="Риск-менеджмент")
+take_profit_percent = input.float(4.0, "Тейк-профит %", minval=0.1, maxval=20, step=0.1, group="Риск-менеджмент")
+use_trailing = input.bool(true, "Использовать трейлинг-стоп", group="Риск-менеджмент")
+trailing_percent = input.float(1.0, "Трейлинг-стоп %", minval=0.1, maxval=5, step=0.1, group="Риск-менеджмент")
+
+// Настройки подтверждения сигналов
+min_confirmations = input.int(3, "Минимум подтверждений", minval=1, maxval=8, group="Фильтры")
+check_trend = input.bool(true, "Учитывать тренд", group="Фильтры")
+
+// ============================================================================
+// индюки аргументы
+// ============================================================================
+
+// RSI
+rsi = ta.rsi(close, rsi_length)
+
+// Williams 
+williams_r_6 = ta.wpr(williams_length_6)
+williams_r_12 = ta.wpr(williams_length_12)
+
+// TSI (защита от деления на ноль)
+double_smooth(src, longlen, shortlen) =>
+    tmp = ta.ema(src, longlen)
+    ta.ema(tmp, shortlen)
+
+pc = ta.change(close)
+double_smoothed_pc = double_smooth(pc, tsi_long, tsi_short)
+double_smoothed_abs_pc = double_smooth(math.abs(pc), tsi_long, tsi_short)
+tsi_value = na(double_smoothed_abs_pc) or double_smoothed_abs_pc == 0 ? 0.0 : 100 * (double_smoothed_pc / double_smoothed_abs_pc)
+tsi_signal_line = ta.ema(tsi_value, tsi_signal)
+
+// KDJ (защита от деления на ноль)
+kdj_high = ta.highest(high, kdj_length)
+kdj_low = ta.lowest(low, kdj_length)
+rsv = (kdj_high - kdj_low) == 0 ? 50.0 : 100 * ((close - kdj_low) / (kdj_high - kdj_low))
+k = ta.sma(rsv, kdj_signal_k)
+d = ta.sma(k, kdj_signal_d)
+j = 3 * k - 2 * d
+
+// Bollinger Bands (защита)
+[bb_middle, bb_upper, bb_lower] = ta.bb(close, bb_length, bb_mult)
+bb_den = bb_upper - bb_lower
+bb_percent = bb_den == 0 ? 0.5 : (close - bb_lower) / bb_den
+
+// RCI (с защитами)
+rci_calc(length) =>
+    valid = bar_index >= length
+    rank_price = valid ? ta.percentrank(close, length) : 0.5
+    rank_time = valid ? ta.percentrank(bar_index, length) : 0.5
+    corr = valid ? ta.correlation(rank_price, rank_time, length) : 0.0
+    corr * 100
+
+rci_fast_value = rci_calc(rci_fast)
+rci_medium_value = rci_calc(rci_medium)
+rci_slow_value = rci_calc(rci_slow)
+
+// Nadaraya-Watson 
+nw_kernel_regression(src, bandwidth, lookback) =>
+    sum_weighted = 0.0
+    sum_weights = 0.0
+    for i = 0 to lookback - 1
+        weight = math.exp(-math.pow(i, 2) / (2 * math.pow(bandwidth, 2)))
+        sum_weighted += src[i] * weight
+        sum_weights += weight
+    sum_weights == 0 ? src : sum_weighted / sum_weights
+
+nw_estimate = use_nadaraya ? nw_kernel_regression(close, nw_bandwidth, nw_lookback) : na
+nw_upper = use_nadaraya and not na(nw_estimate) ? nw_estimate * (1 + nw_bandwidth/100) : na
+nw_lower = use_nadaraya and not na(nw_estimate) ? nw_estimate * (1 - nw_bandwidth/100) : na
+
+// Определение тренда 
+ema_fast = ta.ema(close, 50)
+ema_slow = ta.ema(close, 200)
+trend_up = ema_fast > ema_slow
+trend_down = ema_fast < ema_slow
+
+// ============================================================================
+// сигналы
+// ============================================================================
+
+// Подсчет сигналов на покупку/продажу
+var int buy_signals = 0
+var int sell_signals = 0
+
+// сбрасываем счётчики на каждой новой баре
+if barstate.isnew
+    buy_signals := 0
+    sell_signals := 0
+
+if use_rsi
+    buy_signals := buy_signals + (not na(rsi) and rsi < rsi_oversold ? 1 : 0)
+    sell_signals := sell_signals + (not na(rsi) and rsi > rsi_overbought ? 1 : 0)
+
+if use_williams
+    buy_signals := buy_signals + (not na(williams_r_6) and williams_r_6 < williams_oversold ? 1 : 0)
+    buy_signals := buy_signals + (not na(williams_r_12) and williams_r_12 < williams_oversold ? 1 : 0)
+    sell_signals := sell_signals + (not na(williams_r_6) and williams_r_6 > williams_overbought ? 1 : 0)
+    sell_signals := sell_signals + (not na(williams_r_12) and williams_r_12 > williams_overbought ? 1 : 0)
+
+if use_tsi
+    tsi_divergence_buy = math.abs(tsi_value - tsi_signal_line) > tsi_divergence and tsi_value < tsi_signal_line
+    tsi_divergence_sell = math.abs(tsi_value - tsi_signal_line) > tsi_divergence and tsi_value > tsi_signal_line
+    buy_signals := buy_signals + (tsi_divergence_buy ? 1 : 0)
+    sell_signals := sell_signals + (tsi_divergence_sell ? 1 : 0)
+
+if use_kdj
+    kdj_oversold = j < 20 and math.abs(k - d) > kdj_divergence
+    kdj_overbought = j > 80 and math.abs(k - d) > kdj_divergence
+    buy_signals := buy_signals + (kdj_oversold ? 1 : 0)
+    sell_signals := sell_signals + (kdj_overbought ? 1 : 0)
+
+if use_bb_percent
+    buy_signals := buy_signals + (bb_percent < 0 ? 1 : 0)
+    sell_signals := sell_signals + (bb_percent > 1 ? 1 : 0)
+
+if use_nadaraya
+    buy_signals := buy_signals + (not na(nw_lower) and close < nw_lower ? 1 : 0)
+    sell_signals := sell_signals + (not na(nw_upper) and close > nw_upper ? 1 : 0)
+
+// RCI Ribbon
+rci_all_oversold = rci_fast_value < rci_oversold and rci_medium_value < rci_oversold and rci_slow_value < rci_oversold
+rci_all_overbought = rci_fast_value > rci_overbought and rci_medium_value > rci_overbought and rci_slow_value > rci_overbought
+buy_signals := buy_signals + (rci_all_oversold ? 1 : 0)
+sell_signals := sell_signals + (rci_all_overbought ? 1 : 0)
+
+// ============================================================================
+// твх
+// ============================================================================
+
+trend_filter_buy = check_trend ? (trend_up or not trend_down) : true
+trend_filter_sell = check_trend ? (trend_down or not trend_up) : true
+
+long_condition = buy_signals >= min_confirmations and trend_filter_buy and strategy.position_size == 0
+short_condition = sell_signals >= min_confirmations and trend_filter_sell and strategy.position_size == 0
+
+// ============================================================================
+// ордера
+// ============================================================================
+
+if long_condition
+    strategy.entry("Long", strategy.long)
+
+if short_condition
+    strategy.entry("Short", strategy.short)
+
+// стоп/тейк/трейлинг)
+if strategy.position_size > 0
+    stop_price = strategy.position_avg_price * (1 - stop_loss_percent / 100)
+    take_price = strategy.position_avg_price * (1 + take_profit_percent / 100)
+
+    if use_trailing
+        // Для трейлинга: подаём пару trail_points + trail_offset (требование)
+        trail_points = math.abs(strategy.position_avg_price * trailing_percent / 100)  // величина в цене
+        trail_offset = trail_points  // используем одинаковое значение — удовлетворяет требованию пары
+        // Можно также сохранить limit (тейк) — оставляем limit, чтобы зафиксировать цель
+        strategy.exit("Exit Long", "Long", trail_points=trail_points, trail_offset=trail_offset, limit=take_price)
+    else
+        strategy.exit("Exit Long", "Long", stop=stop_price, limit=take_price)
+
+if strategy.position_size < 0
+    stop_price = strategy.position_avg_price * (1 + stop_loss_percent / 100)
+    take_price = strategy.position_avg_price * (1 - take_profit_percent / 100)
+
+    if use_trailing
+        trail_points = math.abs(strategy.position_avg_price * trailing_percent / 100)
+        trail_offset = trail_points
+        strategy.exit("Exit Short", "Short", trail_points=trail_points, trail_offset=trail_offset, limit=take_price)
+    else
+        strategy.exit("Exit Short", "Short", stop=stop_price, limit=take_price)
+
+// ============================================================================
+// алерты
+// ============================================================================
+
+long_alert = long_condition
+short_alert = short_condition
+exit_long_alert = strategy.position_size > 0 and (close <= strategy.position_avg_price * (1 - stop_loss_percent / 100) or close >= strategy.position_avg_price * (1 + take_profit_percent / 100))
+exit_short_alert = strategy.position_size < 0 and (close >= strategy.position_avg_price * (1 + stop_loss_percent / 100) or close <= strategy.position_avg_price * (1 - take_profit_percent / 100))
+
+alertcondition(long_alert, title="🟢 Long Signal", message='{"signal":"long","symbol":"{{ticker}}","price":"{{close}}"}')
+alertcondition(short_alert, title="🔴 Short Signal", message='{"signal":"short","symbol":"{{ticker}}","price":"{{close}}"}')
+alertcondition(exit_long_alert, title="🚪 Закрытие Long", message='{"signal":"exit_long","symbol":"{{ticker}}","price":"{{close}}"}')
+alertcondition(exit_short_alert, title="🚪 Закрытие Short", message='{"signal":"exit_short","symbol":"{{ticker}}","price":"{{close}}"}')
+
+plotshape(long_alert, title="Alert Long", location=location.belowbar, color=color.lime, style=shape.circle, size=size.tiny)
+plotshape(short_alert, title="Alert Short", location=location.abovebar, color=color.red, style=shape.circle, size=size.tiny)
+
+// ============================================================================
+// вижуал
+// ============================================================================
+
+plot(use_nadaraya ? nw_upper : na, "NW Upper", color=color.new(color.purple, 70), linewidth=1)
+plot(use_nadaraya ? nw_estimate : na, "NW Middle", color=color.new(color.purple, 50), linewidth=2)
+plot(use_nadaraya ? nw_lower : na, "NW Lower", color=color.new(color.purple, 70), linewidth=1)
+
+plot(check_trend ? ema_fast : na, "EMA 50", color=color.orange)
+plot(check_trend ? ema_slow : na, "EMA 200", color=color.blue)
+
+var table infoTable = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 85))
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Индикатор", text_color=color.white)
+    table.cell(infoTable, 1, 0, "Значение", text_color=color.white)
+    table.cell(infoTable, 0, 1, "Buy Signals", text_color=color.green)
+    table.cell(infoTable, 1, 1, str.tostring(buy_signals))
+    table.cell(infoTable, 0, 2, "Sell Signals", text_color=color.red)
+    table.cell(infoTable, 1, 2, str.tostring(sell_signals))
+    table.cell(infoTable, 0, 3, "RSI", text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(rsi, "#.##"))
+    table.cell(infoTable, 0, 4, "TSI", text_color=color.white)
+    table.cell(infoTable, 1, 4, str.tostring(tsi_value, "#.##"))
+    table.cell(infoTable, 0, 5, "KDJ-J", text_color=color.white)
+    table.cell(infoTable, 1, 5, str.tostring(j, "#.##"))
+    table.cell(infoTable, 0, 6, "%BB", text_color=color.white)
+    table.cell(infoTable, 1, 6, str.tostring(bb_percent, "#.##"))
+    trend_text = trend_up ? "↑" : trend_down ? "↓" : "→"
+    trend_color = trend_up ? color.green : trend_down ? color.red : color.yellow
+    table.cell(infoTable, 0, 7, "Тренд", text_color=color.white)
+    table.cell(infoTable, 1, 7, trend_text, text_color=trend_color)

@@ -1,0 +1,651 @@
+//@version=6
+//v2-Feb-2026
+indicator("Adaptive Buy Sell Signal [AvantCoin]", overlay=true, max_labels_count=500)
+
+// ============================================================================
+// MARKET TYPE SELECTION
+// ============================================================================
+
+marketType = input.string("Auto-Detect", "Market Type", 
+                          options=["Auto-Detect", "Forex", "Stocks", "Indices", "Commodities", "Crypto"],
+                          group="🌍 Market Settings",
+                          tooltip="Auto-detect analyzes symbol name. Manual selection overrides.")
+
+// Auto-detect market type based on symbol
+var string detectedMarket = "Forex"
+symbolStr = str.tostring(syminfo.ticker)
+
+if marketType == "Auto-Detect"
+    // Forex pairs detection
+    if str.contains(symbolStr, "USD") or str.contains(symbolStr, "EUR") or str.contains(symbolStr, "GBP") or 
+       str.contains(symbolStr, "JPY") or str.contains(symbolStr, "AUD") or str.contains(symbolStr, "CAD") or
+       str.contains(symbolStr, "CHF") or str.contains(symbolStr, "NZD")
+        detectedMarket := "Forex"
+    // Crypto detection
+    else if str.contains(symbolStr, "BTC") or str.contains(symbolStr, "ETH") or str.contains(symbolStr, "USDT") or str.contains(symbolStr, "BUSD") or syminfo.type == "crypto" 
+        detectedMarket := "Crypto"
+    // Indices detection
+    else if str.contains(symbolStr, "NAS") or str.contains(symbolStr, "SPX") or str.contains(symbolStr, "NDX") or str.contains(symbolStr, "US100") or str.contains(symbolStr, "US500") or str.contains(symbolStr, "DJI")
+        detectedMarket := "Indices"
+    // Gold/Commodities
+    else if str.contains(symbolStr, "GOLD") or str.contains(symbolStr, "XAU") or str.contains(symbolStr, "SILVER") or str.contains(symbolStr, "OIL") or str.contains(symbolStr, "WTI")
+        detectedMarket := "Commodities"
+    // Stocks (default for everything else)
+    else
+        detectedMarket := "Stocks"
+else
+    detectedMarket := marketType
+
+// ============================================================================
+// MARKET-SPECIFIC PARAMETER OPTIMIZATION
+// ============================================================================
+
+// Confluence thresholds per market
+var int forexMinConfluence = 5
+var int stocksMinConfluence = 6
+var int indicesMinConfluence = 5
+var int commoditiesMinConfluence = 6
+var int cryptoMinConfluence = 4
+
+// ADX thresholds (trend strength requirements)
+var int forexADX = 20
+var int stocksADX = 22
+var int indicesADX = 18
+var int commoditiesADX = 23
+var int cryptoADX = 15
+
+// Volatility multipliers
+var float forexVolMult = 1.5
+var float stocksVolMult = 1.3
+var float indicesVolMult = 1.4
+var float commoditiesVolMult = 1.6
+var float cryptoVolMult = 2.0
+
+// Volume significance thresholds
+var float forexVolThresh = 1.3
+var float stocksVolThresh = 1.5
+var float indicesVolThresh = 1.4
+var float commoditiesVolThresh = 1.3
+var float cryptoVolThresh = 2.0
+
+// Cooldown periods (bars between signals)
+var int forexCooldown = 5
+var int stocksCooldown = 3
+var int indicesCooldown = 4
+var int commoditiesCooldown = 6
+var int cryptoCooldown = 3
+
+// Apply market-specific settings
+minConfluence = detectedMarket == "Forex" ? forexMinConfluence : detectedMarket == "Stocks" ? stocksMinConfluence : detectedMarket == "Indices" ? indicesMinConfluence : detectedMarket == "Commodities" ? commoditiesMinConfluence : cryptoMinConfluence
+
+adxThreshold = detectedMarket == "Forex" ? forexADX :
+               detectedMarket == "Stocks" ? stocksADX :
+               detectedMarket == "Indices" ? indicesADX :
+               detectedMarket == "Commodities" ? commoditiesADX : cryptoADX
+
+volatilityMult = detectedMarket == "Forex" ? forexVolMult :
+                 detectedMarket == "Stocks" ? stocksVolMult :
+                 detectedMarket == "Indices" ? indicesVolMult :
+                 detectedMarket == "Commodities" ? commoditiesVolMult : cryptoVolMult
+
+volumeThreshold = detectedMarket == "Forex" ? forexVolThresh :
+                  detectedMarket == "Stocks" ? stocksVolThresh :
+                  detectedMarket == "Indices" ? indicesVolThresh :
+                  detectedMarket == "Commodities" ? commoditiesVolThresh : cryptoVolThresh
+
+cooldownBars = detectedMarket == "Forex" ? forexCooldown :
+               detectedMarket == "Stocks" ? stocksCooldown :
+               detectedMarket == "Indices" ? indicesCooldown :
+               detectedMarket == "Commodities" ? commoditiesCooldown : cryptoCooldown
+
+// ============================================================================
+// SESSION FILTERS (Forex & Stocks)
+// ============================================================================
+
+enableSessionFilter = input.bool(true, "Enable Trading Session Filter", group="⏰ Session Settings",
+                                 tooltip="Filters signals based on market sessions")
+
+// Session definitions (in UTC)
+asianStart = input.int(0, "Asian Session Start (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+asianEnd = input.int(8, "Asian Session End (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+
+londonStart = input.int(8, "London Session Start (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+londonEnd = input.int(16, "London Session End (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+
+nyStart = input.int(13, "NY Session Start (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+nyEnd = input.int(21, "NY Session End (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+
+// Stock market hours (NYSE: 9:30 AM - 4:00 PM EST = 14:30 - 21:00 UTC)
+stockMarketOpen = input.int(14, "Stock Market Open (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+stockMarketClose = input.int(21, "Stock Market Close (UTC)", minval=0, maxval=23, group="⏰ Session Settings")
+
+avoidAsianSession = input.bool(true, "Avoid Asian Session (Forex)", group="⏰ Session Settings",
+                               tooltip="Low liquidity for major Forex pairs")
+
+tradeStockHoursOnly = input.bool(true, "Trade Stock Hours Only (Stocks)", group="⏰ Session Settings",
+                                 tooltip="Only signal during regular trading hours")
+
+// Current hour in UTC
+currentHour = hour(time, "UTC")
+
+// Session checks
+isAsianSession = currentHour >= asianStart and currentHour < asianEnd
+isLondonSession = currentHour >= londonStart and currentHour < londonEnd
+isNYSession = currentHour >= nyStart and currentHour < nyEnd
+isLondonNYOverlap = currentHour >= nyStart and currentHour < londonEnd  // Best liquidity
+isStockMarketOpen = currentHour >= stockMarketOpen and currentHour < stockMarketClose
+
+// Session filter logic per market
+sessionAllowed = true
+if enableSessionFilter
+    if detectedMarket == "Forex"
+        // For Forex: prefer London, NY, and overlap sessions
+        if avoidAsianSession
+            sessionAllowed := not isAsianSession
+    else if detectedMarket == "Stocks"
+        // For Stocks: only trade during market hours
+        if tradeStockHoursOnly
+            sessionAllowed := isStockMarketOpen
+    else if detectedMarket == "Indices"
+        // Indices follow stock hours
+        if tradeStockHoursOnly
+            sessionAllowed := isStockMarketOpen
+    // Crypto and Commodities: 24/7, no restrictions
+
+// ============================================================================
+// ADVANCED INPUTS
+// ============================================================================
+
+// EMA Settings
+emaFast = input.int(9, "EMA Fast", minval=1, group="📈 Technical Indicators")
+emaMid = input.int(21, "EMA Mid", minval=1, group="📈 Technical Indicators")
+emaSlow = input.int(50, "EMA Slow", minval=1, group="📈 Technical Indicators")
+ema200 = input.int(200, "EMA Long", minval=1, group="📈 Technical Indicators")
+
+// RSI Settings
+rsiLength = input.int(14, "RSI Length", minval=1, group="📈 Technical Indicators")
+rsiOverbought = input.int(70, "RSI Overbought", minval=50, maxval=100, group="📈 Technical Indicators")
+rsiOversold = input.int(30, "RSI Oversold", minval=0, maxval=50, group="📈 Technical Indicators")
+
+// MACD Settings
+macdFast = input.int(12, "MACD Fast", minval=1, group="📈 Technical Indicators")
+macdSlow = input.int(26, "MACD Slow", minval=1, group="📈 Technical Indicators")
+macdSignal = input.int(9, "MACD Signal", minval=1, group="📈 Technical Indicators")
+
+// Stochastic Settings
+stochLength = input.int(14, "Stochastic Length", minval=1, group="📈 Technical Indicators")
+stochK = input.int(3, "Stochastic %K", minval=1, group="📈 Technical Indicators")
+stochD = input.int(3, "Stochastic %D", minval=1, group="📈 Technical Indicators")
+
+// Bollinger Bands
+bbLength = input.int(20, "BB Length", minval=1, group="📈 Technical Indicators")
+bbMult = input.float(2.0, "BB Std Dev", minval=0.1, group="📈 Technical Indicators")
+
+// ATR
+atrLength = input.int(14, "ATR Length", minval=1, group="📈 Technical Indicators")
+
+// ADX
+adxLength = input.int(14, "ADX Length", minval=1, group="📈 Technical Indicators")
+
+// Signal Quality Filters
+requireTrendAlignment = input.bool(true, "Require 200 EMA Alignment", group="🎯 Signal Filters")
+requireMomentumConfirmation = input.bool(true, "Require Momentum Confirmation", group="🎯 Signal Filters")
+filterChopMarkets = input.bool(true, "Filter Choppy Markets (ADX)", group="🎯 Signal Filters")
+requireCandleConfirmation = input.bool(true, "Require Bullish/Bearish Candle", group="🎯 Signal Filters")
+requireBreakout = input.bool(true, "Require Price Breakout", group="🎯 Signal Filters")
+lookbackPeriod = input.int(5, "Breakout Lookback", minval=3, maxval=20, group="🎯 Signal Filters")
+
+// Display
+showLabels = input.bool(true, "Show Buy/Sell Labels", group="🎨 Display")
+showTable = input.bool(true, "Show Signal Table", group="🎨 Display")
+showSupportResistance = input.bool(true, "Show Support/Resistance", group="🎨 Display")
+showSessionBackground = input.bool(true, "Show Session Backgrounds", group="🎨 Display")
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+
+// Moving Averages
+ema9 = ta.ema(close, emaFast)
+ema21 = ta.ema(close, emaMid)
+ema50 = ta.ema(close, emaSlow)
+ema200Line = ta.ema(close, ema200)
+
+// RSI
+rsi = ta.rsi(close, rsiLength)
+
+// MACD
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+// Stochastic
+stochK_value = ta.sma(ta.stoch(close, high, low, stochLength), stochK)
+stochD_value = ta.sma(stochK_value, stochD)
+
+// Bollinger Bands
+bbBasis = ta.sma(close, bbLength)
+bbDev = bbMult * ta.stdev(close, bbLength)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = (bbUpper - bbLower) / bbBasis
+
+// ATR
+atr = ta.atr(atrLength)
+atrAvg = ta.sma(atr, atrLength)
+highVolatility = atr > atrAvg * volatilityMult
+
+// ADX - Trend Strength
+[diPlus, diMinus, adx] = ta.dmi(adxLength, adxLength)
+strongTrend = adx > adxThreshold
+trendingUp = diPlus > diMinus and strongTrend
+trendingDown = diMinus > diPlus and strongTrend
+
+// Volume Analysis
+volAvg = ta.sma(volume, 20)
+volRatio = volume / volAvg
+significantVolume = volRatio > volumeThreshold
+
+// Support and Resistance
+highestHigh = ta.highest(high, lookbackPeriod)
+lowestLow = ta.lowest(low, lookbackPeriod)
+priceBreakingUp = close > highestHigh[1]
+priceBreakingDown = close < lowestLow[1]
+
+// RSI Divergence
+rsiHigher = rsi > rsi[1] and rsi[1] > rsi[2]
+rsiLower = rsi < rsi[1] and rsi[1] < rsi[2]
+priceHigher = close > close[1] and close[1] > close[2]
+priceLower = close < close[1] and close[1] < close[2]
+bullishDivergence = priceLower and rsiHigher and rsi < 45
+bearishDivergence = priceHigher and rsiLower and rsi > 55
+
+// ============================================================================
+// MARKET-SPECIFIC ADJUSTMENTS
+// ============================================================================
+
+// For Stocks: Add gap consideration
+isGapUp = detectedMarket == "Stocks" and open > close[1] * 1.005  // 0.5% gap
+isGapDown = detectedMarket == "Stocks" and open < close[1] * 0.995
+
+// For Forex: Tighter conditions during low volatility
+isLowVolForex = detectedMarket == "Forex" and atr < atrAvg * 0.7
+
+// For Indices: Consider broader market sentiment
+isStrongMomentum = adx > adxThreshold * 1.3  // 30% above threshold
+
+// ============================================================================
+// SIGNAL CONDITIONS
+// ============================================================================
+
+// Price Action
+bullishCandle = close > open and (close - open) > (high - low) * 0.5
+bearishCandle = close < open and (open - close) > (high - low) * 0.5
+
+// EMA Signals
+emaStrongBullish = close > ema9 and ema9 > ema21 and ema21 > ema50 and (close - ema21) / close > 0.001
+emaStrongBearish = close < ema9 and ema9 < ema21 and ema21 < ema50 and (ema21 - close) / close > 0.001
+emaCrossBullish = ta.crossover(ema9, ema21) and ema21 > ema21[1]
+emaCrossBearish = ta.crossunder(ema9, ema21) and ema21 < ema21[1]
+
+// RSI Signals
+rsiBullish = rsi > 45 and rsi < 65 and rsi > rsi[1]
+rsiBearish = rsi < 55 and rsi > 35 and rsi < rsi[1]
+rsiOversoldBounce = rsi < rsiOversold and ta.crossover(rsi, rsiOversold)
+rsiOverboughtDrop = rsi > rsiOverbought and ta.crossunder(rsi, rsiOverbought)
+
+// MACD Signals
+macdBullish = macdLine > signalLine and macdHist > 0 and macdHist > macdHist[1]
+macdBearish = macdLine < signalLine and macdHist < 0 and macdHist < macdHist[1]
+macdCrossBullish = ta.crossover(macdLine, signalLine) and macdLine > macdLine[1]
+macdCrossBearish = ta.crossunder(macdLine, signalLine) and macdLine < macdLine[1]
+
+// Stochastic Signals
+stochBullish = stochK_value > stochD_value and stochK_value > 20 and stochK_value < 80
+stochBearish = stochK_value < stochD_value and stochK_value > 20 and stochK_value < 80
+stochOversoldCross = ta.crossover(stochK_value, stochD_value) and stochK_value < 25
+stochOverboughtCross = ta.crossunder(stochK_value, stochD_value) and stochK_value > 75
+
+// Bollinger Bands
+bbSqueeze = bbWidth < ta.sma(bbWidth, 20) * 0.8
+bbBullishExpansion = close > bbBasis and close > close[1] and not bbSqueeze
+bbBearishExpansion = close < bbBasis and close < close[1] and not bbSqueeze
+
+// Volume
+volumeBullish = volRatio > volumeThreshold and close > open and close > close[1]
+volumeBearish = volRatio > volumeThreshold and close < open and close < close[1]
+
+// Trend Alignment
+higherTF_bullish = close > ema200Line and ema200Line > ema200Line[5]
+higherTF_bearish = close < ema200Line and ema200Line < ema200Line[5]
+
+// ============================================================================
+// MOMENTUM CONFIRMATION
+// ============================================================================
+
+momentumBullish = 0
+momentumBullish := momentumBullish + (rsiBullish or rsiOversoldBounce ? 1 : 0)
+momentumBullish := momentumBullish + (macdBullish or macdCrossBullish ? 1 : 0)
+momentumBullish := momentumBullish + (stochBullish or stochOversoldCross ? 1 : 0)
+
+momentumBearish = 0
+momentumBearish := momentumBearish + (rsiBearish or rsiOverboughtDrop ? 1 : 0)
+momentumBearish := momentumBearish + (macdBearish or macdCrossBearish ? 1 : 0)
+momentumBearish := momentumBearish + (stochBearish or stochOverboughtCross ? 1 : 0)
+
+strongMomentumBullish = momentumBullish >= 2
+strongMomentumBearish = momentumBearish >= 2
+
+// ============================================================================
+// WEIGHTED CONFLUENCE SCORING
+// ============================================================================
+
+bullishScore = 0
+bullishScore := bullishScore + (emaStrongBullish ? 2 : emaCrossBullish ? 1 : 0)
+bullishScore := bullishScore + (rsiBullish ? 1 : rsiOversoldBounce ? 2 : bullishDivergence ? 2 : 0)
+bullishScore := bullishScore + (macdBullish ? 1 : macdCrossBullish ? 2 : 0)
+bullishScore := bullishScore + (stochBullish ? 1 : stochOversoldCross ? 2 : 0)
+bullishScore := bullishScore + (volumeBullish and significantVolume ? 2 : 0)
+bullishScore := bullishScore + (higherTF_bullish ? 1 : 0)
+bullishScore := bullishScore + (trendingUp ? 1 : 0)
+bullishScore := bullishScore + (bbBullishExpansion ? 1 : 0)
+
+bearishScore = 0
+bearishScore := bearishScore + (emaStrongBearish ? 2 : emaCrossBearish ? 1 : 0)
+bearishScore := bearishScore + (rsiBearish ? 1 : rsiOverboughtDrop ? 2 : bearishDivergence ? 2 : 0)
+bearishScore := bearishScore + (macdBearish ? 1 : macdCrossBearish ? 2 : 0)
+bearishScore := bearishScore + (stochBearish ? 1 : stochOverboughtCross ? 2 : 0)
+bearishScore := bearishScore + (volumeBearish and significantVolume ? 2 : 0)
+bearishScore := bearishScore + (higherTF_bearish ? 1 : 0)
+bearishScore := bearishScore + (trendingDown ? 1 : 0)
+bearishScore := bearishScore + (bbBearishExpansion ? 1 : 0)
+
+// ============================================================================
+// SIGNAL FILTERING
+// ============================================================================
+
+// Trend Filter
+trendFilter = true
+if requireTrendAlignment
+    trendFilter := (bullishScore > bearishScore and higherTF_bullish) or 
+                   (bearishScore > bullishScore and higherTF_bearish) or
+                   (bullishScore == 0 and bearishScore == 0)
+
+// Momentum Filter
+momentumFilter = true
+if requireMomentumConfirmation
+    momentumFilter := (bullishScore > bearishScore and strongMomentumBullish) or 
+                      (bearishScore > bullishScore and strongMomentumBearish) or
+                      (bullishScore == 0 and bearishScore == 0)
+
+// Choppy Market Filter
+choppyFilter = true
+if filterChopMarkets
+    choppyFilter := strongTrend or (bullishScore == 0 and bearishScore == 0)
+
+// Candle Filter
+candleFilter = true
+if requireCandleConfirmation
+    candleFilter := (bullishScore > bearishScore and bullishCandle) or (bearishScore > bullishScore and bearishCandle) or (bullishScore == 0 and bearishScore == 0)
+
+// Breakout Filter
+breakoutFilter = true
+if requireBreakout
+    breakoutFilter := (bullishScore > bearishScore and priceBreakingUp) or 
+                      (bearishScore > bullishScore and priceBreakingDown) or
+                      (bullishScore == 0 and bearishScore == 0)
+
+// Signal Cooldown
+var int lastSignalBar = na
+var string lastSignalType = ""
+
+canSignal = true
+if not na(lastSignalBar)
+    barsSinceSignal = bar_index - lastSignalBar
+    canSignal := barsSinceSignal >= cooldownBars
+
+// Market-specific filters
+marketFilter = true
+if detectedMarket == "Stocks"
+    // Avoid trading immediately after large gaps
+    marketFilter := not (isGapUp and bullishScore > bearishScore) and not (isGapDown and bearishScore > bullishScore)
+else if detectedMarket == "Forex"
+    // Avoid low volatility periods
+    marketFilter := not isLowVolForex
+
+// ============================================================================
+// FINAL SIGNAL GENERATION
+// ============================================================================
+
+buySignal = canSignal and sessionAllowed and marketFilter and bullishScore >= minConfluence and bearishScore < 3 and trendFilter and momentumFilter and choppyFilter and candleFilter and breakoutFilter and not highVolatility
+
+sellSignal = canSignal and sessionAllowed and marketFilter and bearishScore >= minConfluence and bullishScore < 3 and trendFilter and momentumFilter and choppyFilter and candleFilter and breakoutFilter and not highVolatility
+
+// Update signal tracking
+if buySignal
+    lastSignalBar := bar_index
+    lastSignalType := "BUY"
+    
+if sellSignal
+    lastSignalBar := bar_index
+    lastSignalType := "SELL"
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// Session Background Colors - must be at global scope
+forexSessionColor = showSessionBackground and enableSessionFilter and detectedMarket == "Forex" ?
+                   (isLondonNYOverlap ? color.new(color.green, 97) : 
+                    isLondonSession ? color.new(color.blue, 98) : 
+                    isNYSession ? color.new(color.orange, 98) : 
+                    isAsianSession ? color.new(color.red, 98) : na) : na
+
+stockSessionColor = showSessionBackground and enableSessionFilter and (detectedMarket == "Stocks" or detectedMarket == "Indices") ?
+                   (isStockMarketOpen ? color.new(color.green, 97) : color.new(color.gray, 98)) : na
+
+bgcolor(forexSessionColor, title="Forex Sessions")
+bgcolor(stockSessionColor, title="Market Hours")
+
+// EMAs
+plot(ema9, "EMA 9", color=color.new(color.aqua, 0), linewidth=1)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
+plot(ema50, "EMA 50", color=color.new(color.fuchsia, 0), linewidth=2)
+plot(ema200Line, "EMA 200", color=color.new(color.gray, 30), linewidth=3)
+
+// Bollinger Bands
+p1 = plot(bbUpper, "BB Upper", color=color.new(color.blue, 80), linewidth=1)
+p2 = plot(bbLower, "BB Lower", color=color.new(color.blue, 80), linewidth=1)
+fill(p1, p2, color=color.new(color.blue, 95))
+
+// Support/Resistance
+if showSupportResistance
+    var line resistanceLine = na
+    var line supportLine = na
+    
+    if barstate.islast
+        if not na(resistanceLine)
+            line.delete(resistanceLine)
+        if not na(supportLine)
+            line.delete(supportLine)
+            
+        resistanceLine := line.new(bar_index - lookbackPeriod, highestHigh, bar_index, highestHigh, 
+                                   color=color.new(color.red, 70), style=line.style_dashed, width=1)
+        supportLine := line.new(bar_index - lookbackPeriod, lowestLow, bar_index, lowestLow, 
+                               color=color.new(color.green, 70), style=line.style_dashed, width=1)
+
+// Signals
+plotshape(showLabels and buySignal, "Buy", shape.triangleup, location.belowbar, 
+         color=color.new(color.lime, 0), text="BUY\n▲", textcolor=color.white, size=size.normal)
+plotshape(showLabels and sellSignal, "Sell", shape.triangledown, location.abovebar, 
+         color=color.new(color.red, 0), text="SELL\n▼", textcolor=color.white, size=size.normal)
+
+// Trend background
+bgcolor(emaStrongBullish and strongTrend ? color.new(color.green, 97) : 
+        emaStrongBearish and strongTrend ? color.new(color.red, 97) : na)
+
+bgcolor(bbSqueeze ? color.new(color.yellow, 95) : na, title="BB Squeeze")
+
+// ============================================================================
+// TABLE DISPLAY
+// ============================================================================
+
+if showTable
+    var table signalTable = table.new(position.top_right, 3, 16, 
+                                       bgcolor=color.new(color.black, 85), 
+                                       frame_color=color.gray, 
+                                       frame_width=2, 
+                                       border_width=1, 
+                                       border_color=color.new(color.gray, 50))
+    
+    if barstate.islast
+        // Market Type Header
+        marketColor = detectedMarket == "Forex" ? color.new(color.blue, 50) :
+                      detectedMarket == "Stocks" ? color.new(color.green, 50) :
+                      detectedMarket == "Indices" ? color.new(color.orange, 50) :
+                      detectedMarket == "Commodities" ? color.new(color.yellow, 50) : color.new(color.purple, 50)
+        
+        // Session Info
+        sessionText = detectedMarket == "Forex" ? 
+                     (isLondonNYOverlap ? "🟢 LDN/NY" : isLondonSession ? "🔵 London" : 
+                      isNYSession ? "🟠 NY" : isAsianSession ? "🔴 Asian" : "⚪ Off") :
+                     detectedMarket == "Stocks" or detectedMarket == "Indices" ?
+                     (isStockMarketOpen ? "🟢 Open" : "🔴 Closed") : "24/7"
+
+        // Market Type Header - span across all 3 columns manually
+        table.cell(signalTable, 0, 0, "📊 " + detectedMarket, text_color=color.white, bgcolor=marketColor, text_size=size.normal)
+        table.cell(signalTable, 1, 0, "", bgcolor=marketColor)
+        table.cell(signalTable, 2, 0, "", bgcolor=marketColor)
+
+        // Session Info - span across all 3 columns manually
+        table.cell(signalTable, 0, 1, sessionText, text_color=sessionAllowed ? color.lime : color.red, 
+                text_size=size.small, text_halign=text.align_center)
+        table.cell(signalTable, 1, 1, "", bgcolor=color.new(color.black, 85))
+        table.cell(signalTable, 2, 1, "", bgcolor=color.new(color.black, 85))
+        
+        //table.cell(signalTable, 0, 1, sessionText, text_color=sessionAllowed ? color.lime : color.red, text_size=size.small, colspan=3, text_halign=text.align_center)
+        
+        // Headers
+        table.cell(signalTable, 0, 2, "Indicator", text_color=color.white, bgcolor=color.new(color.blue, 60), text_size=size.tiny)
+        table.cell(signalTable, 1, 2, "🟢", text_color=color.lime, bgcolor=color.new(color.blue, 60), text_size=size.tiny)
+        table.cell(signalTable, 2, 2, "🔴", text_color=color.red, bgcolor=color.new(color.blue, 60), text_size=size.tiny)
+        
+        // Indicators (rows 3-10)
+        table.cell(signalTable, 0, 3, "EMA", text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 3, emaStrongBullish ? "✓✓" : emaCrossBullish ? "✓" : "", 
+                  text_color=color.lime, bgcolor=emaStrongBullish ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 3, emaStrongBearish ? "✓✓" : emaCrossBearish ? "✓" : "", 
+                  text_color=color.red, bgcolor=emaStrongBearish ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        rsiText = str.tostring(math.round(rsi))
+        table.cell(signalTable, 0, 4, "RSI " + rsiText, text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 4, rsiBullish or rsiOversoldBounce or bullishDivergence ? "✓" : "", 
+                  text_color=color.lime, bgcolor=rsiBullish or rsiOversoldBounce ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 4, rsiBearish or rsiOverboughtDrop or bearishDivergence ? "✓" : "", 
+                  text_color=color.red, bgcolor=rsiBearish or rsiOverboughtDrop ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        table.cell(signalTable, 0, 5, "MACD", text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 5, macdBullish or macdCrossBullish ? "✓" : "", 
+                  text_color=color.lime, bgcolor=macdBullish or macdCrossBullish ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 5, macdBearish or macdCrossBearish ? "✓" : "", 
+                  text_color=color.red, bgcolor=macdBearish or macdCrossBearish ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        stochText = str.tostring(math.round(stochK_value))
+        table.cell(signalTable, 0, 6, "Stoch " + stochText, text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 6, stochBullish or stochOversoldCross ? "✓" : "", 
+                  text_color=color.lime, bgcolor=stochBullish or stochOversoldCross ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 6, stochBearish or stochOverboughtCross ? "✓" : "", 
+                  text_color=color.red, bgcolor=stochBearish or stochOverboughtCross ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        volText = str.tostring(volRatio, "#.#") + "x"
+        table.cell(signalTable, 0, 7, "Vol " + volText, text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 7, volumeBullish ? "✓" : "", 
+                  text_color=color.lime, bgcolor=volumeBullish and significantVolume ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 7, volumeBearish ? "✓" : "", 
+                  text_color=color.red, bgcolor=volumeBearish and significantVolume ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        adxText = str.tostring(math.round(adx))
+        table.cell(signalTable, 0, 8, "ADX " + adxText, text_color=strongTrend ? color.yellow : color.gray, text_size=size.tiny)
+        table.cell(signalTable, 1, 8, trendingUp ? "✓" : "", 
+                  text_color=color.lime, bgcolor=trendingUp ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 8, trendingDown ? "✓" : "", 
+                  text_color=color.red, bgcolor=trendingDown ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        table.cell(signalTable, 0, 9, "200 EMA", text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 9, higherTF_bullish ? "✓" : "", 
+                  text_color=color.lime, bgcolor=higherTF_bullish ? color.new(color.green, 70) : na, text_size=size.small)
+        table.cell(signalTable, 2, 9, higherTF_bearish ? "✓" : "", 
+                  text_color=color.red, bgcolor=higherTF_bearish ? color.new(color.red, 70) : na, text_size=size.small)
+        
+        bbCondition = bbSqueeze ? "Squeeze" : bbBullishExpansion ? "Bull" : bbBearishExpansion ? "Bear" : "Normal"
+        table.cell(signalTable, 0, 10, "BB: " + bbCondition, text_color=bbSqueeze ? color.yellow : color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 10, bbBullishExpansion ? "✓" : "", text_color=color.lime, text_size=size.small)
+        table.cell(signalTable, 2, 10, bbBearishExpansion ? "✓" : "", text_color=color.red, text_size=size.small)
+
+        // Separator
+        //table.cell(signalTable, 0, 11, "━━━━━━━", text_color=color.gray, text_size=size.tiny, colspan=3)
+        
+        // Settings Display
+        settingsText = "Min:" + str.tostring(minConfluence) + " ADX:" + str.tostring(adxThreshold) + 
+                      " Cool:" + str.tostring(cooldownBars)
+        //table.cell(signalTable, 0, 12, settingsText, text_color=color.gray, text_size=size.tiny, colspan=3, text_halign=text.align_center)
+        
+
+        // Separator
+        table.cell(signalTable, 0, 11, "━━━━━━━", text_color=color.gray, text_size=size.tiny)
+        table.cell(signalTable, 1, 11, "━━━", text_color=color.gray, text_size=size.tiny)
+        table.cell(signalTable, 2, 11, "━━━", text_color=color.gray, text_size=size.tiny)
+
+        // Settings Display
+        table.cell(signalTable, 0, 12, settingsText, text_color=color.gray, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(signalTable, 1, 12, "", bgcolor=color.new(color.black, 85))
+        table.cell(signalTable, 2, 12, "", bgcolor=color.new(color.black, 85))
+
+        // Filters
+        filtersActive = (requireTrendAlignment ? 1 : 0) + (requireMomentumConfirmation ? 1 : 0) + (filterChopMarkets ? 1 : 0) + (requireCandleConfirmation ? 1 : 0) + (requireBreakout ? 1 : 0)
+        filtersPassed = (trendFilter ? 1 : 0) + (momentumFilter ? 1 : 0) + (choppyFilter ? 1 : 0) + (candleFilter ? 1 : 0) + (breakoutFilter ? 1 : 0)
+        
+        filterColor = filtersPassed == filtersActive ? color.lime : filtersPassed > filtersActive/2 ? color.yellow : color.red
+        table.cell(signalTable, 0, 13, "Filters", text_color=color.white, text_size=size.tiny)
+        table.cell(signalTable, 1, 13, str.tostring(filtersPassed) + "/" + str.tostring(filtersActive), 
+                  text_color=filterColor, text_halign=text.align_center, text_size=size.small)
+        table.cell(signalTable, 2, 13, canSignal and sessionAllowed ? "✓" : "⏳", 
+                  text_color=canSignal and sessionAllowed ? color.lime : color.orange, text_halign=text.align_center, text_size=size.small)
+        
+        // Scores
+        table.cell(signalTable, 0, 14, "SCORE", text_color=color.yellow, text_size=size.small)
+        table.cell(signalTable, 1, 14, str.tostring(bullishScore), 
+                  text_color=color.white, text_size=size.large, 
+                  bgcolor=bullishScore >= minConfluence ? color.new(color.green, 60) : color.new(color.gray, 80))
+        table.cell(signalTable, 2, 14, str.tostring(bearishScore), 
+                  text_color=color.white, text_size=size.large,
+                  bgcolor=bearishScore >= minConfluence ? color.new(color.red, 60) : color.new(color.gray, 80))
+        
+        // Final Signal
+        table.cell(signalTable, 0, 15, "⚡ SIGNAL", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+        if buySignal
+            table.cell(signalTable, 1, 15, "BUY", text_color=color.black, text_size=size.large, 
+                      bgcolor=color.new(color.lime, 0))
+            table.cell(signalTable, 2, 15, "", bgcolor=color.new(color.gray, 90))
+        else if sellSignal
+            table.cell(signalTable, 1, 15, "", bgcolor=color.new(color.gray, 90))
+            table.cell(signalTable, 2, 15, "SELL", text_color=color.white, text_size=size.large, 
+                      bgcolor=color.new(color.red, 0))
+        else
+            waitReason = not sessionAllowed ? "Session" : not canSignal ? "Cooldown" : not choppyFilter ? "Choppy" : bullishScore < minConfluence and bearishScore < minConfluence ? "Score" : "WAIT"
+
+            // Final Signal - wait reason spanning 2 columns
+            table.cell(signalTable, 1, 15, waitReason, text_color=color.gray, text_halign=text.align_center, text_size=size.small)
+            table.cell(signalTable, 2, 15, "", bgcolor=color.new(color.gray, 90))
+
+// ============================================================================
+// ALERTS 
+// ============================================================================
+
+if buySignal
+    alert("🟢 BUY Signal: " + detectedMarket, alert.freq_once_per_bar)
+
+if sellSignal
+    alert("🔴 SELL Signal: " + detectedMarket, alert.freq_once_per_bar)
+
+plot(bullishScore, "Bull Score", display=display.data_window)
+plot(bearishScore, "Bear Score", display=display.data_window)
+plot(adx, "ADX", display=display.data_window)

@@ -1,0 +1,356 @@
+//@version=6
+// RSI Divergence Strategy v6
+// Solid RSI pivots + improved divergence engine + RSI@pivot gating
+// + strength/volume filter (with optional volume gate)
+// + rigid stop-loss + activatable trailing + horizontal RSI gradient
+// ----------------------------------------------------------------------------
+// Credits / Attribution
+// • RSI (Relative Strength Index) by J. Welles Wilder Jr. (1978),
+//   "New Concepts in Technical Trading Systems".
+// • Divergence idea and an earlier reference implementation by
+//   eemani123: https://www.tradingview.com/script/qSLcZSyw-RSI-Divergence-Indicator-strategy/
+//
+// What’s new vs. the reference script
+// • Reworked, more robust divergence engine using explicit L/R RSI pivots,
+//   bar-window checks, and line throttling to reduce clutter.
+// • RSI-at-pivot gating (e.g., long only if RSI at the bullish pivot ≤ threshold;
+//   short only if RSI at the bearish pivot ≥ threshold).
+// • Strength filter normalized by volume (price % change × RSI delta × volume ratio)
+//   to filter out weak/noisy setups.
+// • Optional volume gating: signals can be required to pass a user-controlled
+//   volume baseline ratio before they are drawn/used.
+// • Optional delayed entries after a divergence (bars-since-divergence).
+// • Rigid stop-loss plus activatable trailing that anchors to fresh extremes.
+// • Horizontal RSI gradient that hugs the curve without gaps.
+// • English-only inputs, titles, and variables for Public Library compliance.
+//
+// Publishing notes
+// • Educational tool, NOT financial advice. No performance promises.
+// • Pivots require confirmation; the most recent forming pivot can shift until
+//   confirmed (typical pivot behavior).
+// • Open-source for study and improvement; please keep credits if you fork.
+//
+// Author: tagstrading 2025
+// © tagstrading 2025. Licensed for use on TradingView with attribution.
+// ============================================================================
+
+strategy(
+     title="RSI Divergence Strategy v6 ",
+     shorttitle="RSI Divergence Strategy v6",
+     overlay=false,
+     initial_capital=200,
+     default_qty_type=strategy.cash,
+     default_qty_value=100,
+     pyramiding=1,                   // keep trailing/SL behavior predictable
+     calc_on_every_tick=true)
+
+// ============================== Inputs ======================================
+rsiLen          = input.int(9,  "RSI Period", minval=1)
+src             = input.source(close, "RSI Source")
+lbR             = input.int(3,  "Pivot Lookback Right",  minval=1)
+lbL             = input.int(1,  "Pivot Lookback Left",   minval=1)
+
+rangeUpper      = input.int(60, "Max bars between pivot pair")
+rangeLower      = input.int(5,  "Min bars between pivot pair")
+
+showRegular     = input.bool(true,  "Detect regular divergences")
+showHidden      = input.bool(true,  "Detect hidden divergences")
+
+// RSI thresholds for entries
+rsiLongMax      = input.int(30, "RSI max for LONG (<=)",  minval=1, maxval=100)
+rsiShortMin     = input.int(70, "RSI min for SHORT (>=)", minval=1, maxval=100)
+
+// Risk management
+trailActivate   = input.float(2.0, "Activate trailing when gain >= (%)", step=0.1)
+trailPerc       = input.float(1.0, "Trailing (%) once activated", step=0.1)
+slPerc          = input.float(4.5, "Rigid stop loss (%)", minval=0.1, step=0.1)
+
+// Strength / Volume filter
+volLen          = input.int(20,  "Volume SMA length", minval=1)
+volNormLen      = input.int(200, "Volume baseline SMA", minval=10)
+minStrength     = input.float(0.0,"Min divergence strength (0 = off)", minval=0.0, step=0.5)
+
+// Drawing controls
+minDrawSep      = input.int(20, "Min bars between drawn lines (same side)", minval=1)
+maxLines        = input.int(100,"Max lines kept", minval=10, maxval=400)
+plotStops       = input.bool(false,"Plot price stops in RSI panel (visual only)")
+
+// Entry mode
+useDivergencesForEntries = input.bool(true, "Use divergences for entries (ON) or RSI-only (OFF)")
+divDelayBars             = input.int(0,    "Entry delay after divergence (bars)", minval=0)
+
+// ============================== Colors ======================================
+colRSI         = color.new(color.purple, 0)
+colGrid        = color.new(color.gray,   0)
+colBull        = color.new(color.green,  0)
+colBear        = color.new(color.red,    0)
+colHiddenBull  = color.new(color.green, 70)
+colHiddenBear  = color.new(color.red,   70)
+colText        = color.white
+
+// ============================== Base RSI ====================================
+rsiVal  = ta.rsi(src, rsiLen)
+rsiPlot = plot(series=rsiVal, title="RSI", color=colRSI, linewidth=2)
+hOB     = hline(price=70, title="Overbought", color=colGrid, linestyle=hline.style_dotted, linewidth=1)
+hOS     = hline(price=30, title="Oversold",   color=colGrid, linestyle=hline.style_dotted, linewidth=1)
+fill(hOB, hOS, color=color.new(color.purple, 90))
+
+// ======================= RSI Pivots (bars & values) ==========================
+pl = ta.pivotlow(rsiVal,  lbL, lbR)     // RSI value at LOW pivot
+ph = ta.pivothigh(rsiVal, lbL, lbR)     // RSI value at HIGH pivot
+
+int plBar = na
+if not na(pl)
+    plBar := bar_index - lbR
+
+int phBar = na
+if not na(ph)
+    phBar := bar_index - lbR
+
+// LOW pivot state
+var int   lastPLBar    = na
+var float lastPLRsi    = na
+var float lastPLPrice  = na
+var int   prevPLBar    = na
+var float prevPLRsi    = na
+var float prevPLPrice  = na
+
+// HIGH pivot state
+var int   lastPHBar    = na
+var float lastPHRsi    = na
+var float lastPHPrice  = na
+var int   prevPHBar    = na
+var float prevPHRsi    = na
+var float prevPHPrice  = na
+
+// Update LOW
+if not na(pl)
+    prevPLBar   := lastPLBar
+    prevPLRsi   := lastPLRsi
+    prevPLPrice := lastPLPrice
+    lastPLBar   := plBar
+    lastPLRsi   := pl
+    lastPLPrice := low[lbR]
+
+// Update HIGH
+if not na(ph)
+    prevPHBar   := lastPHBar
+    prevPHRsi   := lastPHRsi
+    prevPHPrice := lastPHPrice
+    lastPHBar   := phBar
+    lastPHRsi   := ph
+    lastPHPrice := high[lbR]
+
+// ======================= Strength normalized by volume =======================
+volSma     = ta.sma(volume, volLen)
+volBaseSma = ta.sma(volume, volNormLen)
+volFactor  = nz(volSma / volBaseSma, 1.0)
+
+// Helpers
+inRange(b1, b2) =>
+    dist = math.abs(b1 - b2)
+    (dist >= rangeLower) and (dist <= rangeUpper)
+
+strengthPair(prevPx, nowPx, prevRsi, nowRsi) =>
+    pxChangePct = math.abs((nowPx - prevPx) / prevPx) * 100.0
+    rsiDelta    = math.abs(nowRsi - prevRsi)
+    pxChangePct * rsiDelta * volFactor
+
+// =========================== Line arrays & throttling ========================
+var line[] bullLines       = array.new_line()
+var line[] bearLines       = array.new_line()
+var int    lastDrawBullBar = na
+var int    lastDrawBearBar = na
+
+drawLine(arr, x1, y1, x2, y2, col) =>
+    ln = line.new(x1, y1, x2, y2, xloc=xloc.bar_index, extend=extend.none, color=col, width=2)
+    array.push(arr, ln)
+    if array.size(arr) > maxLines
+        line.delete(array.shift(arr))
+
+// =================== Divergence event flags (for entry timing) ==============
+var bool newDivBull = false
+var bool newDivBear = false
+newDivBull := false
+newDivBear := false
+
+// ============================== Bullish side ================================
+if not na(lastPLBar) and not na(prevPLBar) and inRange(lastPLBar, prevPLBar)
+    isRegularBull = showRegular and (lastPLPrice < prevPLPrice) and (lastPLRsi > prevPLRsi) // LL + HL
+    isHiddenBull  = showHidden  and (lastPLPrice > prevPLPrice) and (lastPLRsi < prevPLRsi) // HL + LL
+    if isRegularBull or isHiddenBull
+        sB       = strengthPair(prevPLPrice, lastPLPrice, prevPLRsi, lastPLRsi)
+        passStr  = (minStrength <= 0.0) or (sB >= minStrength)
+        passRSI  = lastPLRsi <= rsiLongMax
+        canDrawB = na(lastDrawBullBar) or (lastPLBar - lastDrawBullBar >= minDrawSep)
+        if passStr and canDrawB
+            drawLine(bullLines, prevPLBar, prevPLRsi, lastPLBar, lastPLRsi, isHiddenBull ? colHiddenBull : colBull)
+            label.new(x=lastPLBar, y=lastPLRsi + 1, text=(isHiddenBull ? "H Bull" : "Bull"),
+                      xloc=xloc.bar_index, style=label.style_label_up, color=colBull, textcolor=colText)
+            lastDrawBullBar := lastPLBar
+        if passStr
+            newDivBull := true
+
+// ============================== Bearish side ================================
+if not na(lastPHBar) and not na(prevPHBar) and inRange(lastPHBar, prevPHBar)
+    isRegularBear = showRegular and (lastPHPrice > prevPHPrice) and (lastPHRsi < prevPHRsi) // HH + LH
+    isHiddenBear  = showHidden  and (lastPHPrice < prevPHPrice) and (lastPHRsi > prevPHRsi) // LH + HH
+    if isRegularBear or isHiddenBear
+        sS       = strengthPair(prevPHPrice, lastPHPrice, prevPHRsi, lastPHRsi)
+        passStrS = (minStrength <= 0.0) or (sS >= minStrength)
+        passRSIS = lastPHRsi >= rsiShortMin
+        canDrawS = na(lastDrawBearBar) or (lastPHBar - lastDrawBearBar >= minDrawSep)
+        if passStrS and canDrawS
+            drawLine(bearLines, prevPHBar, prevPHRsi, lastPHBar, lastPHRsi, isHiddenBear ? colHiddenBear : colBear)
+            label.new(x=lastPHBar, y=lastPHRsi - 1, text=(isHiddenBear ? "H Bear" : "Bear"),
+                      xloc=xloc.bar_index, style=label.style_label_down, color=colBear, textcolor=colText)
+            lastDrawBearBar := lastPHBar
+        if passStrS
+            newDivBear := true
+
+// ============================== Entry logic =================================
+rsiLongNowOK  = rsiVal <= rsiLongMax
+rsiShortNowOK = rsiVal >= rsiShortMin
+
+bssBull = ta.barssince(newDivBull)
+bssBear = ta.barssince(newDivBear)
+
+bool longSignal  = false
+bool shortSignal = false
+
+if useDivergencesForEntries
+    longImmediate  = (divDelayBars == 0) and newDivBull and rsiLongNowOK
+    shortImmediate = (divDelayBars == 0) and newDivBear and rsiShortNowOK
+    longDelayed    = (divDelayBars > 0) and (bssBull >= divDelayBars) and not na(bssBull) and rsiLongNowOK
+    shortDelayed   = (divDelayBars > 0) and (bssBear >= divDelayBars) and not na(bssBear) and rsiShortNowOK
+    longSignal  := longImmediate  or longDelayed
+    shortSignal := shortImmediate or shortDelayed
+else
+    longSignal  := rsiLongNowOK
+    shortSignal := rsiShortNowOK
+
+// Avoid simultaneous signals: prefer the one farther from 50
+if longSignal and shortSignal
+    longBias  = 50 - rsiVal
+    shortBias = rsiVal - 50
+    longSignal  := longBias  > shortBias
+    shortSignal := shortBias > longBias
+
+// Entries
+if longSignal
+    strategy.entry(id="RSI_LONG", direction=strategy.long)
+if shortSignal
+    strategy.entry(id="RSI_SHORT", direction=strategy.short)
+
+// ================== Risk management: rigid SL + activatable trailing ========
+var float hiSinceEntry    = na
+var float loSinceEntry    = na
+var bool  trailActiveL    = false
+var bool  trailActiveS    = false
+var float trailAnchorHigh = na
+var float trailAnchorLow  = na
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avg     = strategy.position_avg_price
+
+// Reset when flat
+if strategy.position_size == 0
+    hiSinceEntry    := na
+    loSinceEntry    := na
+    trailActiveL    := false
+    trailActiveS    := false
+    trailAnchorHigh := na
+    trailAnchorLow  := na
+
+// Track intrabar extremes since ENTRY
+if inLong
+    hiSinceEntry := na(hiSinceEntry) ? high : math.max(hiSinceEntry, high)
+if inShort
+    loSinceEntry := na(loSinceEntry) ? low  : math.min(loSinceEntry,  low)
+
+// Activation by intrabar extremes
+gainFromHigh = inLong  ? (high - avg) / avg * 100.0 : 0.0
+gainFromLow  = inShort ? (avg  - low)  / avg * 100.0 : 0.0
+
+if inLong and not trailActiveL and gainFromHigh >= trailActivate
+    trailActiveL    := true
+    trailAnchorHigh := hiSinceEntry
+
+if inShort and not trailActiveS and gainFromLow >= trailActivate
+    trailActiveS   := true
+    trailAnchorLow := loSinceEntry
+
+// Move anchors only on new extremes
+if inLong  and trailActiveL
+    trailAnchorHigh := math.max(trailAnchorHigh, high)
+if inShort and trailActiveS
+    trailAnchorLow  := math.min(trailAnchorLow,  low)
+
+// Stops
+longRigidStop  = inLong  ? avg * (1.0 - slPerc/100.0) : na
+shortRigidStop = inShort ? avg * (1.0 + slPerc/100.0) : na
+
+longTrailStop  = (inLong  and trailActiveL and not na(trailAnchorHigh)) ? trailAnchorHigh * (1.0 - trailPerc/100.0) : na
+shortTrailStop = (inShort and trailActiveS and not na(trailAnchorLow))  ? trailAnchorLow  * (1.0 + trailPerc/100.0) : na
+
+finalLongStop  = inLong  ? (na(longTrailStop)  ? longRigidStop  : math.max(longRigidStop,  longTrailStop)) : na
+finalShortStop = inShort ? (na(shortTrailStop) ? shortRigidStop : math.min(shortRigidStop, shortTrailStop)) : na
+
+strategy.exit(id="LX", from_entry="RSI_LONG",  stop=finalLongStop)
+strategy.exit(id="SX", from_entry="RSI_SHORT", stop=finalShortStop)
+
+// ================== Optional: draw stops inside RSI pane ====================
+plot(series=(plotStops ? finalLongStop  : na), title="Stop LONG (price)",  color=color.new(color.green, 0), style=plot.style_linebr)
+plot(series=(plotStops ? finalShortStop : na), title="Stop SHORT (price)", color=color.new(color.red,   0), style=plot.style_linebr)
+
+// ================== Smooth horizontal banded gradient around RSI ============
+// Upper bands
+u70_75_top = plot(rsiVal > 70 ? math.min(rsiVal, 75) : na, display=display.none)
+u70_75_bot = plot(rsiVal > 70 ? 70 : na,                   display=display.none)
+fill(u70_75_top, u70_75_bot, color=color.new(color.green, 88), title="RSI 70–75")
+
+u75_80_top = plot(rsiVal > 75 ? math.min(rsiVal, 80) : na, display=display.none)
+u75_80_bot = plot(rsiVal > 75 ? 75 : na,                   display=display.none)
+fill(u75_80_top, u75_80_bot, color=color.new(color.green, 78), title="RSI 75–80")
+
+u80_85_top = plot(rsiVal > 80 ? math.min(rsiVal, 85) : na, display=display.none)
+u80_85_bot = plot(rsiVal > 80 ? 80 : na,                   display=display.none)
+fill(u80_85_top, u80_85_bot, color=color.new(color.green, 68), title="RSI 80–85")
+
+u85_90_top = plot(rsiVal > 85 ? math.min(rsiVal, 90) : na, display=display.none)
+u85_90_bot = plot(rsiVal > 85 ? 85 : na,                   display=display.none)
+fill(u85_90_top, u85_90_bot, color=color.new(color.green, 58), title="RSI 85–90")
+
+u90_95_top = plot(rsiVal > 90 ? math.min(rsiVal, 95) : na, display=display.none)
+u90_95_bot = plot(rsiVal > 90 ? 90 : na,                   display=display.none)
+fill(u90_95_top, u90_95_bot, color=color.new(color.green, 48), title="RSI 90–95")
+
+u95_100_top = plot(rsiVal > 95 ? math.min(rsiVal, 100) : na, display=display.none)
+u95_100_bot = plot(rsiVal > 95 ? 95 : na,                     display=display.none)
+fill(u95_100_top, u95_100_bot, color=color.new(color.green, 40), title="RSI 95–100")
+
+// Lower bands
+d30_25_top = plot(rsiVal < 30 ? 30 : na,                       display=display.none)
+d30_25_bot = plot(rsiVal < 30 ? math.max(rsiVal, 25) : na,     display=display.none)
+fill(d30_25_top, d30_25_bot, color=color.new(color.red, 88), title="RSI 30–25")
+
+d25_20_top = plot(rsiVal < 25 ? 25 : na,                       display=display.none)
+d25_20_bot = plot(rsiVal < 25 ? math.max(rsiVal, 20) : na,     display=display.none)
+fill(d25_20_top, d25_20_bot, color=color.new(color.red, 78), title="RSI 25–20")
+
+d20_15_top = plot(rsiVal < 20 ? 20 : na,                       display=display.none)
+d20_15_bot = plot(rsiVal < 20 ? math.max(rsiVal, 15) : na,     display=display.none)
+fill(d20_15_top, d20_15_bot, color=color.new(color.red, 68), title="RSI 20–15")
+
+d15_10_top = plot(rsiVal < 15 ? 15 : na,                       display=display.none)
+d15_10_bot = plot(rsiVal < 15 ? math.max(rsiVal, 10) : na,     display=display.none)
+fill(d15_10_top, d15_10_bot, color=color.new(color.red, 58), title="RSI 15–10")
+
+d10_05_top = plot(rsiVal < 10 ? 10 : na,                       display=display.none)
+d10_05_bot = plot(rsiVal < 10 ? math.max(rsiVal, 5)  : na,     display=display.none)
+fill(d10_05_top, d10_05_bot, color=color.new(color.red, 50), title="RSI 10–5")
+
+d05_00_top = plot(rsiVal < 5 ? 5 : na,                         display=display.none)
+d05_00_bot = plot(rsiVal < 5 ? math.max(rsiVal, 0) : na,       display=display.none)
+fill(d05_00_top, d05_00_bot, color=color.new(color.red, 44), title="RSI 5–0")

@@ -1,0 +1,550 @@
+//@version=5
+indicator("Mandelbrot-Fibonacci Cascade Vortex (MFCV)", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ========================================
+// DETAILED INPUT SYSTEM
+// ========================================
+group_mandelbrot = "🌊 Mandelbrot Cascade Parameters"
+cascade_depth = input.int(5, "Cascade Levels", minval=3, maxval=8, group=group_mandelbrot, tooltip="Volatility bands (3-4: clean | 5-6: balanced | 7-8: detailed) • CRYPTO: 5-7 | INDICES: 4-5 | FOREX: 3-4 • Higher TF = more levels")
+hurst_period = input.int(100, "Hurst Exponent Period", minval=20, maxval=200, group=group_mandelbrot, tooltip="Trend persistence lookback • CRYPTO: 50-100 | INDICES: 80-120 | FOREX: 100-150 • Scalping: 20-50 | Swing: 100-150")
+volatility_cascade_factor = input.float(1.618, "Cascade Ratio", minval=1.0, maxval=3.0, step=0.1, group=group_mandelbrot, tooltip="Band width multiplier • CRYPTO: 1.618-2.618 | INDICES: 1.382-1.618 | FOREX: 1.0-1.382 • Trending: higher | Ranging: lower")
+fractal_memory = input.int(89, "Fractal Memory", minval=21, maxval=233, group=group_mandelbrot, tooltip="Fib retracement lookback • CRYPTO: 34-55 | INDICES: 55-89 | FOREX: 89-144 • Use Fib numbers: 21,34,55,89,144,233")
+group_fibonacci = "🌀 Fibonacci Vortex Settings"
+spiral_periods = input.string("8,13,21,34,55", "Spiral Periods", group=group_fibonacci, tooltip="Fib spiral layers • Fast: '5,8,13,21,34' | Standard: '8,13,21,34,55' | Swing: '13,21,34,55,89' • CRYPTO: use faster")
+vortex_rotation_speed = input.float(0.618, "Rotation Speed", minval=0.1, maxval=2.0, step=0.1, group=group_fibonacci, tooltip="Spiral oscillation speed • CRYPTO: 0.786-1.2 | INDICES: 0.5-0.786 | FOREX: 0.382-0.618 • Higher = more signals")
+volume_amplification = input.bool(true, "Volume Amplification", group=group_fibonacci, tooltip="Volume-based spiral expansion • Enable for: Stocks, Crypto, Index futures • Disable for: Forex, overnight sessions")
+// Add this input to your visual settings group
+fib_update_bars = input.int(50, "Fib Update Frequency", minval=10, maxval=200, group=group_fibonacci, tooltip="Bars between Fibonacci level updates • Lower = more responsive • Higher = more stable")
+group_visual = "🎨 Visual Settings"
+show_cascade_bands = input.bool(true, "Cascade Bands", group=group_visual,tooltip="Show/hide volatility bands • Disable if chart is cluttered")
+show_vortex_spirals = input.bool(true, "Vortex Spirals", group=group_visual, tooltip="Show/hide Fibonacci spirals • Disable for cleaner chart")
+show_fibonacci_levels = input.bool(true, "Fibonacci Levels", group=group_visual, tooltip="Show/hide Fib retracements (23.6%, 38.2%, 50%, 61.8%, 78.6%)")
+show_confluence_zones = input.bool(true, "Highlight Confluence", group=group_visual, tooltip="Highlight vortex/cascade convergence zones • Best for finding S/R levels")
+cascade_transparency = input.int(85, "Band Transparency", minval=50, maxval=95, group=group_visual, tooltip="Band opacity (50-70: bold | 70-85: balanced | 85-95: subtle)")
+vortex_style = input.string("Circles", "Vortex Display Style", options=["Lines", "Circles", "Cross"], group=group_visual, tooltip="Spiral visual style • Lines: smooth | Circles: clear points | Dots: minimal | Cross: precise")
+group_dashboard = "📊 Dashboard Settings"
+show_main_dashboard = input.bool(true, "Fractal Dashboard", group=group_dashboard, tooltip="Show/hide main metrics dashboard")
+show_vortex_metrics = input.bool(true, "Vortex Metrics", group=group_dashboard, tooltip="Show/hide vortex deviation panel")
+show_theory_guide = input.bool(true, "Theory Guide", group=group_dashboard, tooltip="Show/hide educational theory panel")
+dashboard_size = input.string("Normal", "Dashboard Size", options=["Small", "Normal", "Large"], group=group_dashboard, tooltip="Dashboard text size")
+group_colors = "🎨 Color Themes"
+color_scheme = input.string("Fractal", "Color Theme", options=["Fractal", "Golden", "Plasma", "Cosmic", "Matrix", "Fire"], group=group_colors, tooltip="Visual color theme • Fractal: balanced | Golden: warm | Plasma: vibrant | Cosmic: dark | Matrix: green | Fire: heat map")
+
+// ========================================
+// COLOR SYSTEM
+// ========================================
+get_theme_colors() =>
+    switch color_scheme
+        "Fractal" => [#4A90E2, #9B59B6, #F39C12, #E74C3C, #1ABC9C, #34495E]
+        "Golden" => [#FFD700, #FFA500, #FF8C00, #FF6347, #FFB347, #FFDB58]
+        "Plasma" => [#FF006E, #FB5607, #FFBE0B, #8338EC, #3A86FF, #FF4365]
+        "Cosmic" => [#00D9FF, #00A8CC, #0080FF, #4169E1, #6A5ACD, #9370DB]
+        "Matrix" => [#00FF41, #008F11, #003B00, #00FF41, #00D100, #00A100]
+        "Fire" => [#FF0000, #FF4500, #FF6347, #FF8C00, #FFA500, #FFD700]
+        => [#4A90E2, #9B59B6, #F39C12, #E74C3C, #1ABC9C, #34495E]
+
+[col_primary, col_secondary, col_accent, col_warning, col_danger, col_info] = get_theme_colors()
+
+// ========================================
+// PARSE FIBONACCI PERIODS
+// ========================================
+parse_fibonacci_periods(input_string) =>
+    parts = str.split(input_string, ",")
+    periods = array.new<int>()
+    for part in parts
+        if str.length(str.trim(part)) > 0
+            array.push(periods, int(str.tonumber(str.trim(part))))
+    periods
+
+fib_periods = parse_fibonacci_periods(spiral_periods)
+
+// ========================================
+// MANDELBROT CALCULATIONS WITH DYNAMIC RESPONSE
+// ========================================
+calculate_hurst_exponent(src, length) =>
+    mean = ta.sma(src, length)
+    cumsum = 0.0, max_cumsum = 0.0, min_cumsum = 0.0
+    
+    for i = 0 to length - 1
+        cumsum := cumsum + (src[i] - mean)
+        max_cumsum := math.max(max_cumsum, cumsum)
+        min_cumsum := math.min(min_cumsum, cumsum)
+    
+    R = max_cumsum - min_cumsum
+    S = ta.stdev(src, length)
+    RS = S != 0 ? R / S : 0
+    H = RS > 0 ? math.log(RS) / math.log(length / 2) : 0.5
+    math.max(0, math.min(1, H))
+
+// Calculate with dynamic period
+hurst = calculate_hurst_exponent(close, hurst_period)
+fractal_dimension = 2 - hurst
+
+// ========================================
+// VOLATILITY CASCADE WITH VISIBLE IMPACT
+// ========================================
+base_volatility = ta.atr(20)
+cascade_volatilities = array.new<float>()
+
+// Create cascade levels with increasing volatility
+for i = 0 to cascade_depth - 1
+    cascade_vol = base_volatility * math.pow(volatility_cascade_factor, i)
+    array.push(cascade_volatilities, cascade_vol)
+
+// ======================================== 
+// DYNAMIC VORTEX CALCULATIONS 
+// ======================================== 
+calculate_vortex_value(src, index, speed, vol_amp, period) => 
+    base_movement = math.sin((index * speed) / period) * ta.atr(period)
+    volume_factor = vol_amp ? 1 + (volume / ta.sma(volume, 50) - 1) * 0.5 : 1
+    src + base_movement * volume_factor
+
+// Calculate all vortex values with fixed periods
+vortex_8 = calculate_vortex_value(close, bar_index, vortex_rotation_speed, volume_amplification, 8)
+vortex_13 = calculate_vortex_value(close, bar_index, vortex_rotation_speed, volume_amplification, 13)
+vortex_21 = calculate_vortex_value(close, bar_index, vortex_rotation_speed, volume_amplification, 21)
+vortex_34 = calculate_vortex_value(close, bar_index, vortex_rotation_speed, volume_amplification, 34)
+vortex_55 = calculate_vortex_value(close, bar_index, vortex_rotation_speed, volume_amplification, 55)
+
+// Store period values for display
+period_0 = array.size(fib_periods) > 0 ? array.get(fib_periods, 0) : 8
+period_1 = array.size(fib_periods) > 1 ? array.get(fib_periods, 1) : 13
+period_2 = array.size(fib_periods) > 2 ? array.get(fib_periods, 2) : 21
+period_3 = array.size(fib_periods) > 3 ? array.get(fib_periods, 3) : 34
+period_4 = array.size(fib_periods) > 4 ? array.get(fib_periods, 4) : 55
+
+// Store in array with explicit float type
+vortex_values = array.new<float>()
+array.push(vortex_values, vortex_8)
+array.push(vortex_values, vortex_13)
+array.push(vortex_values, vortex_21)
+array.push(vortex_values, vortex_34)
+array.push(vortex_values, vortex_55)
+
+// ========================================
+// SIGNAL GENERATION
+// ========================================
+// Dynamic thresholds based on inputs
+hurst_threshold = 0.5 + (hurst_period - 100) * 0.001
+volatility_expansion = base_volatility > ta.sma(base_volatility, 50) * (1 + (cascade_depth - 5) * 0.05)
+
+// Market state variables
+trend_persistence = hurst > 0.65
+mean_reversion_zone = hurst < 0.35
+
+// Vortex alignment check - less strict for fractal
+vortex_bullish = vortex_8 > close and vortex_13 > close
+vortex_bearish = vortex_8 < close and vortex_13 < close
+
+// Calculate trend strength
+trend_strength = math.abs(hurst - 0.5) * 2
+
+// Pre-calculate indicators for consistency
+rsi_value = ta.rsi(close, 14)
+sma_50 = ta.sma(close, 50)
+
+// Add signal cooldown to prevent spam
+var int last_fractal_signal = 0
+var int last_cascade_signal = 0
+signal_cooldown = 15  // Reduced from 20
+
+// Much stricter signal conditions
+fractal_signal = false
+cascade_signal = false
+
+// FRACTAL SIGNAL - Less strict
+// Fire if trend is moderately strong OR volatility expanding with vortex confirmation
+if (bar_index - last_fractal_signal) > signal_cooldown
+    if (hurst > 0.65 and volatility_expansion) or 
+       (hurst < 0.35 and rsi_value < 35) or
+       (trend_strength > 0.4 and vortex_bullish and rsi_value < 70)
+        fractal_signal := true
+        last_fractal_signal := bar_index
+
+// CASCADE SIGNAL - More reasonable conditions
+// Fire on trend exhaustion or strong reversal setups
+if (bar_index - last_cascade_signal) > signal_cooldown
+    if (hurst > 0.6 and close > sma_50 and rsi_value > 65 and vortex_bearish) or
+       (hurst < 0.4 and close < sma_50 and rsi_value < 35 and vortex_bullish) or
+       (volatility_expansion and trend_strength > 0.6 and math.abs(close - sma_50) / sma_50 > 0.02)
+        cascade_signal := true
+        last_cascade_signal := bar_index
+
+// ========================================
+// CASCADE BANDS VISUALIZATION
+// ========================================
+// Pre-define plot titles as constants
+upper_0_title = "Upper 0"
+upper_1_title = "Upper 1"
+upper_2_title = "Upper 2"
+upper_3_title = "Upper 3"
+upper_4_title = "Upper 4"
+
+lower_0_title = "Lower 0"
+lower_1_title = "Lower 1"
+lower_2_title = "Lower 2"
+lower_3_title = "Lower 3"
+lower_4_title = "Lower 4"
+
+// Calculate cascade levels
+cascade_upper_0 = show_cascade_bands and array.size(cascade_volatilities) > 0 ? close + array.get(cascade_volatilities, 0) : na
+cascade_lower_0 = show_cascade_bands and array.size(cascade_volatilities) > 0 ? close - array.get(cascade_volatilities, 0) : na
+cascade_upper_1 = show_cascade_bands and array.size(cascade_volatilities) > 1 ? close + array.get(cascade_volatilities, 1) : na
+cascade_lower_1 = show_cascade_bands and array.size(cascade_volatilities) > 1 ? close - array.get(cascade_volatilities, 1) : na
+cascade_upper_2 = show_cascade_bands and array.size(cascade_volatilities) > 2 ? close + array.get(cascade_volatilities, 2) : na
+cascade_lower_2 = show_cascade_bands and array.size(cascade_volatilities) > 2 ? close - array.get(cascade_volatilities, 2) : na
+cascade_upper_3 = show_cascade_bands and array.size(cascade_volatilities) > 3 ? close + array.get(cascade_volatilities, 3) : na
+cascade_lower_3 = show_cascade_bands and array.size(cascade_volatilities) > 3 ? close - array.get(cascade_volatilities, 3) : na
+cascade_upper_4 = show_cascade_bands and array.size(cascade_volatilities) > 4 ? close + array.get(cascade_volatilities, 4) : na
+cascade_lower_4 = show_cascade_bands and array.size(cascade_volatilities) > 4 ? close - array.get(cascade_volatilities, 4) : na
+
+// Colors for each level
+cascade_color_0 = color.from_gradient(0, 0, 7, col_primary, col_secondary)
+cascade_color_1 = color.from_gradient(1, 0, 7, col_primary, col_secondary)
+cascade_color_2 = color.from_gradient(2, 0, 7, col_primary, col_secondary)
+cascade_color_3 = color.from_gradient(3, 0, 7, col_primary, col_secondary)
+cascade_color_4 = color.from_gradient(4, 0, 7, col_primary, col_secondary)
+
+// Plot cascade bands
+p_upper_0 = plot(cascade_upper_0, upper_0_title, color=color.new(cascade_color_0, cascade_transparency), linewidth=1)
+p_lower_0 = plot(cascade_lower_0, lower_0_title, color=color.new(cascade_color_0, cascade_transparency), linewidth=1)
+p_upper_1 = plot(cascade_upper_1, upper_1_title, color=color.new(cascade_color_1, cascade_transparency), linewidth=1)
+p_lower_1 = plot(cascade_lower_1, lower_1_title, color=color.new(cascade_color_1, cascade_transparency), linewidth=1)
+p_upper_2 = plot(cascade_upper_2, upper_2_title, color=color.new(cascade_color_2, cascade_transparency), linewidth=1)
+p_lower_2 = plot(cascade_lower_2, lower_2_title, color=color.new(cascade_color_2, cascade_transparency), linewidth=1)
+p_upper_3 = plot(cascade_upper_3, upper_3_title, color=color.new(cascade_color_3, cascade_transparency), linewidth=1)
+p_lower_3 = plot(cascade_lower_3, lower_3_title, color=color.new(cascade_color_3, cascade_transparency), linewidth=1)
+p_upper_4 = plot(cascade_upper_4, upper_4_title, color=color.new(cascade_color_4, cascade_transparency), linewidth=1)
+p_lower_4 = plot(cascade_lower_4, lower_4_title, color=color.new(cascade_color_4, cascade_transparency), linewidth=1)
+
+// Fill between bands
+fill(p_upper_0, p_lower_0, color=color.new(cascade_color_0, cascade_transparency + 10))
+fill(p_upper_1, p_lower_1, color=color.new(cascade_color_1, cascade_transparency + 10))
+fill(p_upper_2, p_lower_2, color=color.new(cascade_color_2, cascade_transparency + 10))
+fill(p_upper_3, p_lower_3, color=color.new(cascade_color_3, cascade_transparency + 10))
+fill(p_upper_4, p_lower_4, color=color.new(cascade_color_4, cascade_transparency + 10))
+
+// ========================================
+// VORTEX SPIRALS WITH STYLE OPTIONS
+// ========================================
+// Define plot titles as constants
+vortex_0_title = "Vortex 0"
+vortex_1_title = "Vortex 1"
+vortex_2_title = "Vortex 2"
+vortex_3_title = "Vortex 3"
+vortex_4_title = "Vortex 4"
+
+// Determine plot style
+plot_style = vortex_style == "Lines" ? plot.style_line : vortex_style == "Cross" ? plot.style_cross : plot.style_circles
+
+// Determine colors
+vortex_color_0 = show_vortex_spirals ? (vortex_8 > close ? color.new(col_primary, 70) : color.new(col_danger, 70)) : na
+vortex_color_1 = show_vortex_spirals ? (vortex_13 > close ? color.new(col_primary, 70) : color.new(col_danger, 70)) : na
+vortex_color_2 = show_vortex_spirals ? (vortex_21 > close ? color.new(col_primary, 70) : color.new(col_danger, 70)) : na
+vortex_color_3 = show_vortex_spirals ? (vortex_34 > close ? color.new(col_primary, 70) : color.new(col_danger, 70)) : na
+vortex_color_4 = show_vortex_spirals ? (vortex_55 > close ? color.new(col_primary, 70) : color.new(col_danger, 70)) : na
+
+// Plot vortex spirals (must be in global scope)
+plot(show_vortex_spirals ? vortex_8 : na, vortex_0_title, color=vortex_color_0, style=plot_style, linewidth=2)
+plot(show_vortex_spirals ? vortex_13 : na, vortex_1_title, color=vortex_color_1, style=plot_style, linewidth=2)
+plot(show_vortex_spirals ? vortex_21 : na, vortex_2_title, color=vortex_color_2, style=plot_style, linewidth=2)
+plot(show_vortex_spirals ? vortex_34 : na, vortex_3_title, color=vortex_color_3, style=plot_style, linewidth=2)
+plot(show_vortex_spirals ? vortex_55 : na, vortex_4_title, color=vortex_color_4, style=plot_style, linewidth=2)
+
+// ========================================
+// FIBONACCI LEVELS (PRE-CALCULATIONS)
+// ========================================
+// Store line and label references - MOVED TO TOP
+var line[] fib_lines = array.new<line>()
+var label[] fib_labels = array.new<label>()
+
+// Calculate these values on every bar for consistency
+fib_highest = ta.highest(high, fractal_memory)
+fib_lowest = ta.lowest(low, fractal_memory)
+fib_sma = ta.sma(close, 50)
+
+// Smart update control - only update when price moves away from current levels
+var float stored_fib_highest = fib_highest
+var float stored_fib_lowest = fib_lowest
+price_near_fib_level = false
+
+// Check if price is within 0.5% of any current fib level
+if array.size(fib_lines) > 0
+    fib_range = stored_fib_highest - stored_fib_lowest
+    for level in array.from(0.786, 0.618, 0.5, 0.382, 0.236)
+        fib_price = close > fib_sma ? stored_fib_highest - fib_range * level : stored_fib_lowest + fib_range * level
+        if math.abs(close - fib_price) / close < 0.005  // Within 0.5%
+            price_near_fib_level := true
+
+// Dynamic update control
+volatility_spike = base_volatility > ta.sma(base_volatility, 20) * 1.5
+var int last_fib_update = 0
+bars_since_last_update = bar_index - last_fib_update
+
+// Only update if price is NOT near a level, or if there's been a significant range change
+range_change = math.abs(fib_highest - stored_fib_highest) / stored_fib_highest > 0.02 or math.abs(fib_lowest - stored_fib_lowest) / stored_fib_lowest > 0.02
+should_update_fibs = barstate.islast and not price_near_fib_level and (bars_since_last_update >= fib_update_bars or volatility_spike or range_change)
+
+// ========================================
+// FIBONACCI LEVELS DRAWING
+// ========================================
+if show_fibonacci_levels and should_update_fibs
+    // Clear old lines and labels with proper bounds checking
+    if array.size(fib_lines) > 0
+        for i = array.size(fib_lines) - 1 to 0
+            line.delete(array.get(fib_lines, i))
+        array.clear(fib_lines)
+    
+    if array.size(fib_labels) > 0
+        for i = array.size(fib_labels) - 1 to 0
+            label.delete(array.get(fib_labels, i))
+        array.clear(fib_labels)
+    
+    // Update stored values and last update bar
+    stored_fib_highest := fib_highest
+    stored_fib_lowest := fib_lowest
+    last_fib_update := bar_index
+    
+    // Calculate new levels
+    price_range = fib_highest - fib_lowest
+    
+    fib_levels = array.from(0.236, 0.382, 0.5, 0.618, 0.786)
+    fib_colors = array.from(col_info, col_primary, col_accent, #FFD700, col_warning)
+    
+    // Draw new lines with distance-based transparency
+    for i = 0 to array.size(fib_levels) - 1
+        level = array.get(fib_levels, i)
+        price = close > fib_sma ? fib_highest - price_range * level : fib_lowest + price_range * level
+        
+        // Calculate distance from current price for transparency
+        distance_from_price = math.abs(close - price) / close
+        // Closer lines are more visible (30-80 transparency based on distance)
+        line_transparency = 30 + math.min(50, distance_from_price * 1000)
+        
+        // Create line that extends infinitely to the right
+        new_line = line.new(bar_index - 20, price, bar_index + 10, price, color=color.new(array.get(fib_colors, i), line_transparency), width=2, extend=extend.right)
+        
+        // Labels also get distance-based transparency
+        label_transparency = 60 + math.min(30, distance_from_price * 500)
+        
+        // Create label
+        new_label = label.new(bar_index + 5, price, str.tostring(level * 100, "#.#") + "%", color=color.new(array.get(fib_colors, i), label_transparency), textcolor=array.get(fib_colors, i), style=label.style_label_left, size=size.small)
+        
+        // Store references
+        array.push(fib_lines, new_line)
+        array.push(fib_labels, new_label)
+// ========================================
+// CONFLUENCE ZONES (PRE-CALCULATIONS)
+// ========================================
+// Calculate ATR on every bar
+confluence_atr = ta.atr(20)
+
+// ========================================
+// CONFLUENCE ZONES DRAWING
+// ========================================
+if show_confluence_zones and barstate.islast
+    // Find areas where indicators align
+    if array.size(cascade_volatilities) > 0
+        // Calculate average vortex directly from the vortex values
+        avg_vortex = (vortex_8 + vortex_13 + vortex_21 + vortex_34 + vortex_55) / 5
+        first_cascade = close + array.get(cascade_volatilities, 0)
+        
+        if math.abs(avg_vortex - first_cascade) < confluence_atr * 0.5
+            box.new(bar_index - 10, math.max(avg_vortex, first_cascade), bar_index + 5, math.min(avg_vortex, first_cascade), bgcolor=color.new(col_accent, 90), border_color=color.new(col_accent, 50))
+
+// ========================================
+// SIGNAL LABELS
+// ========================================
+if fractal_signal
+    label.new(bar_index, low * 0.995, "🌀 FRACTAL", color=col_primary, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+if cascade_signal
+    label.new(bar_index, high * 1.005, "🌊 CASCADE", color=col_danger, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// ========================================
+// DASHBOARD HELPERS
+// ========================================
+get_text_size() =>
+    dashboard_size == "Small" ? size.tiny : dashboard_size == "Large" ? size.normal : size.small
+
+// ========================================
+// DYNAMIC DASHBOARD
+// ========================================
+if show_main_dashboard
+    var table main_dash = table.new(position.top_right, 2, 8, bgcolor=#000000, border_color=#333333, border_width=1)
+    
+    if barstate.islast
+        // Get size
+        text_size = get_text_size()
+        
+        // Updated title cells
+        table.cell(main_dash, 0, 0, "🌀 Mandelbrot-Fibonacci", text_color=col_primary, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 0, "Cascade Vortex 🌊", text_color=col_secondary, text_size=text_size, bgcolor=#000000)
+        
+        // Hurst with dynamic interpretation
+        hurst_state = hurst > 0.65 ? "STRONG TREND" : hurst > 0.55 ? "TRENDING" : hurst > 0.45 ? "RANDOM WALK" : "MEAN REVERTING"
+        table.cell(main_dash, 0, 1, "Hurst Exponent", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 1, str.tostring(hurst, "#.###") + " " + hurst_state, text_color=hurst > 0.6 ? col_danger : hurst < 0.4 ? col_primary : col_warning, text_size=text_size, bgcolor=#000000)
+        
+        // Fractal Dimension with meaning
+        complexity_level = fractal_dimension > 1.5 ? "CHAOTIC" : fractal_dimension > 1.3 ? "COMPLEX" : "SIMPLE"
+        table.cell(main_dash, 0, 2, "Fractal Dimension", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 2, str.tostring(fractal_dimension, "#.###") + " " + complexity_level, text_color=col_accent, text_size=text_size, bgcolor=#000000)
+        
+        // Volatility Cascade Status
+        cascade_status = volatility_expansion ? "EXPANDING" : "CONTRACTING"
+        table.cell(main_dash, 0, 3, "Volatility Cascade", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 3, cascade_status, text_color=volatility_expansion ? col_danger : col_primary, text_size=text_size, bgcolor=#000000)
+        
+        // Vortex Rotation Impact
+        rotation_impact = vortex_rotation_speed > 1.0 ? "FAST" : vortex_rotation_speed > 0.5 ? "MEDIUM" : "SLOW"
+        table.cell(main_dash, 0, 4, "Vortex Speed", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 4, rotation_impact + " (" + str.tostring(vortex_rotation_speed, "#.##") + ")", text_color=col_warning, text_size=text_size, bgcolor=#000000)
+        
+        // Market State
+        market_state = trend_strength > 0.7 ? "STRONG DIRECTIONAL" : trend_strength > 0.3 ? "MODERATE TREND" : "CHOPPY/RANGING"
+        table.cell(main_dash, 0, 5, "Market State", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 5, market_state, text_color=trend_strength > 0.7 ? col_danger : col_info, text_size=text_size, bgcolor=#000000)
+        
+        // Signal Strength
+        signal_power = (trend_strength + (volatility_expansion ? 0.3 : 0)) * 100
+        table.cell(main_dash, 0, 6, "Signal Strength", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 6, str.tostring(signal_power, "#") + "%", text_color=signal_power > 70 ? col_danger : signal_power > 40 ? col_warning : col_info, text_size=text_size, bgcolor=#000000)
+        
+        // Active Levels
+        active_levels = str.tostring(cascade_depth) + " bands, " + str.tostring(array.size(vortex_values)) + " spirals"
+        table.cell(main_dash, 0, 7, "Active Levels", text_color=#808080, text_size=text_size, bgcolor=#000000)
+        table.cell(main_dash, 1, 7, active_levels, text_color=col_primary, text_size=text_size, bgcolor=#000000)
+
+// ========================================
+// VORTEX METRICS PANEL
+// ========================================
+if show_vortex_metrics and barstate.islast
+    var table vortex_panel = table.new(position.middle_left, 2, 7, bgcolor=#000000, border_color=#333333, border_width=1)
+    
+    text_size = get_text_size()
+    
+    table.cell(vortex_panel, 0, 0, "VORTEX DYNAMICS", text_color=col_secondary, text_size=text_size, bgcolor=#000000)
+    table.cell(vortex_panel, 1, 0, "", bgcolor=#000000)
+    
+    // Show actual vortex deviations using direct variables
+    if array.size(fib_periods) > 0
+        // F8
+        if array.size(fib_periods) > 0
+            deviation_0 = ((vortex_8 - close) / close) * 100
+            table.cell(vortex_panel, 0, 1, "F" + str.tostring(period_0), text_color=#808080, text_size=text_size, bgcolor=#000000)
+            table.cell(vortex_panel, 1, 1, str.tostring(deviation_0, "#.##") + "%", text_color=deviation_0 > 0 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+        
+        // F13
+        if array.size(fib_periods) > 1
+            deviation_1 = ((vortex_13 - close) / close) * 100
+            table.cell(vortex_panel, 0, 2, "F" + str.tostring(period_1), text_color=#808080, text_size=text_size, bgcolor=#000000)
+            table.cell(vortex_panel, 1, 2, str.tostring(deviation_1, "#.##") + "%", text_color=deviation_1 > 0 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+        
+        // F21
+        if array.size(fib_periods) > 2
+            deviation_2 = ((vortex_21 - close) / close) * 100
+            table.cell(vortex_panel, 0, 3, "F" + str.tostring(period_2), text_color=#808080, text_size=text_size, bgcolor=#000000)
+            table.cell(vortex_panel, 1, 3, str.tostring(deviation_2, "#.##") + "%", text_color=deviation_2 > 0 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+        
+        // F34
+        if array.size(fib_periods) > 3
+            deviation_3 = ((vortex_34 - close) / close) * 100
+            table.cell(vortex_panel, 0, 4, "F" + str.tostring(period_3), text_color=#808080, text_size=text_size, bgcolor=#000000)
+            table.cell(vortex_panel, 1, 4, str.tostring(deviation_3, "#.##") + "%", text_color=deviation_3 > 0 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+        
+        // F55
+        if array.size(fib_periods) > 4
+            deviation_4 = ((vortex_55 - close) / close) * 100
+            table.cell(vortex_panel, 0, 5, "F" + str.tostring(period_4), text_color=#808080, text_size=text_size, bgcolor=#000000)
+            table.cell(vortex_panel, 1, 5, str.tostring(deviation_4, "#.##") + "%", text_color=deviation_4 > 0 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+    
+    // Convergence metric - using direct vortex values
+    vortex_convergence = 0.0
+    vortex_conv_state = "NEUTRAL"
+    
+    // Calculate deviations directly
+    dev_0 = math.abs((vortex_8 - close) / close)
+    dev_1 = math.abs((vortex_13 - close) / close)
+    dev_2 = math.abs((vortex_21 - close) / close)
+    dev_3 = math.abs((vortex_34 - close) / close)
+    dev_4 = math.abs((vortex_55 - close) / close)
+    
+    // Find max and min deviations
+    max_dev = math.max(dev_0, math.max(dev_1, math.max(dev_2, math.max(dev_3, dev_4))))
+    min_dev = math.min(dev_0, math.min(dev_1, math.min(dev_2, math.min(dev_3, dev_4))))
+    
+    vortex_convergence := (max_dev - min_dev) * 100
+    vortex_conv_state := vortex_convergence < 1 ? "TIGHT" : vortex_convergence < 3 ? "MODERATE" : "WIDE"
+    
+    table.cell(vortex_panel, 0, 6, "Convergence", text_color=#808080, text_size=text_size, bgcolor=#000000)
+    table.cell(vortex_panel, 1, 6, vortex_conv_state + " (" + str.tostring(vortex_convergence, "#.#") + "%)", text_color=vortex_convergence < 1 ? col_primary : col_danger, text_size=text_size, bgcolor=#000000)
+
+// ========================================
+// FRACTAL METRICS DISPLAY
+// ========================================
+if barstate.islast
+    var table fractal_table = table.new(position.bottom_right, 2, 5, bgcolor=#000000, border_color=#333333, border_width=1)
+    
+    metric_size = get_text_size()
+    
+    table.cell(fractal_table, 0, 0, "FRACTAL METRICS", text_color=col_info, text_size=metric_size, bgcolor=#000000)
+    table.cell(fractal_table, 1, 0, "", bgcolor=#000000)
+    
+    // Dynamic dimension display
+    table.cell(fractal_table, 0, 1, "Dimension D", text_color=#808080, text_size=metric_size, bgcolor=#000000)
+    table.cell(fractal_table, 1, 1, str.tostring(fractal_dimension, "#.###"), text_color=col_accent, text_size=metric_size, bgcolor=#000000)
+    
+    // Complexity with actual calculation
+    roughness = math.abs(fractal_dimension - 1.5)
+    complexity = roughness < 0.2 ? "HIGH" : roughness < 0.5 ? "MEDIUM" : "LOW"
+    table.cell(fractal_table, 0, 2, "Complexity", text_color=#808080, text_size=metric_size, bgcolor=#000000)
+    table.cell(fractal_table, 1, 2, complexity, text_color=complexity == "HIGH" ? col_danger : col_warning, text_size=metric_size, bgcolor=#000000)
+    
+    // Self-similarity based on Hurst persistence
+    similarity = math.abs(hurst - 0.5) > 0.2 ? "STRONG" : "WEAK"
+    table.cell(fractal_table, 0, 3, "Self-Similarity", text_color=#808080, text_size=metric_size, bgcolor=#000000)
+    table.cell(fractal_table, 1, 3, similarity, text_color=similarity == "STRONG" ? col_primary : col_info, text_size=metric_size, bgcolor=#000000)
+    
+    // Trend Quality
+    trend_quality = trend_strength > 0.7 ? "EXCELLENT" : trend_strength > 0.4 ? "GOOD" : "POOR"
+    table.cell(fractal_table, 0, 4, "Trend Quality", text_color=#808080, text_size=metric_size, bgcolor=#000000)
+    table.cell(fractal_table, 1, 4, trend_quality, text_color=trend_strength > 0.7 ? col_danger : col_warning, text_size=metric_size, bgcolor=#000000)
+
+// ========================================
+// MANDELBROT-FIBONACCI THEORY GUIDE
+// ========================================
+if show_theory_guide and barstate.islast
+    var table theory_guide = table.new(position.bottom_left, 1, 11, bgcolor=#000000, border_color=#333333, border_width=1)
+    
+    // Get dynamic text size
+    text_size = get_text_size()
+    
+    table.cell(theory_guide, 0, 0, "MANDELBROT-FIBONACCI THEORY", text_color=col_primary, text_size=text_size, bgcolor=#000000)
+    table.cell(theory_guide, 0, 1, "", bgcolor=#1a1a1a, height=2)
+    table.cell(theory_guide, 0, 2, "MANDELBROT PRINCIPLES:", text_color=col_secondary, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 3, "• Markets are fractal - patterns repeat at all scales", text_color=#808080, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 4, "• Volatility cascades through timeframes", text_color=#808080, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 5, "• Hurst H>0.5 = Trending, H<0.5 = Mean reverting", text_color=#808080, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 6, "", bgcolor=#1a1a1a, height=2)
+    table.cell(theory_guide, 0, 7, "FIBONACCI VORTEX:", text_color=col_accent, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 8, "• Price spirals follow golden ratio φ = 1.618", text_color=#808080, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 9, "• Multiple Fib periods create vortex layers", text_color=#808080, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+    table.cell(theory_guide, 0, 10, "💡 " + (trend_persistence ? "Follow the cascade" : mean_reversion_zone ? "Fade the vortex" : "Wait for clarity"), text_color=col_warning, text_size=text_size, text_halign=text.align_left, bgcolor=#000000)
+
+// ========================================
+// ALERTS
+// ========================================
+alertcondition(fractal_signal, "🌀 Fractal Signal", "Fractal pattern detected - potential entry!")
+alertcondition(cascade_signal, "🌊 Cascade Signal", "Cascade pattern detected - potential reversal!")
+alertcondition(volatility_expansion, "🌋 Volatility Expansion", "Volatility expanding across timeframes!")
+alertcondition(trend_strength > 0.7, "💪 Strong Trend", "Market showing strong directional movement!")
+
+// ========================================
+// WATERMARK
+// ========================================
+var table watermarkTable = na
+if na(watermarkTable)
+    watermarkTable := table.new(position.bottom_center, 1, 1, bgcolor=color.new(color.black, 90), border_color=color.new(color.purple, 80), border_width=1)
+table.clear(watermarkTable, 0, 0)
+table.cell(watermarkTable, 0, 0, "⚡ Dskyz (DAFE) Trading Systems", text_color=color.rgb(200, 200, 255), text_size=size.normal)

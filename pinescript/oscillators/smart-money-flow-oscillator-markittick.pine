@@ -1,0 +1,322 @@
+// // This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © [MarkitTick]
+
+//@version=6
+indicator("Smart Money Flow Oscillator [MarkitTick]", overlay = false, max_lines_count = 500, max_labels_count = 500, format = format.volume, precision = 2)
+
+// -----------------------------------------------------------------------------
+// 1. Constants 
+// -----------------------------------------------------------------------------
+const float EPSILON              = 1e-9
+const int   GRADIENT_STDEV_LEN   = 50
+const int   GRADIENT_TRANSPARENCY = 85
+
+// -----------------------------------------------------------------------------
+// 2. User Inputs
+// -----------------------------------------------------------------------------
+string grp_set = "LFA: Logic Settings"
+string grp_vis = "LFA: Visuals"
+
+string calc_mode_in       = input.string("Cumulative Delta Flow", "Calculation Mode", options = ["Cumulative Delta Flow", "In/Out Ratio"], group = grp_set) 
+bool   auto_period_enable = input.bool(true, "Auto-Adjust Period", group = grp_set)
+int    manual_period      = input.int(21, "Manual Period", minval = 1, group = grp_set)
+int    impact_avg_len     = input.int(3, "Efficiency Length", minval = 1, group = grp_set)
+float  impact_cap_min     = input.float(0.2, "Eff. Min Cap", step = 0.1, group = grp_set) 
+float  impact_cap_max     = input.float(2.0, "Eff. Max Cap", step = 0.1, group = grp_set)
+float  threshold_factor   = input.float(0.5, "Momentum Threshold", group = grp_set)
+
+bool   show_dashboard     = input.bool(true, "Show Dashboard", group = grp_vis)
+bool   show_divs          = input.bool(true, "Show Divergences (Oscillator)", group = grp_vis)
+bool   show_price_divs    = input.bool(true, "Show Divergences (Price)", group = grp_vis) 
+int    div_confirm_bars   = input.int(5, "Confirmation Bars", minval = 0, group = grp_vis, tooltip = "Number of bars to wait after pivot detection to confirm divergence.")
+
+// -----------------------------------------------------------------------------
+// 3. Pre-Computed Input-Derived Constants
+// -----------------------------------------------------------------------------
+bool IS_CDF_MODE   = calc_mode_in == "Cumulative Delta Flow"
+bool IS_RATIO_MODE = not IS_CDF_MODE
+int  FINAL_PERIOD  = auto_period_enable ? (timeframe.isweekly ? 52 : timeframe.isdaily ? 21 : manual_period) : manual_period
+
+// -----------------------------------------------------------------------------
+// 4. Quant Architecture 
+// -----------------------------------------------------------------------------
+type LFA_Engine
+    float delta_current      = 0.0
+    float cumulative_flow    = 0.0
+    float cumulative_ma      = 0.0
+    float in_out_ratio       = 50.0
+    float in_out_ratio_ma    = 50.0
+    float efficiency_mult    = 1.0
+    bool  is_strong_up       = false 
+    bool  is_strong_down     = false
+    bool  div_bull           = false
+    bool  div_bear           = false
+    bool  h_div_bull         = false
+    bool  h_div_bear         = false
+
+type PivotState
+    float last_price = na
+    float last_val   = na 
+    int   last_idx   = na
+
+type DivergenceGraphics
+    map<int, line>  lines     = na
+    map<int, label> labels    = na
+    map<int, line>  lines_px  = na 
+    map<int, label> labels_px = na 
+
+type Dashboard
+    table display_table
+
+// -----------------------------------------------------------------------------
+// 5. Persistent State Initialization
+// -----------------------------------------------------------------------------
+var LFA_Engine lfa = LFA_Engine.new()
+var PivotState ph_05 = PivotState.new()
+var PivotState ph_10 = PivotState.new()
+var PivotState ph_20 = PivotState.new()
+var PivotState pl_05 = PivotState.new()
+var PivotState pl_10 = PivotState.new()
+var PivotState pl_20 = PivotState.new() 
+var DivergenceGraphics bear_gfx = DivergenceGraphics.new()
+var DivergenceGraphics bull_gfx = DivergenceGraphics.new()
+
+if barstate.isfirst
+    bear_gfx.lines     := map.new<int, line>()
+    bear_gfx.labels    := map.new<int, label>()
+    bear_gfx.lines_px  := map.new<int, line>() 
+    bear_gfx.labels_px := map.new<int, label>() 
+    
+    bull_gfx.lines     := map.new<int, line>()
+    bull_gfx.labels    := map.new<int, label>()
+    bull_gfx.lines_px  := map.new<int, line>() 
+    bull_gfx.labels_px := map.new<int, label>() 
+
+var Dashboard hud = Dashboard.new(table.new(position.top_right, 2, 4, border_width = 1))
+
+// ----------------------------------------------------------------------------- 
+// 6. Core Calculation Functions
+// -----------------------------------------------------------------------------
+calc_lfa_update(LFA_Engine self, float avg_body, float avg_vol) =>
+    float typical_price   = (high + low + close) / 3.0
+    float tv_base         = typical_price * volume
+    float curr_body       = math.abs(close - open)
+    
+    float raw_eff         = curr_body / math.max(volume, 1.0)
+    float exp_eff         = avg_body / math.max(avg_vol, EPSILON)
+  
+    float rel_eff         = raw_eff / math.max(exp_eff, EPSILON) 
+    
+    self.efficiency_mult := math.max(impact_cap_min, math.min(rel_eff, impact_cap_max))
+   
+    float close_change    = close - close[1]
+    float threshold_val   = math.abs(open[1] - close[1]) * threshold_factor
+    
+    self.is_strong_up   := close_change > threshold_val
+    self.is_strong_down := close_change < -threshold_val
+    
+    self.delta_current := self.is_strong_up ? tv_base * self.efficiency_mult : self.is_strong_down ? -tv_base * self.efficiency_mult : 0.0 
+                          
+    float flow_val       = self.delta_current
+    self.cumulative_flow := math.sum(flow_val, FINAL_PERIOD)
+    self.cumulative_ma   := ta.sma(self.cumulative_flow, FINAL_PERIOD)
+    
+    float inflow_raw  = math.max(flow_val, 0.0)
+    float outflow_raw = -math.min(flow_val, 0.0)
+    float sum_in      = math.sum(inflow_raw, FINAL_PERIOD)
+ 
+    float sum_out     = math.sum(outflow_raw, FINAL_PERIOD) 
+    float total_flow  = sum_in + sum_out
+    
+    self.in_out_ratio    := total_flow > 0.0 ? sum_in / total_flow * 100.0 : 50.0 
+    self.in_out_ratio_ma := ta.sma(self.in_out_ratio, FINAL_PERIOD)
+
+// -----------------------------------------------------------------------------
+// 7. Divergence Detection 
+// -----------------------------------------------------------------------------
+process_pivot_high(PivotState state, DivergenceGraphics gfx, float ph_val, int lookback, bool show_lines, LFA_Engine eng, int confirm_bars) =>
+    if not na(ph_val)
+        int   calc_lookback = lookback + confirm_bars
+        int   curr_idx      = bar_index - calc_lookback
+        float curr_price    = high[calc_lookback]
+        
+        if not na(state.last_price)
+            bool regular_bear = curr_price > state.last_price and ph_val < state.last_val  
+            bool hidden_bear  = curr_price < state.last_price and ph_val > state.last_val
+            
+            if regular_bear
+                eng.div_bear := true
+            if hidden_bear
+                eng.h_div_bear := true 
+                
+            color  line_col   = regular_bear ? color.red : color.maroon  
+            string label_text = regular_bear ? "R" : "H" 
+
+            if show_lines and (regular_bear or hidden_bear)
+                line  existing_line  = gfx.lines.get(curr_idx)
+                label existing_label = gfx.labels.get(curr_idx)
+                if not na(existing_line)
+                    line.delete(existing_line)
+   
+                if not na(existing_label)
+                    label.delete(existing_label)
+                
+                gfx.lines.put(curr_idx, line.new(state.last_idx, state.last_val, curr_idx, ph_val, color = line_col, width = 1, style = regular_bear ? line.style_solid : line.style_dashed))
+                
+                gfx.labels.put(curr_idx, label.new(curr_idx, ph_val, label_text, color = line_col, textcolor = color.white, style = label.style_label_down, size = size.small)) 
+
+            if show_price_divs and (regular_bear or hidden_bear)
+                line  existing_p_line  = gfx.lines_px.get(curr_idx)
+                label existing_p_label = gfx.labels_px.get(curr_idx)
+                if not na(existing_p_line)
+          
+                    line.delete(existing_p_line) 
+                if not na(existing_p_label)
+                    label.delete(existing_p_label)
+
+                gfx.lines_px.put(curr_idx, line.new(state.last_idx, state.last_price, curr_idx, curr_price, xloc=xloc.bar_index, color=line_col, width=1, style=regular_bear ? line.style_solid : line.style_dashed, force_overlay=true))  
+                gfx.labels_px.put(curr_idx, label.new(curr_idx, curr_price, label_text, xloc=xloc.bar_index, color=line_col, textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay=true))
+
+        state.last_price := curr_price
+        state.last_val   := ph_val
+        state.last_idx   := curr_idx
+
+process_pivot_low(PivotState state, DivergenceGraphics gfx, float pl_val, int lookback, bool show_lines, LFA_Engine eng, int confirm_bars) =>
+    if not na(pl_val)
+        int   calc_lookback = lookback + confirm_bars
+        int   curr_idx      = bar_index - calc_lookback
+        float curr_price    = low[calc_lookback] 
+        
+        if not na(state.last_price)
+            bool regular_bull = curr_price < state.last_price and pl_val > state.last_val
+            bool hidden_bull  = curr_price > state.last_price and pl_val < state.last_val
+            
+            if regular_bull
+      
+                eng.div_bull := true 
+            if hidden_bull
+                eng.h_div_bull := true
+   
+            color  line_col   = regular_bull ? color.green : color.lime 
+            string label_text = regular_bull ? "R" : "H" 
+            color  text_col   = regular_bull ? color.black : color.black  
+            
+            if show_lines and (regular_bull or hidden_bull)
+                line  existing_line  = gfx.lines.get(curr_idx)
+                label existing_label = gfx.labels.get(curr_idx)
+                if not na(existing_line)
+           
+                    line.delete(existing_line) 
+                if not na(existing_label)
+                    label.delete(existing_label)
+                
+                gfx.lines.put(curr_idx, line.new(state.last_idx, state.last_val, curr_idx, pl_val, color = line_col, width = 1, style = regular_bull ? line.style_solid : line.style_dashed))
+    
+                gfx.labels.put(curr_idx, label.new(curr_idx, pl_val, label_text, color = line_col, textcolor = text_col, style = label.style_label_up, size = size.small))
+
+            if show_price_divs and (regular_bull or hidden_bull)
+                line  existing_p_line  = gfx.lines_px.get(curr_idx)
+                label existing_p_label = gfx.labels_px.get(curr_idx)
+                
+                if not na(existing_p_line) 
+                    line.delete(existing_p_line)
+                if not na(existing_p_label)
+                    label.delete(existing_p_label)
+
+                gfx.lines_px.put(curr_idx, line.new(state.last_idx, state.last_price, curr_idx, curr_price, xloc=xloc.bar_index, color=line_col, width=1, style=regular_bull ? line.style_solid : line.style_dashed, force_overlay=true))  
+                gfx.labels_px.put(curr_idx, label.new(curr_idx, curr_price, label_text, xloc=xloc.bar_index, color=line_col, textcolor=text_col, style=label.style_label_up, size=size.small, force_overlay=true))
+
+        state.last_price := curr_price
+        state.last_val   := pl_val
+        state.last_idx   := curr_idx
+
+// -----------------------------------------------------------------------------
+// 8. Dashboard Rendering
+// -----------------------------------------------------------------------------
+draw_hud(Dashboard self, LFA_Engine engine, bool is_cdf_active) =>
+    if barstate.islast
+        color header_bg = color.new(color.navy, 30)
+        color text_col  = color.white 
+        color val_col   = engine.delta_current > 0.0 ? color.new(color.green, 20) : engine.delta_current < 0.0 ? color.new(color.red, 20) : color.gray  
+        color cell_bg   = color.new(color.black, 50)
+        
+        self.display_table.cell(0, 0, "Metric", bgcolor = header_bg, text_color = text_col, text_size = size.small)
+        self.display_table.cell(1, 0, "Value", bgcolor = header_bg, text_color = text_col, text_size = size.small)
+        self.display_table.cell(0, 1, "Mode", bgcolor = cell_bg, text_color = text_col, text_size = size.small)
+        self.display_table.cell(1, 1, is_cdf_active ? "CDF" : "In/Out", bgcolor = cell_bg, text_color = color.yellow, text_size = size.small) 
+        self.display_table.cell(0, 2, "Efficiency", bgcolor = cell_bg, text_color = text_col, text_size = size.small)
+        self.display_table.cell(1, 2, str.tostring(engine.efficiency_mult, "#.##") + "x", bgcolor = cell_bg, text_color = color.teal, text_size = size.small)
+        self.display_table.cell(0, 3, "Net Flow", bgcolor = cell_bg, text_color = text_col, text_size = size.small)
+        self.display_table.cell(1, 3, str.tostring(engine.delta_current, format.volume), bgcolor = val_col, text_color = text_col, text_size = size.small)
+
+// -----------------------------------------------------------------------------
+// 9. Main Execution
+// -----------------------------------------------------------------------------
+float avg_body_calc = ta.sma(math.abs(close - open), impact_avg_len)  
+float avg_vol_calc  = ta.sma(volume, impact_avg_len)
+calc_lfa_update(lfa, avg_body_calc, avg_vol_calc)
+
+lfa.div_bear   := false
+lfa.div_bull   := false
+lfa.h_div_bear := false
+lfa.h_div_bull := false
+
+if show_divs or show_price_divs
+    float src_series = IS_RATIO_MODE ? lfa.in_out_ratio : lfa.cumulative_flow  
+    
+    float pv_ph_05 = ta.pivothigh(src_series, 5, 5 + div_confirm_bars)
+    float pv_ph_10 = ta.pivothigh(src_series, 10, 10 + div_confirm_bars)
+    float pv_ph_20 = ta.pivothigh(src_series, 20, 20 + div_confirm_bars)
+    float pv_pl_05 = ta.pivotlow(src_series, 5, 5 + div_confirm_bars)
+    float pv_pl_10 = ta.pivotlow(src_series, 10, 10 + div_confirm_bars)
+    float pv_pl_20 = ta.pivotlow(src_series, 20, 20 + div_confirm_bars)
+    
+    process_pivot_high(ph_05, bear_gfx, pv_ph_05, 5,  show_divs, lfa, div_confirm_bars)
+    process_pivot_high(ph_10, bear_gfx, pv_ph_10, 10, show_divs, lfa, div_confirm_bars)
+    process_pivot_high(ph_20, bear_gfx, pv_ph_20, 20, show_divs, lfa, div_confirm_bars)
+    process_pivot_low(pl_05, bull_gfx, pv_pl_05, 5,   show_divs, lfa, div_confirm_bars)  
+    process_pivot_low(pl_10, bull_gfx, pv_pl_10, 10,  show_divs, lfa, div_confirm_bars)
+    process_pivot_low(pl_20, bull_gfx, pv_pl_20, 20,  show_divs, lfa, div_confirm_bars)
+
+// -----------------------------------------------------------------------------
+// 10. Visualization
+// -----------------------------------------------------------------------------
+float active_value = IS_CDF_MODE ? lfa.cumulative_flow : lfa.in_out_ratio 
+float active_ma    = IS_CDF_MODE ? lfa.cumulative_ma : lfa.in_out_ratio_ma 
+float spread       = active_value - active_ma
+color active_color = na
+
+if IS_CDF_MODE
+    float stdev_range = ta.stdev(spread, GRADIENT_STDEV_LEN) * 2.0
+    active_color := spread > 0.0 ? color.from_gradient(spread, 0.0, stdev_range, color.new(color.green, 60), color.green) : color.from_gradient(spread, -stdev_range, 0.0, color.red, color.new(color.red, 60))  
+else
+    active_color := spread > 0.0 ? color.from_gradient(spread, 0.0, 5.0, color.new(color.green, 60), color.green) : color.from_gradient(spread, -5.0, 0.0, color.red, color.new(color.red, 60)) 
+
+p1 = plot(active_value, "Flow/Ratio", color = active_color, linewidth = 2)
+p2 = plot(active_ma, "Signal", color = color.new(color.gray, 50), linewidth = 1)
+fill(p1, p2, color.new(active_color, GRADIENT_TRANSPARENCY), "Cloud")
+
+hline(IS_RATIO_MODE ? 50 : 0, "Zero/Mid Line", color = color.gray, linestyle = hline.style_dotted)
+hline(IS_RATIO_MODE ? 70 : na, "OB", color.red, linestyle = hline.style_dotted)
+hline(IS_RATIO_MODE ? 30 : na, "OS", color.green, linestyle = hline.style_dotted)
+
+if show_dashboard
+    draw_hud(hud, lfa, IS_CDF_MODE)
+
+// -----------------------------------------------------------------------------
+// 11. Alerts System
+// -----------------------------------------------------------------------------
+bool cross_zero_up   = ta.crossover(lfa.cumulative_flow, 0)
+bool cross_zero_down = ta.crossunder(lfa.cumulative_flow, 0)
+bool cross_sig_up    = ta.crossover(lfa.cumulative_flow, lfa.cumulative_ma)
+bool cross_sig_down  = ta.crossunder(lfa.cumulative_flow, lfa.cumulative_ma)
+
+alertcondition(cross_zero_up, "LFA: Zero Cross Up", "Liquidity Flow crossed above Zero (Bullish)")
+alertcondition(cross_zero_down, "LFA: Zero Cross Down", "Liquidity Flow crossed below Zero (Bearish)")
+alertcondition(cross_sig_up, "LFA: Signal Cross Bull", "CDF crossed above Signal Line")
+alertcondition(cross_sig_down, "LFA: Signal Cross Bear", "CDF crossed below Signal Line")
+alertcondition(lfa.div_bull, "LFA: Bullish Divergence", "Regular Bullish Divergence detected")
+alertcondition(lfa.div_bear, "LFA: Bearish Divergence", "Regular Bearish Divergence detected")
+alertcondition(lfa.h_div_bull, "LFA: Hidden Bullish Div", "Hidden Bullish Divergence detected (Continuation)")
+alertcondition(lfa.h_div_bear, "LFA: Hidden Bearish Div", "Hidden Bearish Divergence detected (Continuation)")

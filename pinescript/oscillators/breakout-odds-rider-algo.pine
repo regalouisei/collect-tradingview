@@ -1,0 +1,367 @@
+//@version=6
+// Developed by Rider Algo
+// Breakout Odds v4 — Empirical Breakout Probability with Directional Bias
+// Enhanced with: Trend Filter, Candle Confirmation, Candle Bias Analysis, Signal Cooldown
+// Combines 5 factors for probability + 3 factors for direction + 3 quality filters
+
+indicator("Breakout Odds [Rider Algo]", shorttitle="BO v4 [Rider Algo]", overlay=false, max_lines_count=10, max_labels_count=50)
+
+// ═══════════════════════════════════════════════════════════════
+// ─── INPUTS ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+// --- General Parameters ---
+lookback        = input.int(50,    "Analysis Period (bars)",            minval=10, maxval=200, tooltip="Window for calculating ranges, averages and level tests")
+threshold       = input.int(70,    "Signal Threshold (score)",          minval=50, maxval=95,  tooltip="Minimum score to trigger a probable breakout alert")
+
+// --- Bollinger Bands ---
+bb_length       = input.int(20,    "BB — Period",                      minval=5,  maxval=100, group="Bollinger Bands")
+bb_mult         = input.float(2.0, "BB — Multiplier",                  minval=0.5,maxval=4.0, step=0.1, group="Bollinger Bands")
+
+// --- ATR ---
+atr_length      = input.int(14,    "ATR — Period",                     minval=5,  maxval=50,  group="ATR")
+
+// --- Volume ---
+vol_length      = input.int(20,    "Volume — Average Period",          minval=5,  maxval=100, group="Volume")
+
+// --- Support / Resistance Level ---
+sr_tolerance    = input.float(0.5, "S/R Tolerance (%)",                minval=0.1,maxval=2.0, step=0.1, group="S/R Levels", tooltip="How close to the high/low the price must be to count as a test")
+min_tests       = input.int(2,     "Minimum Tests for Relevance",      minval=1,  maxval=10,  group="S/R Levels")
+
+// --- Component Weights for Breakout Score ---
+w_bb            = input.float(25.0, "Weight — BB Width (%)",           minval=0, maxval=100, group="Score Weights")
+w_atr           = input.float(20.0, "Weight — ATR Compression (%)",    minval=0, maxval=100, group="Score Weights")
+w_vol           = input.float(25.0, "Weight — Relative Volume (%)",    minval=0, maxval=100, group="Score Weights")
+w_dist          = input.float(15.0, "Weight — Distance to Edges (%)",  minval=0, maxval=100, group="Score Weights")
+w_tests         = input.float(15.0, "Weight — Level Tests (%)",        minval=0, maxval=100, group="Score Weights")
+
+// --- Direction Bias Weights ---
+w_dir_pos       = input.float(30.0, "Dir Weight — Price Position (%)",     minval=0, maxval=100, group="Direction Weights", tooltip="How much the price position within the range influences direction")
+w_dir_volpress  = input.float(30.0, "Dir Weight — Volume Pressure (%)",    minval=0, maxval=100, group="Direction Weights", tooltip="How much the volume distribution at highs vs lows influences direction")
+w_dir_momentum  = input.float(20.0, "Dir Weight — Momentum Slope (%)",     minval=0, maxval=100, group="Direction Weights", tooltip="How much recent price momentum influences direction")
+w_dir_candle    = input.float(20.0, "Dir Weight — Candle Bias (%)",        minval=0, maxval=100, group="Direction Weights", tooltip="How much the recent candle body analysis influences direction")
+
+// --- Momentum ---
+momentum_len    = input.int(10,    "Momentum — Lookback (bars)",       minval=3,  maxval=50,  group="Direction Settings", tooltip="Number of bars used to calculate short-term price slope")
+
+// --- FILTER 1: Trend Filter (optional, default ON) ---
+use_trend_filter = input.bool(true,  "Enable Trend Filter (EMA)",      group="Quality Filters", tooltip="When ON: BULL signals require price above EMA, BEAR signals require price below EMA")
+trend_ema_len    = input.int(200,    "Trend EMA — Period",             minval=50, maxval=500, group="Quality Filters")
+
+// --- FILTER 2: Candle Confirmation is always active (no toggle) ---
+// Signal only fires when the candle closes outside the range boundary
+
+// --- FILTER 3: Candle Bias Analysis (optional) ---
+use_candle_bias  = input.bool(true,  "Enable Candle Bias Analysis",    group="Quality Filters", tooltip="When ON: analyzes recent candle bodies to strengthen directional conviction")
+candle_bias_len  = input.int(10,     "Candle Bias — Lookback (bars)",  minval=3,  maxval=30,  group="Quality Filters")
+
+// --- FILTER 4: Signal Cooldown ---
+cooldown_bars    = input.int(10,     "Signal Cooldown (bars)",         minval=1,  maxval=50,  group="Quality Filters", tooltip="Minimum bars between signals to avoid repetitive triggers in choppy ranges")
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── BREAKOUT PROBABILITY SCORE (5 factors) ───────────────────
+// ═══════════════════════════════════════════════════════════════
+
+// --- 1. BOLLINGER BAND WIDTH (Compression = higher breakout probability) ---
+bb_basis     = ta.sma(close, bb_length)
+bb_dev       = bb_mult * ta.stdev(close, bb_length)
+bb_upper     = bb_basis + bb_dev
+bb_lower     = bb_basis - bb_dev
+bb_width     = (bb_upper - bb_lower) / bb_basis * 100
+
+bb_highest   = ta.highest(bb_width, lookback)
+bb_lowest    = ta.lowest(bb_width, lookback)
+bb_range     = bb_highest - bb_lowest
+bb_score     = bb_range > 0 ? (1.0 - (bb_width - bb_lowest) / bb_range) * 100 : 50.0
+
+// --- 2. ATR% (Low relative volatility = compression) ---
+atr_val      = ta.atr(atr_length)
+atr_pct      = atr_val / close * 100
+
+atr_highest  = ta.highest(atr_pct, lookback)
+atr_lowest   = ta.lowest(atr_pct, lookback)
+atr_range    = atr_highest - atr_lowest
+atr_score    = atr_range > 0 ? (1.0 - (atr_pct - atr_lowest) / atr_range) * 100 : 50.0
+
+// --- 3. RELATIVE VOLUME (Rising volume during compression = accumulated force) ---
+vol_avg      = ta.sma(volume, vol_length)
+vol_ratio    = vol_avg > 0 ? volume / vol_avg : 1.0
+
+vol_clamped  = math.min(vol_ratio, 3.0)
+vol_score    = (vol_clamped / 3.0) * 100
+
+// --- 4. DISTANCE TO RANGE HIGHS/LOWS (Closer to edge = more likely to break) ---
+range_high   = ta.highest(high, lookback)
+range_low    = ta.lowest(low, lookback)
+range_size   = range_high - range_low
+range_mid    = range_low + range_size / 2.0
+
+dist_to_high = range_high - close
+dist_to_low  = close - range_low
+dist_to_edge = math.min(dist_to_high, dist_to_low)
+
+dist_score   = range_size > 0 ? (1.0 - dist_to_edge / (range_size / 2.0)) * 100 : 50.0
+dist_score_c = math.max(0.0, math.min(100.0, dist_score))
+
+// --- 5. LEVEL TESTS (More touches = weaker level = breakout more likely) ---
+tol_abs      = close * sr_tolerance / 100.0
+
+var int tests_high = 0
+var int tests_low  = 0
+
+tests_high := 0
+tests_low  := 0
+
+for i = 1 to lookback
+    if math.abs(high[i] - range_high) <= tol_abs
+        tests_high += 1
+    if math.abs(low[i] - range_low) <= tol_abs
+        tests_low += 1
+
+total_tests  = math.max(tests_high, tests_low)
+tests_norm   = math.min(total_tests, 10)
+tests_score  = (tests_norm / 10.0) * 100
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── WEIGHTED COMPOSITE SCORE ─────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+total_weight = w_bb + w_atr + w_vol + w_dist + w_tests
+safe_weight  = total_weight > 0 ? total_weight : 1.0
+
+composite    = (bb_score     * w_bb   +
+                atr_score    * w_atr  +
+                vol_score    * w_vol  +
+                dist_score_c * w_dist +
+                tests_score  * w_tests) / safe_weight
+
+score_final  = math.round(composite)
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── DIRECTIONAL BIAS ENGINE (3 core + 1 optional factor) ─────
+// ═══════════════════════════════════════════════════════════════
+
+// --- Factor A: Price Position within range ---
+pos_raw      = range_size > 0 ? (close - range_mid) / (range_size / 2.0) * 100 : 0.0
+pos_score    = math.max(-100.0, math.min(100.0, pos_raw))
+
+// --- Factor B: Volume Pressure at levels ---
+var float vol_at_highs = 0.0
+var float vol_at_lows  = 0.0
+
+vol_at_highs := 0.0
+vol_at_lows  := 0.0
+
+for i = 0 to lookback - 1
+    if math.abs(high[i] - range_high) <= tol_abs
+        vol_at_highs += volume[i]
+    if math.abs(low[i] - range_low) <= tol_abs
+        vol_at_lows += volume[i]
+
+float vol_total_sr = vol_at_highs + vol_at_lows
+float volpress_score = 0.0
+
+if vol_total_sr > 0
+    volpress_score := ((vol_at_highs - vol_at_lows) / vol_total_sr) * 100
+else
+    volpress_score := 0.0
+
+volpress_clamped = math.max(-100.0, math.min(100.0, volpress_score))
+
+// --- Factor C: Short-term Momentum Slope ---
+slope_val    = ta.linreg(close, momentum_len, 0) - ta.linreg(close, momentum_len, 1)
+slope_norm   = range_size > 0 ? (slope_val / range_size) * 1000 : 0.0
+momentum_score = math.max(-100.0, math.min(100.0, slope_norm))
+
+// --- Factor D: Candle Bias Analysis (optional) ---
+// Analyzes the proportion and strength of bullish vs bearish candle bodies
+float candle_bias_score = 0.0
+
+if use_candle_bias
+    float bull_power = 0.0
+    float bear_power = 0.0
+    for i = 0 to candle_bias_len - 1
+        float body = close[i] - open[i]
+        float body_size = math.abs(body)
+        float bar_range = high[i] - low[i]
+        // Weight each candle by its body-to-range ratio (clean moves count more)
+        float quality = bar_range > 0 ? body_size / bar_range : 0.0
+        if body > 0
+            bull_power += quality
+        else if body < 0
+            bear_power += quality
+    float total_power = bull_power + bear_power
+    if total_power > 0
+        candle_bias_score := ((bull_power - bear_power) / total_power) * 100
+    candle_bias_score := math.max(-100.0, math.min(100.0, candle_bias_score))
+
+// --- Weighted Directional Bias ---
+// When candle bias is disabled, its weight is redistributed automatically
+float active_w_candle = use_candle_bias ? w_dir_candle : 0.0
+dir_total_w  = w_dir_pos + w_dir_volpress + w_dir_momentum + active_w_candle
+dir_safe_w   = dir_total_w > 0 ? dir_total_w : 1.0
+
+dir_bias     = (pos_score        * w_dir_pos      +
+                volpress_clamped * w_dir_volpress  +
+                momentum_score   * w_dir_momentum  +
+                candle_bias_score * active_w_candle) / dir_safe_w
+
+is_bullish   = dir_bias > 0
+is_bearish   = dir_bias < 0
+dir_strength = math.round(math.abs(dir_bias))
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── QUALITY FILTERS ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+// --- FILTER 1: Trend Filter (EMA) ---
+// When active: BULL signals only above EMA, BEAR signals only below EMA
+trend_ema     = ta.ema(close, trend_ema_len)
+bool trend_allows_bull = use_trend_filter ? close > trend_ema : true
+bool trend_allows_bear = use_trend_filter ? close < trend_ema : true
+
+// --- FILTER 2: Candle Confirmation ---
+// Signal only valid when the current candle closes outside the range boundary
+// For BULL: close must be above the range high (or within tolerance above it)
+// For BEAR: close must be below the range low (or within tolerance below it)
+float confirm_tol = range_size * 0.002
+bool candle_confirms_bull = close >= (range_high - confirm_tol)
+bool candle_confirms_bear = close <= (range_low + confirm_tol)
+
+// --- FILTER 3: Signal Cooldown ---
+// Track bars since the last signal to prevent clustering
+var int bars_since_signal = cooldown_bars + 1
+bars_since_signal := bars_since_signal + 1
+bool cooldown_clear = bars_since_signal > cooldown_bars
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── FINAL SIGNALS (all filters applied) ──────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+// Raw score crossover
+breakout_cross = ta.crossover(composite, threshold)
+
+// Also detect when score is already above threshold and a new confirmation candle appears
+score_above    = composite >= threshold
+
+// BULL signal: score triggers + direction is bullish + all filters pass
+bool bullish_signal = false
+if (breakout_cross or score_above) and is_bullish and trend_allows_bull and candle_confirms_bull and cooldown_clear
+    bullish_signal := true
+
+// BEAR signal: score triggers + direction is bearish + all filters pass
+bool bearish_signal = false
+if (breakout_cross or score_above) and is_bearish and trend_allows_bear and candle_confirms_bear and cooldown_clear
+    bearish_signal := true
+
+// Reset cooldown counter when a signal fires
+if bullish_signal or bearish_signal
+    bars_since_signal := 0
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── FILTER STATUS (for info panel) ──────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+string trend_status = ""
+if use_trend_filter
+    trend_status := close > trend_ema ? "ABOVE EMA (Bull OK)" : "BELOW EMA (Bear OK)"
+else
+    trend_status := "DISABLED"
+
+string confirm_status = ""
+if candle_confirms_bull
+    confirm_status := "AT UPPER EDGE"
+else if candle_confirms_bear
+    confirm_status := "AT LOWER EDGE"
+else
+    confirm_status := "MID-RANGE"
+
+string cooldown_status = cooldown_clear ? "READY" : str.tostring(cooldown_bars - bars_since_signal) + " bars left"
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── VISUALIZATION ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+// --- Dynamic score color ---
+score_color = score_final >= 80 ? color.new(#00E676, 0) :
+              score_final >= 60 ? color.new(#FFEB3B, 0) :
+              score_final >= 40 ? color.new(#FF9800, 0) :
+              color.new(#F44336, 0)
+
+// --- Main score line ---
+plot(score_final, "Breakout Score", color=score_color, linewidth=2, style=plot.style_line)
+
+// --- Directional bias area ---
+dir_color = is_bullish ? color.new(#00E676, 30) : color.new(#F44336, 30)
+plot(dir_bias, "Direction Bias", color=dir_color, linewidth=1, style=plot.style_area)
+
+// --- Reference lines ---
+hline(0,         "Neutral",          color=color.new(color.gray, 50),   linestyle=hline.style_solid)
+hline(threshold, "Signal Threshold", color=color.new(color.white, 60),  linestyle=hline.style_dashed)
+hline(80,        "High Zone",        color=color.new(#00E676, 80),      linestyle=hline.style_dotted)
+hline(50,        "Mid Zone",         color=color.new(#FFEB3B, 80),      linestyle=hline.style_dotted)
+hline(20,        "Low Zone",         color=color.new(#F44336, 80),      linestyle=hline.style_dotted)
+
+// --- Background tint for active breakout zone ---
+bull_bg = score_final >= threshold and is_bullish and trend_allows_bull ? color.new(#00E676, 88) : na
+bear_bg = score_final >= threshold and is_bearish and trend_allows_bear ? color.new(#F44336, 88) : na
+bgcolor(bull_bg, title="Bullish Breakout Zone")
+bgcolor(bear_bg, title="Bearish Breakout Zone")
+
+// --- Confirmed signal markers (only after all filters pass) ---
+plotshape(bullish_signal, title="Confirmed BULL", location=location.bottom, style=shape.triangleup, size=size.small, color=color.new(#00E676, 0), text="BULL", textcolor=color.white)
+plotshape(bearish_signal, title="Confirmed BEAR", location=location.top, style=shape.triangledown, size=size.small, color=color.new(#F44336, 0), text="BEAR", textcolor=color.white)
+
+// --- Info panel on last bar ---
+var label info_label = na
+
+if barstate.islast
+    label.delete(info_label)
+
+    string dir_text = is_bullish ? "BULLISH" : "BEARISH"
+    string dir_icon = is_bullish ? "▲" : "▼"
+
+    string ln01 = "===== BREAKOUT ODDS v4 ====="
+    string ln02 = "Score: " + str.tostring(score_final) + " / 100"
+    string ln03 = "Direction: " + dir_icon + " " + dir_text
+    string ln04 = "Dir Strength: " + str.tostring(dir_strength) + "%"
+    string ln05 = "============================"
+    string ln06 = "--- Probability ---"
+    string ln07 = "BB Width: " + str.tostring(math.round(bb_score))
+    string ln08 = "ATR Comp: " + str.tostring(math.round(atr_score))
+    string ln09 = "Volume: " + str.tostring(math.round(vol_score))
+    string ln10 = "Distance: " + str.tostring(math.round(dist_score_c))
+    string ln11 = "Tests (" + str.tostring(total_tests) + "): " + str.tostring(math.round(tests_score))
+    string ln12 = "--- Direction ---"
+    string ln13 = "Price Pos: " + str.tostring(math.round(pos_score))
+    string ln14 = "Vol Press: " + str.tostring(math.round(volpress_clamped))
+    string ln15 = "Momentum: " + str.tostring(math.round(momentum_score))
+    string ln16 = use_candle_bias ? "Candle Bias: " + str.tostring(math.round(candle_bias_score)) : "Candle Bias: OFF"
+    string ln17 = "--- Filters ---"
+    string ln18 = "Trend: " + trend_status
+    string ln19 = "Confirm: " + confirm_status
+    string ln20 = "Cooldown: " + cooldown_status
+
+    string sep = "\n"
+    string info_text = ln01 + sep + ln02 + sep + ln03 + sep + ln04 + sep + ln05 + sep + ln06 + sep + ln07 + sep + ln08 + sep + ln09 + sep + ln10 + sep + ln11 + sep + ln12 + sep + ln13 + sep + ln14 + sep + ln15 + sep + ln16 + sep + ln17 + sep + ln18 + sep + ln19 + sep + ln20
+
+    lbl_color = is_bullish ? color.new(#0D3B2E, 10) : color.new(#3B0D0D, 10)
+    info_label := label.new(bar_index + 3, score_final, info_text, style=label.style_label_left, color=lbl_color, textcolor=color.white, size=size.normal)
+
+
+// ═══════════════════════════════════════════════════════════════
+// ─── ALERTS ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(bullish_signal, title="Confirmed Bullish Breakout", message="CONFIRMED BULL Breakout — Score, direction, trend, and candle confirmation all aligned")
+
+alertcondition(bearish_signal, title="Confirmed Bearish Breakout", message="CONFIRMED BEAR Breakout — Score, direction, trend, and candle confirmation all aligned")
+
+alertcondition(score_final >= 90, title="Extreme Score (>=90)", message="Breakout Odds in extreme zone — High probability of breakout")

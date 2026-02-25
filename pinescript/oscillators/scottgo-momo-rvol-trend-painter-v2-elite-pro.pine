@@ -1,0 +1,169 @@
+//@version=6
+// SCOTTGO - MOMO RVOL Trend Painter V3 (Elite + Supertrend PRO)
+indicator("SCOTTGO - MOMO RVOL Elite + Supertrend V3", overlay=true, max_labels_count = 500)
+
+// --- 1. Global Functions ---
+f_get_pos(pos) =>
+    switch pos
+        "Top Left"      => position.top_left
+        "Middle Left"   => position.middle_left
+        "Bottom Left"   => position.bottom_left
+        "Top Right"     => position.top_right
+        "Middle Right"  => position.middle_right
+        "Bottom Right"  => position.bottom_right
+        => position.middle_right
+
+f_get_size(s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.normal
+
+// Updated: High-contrast cell coloring for better visibility
+f_set_cell(tab, row, label, active, activeCol, inactiveCol) =>
+    cellColor = active ? activeCol : inactiveCol
+    status    = active ? "✓" : "✗"
+    table.cell(tab, 0, row, label, text_color = color.white, text_halign = text.align_left)
+    table.cell(tab, 1, row, status, text_color = cellColor, text_halign = text.align_center)
+
+f_get_elite_tooltip(isBull, rvol, rsi, trend, macd, volP) =>
+    string title = isBull ? "⭐ ELITE BULLISH SIGNAL" : "⭐ ELITE BEARISH SIGNAL"
+    str.format("{0}\n--------------------\n• RVOL: {1}x\n• RSI: {2}\n• Trend: {3}\n• MACD: {4}\n• Vol Pressure: {5}", 
+     title, str.tostring(rvol, "0.00"), str.tostring(rsi, "0.0"), trend, macd, volP)
+
+f_get_st_tooltip(isBuy, mult, atrLen, price, vwap) =>
+    string title = isBuy ? "🚀 STRONG BUY (Supertrend)" : "🩸 STRONG SELL (Supertrend)"
+    string desc  = isBuy ? "Trend has flipped Bullish: Price closed above the upper volatility band." : "Trend has flipped Bearish: Price closed below the lower volatility band."
+    string vwapRel = price > vwap ? "Above VWAP (Stronger)" : "Below VWAP (Weaker)"
+    str.format("{0}\n--------------------\n{1}\n\nDETAILS:\n• Multiplier: {2}\n• ATR Period: {3}\n• VWAP Relation: {4}", 
+     title, desc, str.tostring(mult), str.tostring(atrLen), vwapRel)
+
+// --- 2. Inputs ---
+maType          = input.string("SMA", "Volume MA Type", options=["SMA", "EMA"], group="RVOL Settings")
+rvolLength      = input.int(9, "RVOL Lookback Period", minval=1, group="RVOL Settings")
+rvolThreshold   = input.float(1.75, "RVOL Threshold", group="RVOL Settings")
+requireTrend    = input.bool(true, "Require VWAP & 9EMA Alignment", group="RVOL Settings")
+
+stAtrPeriod     = input.int(10, "ST ATR Period", group="Supertrend Logic")
+stMultiplier    = input.float(3.0, "ST ATR Multiplier", step=0.1, group="Supertrend Logic")
+
+useRsiThresh    = input.bool(true, "Filter: RSI Level", group="Momentum Filters")
+rsiThresh       = input.int(50, "RSI Level Threshold", group="Momentum Filters")
+useRsiDir       = input.bool(false, "Filter: RSI Dir", group="Momentum Filters")
+useMacdCross    = input.bool(true, "Filter: MACD Cross", group="Momentum Filters")
+requireMacdZero = input.bool(false, "Filter: MACD Zero", group="Momentum Filters")
+useVolPressure  = input.bool(false, "Filter: Vol Pressure", group="Momentum Filters")
+
+rsiLen          = input.int(14, "RSI Period", group="Internal Settings")
+fastLen         = input.int(12, "MACD Fast", group="Internal Settings")
+slowLen         = input.int(26, "MACD Slow", group="Internal Settings")
+sigLen          = input.int(9, "MACD Signal", group="Internal Settings")
+
+// --- 3. Visual & Color Inputs ---
+showElite       = input.bool(true, "Show Elite Labels", group="Visual Toggles")
+showStLines     = input.bool(true, "Show ST Lines", group="Visual Toggles")
+showStLabels    = input.bool(true, "Show ST Buy/Sell Labels", group="Visual Toggles")
+showDash        = input.bool(true, "Show Dashboard Table", group="Visual Toggles")
+
+// Global Theme (Dashboard Header)
+bullTheme       = input.color(#006400, "Global Bull (Dashboard)", group="Global Theme")
+bearTheme       = input.color(#8b0000, "Global Bear (Dashboard)", group="Global Theme")
+
+// Dashboard Icon Visibility
+checkCol        = input.color(#00FF00, "Table Checkmark (Active)", group="Dashboard Colors")
+crossCol        = input.color(#FF0000, "Table Cross (Inactive)", group="Dashboard Colors") // Updated to Red
+
+// Elite Colors
+eliteBullCol    = input.color(#006400, "Elite Bull Color", group="Elite Label Colors")
+eliteBearCol    = input.color(#8b0000, "Elite Bear Color", group="Elite Label Colors")
+
+// Strong Buy/Sell Colors
+stBuyCol        = input.color(#006400, "Strong Buy Color", group="Strong ST Colors")
+stSellCol       = input.color(#8b0000, "Strong Sell Color", group="Strong ST Colors")
+stUpColor       = input.color(#00C853, "Supertrend Up Line Color", group="Strong ST Colors")
+stDnColor       = input.color(#FF5252, "Supertrend Down Line Color", group="Strong ST Colors")
+
+eliteSizeStr    = input.string("Normal", "Elite Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="UI Sizes & Pos")
+stSizeStr       = input.string("Small", "ST Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="UI Sizes & Pos")
+dashPos         = input.string("Middle Right", "Dash Position", options=["Top Left", "Middle Left", "Bottom Left", "Top Right", "Middle Right", "Bottom Right"], group="UI Sizes & Pos")
+useSolidDash    = input.bool(true, "Dash: Use Solid Colors", group="UI Sizes & Pos")
+
+// --- 4. Calculations ---
+avgVol = maType == "SMA" ? ta.sma(volume, rvolLength) : ta.ema(volume, rvolLength)
+rvol   = volume / avgVol
+vwapV = ta.vwap(close), ema9V = ta.ema(close, 9)
+rsiV = ta.rsi(close, rsiLen)
+[macdLine, signalLine, _] = ta.macd(close, fastLen, slowLen, sigLen)
+
+buyVolume  = (high == low) ? 0.0 : volume * (close - low) / (high - low)
+sellVolume = (high == low) ? 0.0 : volume * (high - close) / (high - low)
+
+[stValue, stTrend] = ta.supertrend(stMultiplier, stAtrPeriod)
+
+isHighRVOL = rvol >= rvolThreshold
+isBullBias = close > open
+
+condVwap = isBullBias ? (close > vwapV) : (close < vwapV)
+condEma  = isBullBias ? (close > ema9V) : (close < ema9V)
+condRvol = rvol > rvol[1]
+condRsi  = isBullBias ? (rsiV > 50) : (rsiV < 50)
+condMacd = isBullBias ? (macdLine > signalLine) : (macdLine < signalLine)
+condZero = isBullBias ? (macdLine > 0) : (macdLine < 0)
+
+int totalScore = (condVwap ? 1 : 0) + (condEma ? 1 : 0) + (condRvol ? 1 : 0) + (condRsi ? 1 : 0) + (condMacd ? 1 : 0) + (condZero ? 1 : 0)
+
+bullishMom = (not useRsiThresh or rsiV > rsiThresh) and (not useRsiDir or rsiV > rsiV[1]) and (not useMacdCross or macdLine > signalLine) and (not requireMacdZero or macdLine > 0) and (not useVolPressure or buyVolume > sellVolume)
+bearishMom = (not useRsiThresh or rsiV < rsiThresh) and (not useRsiDir or rsiV < rsiV[1]) and (not useMacdCross or macdLine < signalLine) and (not requireMacdZero or macdLine < 0) and (not useVolPressure or sellVolume > buyVolume)
+
+bullSignalRaw = isHighRVOL and isBullBias and (not requireTrend or (close > vwapV and close > ema9V)) and bullishMom
+bearSignalRaw = isHighRVOL and not isBullBias and (not requireTrend or (close < vwapV and close < ema9V)) and bearishMom
+
+var int lastSignalBar = 0
+bool bullSignal = bullSignalRaw and (bar_index - lastSignalBar > 2)
+bool bearSignal = bearSignalRaw and (bar_index - lastSignalBar > 2)
+if bullSignal or bearSignal
+    lastSignalBar := bar_index
+
+// --- 5. Dashboard ---
+var testTable = table.new(f_get_pos(dashPos), 2, 8, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.gray)
+
+if showDash and barstate.islast
+    color baseCol = isBullBias ? bullTheme : bearTheme
+    int headTrans = useSolidDash ? 0 : 100 - (totalScore * 13)
+    color headBg  = color.new(baseCol, headTrans)
+    table.cell(testTable, 0, 0, "BIAS: " + (isBullBias ? "Long" : "Short"), text_color = color.white, bgcolor = headBg)
+    table.cell(testTable, 1, 0, "SCORE: " + str.tostring(totalScore) + "/6", text_color = color.white, bgcolor = headBg)
+    
+    f_set_cell(testTable, 2, isBullBias ? "Above VWAP" : "Below VWAP", condVwap, checkCol, crossCol)
+    f_set_cell(testTable, 3, isBullBias ? "Above 9EMA" : "Below 9EMA", condEma, checkCol, crossCol)
+    f_set_cell(testTable, 4, "RVol Rising", condRvol, checkCol, crossCol)
+    f_set_cell(testTable, 5, isBullBias ? "RSI > 50" : "RSI < 50", condRsi, checkCol, crossCol)
+    f_set_cell(testTable, 6, isBullBias ? "MACD Open" : "MACD Closed", condMacd, checkCol, crossCol)
+    f_set_cell(testTable, 7, isBullBias ? "MACD > 0" : "MACD < 0", condZero, checkCol, crossCol)
+
+// --- 6. Plots & Labels ---
+plot(showStLines and stTrend == 1 ? stValue : na, "ST Up Line", color=stUpColor, style=plot.style_linebr, linewidth=2)
+plot(showStLines and stTrend == -1 ? stValue : na, "ST Down Line", color=stDnColor, style=plot.style_linebr, linewidth=2)
+
+if showStLabels
+    stSize = f_get_size(stSizeStr)
+    if ta.change(stTrend) < 0 
+        label.new(bar_index, na, "⭐\nSTRONG\nBUY", yloc=yloc.abovebar, color=stBuyCol, textcolor=color.white, style=label.style_label_lower_right, size=stSize, tooltip=f_get_st_tooltip(true, stMultiplier, stAtrPeriod, close, vwapV))
+    if ta.change(stTrend) > 0 
+        label.new(bar_index, na, "⭐\nSTRONG\nSELL", yloc=yloc.belowbar, color=stSellCol, textcolor=color.white, style=label.style_label_upper_right, size=stSize, tooltip=f_get_st_tooltip(false, stMultiplier, stAtrPeriod, close, vwapV))
+
+if showElite
+    eliteSize = f_get_size(eliteSizeStr)
+    eTrend = requireTrend ? "Aligned" : "Bypassed", eMacd = useMacdCross ? "Bull Cross" : "N/A", eVolP = useVolPressure ? "Positive" : "N/A"
+    if bullSignal
+        label.new(bar_index, na, "⭐\nELITE: BULL\nRVOL: " + str.tostring(rvol, "0.00") + "x", yloc=yloc.abovebar, color=eliteBullCol, textcolor=color.white, style=label.style_label_lower_right, size=eliteSize, tooltip=f_get_elite_tooltip(true, rvol, rsiV, eTrend, eMacd, eVolP))
+    if bearSignal
+        label.new(bar_index, na, "⭐\nELITE: BEAR\nRVOL: " + str.tostring(rvol, "0.00") + "x", yloc=yloc.belowbar, color=eliteBearCol, textcolor=color.white, style=label.style_label_upper_right, size=eliteSize, tooltip=f_get_elite_tooltip(false, rvol, rsiV, eTrend, eMacd, eVolP))
+
+// --- 7. Alerts ---
+alertcondition(bullSignal, "Elite Bull Signal", "Elite Bullish Signal on {{ticker}} at {{close}}")
+alertcondition(bearSignal, "Elite Bear Signal", "Elite Bearish Signal on {{ticker}} at {{close}}")
+alertcondition(totalScore == 6, "Score 6/6 Confluence", "Dashboard Confluence is 6/6 on {{ticker}}!")

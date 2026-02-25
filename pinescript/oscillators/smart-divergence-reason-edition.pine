@@ -1,0 +1,154 @@
+//@version=6
+indicator("Smart Divergence [Reason Edition]", shorttitle="SMART DIV", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ==========================================
+// 1. CONFIGURACIÓN
+// ==========================================
+// Opción para activar/desactivar el filtro de calidad
+use_smart_filter = input.bool(true, "🛡️ Activar Smart Filter", tooltip="Si está activo, solo muestra divergencias que ocurren en zonas de Soporte/Resistencia (Bandas, VWAP, Pivotes). Si está desactivado, muestra todas.")
+
+// Parámetros de detección
+div_len        = input.int(14, "Longitud RSI", group="Configuración")
+piv_lookback   = input.int(2, "Sensibilidad Pivotes", group="Configuración")
+
+// Parámetros de las "Zonas Muro" (Internos, para el filtro)
+bb_len         = 20
+bb_mult        = 2.0
+kc_mult        = 1.5
+
+// ==========================================
+// 2. CÁLCULOS DE ESTRUCTURA (MUROS)
+// ==========================================
+// RSI
+rsi_osc = ta.rsi(close, div_len)
+
+// VWAP
+vwap_val = ta.vwap(close)
+
+// Bandas Bollinger & Keltner
+[m, uBB, lBB] = ta.bb(close, bb_len, bb_mult)
+atr = ta.atr(20)
+uKC = m + (atr * kc_mult)
+lKC = m - (atr * kc_mult)
+
+// Pivotes Diarios (Soporte 1 y Resistencia 1)
+[d_h, d_l, d_c] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+pivot_p = (d_h + d_l + d_c) / 3
+pivot_s1 = (2 * pivot_p) - d_h
+pivot_r1 = (2 * pivot_p) - d_l
+
+// ==========================================
+// 3. LÓGICA DE DIVERGENCIAS
+// ==========================================
+ph = ta.pivothigh(high, piv_lookback, piv_lookback)
+pl = ta.pivotlow(low, piv_lookback, piv_lookback)
+
+// Variables para guardar el estado anterior
+var float prev_ph_price = na
+var float prev_ph_rsi = na
+var int prev_ph_idx = na
+
+var float prev_pl_price = na
+var float prev_pl_rsi = na
+var int prev_pl_idx = na
+
+// Variables de Alerta
+bool alert_bull = false
+bool alert_bear = false
+
+// --- A. DIVERGENCIA BAJISTA (BEAR) ---
+if not na(ph)
+    curr_ph_price = high[piv_lookback]
+    curr_ph_rsi = rsi_osc[piv_lookback]
+    curr_ph_idx = bar_index[piv_lookback]
+    
+    // 1. Detección Técnica
+    is_tech_bear = curr_ph_price > prev_ph_price and curr_ph_rsi < prev_ph_rsi and not na(prev_ph_price)
+    
+    // 2. Smart Filter (Resistencias)
+    price_at_div = high[piv_lookback]
+    
+    touch_ubb  = price_at_div >= uBB[piv_lookback] * 0.999
+    touch_ukc  = price_at_div >= uKC[piv_lookback] * 0.999
+    touch_r1   = price_at_div >= pivot_r1 * 0.999
+    touch_vwap = (price_at_div >= vwap_val[piv_lookback] * 0.998) and (price_at_div <= vwap_val[piv_lookback] * 1.002)
+    rsi_ok_bear = rsi_osc[piv_lookback] > 45 
+    
+    // Validación Final
+    is_valid_bear = use_smart_filter ? (touch_ubb or touch_ukc or touch_r1 or touch_vwap) and rsi_ok_bear : true
+    
+    if is_tech_bear and is_valid_bear
+        alert_bear := true
+        line.new(prev_ph_idx, prev_ph_price, curr_ph_idx, curr_ph_price, color=color.new(color.red, 20), width=2)
+        
+        // --- GENERADOR DE TEXTO DINÁMICO (MOTIVO) ---
+        string reason_bear = ""
+        if use_smart_filter
+            if touch_ubb
+                reason_bear := reason_bear + "BB " // Bollinger
+            if touch_ukc
+                reason_bear := reason_bear + "KC " // Keltner
+            if touch_r1
+                reason_bear := reason_bear + "R1 " // Pivot
+            if touch_vwap
+                reason_bear := reason_bear + "VWAP " // VWAP
+        
+        // Si no hay filtro, texto estándar. Si hay filtro, mostramos el motivo.
+        txt_bear = use_smart_filter ? "SMART BEAR\n(" + reason_bear + ")" : "BEAR\nDIV"
+        
+        label.new(curr_ph_idx, curr_ph_price, txt_bear, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    prev_ph_price := curr_ph_price
+    prev_ph_rsi := curr_ph_rsi
+    prev_ph_idx := curr_ph_idx
+
+// --- B. DIVERGENCIA ALCISTA (BULL) ---
+if not na(pl)
+    curr_pl_price = low[piv_lookback]
+    curr_pl_rsi = rsi_osc[piv_lookback]
+    curr_pl_idx = bar_index[piv_lookback]
+    
+    // 1. Detección Técnica
+    is_tech_bull = curr_pl_price < prev_pl_price and curr_pl_rsi > prev_pl_rsi and not na(prev_pl_price)
+    
+    // 2. Smart Filter (Soportes)
+    price_at_div_l = low[piv_lookback]
+    
+    touch_lbb  = price_at_div_l <= lBB[piv_lookback] * 1.001
+    touch_lkc  = price_at_div_l <= lKC[piv_lookback] * 1.001
+    touch_s1   = price_at_div_l <= pivot_s1 * 1.001
+    touch_vwap_l = (price_at_div_l <= vwap_val[piv_lookback] * 1.002) and (price_at_div_l >= vwap_val[piv_lookback] * 0.998)
+    rsi_ok_bull = rsi_osc[piv_lookback] < 55 
+    
+    // Validación Final
+    is_valid_bull = use_smart_filter ? (touch_lbb or touch_lkc or touch_s1 or touch_vwap_l) and rsi_ok_bull : true
+
+    if is_tech_bull and is_valid_bull
+        alert_bull := true
+        line.new(prev_pl_idx, prev_pl_price, curr_pl_idx, curr_pl_price, color=color.new(color.green, 20), width=2)
+        
+        // --- GENERADOR DE TEXTO DINÁMICO (MOTIVO) ---
+        string reason_bull = ""
+        if use_smart_filter
+            if touch_lbb
+                reason_bull := reason_bull + "BB "
+            if touch_lkc
+                reason_bull := reason_bull + "KC "
+            if touch_s1
+                reason_bull := reason_bull + "S1 "
+            if touch_vwap_l
+                reason_bull := reason_bull + "VWAP "
+        
+        txt_bull = use_smart_filter ? "SMART BULL\n(" + reason_bull + ")" : "BULL\nDIV"
+        
+        label.new(curr_pl_idx, curr_pl_price, txt_bull, color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    prev_pl_price := curr_pl_price
+    prev_pl_rsi := curr_pl_rsi
+    prev_pl_idx := curr_pl_idx
+
+// ==========================================
+// 4. ALERTAS
+// ==========================================
+alertcondition(alert_bull, "ALERTA: Smart Bull Div", "Posible Compra: Divergencia en Soporte")
+alertcondition(alert_bear, "ALERTA: Smart Bear Div", "Posible Venta: Divergencia en Resistencia")

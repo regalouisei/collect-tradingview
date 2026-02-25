@@ -1,0 +1,431 @@
+//@version=5
+indicator("MINI Lead Osc v2 • CCI • Impulse • REG",
+     overlay=false, max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────
+grp1 = "Core Lengths"
+lenCCI   = input.int(20,  "CCI Length", group=grp1, minval=5)
+lenRSI   = input.int(14,  "RSI Length", group=grp1, minval=5)
+lenATR   = input.int(14,  "ATR Length", group=grp1, minval=5)
+
+grpSens = "Sensitivity+"
+sensPlus   = input.int(1, "Sensitivity+ (0=off, 1=low, 2=med, 3=high)", group=grpSens, minval=0, maxval=3)
+sensThrPct = input.float(0.08, "Thr tighten per step (0.05-0.15)", group=grpSens, minval=0.05, maxval=0.15, step=0.01)
+
+grp2 = "Lead Engine (Sharper)"
+slopeLen   = input.int(2,   "Slope Smooth (lower=faster)", group=grp2, minval=1, maxval=10)
+atrRocLen  = input.int(5,   "ATR ROC Lookback", group=grp2, minval=1, maxval=50)
+divPivot   = input.int(5,   "Divergence Pivot (L/R)", group=grp2, minval=2, maxval=20)
+finalEmaOn = input.bool(true, "Final EMA smoothing (recommended)", group=grp2)
+finalEmaLn = input.int(2, "Final EMA Length", group=grp2, minval=1, maxval=10)
+
+grp3 = "Weights (more lead)"
+wSlope  = input.float(0.75, "Weight: Momentum Slope", group=grp3, minval=0, maxval=1, step=0.05)
+wDiv    = input.float(0.15, "Weight: Divergence",     group=grp3, minval=0, maxval=1, step=0.05)
+wAtr    = input.float(0.10, "Weight: ATR Shift",      group=grp3, minval=0, maxval=1, step=0.05)
+
+grp4 = "Signals (Sparse)"
+thr     = input.float(0.18, "Threshold (higher=fewer labels)", group=grp4, minval=0.05, maxval=0.6, step=0.01)
+confirmBars = input.int(1, "Confirm bars after cross (1-3)", group=grp4, minval=0, maxval=3)
+minBarsBetweenSignals = input.int(12, "Cooldown bars between S/L", group=grp4, minval=0, maxval=200)
+useCCI0 = input.bool(true, "CCI Filter: require CCI > 0 for Long, < 0 for Short", group=grp4)
+
+// ─────────────────────────────────────────────────────────────
+// MINI Sharp (A+B)
+// ─────────────────────────────────────────────────────────────
+grpSharp = "MINI Sharp (A+B)"
+useRSIGate = input.bool(true, "RSI 50 Gate (Long>=50 / Short<50)", group=grpSharp)
+rsiGateLv  = input.float(50.0, "RSI Gate Level", group=grpSharp, step=0.5)
+
+useCandleFilter = input.bool(true, "Candle Shape Filter on Signal Bar", group=grpSharp)
+bodyMaxPct = input.float(0.60, "Max Body % (smaller = stricter)", group=grpSharp, step=0.05)
+wickMinPct = input.float(0.25, "Min Wick % (touch-side wick)", group=grpSharp, step=0.05)
+
+// ─────────────────────────────────────────────────────────────
+// MINI line color (EMA200 sistemi KALDIRILDI)
+// ─────────────────────────────────────────────────────────────
+grpClr = "MINI Line Color"
+useAutoMiniColor = input.bool(false, "Auto color (lead100>=0 lime / <0 red)", group=grpClr)
+miniUserColor    = input.color(color.white, "Mini Line Color (manual)", group=grpClr)
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+compress(x, k) =>
+    x / (math.abs(x) + k)
+
+// ─────────────────────────────────────────────────────────────
+// Sensitivity+ (effective params)
+// ─────────────────────────────────────────────────────────────
+effLenRSI  = math.max(5, lenRSI - sensPlus * 2)                 // 14 -> 12/10/8
+effSlopeLn = math.max(1, slopeLen - sensPlus)                   // 2 -> 1
+effFinalLn = math.max(1, finalEmaLn - math.floor(sensPlus / 2)) // 2 -> 1 (med/high)
+thrEff     = clamp(thr * (1.0 - sensPlus * sensThrPct), 0.03, 0.80)
+
+// ─────────────────────────────────────────────────────────────
+// Base indicators
+// ─────────────────────────────────────────────────────────────
+cci = ta.cci(close, lenCCI)
+rsi = ta.rsi(close, effLenRSI)
+atr = ta.atr(lenATR)
+
+// ─────────────────────────────────────────────────────────────
+// 1) Momentum Slope
+// ─────────────────────────────────────────────────────────────
+cciSlopeRaw = cci - cci[1]
+rsiSlopeRaw = rsi - rsi[1]
+
+cciSlope = ta.ema(cciSlopeRaw, effSlopeLn)
+rsiSlope = ta.ema(rsiSlopeRaw, effSlopeLn)
+
+cciSlopeN = compress(cciSlope, 25.0)
+rsiSlopeN = compress(rsiSlope, 2.0)
+
+momSlopeScore = (cciSlopeN + rsiSlopeN) * 0.5
+
+// ─────────────────────────────────────────────────────────────
+// 2) Divergence (pivot-based, confirmed)
+// ─────────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, divPivot, divPivot)
+pl = ta.pivotlow(low,  divPivot, divPivot)
+
+rsiPH = ta.pivothigh(rsi, divPivot, divPivot)
+rsiPL = ta.pivotlow(rsi,  divPivot, divPivot)
+
+var float lastPH_price = na
+var float lastPH_rsi   = na
+var float lastPL_price = na
+var float lastPL_rsi   = na
+
+bearDiv = false
+bullDiv = false
+
+if not na(ph) and not na(rsiPH)
+    curPH_price = ph
+    curPH_rsi   = rsiPH
+    if not na(lastPH_price) and not na(lastPH_rsi)
+        bearDiv := (curPH_price > lastPH_price) and (curPH_rsi < lastPH_rsi)
+    lastPH_price := curPH_price
+    lastPH_rsi   := curPH_rsi
+
+if not na(pl) and not na(rsiPL)
+    curPL_price = pl
+    curPL_rsi   = rsiPL
+    if not na(lastPL_price) and not na(lastPL_rsi)
+        bullDiv := (curPL_price < lastPL_price) and (curPL_rsi > lastPL_rsi)
+    lastPL_price := curPL_price
+    lastPL_rsi   := curPL_rsi
+
+divScore = bullDiv ? +1.0 : bearDiv ? -1.0 : 0.0
+
+// ─────────────────────────────────────────────────────────────
+// 3) Volatility / ATR shift
+// ─────────────────────────────────────────────────────────────
+atrROC   = (atr - atr[atrRocLen]) / atr[atrRocLen]
+atrROCc  = clamp(atrROC, -0.5, 0.5)
+atrScore = -atrROCc / 0.5
+
+// ─────────────────────────────────────────────────────────────
+// CCI bias gate
+// ─────────────────────────────────────────────────────────────
+cciBiasLong  = useCCI0 ? (cci > 0) : true
+cciBiasShort = useCCI0 ? (cci < 0) : true
+
+// ─────────────────────────────────────────────────────────────
+// Composite score → MINI line
+// ─────────────────────────────────────────────────────────────
+wSum = math.max(0.0001, (wSlope + wDiv + wAtr))
+score = (wSlope * momSlopeScore + wDiv * divScore + wAtr * atrScore) / wSum
+scoreClamped = clamp(score, -1.0, 1.0)
+
+leadRaw = scoreClamped
+lead    = finalEmaOn ? ta.ema(leadRaw, effFinalLn) : leadRaw
+lead100 = lead * 100.0
+
+miniLineColor = useAutoMiniColor ? (lead100 >= 0 ? color.lime : color.red) : miniUserColor
+
+// ─────────────────────────────────────────────────────────────
+// REGRESSION SYSTEM (MINI içi)  ✅
+// linreg(lead100) + RMSE bands → momentum rejimi / taşma
+// ─────────────────────────────────────────────────────────────
+grpRegMini = "Regression (MINI)"
+regMiniOn     = input.bool(true,  "Enable MINI Regression", group=grpRegMini)
+regMiniLen    = input.int(34,     "Regression Length (MINI)", minval=10, group=grpRegMini)
+regMiniMul    = input.float(1.8,  "RMSE Multiplier (MINI)", step=0.1, group=grpRegMini)
+showRegLine   = input.bool(true,  "Show Regression Line", group=grpRegMini)
+showRegBands  = input.bool(true,  "Show RMSE Bands", group=grpRegMini)
+regLineColor  = input.color(color.new(color.aqua, 0), "Reg Line Color", group=grpRegMini)
+regBandColor  = input.color(color.new(color.gray, 75), "Band Color", group=grpRegMini)
+
+regMini = ta.linreg(lead100, regMiniLen, 0)
+
+float errM = 0.0
+for i = 0 to regMiniLen - 1
+    errM += math.pow(lead100[i] - regMini[i], 2)
+
+rmseM = math.sqrt(errM / math.max(1, (regMiniLen - 1)))
+
+regUpper = regMini + rmseM * regMiniMul
+regLower = regMini - rmseM * regMiniMul
+
+miniUp    = regMiniOn and (lead100 > regMini)
+miniDown  = regMiniOn and (lead100 < regMini)
+miniExUp  = regMiniOn and (lead100 > regUpper)
+miniExDn  = regMiniOn and (lead100 < regLower)
+
+// ─────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────
+plot(lead100, "Mini Lead", linewidth=3, color=miniLineColor)
+hline(0, "Zero", linestyle=hline.style_dotted)
+
+// MINI Regression plots
+plot(regMiniOn and showRegLine ? regMini : na, "MINI Reg", color=regLineColor, linewidth=2)
+plot(regMiniOn and showRegBands ? regUpper : na, "Reg Upper", color=regBandColor, linewidth=1, style=plot.style_line)
+plot(regMiniOn and showRegBands ? regLower : na, "Reg Lower", color=regBandColor, linewidth=1, style=plot.style_line)
+
+// mini-reg “taşma” görsel uyarı (opsiyonel, sade)
+bgcolor(regMiniOn ? (miniExUp ? color.new(color.red, 88) : miniExDn ? color.new(color.lime, 88) : na) : na)
+
+// ─────────────────────────────────────────────────────────────
+// Auto Bands (orijinal)
+// ─────────────────────────────────────────────────────────────
+grpBands = "Bands"
+bandOn = input.bool(true, "Show Auto Bands (±thr*100)", group=grpBands)
+
+thr100 = thrEff * 100.0
+hline(bandOn ? +thr100 : na, "Upper (Auto)", linestyle=hline.style_dotted)
+hline(bandOn ? -thr100 : na, "Lower (Auto)", linestyle=hline.style_dotted)
+
+// ─────────────────────────────────────────────────────────────
+// Extreme Turn Coloring (orijinal)
+// ─────────────────────────────────────────────────────────────
+grpTurn = "Extreme Turn Coloring (±50 Zone Only)"
+useExtremeColor = input.bool(true, "Enable 1-bar coloring at ±50 turns", group=grpTurn)
+extLevel  = input.float(50.0, "Extreme Level (±)", group=grpTurn, minval=10, maxval=90, step=5)
+near      = input.float(10.0, "Near Zone (±)", group=grpTurn, minval=0, maxval=30, step=1)
+turnLen   = input.int(1, "Turn confirmation (1=faster)", group=grpTurn, minval=1, maxval=5)
+shade     = input.int(85, "Shade (0=solid, 100=transparent)", group=grpTurn, minval=0, maxval=100)
+
+lowZoneOk  = lead100 <= -(extLevel - near)
+highZoneOk = lead100 >=  (extLevel - near)
+
+slopeNow  = lead100 - lead100[1]
+slopePrev = lead100[1] - lead100[2]
+
+bullTurn = lowZoneOk  and (slopePrev < 0) and (slopeNow > 0) and ta.rising(lead100, turnLen)
+bearTurn = highZoneOk and (slopePrev > 0) and (slopeNow < 0) and ta.falling(lead100, turnLen)
+
+bgcolor(useExtremeColor ? (bullTurn ? color.new(color.green, shade) : bearTurn ? color.new(color.red, shade) : na) : na)
+
+// ─────────────────────────────────────────────────────────────
+// Sparse S/L logic (confirmBars FIXED)
+// ─────────────────────────────────────────────────────────────
+crossUp   = ta.crossover(lead, +thrEff)
+crossDown = ta.crossunder(lead, -thrEff)
+
+var int crossUpBar = na
+var int crossDnBar = na
+if crossUp
+    crossUpBar := bar_index
+if crossDown
+    crossDnBar := bar_index
+
+confirmLongOk  = confirmBars == 0 ? (lead > +thrEff) : (not na(crossUpBar) and (bar_index - crossUpBar) == confirmBars and lead > +thrEff)
+confirmShortOk = confirmBars == 0 ? (lead < -thrEff) : (not na(crossDnBar) and (bar_index - crossDnBar) == confirmBars and lead < -thrEff)
+
+var int lastSigBar = na
+cooldownOk = na(lastSigBar) ? true : (bar_index - lastSigBar) >= minBarsBetweenSignals
+
+// Candle filter
+rng = math.max(high - low, syminfo.mintick)
+body = math.abs(close - open)
+bodyPct = body / rng
+
+upperW = high - math.max(open, close)
+lowerW = math.min(open, close) - low
+upperPct = upperW / rng
+lowerPct = lowerW / rng
+
+candleOkLong  = (bodyPct <= bodyMaxPct) and (lowerPct >= wickMinPct)
+candleOkShort = (bodyPct <= bodyMaxPct) and (upperPct >= wickMinPct)
+
+candleGateLong  = not useCandleFilter ? true : candleOkLong
+candleGateShort = not useCandleFilter ? true : candleOkShort
+
+// RSI gate
+rsiGateLong  = not useRSIGate ? true : (rsi >= rsiGateLv)
+rsiGateShort = not useRSIGate ? true : (rsi <  rsiGateLv)
+
+// Final signals
+longSig  = confirmLongOk  and cciBiasLong  and cooldownOk and rsiGateLong  and candleGateLong
+shortSig = confirmShortOk and cciBiasShort and cooldownOk and rsiGateShort and candleGateShort
+
+if longSig or shortSig
+    lastSigBar := bar_index
+
+// ✅ L yeşil, S kırmızı
+plotshape(longSig,  title="Lead Long",  style=shape.triangleup,   location=location.bottom, size=size.tiny, text="L", color=color.new(color.lime, 0), textcolor=color.white)
+plotshape(shortSig, title="Lead Short", style=shape.triangledown, location=location.top,    size=size.tiny, text="S", color=color.new(color.red,  0), textcolor=color.white)
+
+plotshape(bullDiv,  title="Bull Div",   style=shape.circle,       location=location.bottom, size=size.tiny, text="DIV+", color=color.new(color.lime, 0), textcolor=color.white)
+plotshape(bearDiv,  title="Bear Div",   style=shape.circle,       location=location.top,    size=size.tiny, text="DIV-", color=color.new(color.red,  0), textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────
+// IMPULSE → EARLY WEAKNESS → DISTRIBUTION (Leading Module)
+// ─────────────────────────────────────────────────────────────
+grpLead = "Impulse Leading (EMA dist + MINI slope + CCI)"
+useImpulseLead = input.bool(true, "Enable Impulse Leading Module", group=grpLead)
+
+emaFastLen = input.int(5,  "EMA Fast (5)",  group=grpLead, minval=1)
+emaSlowLen = input.int(14, "EMA Slow (14)", group=grpLead, minval=1)
+
+cciImpulseLv = input.float(100.0, "CCI Impulse Level (+100)", group=grpLead, step=5)
+miniTopZone  = input.float(30.0, "MINI high zone (lead100)", group=grpLead, step=5)
+miniDnTol    = input.float(0.0,  "MINI slope <= (early)", group=grpLead, step=0.5)
+distTol      = input.float(0.0,  "EMA dist ROC <= (early)", group=grpLead, step=0.00001)
+coolLeadBars = input.int(8, "Cooldown bars (Lead states)", group=grpLead, minval=0, maxval=200)
+
+ema5p  = ta.ema(close, emaFastLen)
+ema14p = ta.ema(close, emaSlowLen)
+
+emaDist    = ema5p - ema14p
+emaDistROC = emaDist - emaDist[1]
+
+miniSlope = lead100 - lead100[1]
+cciSlope2 = cci - cci[1]
+
+impulseStart =
+     ta.crossover(cci, cciImpulseLv) and
+     ema5p > ema14p and
+     emaDistROC > 0 and
+     miniSlope > 0
+
+earlyWeakness =
+     (cci > cciImpulseLv) and
+     (lead100 > miniTopZone) and
+     (miniSlope <= miniDnTol) and
+     (cciSlope2 < 0) and
+     (emaDistROC <= distTol) and
+     (ema5p > ema14p)
+
+distribution =
+     (ema5p > ema14p) and
+     (emaDist < emaDist[1]) and
+     (miniSlope < 0) and
+     (cciSlope2 < 0)
+
+var int lastLeadBar = na
+leadCooldownOk = na(lastLeadBar) ? true : (bar_index - lastLeadBar) >= coolLeadBars
+
+fireImpulse = useImpulseLead and impulseStart and leadCooldownOk
+fireEarly   = useImpulseLead and earlyWeakness and leadCooldownOk
+fireDist    = useImpulseLead and distribution and not distribution[1] and leadCooldownOk
+
+if fireImpulse or fireEarly or fireDist
+    lastLeadBar := bar_index
+
+// ─────────────────────────────────────────────────────────────
+// ICON ETİKETLER (orijinal)
+// ─────────────────────────────────────────────────────────────
+grpTR = "İkon Etiketler (Panel içi) + Durum"
+pinIconsTop   = input.bool(true, "İkonları panelin üst bandına sabitle", group=grpTR)
+iconPad       = input.float(8.0, "Üst pay (puan)", group=grpTR, step=1)
+iconCooldown  = input.int(20, "İkon aralığı (bar)", group=grpTR, minval=0, maxval=200)
+showStatusTbl = input.bool(true, "Durum tablosu göster", group=grpTR)
+
+iconSizeOpt = input.string("tiny", "İkon boyutu", options=["tiny","small","normal"], group=grpTR)
+iconAlpha   = input.int(10, "İkon solukluk (0=solid, 90=çok soluk)", minval=0, maxval=90, group=grpTR)
+
+colStart = input.color(color.lime,   "Başladı (ok) rengi", group=grpTR)
+colWarn  = input.color(color.yellow, "Zayıf (ünlem) rengi", group=grpTR)
+colStop  = input.color(color.red,    "Bitti (altıgen) rengi", group=grpTR)
+
+f_size(_s) =>
+    _s == "tiny" ? size.tiny : _s == "small" ? size.small : size.normal
+_sz = f_size(iconSizeOpt)
+
+topBase = extLevel + near + iconPad
+yStart  = clamp(topBase - 4,  -95.0, 95.0)
+yWarn   = clamp(topBase - 10, -95.0, 95.0)
+yStop   = clamp(topBase - 16, -95.0, 95.0)
+
+var int lastIconBar = na
+iconOk = na(lastIconBar) ? true : (bar_index - lastIconBar) >= iconCooldown
+
+showStart = fireImpulse and iconOk
+showWarn  = fireEarly   and iconOk
+showStop  = fireDist    and iconOk
+
+if showStart or showWarn or showStop
+    lastIconBar := bar_index
+
+startY = pinIconsTop ? yStart : clamp(lead100 + 10, -95.0, 95.0)
+warnY  = pinIconsTop ? yWarn  : clamp(lead100 + 4,  -95.0, 95.0)
+stopY  = pinIconsTop ? yStop  : clamp(lead100 - 2,  -95.0, 95.0)
+
+if showStart
+    label.new(bar_index, startY, "▲", style=label.style_none, textcolor=color.new(colStart, iconAlpha), color=color.new(color.black, 100), size=_sz)
+
+if showWarn
+    label.new(bar_index, warnY, "⚠", style=label.style_none, textcolor=color.new(colWarn, iconAlpha), color=color.new(color.black, 100), size=_sz)
+
+if showStop
+    label.new(bar_index, stopY, "⬣", style=label.style_none, textcolor=color.new(colStop, iconAlpha), color=color.new(color.black, 100), size=_sz)
+
+// ─────────────────────────────────────────────────────────────
+// Durum tablosu (sağ üst)
+// ─────────────────────────────────────────────────────────────
+var table t = na
+var int state = 0   // 0=—, 1=START, 2=WEAK, 3=STOP
+
+if fireImpulse
+    state := 1
+else if fireEarly
+    state := 2
+else if fireDist
+    state := 3
+
+if barstate.isfirst and showStatusTbl
+    t := table.new(position.top_right, 1, 1)
+
+if showStatusTbl and not na(t)
+    cur =
+         state == 3 ? "🛑 DAĞITIM / BİTTİ" :
+         state == 2 ? "⚠️ GÜÇ AZALIYOR" :
+         state == 1 ? "🚀 İTKİ / BAŞLADI" :
+         "—"
+    table.cell(t, 0, 0, "Durum: " + cur)
+
+// ─────────────────────────────────────────────────────────────
+// Opsiyonel: EW sonrası SHORT tetik (varsayılan kapalı)
+// ─────────────────────────────────────────────────────────────
+grpShort = "EW Sonrası Short (Opsiyonel)"
+useShortTrigger   = input.bool(false, "EW sonrası Short Tetik", group=grpShort)
+shortWindowBars   = input.int(6, "EW sonrası takip penceresi (bar)", group=grpShort, minval=1, maxval=30)
+shortNeedLead0    = input.bool(true, "Şart: lead 0 altına kessin", group=grpShort)
+shortNeedClose14  = input.bool(false,"Şart: kapanış EMA14 altı", group=grpShort)
+
+var int ewBar = na
+if fireEarly
+    ewBar := bar_index
+
+inEwWindow = not na(ewBar) and (bar_index - ewBar) >= 0 and (bar_index - ewBar) <= shortWindowBars
+condLead0   = ta.crossunder(lead, 0)
+condClose14 = close < ema14p
+
+shortTrigger = useShortTrigger and inEwWindow and (not shortNeedLead0 or condLead0) and (not shortNeedClose14 or condClose14)
+
+plotshape(shortTrigger, title="SHORT TETİK", style=shape.triangledown, location=location.top, size=size.small, text="SHORT",
+     color=color.new(color.red, 0), textcolor=color.white)
+
+// Alerts
+alertcondition(fireImpulse, "HAREKET BAŞLADI", "BAŞLADI: CCI +100 kesişti, EMA mesafesi büyüyor, MINI yukarı.")
+alertcondition(fireEarly,   "GÜÇ AZALIYOR",   "ZAYIF: MINI kambur, CCI eğim aşağı, EMA mesafesi büyümüyor.")
+alertcondition(fireDist,    "HAREKET BİTTİ",  "BİTTİ: EMA5 EMA14'e yaklaşıyor, MINI&CCI aşağı.")
+alertcondition(shortTrigger,"EW SONRASI SHORT", "EW sonrası kırılma geldi: SHORT tetik koşulları sağlandı.")

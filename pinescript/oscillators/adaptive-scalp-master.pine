@@ -1,0 +1,197 @@
+//@version=6
+indicator(title="ADAPTIVE SCALP MASTER", shorttitle="ASM", overlay=true, 
+          format=format.price, precision=2, 
+          max_lines_count=500, max_labels_count=500)
+
+// === INPUTS ===
+aggressive_mode = input.bool(false, "⚠️ Aggressive Scalping Mode (High Frequency)", 
+    tooltip="WARNING: Disables all filters and lowers threshold for maximum signal frequency. Generates many signals, suitable only for experienced scalpers on M1-M5. Use with extreme caution - high risk of false signals.")
+
+min_bars_between = input.int(0, "Min Bars Between Signals", minval=0, maxval=10,
+    tooltip="Minimum number of bars to wait before allowing a new entry after the previous one. Helps reduce over-trading (0 = disabled).")
+
+base_sens       = input.int(10, "Base Sensitivity", minval=5, maxval=30,
+    tooltip="Length for Z-Score calculation. Lower = more sensitive (faster signals).")
+
+base_thresh     = input.float(1.5, "Base Threshold", minval=0.5, maxval=3.0, step=0.1,
+    tooltip="Z-Score deviation threshold. Lower = more frequent signals.")
+
+manual_mode     = input.bool(false, "Manual Mode", 
+    tooltip="Disable auto-adaptation and use manual lengths.")
+
+custom_zlsma    = input.int(14, "ZLSMA Length (Manual)", minval=5, maxval=50)
+custom_atr      = input.int(14, "ATR Length (Manual)",   minval=5, maxval=30)
+
+use_volume      = input.bool(true,  "Volume Filter", 
+    tooltip="Require volume above 20-period average.")
+use_confirm     = input.bool(true,  "Candle Confirmation", 
+    tooltip="Require bullish/bearish candle for entry.")
+use_trend       = input.bool(true,  "Trend Filter", 
+    tooltip="Require alignment with ZLSMA trend direction.")
+
+show_all        = input.bool(true,  "Show Indicators")
+show_panel      = input.bool(true,  "Info Panel")
+show_zones      = input.bool(true,  "Signal Zones")
+show_all_signals = input.bool(true, "Show All Signals (including inside position)")
+
+// === APPLY MODE SETTINGS ===
+final_threshold   = aggressive_mode ? 1.0 : base_thresh
+use_final_volume  = aggressive_mode ? false : use_volume
+use_final_confirm = aggressive_mode ? false : use_confirm
+use_final_trend   = aggressive_mode ? false : use_trend
+
+// === ADAPTIVE PARAMETERS ===
+tf_minutes = timeframe.isseconds ? timeframe.multiplier / 60 : 
+             timeframe.isminutes ? timeframe.multiplier : 
+             timeframe.isdaily ? timeframe.multiplier * 1440 : 
+             timeframe.isweekly ? timeframe.multiplier * 10080 : 
+             timeframe.ismonthly ? timeframe.multiplier * 43200 : 1
+
+get_len(base) =>
+    if tf_minutes <= 1
+        int(base * 0.7)
+    else if tf_minutes <= 5
+        int(base * 0.85)
+    else if tf_minutes <= 15
+        base
+    else if tf_minutes <= 30
+        int(base * 1.2)
+    else if tf_minutes <= 60
+        int(base * 1.5)
+    else
+        int(base * 2.0)
+
+get_thresh(base) =>
+    if tf_minutes <= 1
+        base * 0.8
+    else if tf_minutes <= 5
+        base * 0.9
+    else if tf_minutes <= 15
+        base
+    else if tf_minutes <= 30
+        base * 1.1
+    else if tf_minutes <= 60
+        base * 1.3
+    else
+        base * 1.5
+
+zlsma_len     = manual_mode ? custom_zlsma : get_len(14)
+atr_len       = manual_mode ? custom_atr   : get_len(14)
+signal_len    = manual_mode ? base_sens    : get_len(base_sens)
+signal_thresh = manual_mode ? base_thresh  : get_thresh(final_threshold)
+
+atr_mult = manual_mode ? 2.0 : (tf_minutes <= 5 ? 1.5 : (tf_minutes <= 60 ? 2.0 : 3.0))
+
+// === INDICATORS ===
+zlsma1    = ta.linreg(close, zlsma_len, 0)
+zlsma2    = ta.linreg(zlsma1, zlsma_len, 0)
+zlsma_val = 2 * zlsma1 - zlsma2
+trend_up  = zlsma_val > zlsma_val[1]
+trend_dn  = zlsma_val < zlsma_val[1]
+
+atr_val = ta.atr(atr_len)
+
+price_mean = ta.sma(close, signal_len)
+price_std  = ta.stdev(close, signal_len)
+z_score    = price_std > 0 ? (close - price_mean) / price_std : 0
+
+// === FILTERS ===
+vol_avg = ta.sma(volume, 20)
+vol_ok  = not use_final_volume or volume > vol_avg
+
+candle_ok = not use_final_confirm or ((z_score <= -signal_thresh and close > open) or (z_score >= signal_thresh and close < open))
+trend_ok  = not use_final_trend or ((z_score <= -signal_thresh and trend_up) or (z_score >= signal_thresh and trend_dn))
+
+// === SIGNALS ===
+buy_signal_raw  = z_score <= -signal_thresh and vol_ok and candle_ok and trend_ok
+sell_signal_raw = z_score >= signal_thresh and vol_ok and candle_ok and trend_ok
+
+// Min bars protection
+var int last_signal_bar = 0
+can_enter = bar_index - last_signal_bar >= min_bars_between
+
+buy_signal  = buy_signal_raw and can_enter
+sell_signal = sell_signal_raw and can_enter
+
+// === POSITION MANAGEMENT ===
+var int    pos   = 0
+var float  sl    = na
+var float  tp    = na
+var string last  = "NONE"
+
+if buy_signal and pos <= 0
+    pos  := 1
+    sl   := low - (atr_val * atr_mult)
+    tp   := close + (atr_val * atr_mult * 1.5)
+    last := "LONG"
+    last_signal_bar := bar_index
+
+if sell_signal and pos >= 0
+    pos  := -1
+    sl   := high + (atr_val * atr_mult)
+    tp   := close - (atr_val * atr_mult * 1.5)
+    last := "SHORT"
+    last_signal_bar := bar_index
+
+if pos == 1 and (low <= sl or high >= tp)
+    pos := 0
+    sl  := na
+    tp  := na
+
+if pos == -1 and (high >= sl or low <= tp)
+    pos := 0
+    sl  := na
+    tp  := na
+
+// === PLOTTING ===
+plot(show_all ? zlsma_val : na, title="ZLSMA", color=trend_up ? color.green : color.red, linewidth=2)
+
+sl_line = show_all and not na(sl) ? sl : na
+tp_line = show_all and not na(tp) ? tp : na
+plot(sl_line, title="Stop Loss", color=pos == 1 ? color.red : color.green, linewidth=1)
+plot(tp_line, title="Take Profit", color=color.orange, linewidth=1)
+
+buy_series  = show_all_signals ? buy_signal_raw : (buy_signal_raw and pos <= 0)
+sell_series = show_all_signals ? sell_signal_raw : (sell_signal_raw and pos >= 0)
+
+plotshape(series=buy_series,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small)
+plotshape(series=sell_series, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small)
+
+// Improved zone coloring
+is_oversold   = z_score <= -signal_thresh
+is_overbought = z_score >= signal_thresh
+zone_color    = is_oversold ? color.new(color.green, 85) : (is_overbought ? color.new(color.red, 85) : na)
+bgcolor(show_zones ? zone_color : na)
+
+// === INFO PANEL ===
+if show_panel and barstate.islast
+    tf_name = timeframe.period
+    var table panel = table.new(position.top_right, 3, 8, bgcolor=color.new(#0A0E17, 95))
+    table.cell(panel, 0, 0, "ADAPTIVE SCALP", text_color=color.yellow)
+    table.cell(panel, 2, 0, tf_name, text_color=color.white)
+    table.cell(panel, 0, 1, "Mode:", text_color=color.gray)
+    table.cell(panel, 1, 1, aggressive_mode ? "AGGRESSIVE" : "BALANCED", text_color=aggressive_mode ? color.red : color.lime)
+    table.cell(panel, 0, 2, "Position:", text_color=color.gray)
+    pos_text  = pos == 1 ? "LONG" : (pos == -1 ? "SHORT" : "FLAT")
+    pos_color = pos == 1 ? color.green : (pos == -1 ? color.red : color.white)
+    table.cell(panel, 1, 2, pos_text, text_color=pos_color)
+    table.cell(panel, 0, 3, "Z-Score:", text_color=color.gray)
+    z_color = is_oversold ? color.green : (is_overbought ? color.red : color.white)
+    table.cell(panel, 1, 3, str.tostring(z_score, "#.##"), text_color=z_color)
+    table.cell(panel, 2, 3, is_oversold ? "OVERSOLD" : (is_overbought ? "OVERBOUGHT" : "NEUTRAL"), text_color=z_color)
+    table.cell(panel, 0, 4, "Trend:", text_color=color.gray)
+    trend_text  = trend_up ? "BULLISH" : (trend_dn ? "BEARISH" : "SIDEWAYS")
+    trend_color = trend_up ? color.green : (trend_dn ? color.red : color.gray)
+    table.cell(panel, 1, 4, trend_text, text_color=trend_color)
+    table.cell(panel, 0, 5, "ATR:", text_color=color.gray)
+    table.cell(panel, 1, 5, str.tostring(atr_val, "#.##"), text_color=color.white)
+    table.cell(panel, 2, 5, "x" + str.tostring(atr_mult, "#.#"), text_color=color.orange)
+    table.cell(panel, 0, 6, "Last:", text_color=color.gray)
+    last_color = last == "LONG" ? color.green : (last == "SHORT" ? color.red : color.gray)
+    table.cell(panel, 1, 6, last, text_color=last_color)
+    table.cell(panel, 0, 7, "Threshold:", text_color=color.gray)
+    table.cell(panel, 1, 7, str.tostring(signal_thresh, "#.##"), text_color=color.white)
+
+// === ALERTS ===
+alertcondition(buy_signal and pos <= 0, title="ASM: Buy Signal", message="BUY")
+alertcondition(sell_signal and pos >= 0, title="ASM: Sell Signal", message="SELL")

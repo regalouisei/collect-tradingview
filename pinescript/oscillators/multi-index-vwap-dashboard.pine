@@ -1,0 +1,122 @@
+//@version=6
+indicator("Multi-Index VWAP Dashboard", overlay=true)
+
+// --- INPUTS ---
+grp_ui = "Dashboard Appearance"
+pos_input  = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left", "Top Center", "Bottom Center"], group=grp_ui)
+size_input = input.string("Small", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=grp_ui)
+style_input = input.string("Bubble", "Dot Style", options=["Solid", "Bubble", "Ring"], group=grp_ui)
+
+// Helper for UI Style
+get_char(s) =>
+    switch s
+        "Solid"  => "●"
+        "Bubble" => "◎"
+        "Ring"   => "○"
+        => "◎"
+
+get_pos(p) =>
+    switch p
+        "Top Right"     => position.top_right
+        "Bottom Right"  => position.bottom_right
+        "Top Left"      => position.top_left
+        "Bottom Left"   => position.bottom_left
+        "Top Center"    => position.top_center
+        "Bottom Center" => position.bottom_center
+        => position.top_right
+
+get_size(s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+
+// --- Timezone & Session Logic (NY Time) ---
+is_ny_session(t) =>
+    h = hour(t, "America/New_York"), m = minute(t, "America/New_York")
+    total_min = h * 60 + m
+    total_min >= 570 and total_min < 960
+
+is_or_session(t) =>
+    h = hour(t, "America/New_York"), m = minute(t, "America/New_York")
+    total_min = h * 60 + m
+    total_min >= 570 and total_min < 585
+
+// --- Symbols & Data ---
+s1 = "CME_MINI:NQ1!", s2 = "CME_MINI:ES1!", s3 = "CBOT_MINI:YM1!"
+[h1, l1, c1, v1, t1] = request.security(s1, timeframe.period, [high, low, close, volume, time])
+[h2, l2, c2, v2, t2] = request.security(s2, timeframe.period, [high, low, close, volume, time])
+[h3, l3, c3, v3, t3] = request.security(s3, timeframe.period, [high, low, close, volume, time])
+
+// --- Calculation Logic ---
+calc_metrics(h, l, c, v, t) =>
+    in_ny = is_ny_session(t), in_or = is_or_session(t)
+    new_day = ta.change(time("D", "America/New_York")) > 0
+    new_ny  = in_ny and not in_ny[1]
+    v_src = (h + l + c) / 3
+
+    var float sumPV_ny = 0.0, var float sumV_ny = 0.0
+    if new_ny
+        sumPV_ny := 0.0, sumV_ny := 0.0
+    if in_ny
+        sumPV_ny += v_src * v, sumV_ny += v
+    ny_vwap = sumPV_ny / sumV_ny
+
+    var float pd_ny_vwap = na
+    if not in_ny and in_ny[1]
+        pd_ny_vwap := ny_vwap[1]
+
+    var float hod = 0.0, var float lod = 1e10
+    var float sumPV_hod = 0.0, var float sumV_hod = 0.0
+    var float sumPV_lod = 0.0, var float sumV_lod = 0.0
+    if new_day
+        hod := 0.0, lod := 1e10
+    if h > hod
+        hod := h, sumPV_hod := v_src * v, sumV_hod := v
+    else
+        sumPV_hod += v_src * v, sumV_hod += v
+    if l < lod
+        lod := l, sumPV_lod := v_src * v, sumV_lod := v
+    else
+        sumPV_lod += v_src * v, sumV_lod += v
+    
+    var float orh = na, var float orl = na
+    if new_ny
+        orh := h, orl := l
+    else if in_or
+        orh := math.max(orh, h), orl := math.min(orl, l)
+
+    [ny_vwap, pd_ny_vwap, sumPV_lod/sumV_lod, sumPV_hod/sumV_hod, orh, orl]
+
+[ny1, pd1, lod1, hod1, orh1, orl1] = calc_metrics(h1, l1, c1, v1, t1)
+[ny2, pd2, lod2, hod2, orh2, orl2] = calc_metrics(h2, l2, c2, v2, t2)
+[ny3, pd3, lod3, hod3, orh3, orl3] = calc_metrics(h3, l3, c3, v3, t3)
+
+// --- Table UI ---
+var tbl = table.new(get_pos(pos_input), 7, 4, frame_color=color.new(color.gray, 50), frame_width=1, border_width=1)
+
+fill_row(tbl, row, name, cur, ny, pd, lod, hod, orh, orl, txt_sz, char) =>
+    table.cell(tbl, 0, row, name, text_color=color.white, text_size=txt_sz)
+    table.cell(tbl, 1, row, char, text_color = cur > ny  ? color.lime : color.red, text_size=txt_sz)
+    table.cell(tbl, 2, row, char, text_color = cur > pd  ? color.lime : color.red, text_size=txt_sz)
+    table.cell(tbl, 3, row, char, text_color = cur > lod ? color.lime : color.red, text_size=txt_sz)
+    table.cell(tbl, 4, row, char, text_color = cur > hod ? color.lime : color.red, text_size=txt_sz)
+    
+    or_txt = cur > orh ? "▲ ABOVE" : cur < orl ? "▼ BELOW" : "◎ INSIDE"
+    or_color = cur > orh ? color.lime : cur < orl ? color.red : color.yellow
+    table.cell(tbl, 5, row, or_txt, text_color=or_color, text_size=txt_sz)
+    
+    trend_bull = ta.ema(cur, 9) > ta.ema(cur, 21)
+    table.cell(tbl, 6, row, trend_bull ? "BULLISH" : "BEARISH", text_color = trend_bull ? color.lime : color.red, text_size=txt_sz)
+
+if barstate.islast
+    headers = array.from("Index", "NY V", "PD NY", "LOD V", "HOD V", "OR 15m", "Trend")
+    for i = 0 to array.size(headers) - 1
+        table.cell(tbl, i, 0, array.get(headers, i), bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=get_size(size_input))
+
+// Update data rows
+fill_row(tbl, 1, "NQ", c1, ny1, pd1, lod1, hod1, orh1, orl1, get_size(size_input), get_char(style_input))
+fill_row(tbl, 2, "ES", c2, ny2, pd2, lod2, hod2, orh2, orl2, get_size(size_input), get_char(style_input))
+fill_row(tbl, 3, "YM", c3, ny3, pd3, lod3, hod3, orh3, orl3, get_size(size_input), get_char(style_input))

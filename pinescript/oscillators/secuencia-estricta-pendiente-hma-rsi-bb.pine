@@ -1,0 +1,112 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © valentinportillo2
+
+//@version=5
+strategy("Secuencia estricta (pendiente) HMA->RSI BB", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=1)
+
+// === Inputs ===
+rsiLen = input.int(14, "RSI Length", minval=1)
+rsiSrc = input.source(close, "RSI Source")
+bbLen = input.int(24, "BB Periods (sobre RSI)", minval=1)
+bbMult = input.float(1.0, "BB Multiplier", step=0.1)
+
+hmaLen = input.int(100, "HMA Periods", minval=1)
+hmaSrc = input.source(close, "HMA Source")
+useMaxBarsSinceCross = input.bool(true, "Limitar barras desde cruce HMA")
+maxBarsSinceCross = input.int(50, "Max barras desde cruce", minval=1)
+
+stopPerc = input.float(1.5, "Stop %", step=0.1) / 100
+takePerc = input.float(3.0, "Take %", step=0.1) / 100
+
+// === HMA function ===
+hma(src, length) =>
+    w = math.round(math.sqrt(length))
+    half = ta.wma(src, math.round(length / 2))
+    full = ta.wma(src, length)
+    diff = 2 * half - full
+    ta.wma(diff, w)
+
+h = hma(hmaSrc, hmaLen)
+plot(h, title="HMA 100", color = close >= h ? color.green : color.red, linewidth=2)
+
+// === RSI + BB ===
+rsiVal = ta.rsi(rsiSrc, rsiLen)
+bbBasis = ta.sma(rsiVal, bbLen)
+bbDev = ta.stdev(rsiVal, bbLen)
+bbUpper = bbBasis + bbMult * bbDev
+bbLower = bbBasis - bbMult * bbDev
+
+plot(rsiVal, title="RSI", color=color.orange)
+plot(bbUpper, title="BB Upper", color=color.green)
+plot(bbLower, title="BB Lower", color=color.red)
+hline(70, "70", color=color.gray)
+hline(30, "30", color=color.gray)
+
+// === Estados pendientes y registro del cruce ===
+var bool pendingLong = false
+var bool pendingShort = false
+var int crossBar = na
+
+// Detectar cruces en cierre de vela
+crossUp = ta.crossover(close, h)    // precio cerró cruzando hacia arriba HMA
+crossDown = ta.crossunder(close, h) // precio cerró cruzando hacia abajo HMA
+
+if crossUp
+    // precio cruzó por encima -> preparar LONG y cancelar SHORT pendiente
+    pendingLong := true
+    pendingShort := false
+    crossBar := bar_index
+
+if crossDown
+    // precio cruzó por debajo -> preparar SHORT y cancelar LONG pendiente
+    pendingShort := true
+    pendingLong := false
+    crossBar := bar_index
+
+// Si pasa un cruce contrario después, el pending se actualiza arriba (se cancela automáticamente)
+// Limitar tiempo desde cruce
+if useMaxBarsSinceCross and not na(crossBar)
+    if bar_index - crossBar > maxBarsSinceCross
+        pendingLong := false
+        pendingShort := false
+        crossBar := na
+
+// === Detectar salida del RSI de las bandas (evento de señal) ===
+rsiExitAbove = ta.crossover(rsiVal, bbUpper)   // RSI sale por encima -> potencial LONG
+rsiExitBelow = ta.crossunder(rsiVal, bbLower)  // RSI sale por debajo -> potencial SHORT
+
+// === Señales estrictas: solo si hay pending correspondiente ===
+strictLongSignal = rsiExitAbove and pendingLong and (h < close)
+strictShortSignal = rsiExitBelow and pendingShort and (h > close)
+
+// Ejecutar entradas y limpiar pending al entrar
+if strictLongSignal
+    strategy.entry("Long", strategy.long)
+    pendingLong := false
+    crossBar := na
+
+if strictShortSignal
+    strategy.entry("Short", strategy.short)
+    pendingShort := false
+    crossBar := na
+
+// Salidas
+strategy.exit("Exit Long", from_entry="Long", stop=close*(1-stopPerc), limit=close*(1+takePerc))
+strategy.exit("Exit Short", from_entry="Short", stop=close*(1+stopPerc), limit=close*(1-takePerc))
+
+// === Debug visuals ===
+// Marca cruces HMA
+plotshape(crossUp, title="CrossUp HMA", location=location.belowbar, color=color.lime, style=shape.triangleup, size=size.tiny)
+plotshape(crossDown, title="CrossDown HMA", location=location.abovebar, color=color.maroon, style=shape.triangledown, size=size.tiny)
+
+// Marca señales RSI que cumplen secuencia
+plotshape(strictLongSignal, title="Strict Long", location=location.belowbar, color=color.green, style=shape.labelup, size=size.small, text="LONG")
+plotshape(strictShortSignal, title="Strict Short", location=location.abovebar, color=color.red, style=shape.labeldown, size=size.small, text="SHORT")
+
+// Label de estado en la última barra
+var label info = na
+if barstate.islast
+    label.delete(info)
+    s = "PendingLong: " + (pendingLong ? "Y" : "N") + "  PendingShort: " + (pendingShort ? "Y" : "N") + "\n"
+    s += "LastCrossBar: " + (na(crossBar) ? "n/a" : str.tostring(crossBar)) + "  BarsSince: " + (na(crossBar) ? "n/a" : str.tostring(bar_index - crossBar))
+    info := label.new(bar_index, high, s, xloc.bar_index, yloc.price, color.new(color.black, 80), label.style_label_left, color.white, size.small)

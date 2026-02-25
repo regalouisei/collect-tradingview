@@ -1,0 +1,390 @@
+// This Pine Script™ code is subject to the terms of the Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Delta Ladder Order Flow [UAlgo]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// --------------------------------------------------------------------------------------
+// 1. INPUTS
+// --------------------------------------------------------------------------------------
+grp_general = "General Configuration"
+grp_visuals = "Visual Settings"
+grp_colors  = "Colors"
+
+// Calculation Settings
+tf_input        = input.timeframe("5", "Intrabar Resolution", group=grp_general, tooltip="Lower timeframe used to estimate order flow. Must be lower than chart timeframe.")
+bars_to_draw    = input.int(10, "Bars to Draw", minval=1, maxval=50, group=grp_general, tooltip="Number of recent bars to calculate and display. Keep low for performance.")
+tick_size_mult  = input.float(1.0, "Tick Size Multiplier", minval=0.1, step=0.5, group=grp_general, tooltip="Multiplies the symbol's mintick to aggregate levels. Higher = fewer levels (thicker ladder steps).")
+max_levels_per_bar = input.int(10, "Max Levels per Bar", minval=10, maxval=200, group=grp_general, tooltip="Safety limit: If a bar has more levels than this, the ladder steps will be automatically combined to fit. Prevents crashing on high-range bars.")
+
+// Visual Settings
+show_text       = input.bool(true, "Show Delta Values", group=grp_visuals)
+text_size       = input.string(size.small, "Text Size", options=[size.auto, size.tiny, size.small, size.normal, size.large], group=grp_visuals)
+box_width_pct   = input.float(55, "Ladder Width (%)", minval=10, maxval=90, group=grp_visuals, tooltip="Width of the ladder relative to the bar space.")
+text_threshold  = input.float(0, "Min Delta to Show Text", group=grp_visuals, tooltip="Hide text for small delta values to reduce clutter.")
+show_poc        = input.bool(true, "Highlight Point of Control (POC)", group=grp_visuals)
+
+// Colors
+col_pos_delta   = input.color(color.new(#00E676, 50), "Positive Delta (+)", group=grp_colors)
+col_neg_delta   = input.color(color.new(#FF1744, 50), "Negative Delta (-)", group=grp_colors)
+col_text_pos    = input.color(#FFFFFF, "Text Color (+)", group=grp_colors)
+col_text_neg    = input.color(#FFFFFF, "Text Color (-)", group=grp_colors)
+col_outline     = input.color(color.new(#2d2d2d, 100), "Box Outline", group=grp_colors) // Hidden by default for cleaner look
+col_poc         = input.color(#FFD700, "POC Border Color", group=grp_colors)
+
+// Stacked Imbalance
+grp_stacked     = "Stacked Imbalance"
+show_stacked    = input.bool(true, "Show Stacked Imbalance", group=grp_stacked)
+imb_ratio       = input.float(3.0, "Imbalance Ratio", minval=1.1, step=0.1, group=grp_stacked, tooltip="Volume of one side must be X times larger than the other.")
+imb_min_vol     = input.float(10.0, "Min Volume for Imbalance", minval=0.0, group=grp_stacked, tooltip="Minimum volume required to consider a level as an imbalance. Filters out low-volume noise.")
+stack_count     = input.int(3, "Stacked Levels", minval=2, group=grp_stacked, tooltip="Minimum consecutive levels to form a stack.")
+col_imb_bull    = input.color(color.new(#00E676, 0), "Bullish Imbalance", group=grp_colors)
+col_imb_bear    = input.color(color.new(#FF1744, 0), "Bearish Imbalance", group=grp_colors)
+
+// --------------------------------------------------------------------------------------
+// 2. TYPES AND METHODS
+// --------------------------------------------------------------------------------------
+
+// Holds volume data for a specific price bucket
+type PriceLevel
+    float price
+    float buy_vol  = 0.0
+    float sell_vol = 0.0
+
+// Returns the net delta (Buy - Sell)
+method delta(PriceLevel this) => 
+    this.buy_vol - this.sell_vol
+
+// Returns total volume (Buy + Sell)
+method total(PriceLevel this) => 
+    this.buy_vol + this.sell_vol
+
+// Represents the ladder for a single bar
+type DeltaLadder
+    int bar_idx
+    // Using a map for sparse storage: price (float) -> PriceLevel
+    map<float, PriceLevel> levels 
+    float min_price = 10000000.0
+    float max_price = 0.0
+    float max_vol_level = 0.0 // To normalize heatmap
+    float poc_price = na     // Price level with the highest volume
+    float poc_vol = 0.0
+
+method add_volume(DeltaLadder this, float price, float vol, bool is_buy, bool is_neutral) =>
+    // Safety check: Don't add if map is too full (though loop logic should prevent this)
+    if this.levels.size() > 50000
+        runtime.error("Map size exceeded safety limit. Try increasing Tick Size Multiplier.")
+        
+    // Retrieve or create level
+    if not this.levels.contains(price)
+        this.levels.put(price, PriceLevel.new(price))
+        // Update range tracking
+        if price < this.min_price
+            this.min_price := price
+        if price > this.max_price
+            this.max_price := price
+    
+    PriceLevel lvl = this.levels.get(price)
+    
+    if is_neutral
+        lvl.buy_vol  += vol * 0.5
+        lvl.sell_vol += vol * 0.5
+    else if is_buy
+        lvl.buy_vol  += vol
+    else
+        lvl.sell_vol += vol
+    
+    // Track max volume for heatmap scaling
+    float t = lvl.total()
+    if t > this.max_vol_level
+        this.max_vol_level := t
+    
+    // Track POC
+    if t > this.poc_vol
+        this.poc_vol := t
+        this.poc_price := price
+
+// --------------------------------------------------------------------------------------
+// 3. DATA ACQUISITION & CALCULATIONS
+// --------------------------------------------------------------------------------------
+
+// Fetch intrabar data. Returns an array of values for each chart bar.
+// These arrays contain the LTF candles that make up the current chart bar.
+ltf_open  = request.security_lower_tf(syminfo.tickerid, tf_input, open)
+ltf_close = request.security_lower_tf(syminfo.tickerid, tf_input, close)
+ltf_high  = request.security_lower_tf(syminfo.tickerid, tf_input, high)
+ltf_low   = request.security_lower_tf(syminfo.tickerid, tf_input, low)
+ltf_vol   = request.security_lower_tf(syminfo.tickerid, tf_input, volume)
+
+// Helper to align price to tick size (or custom step)
+// If tick_size_mult is 1, aligns to mintick.
+var float base_tick_step = syminfo.mintick * tick_size_mult
+
+// --------------------------------------------------------------------------------------
+// 4. MAIN LOGIC
+// --------------------------------------------------------------------------------------
+
+// We only run this on the LAST bar to construct the ladders for the visible range.
+// This saves massive amounts of memory and processing power.
+if barstate.islast
+    // Calculate start index
+    int start_idx = math.max(0, bar_index - bars_to_draw + 1)
+    
+    // Loop through the requested range of bars
+    for i = start_idx to bar_index
+        // Create a new ladder for this bar
+        DeltaLadder ladder = DeltaLadder.new(i, map.new<float, PriceLevel>())
+        
+        // Access historical values relative to the current real-time bar
+        int offset = bar_index - i
+        
+        // Use `nz` to handle cases where data might be missing
+        float[] arr_o = ltf_open[offset]
+        float[] arr_c = ltf_close[offset]
+        float[] arr_h = ltf_high[offset]
+        float[] arr_l = ltf_low[offset]
+        float[] arr_v = ltf_vol[offset]
+        
+        // --------------------------------------------------------------------------
+        // Dynamic Scaling Logic
+        // Calculate the effective tick size for this specific bar to prevent crashes.
+        // --------------------------------------------------------------------------
+        float bar_h = high[offset]
+        float bar_l = low[offset]
+        float bar_range = bar_h - bar_l
+        
+        // Estimate raw steps
+        float raw_steps = bar_range / base_tick_step
+        
+        // If steps exceed limit, calculate a scaler
+        int scaler = 1
+        if raw_steps > max_levels_per_bar
+            scaler := int(math.ceil(raw_steps / max_levels_per_bar))
+            
+        // Effective step for this bar
+        float current_tick_step = base_tick_step * scaler
+        
+        // --------------------------------------------------------------------------
+        // Process LTF Data
+        // --------------------------------------------------------------------------
+        if array.size(arr_o) > 0
+            // Process each LTF candle inside this bar
+            for j = 0 to array.size(arr_o) - 1
+                float o = array.get(arr_o, j)
+                float c = array.get(arr_c, j)
+                float h = array.get(arr_h, j)
+                float l = array.get(arr_l, j)
+                float v = array.get(arr_v, j)
+                
+                if not na(v) and v > 0
+                    // Determine direction
+                    bool is_buy = c > o
+                    bool is_sell = c < o
+                    bool is_neutral = c == o
+                    
+                    // Distribute volume across price levels
+                    // We iterate from Low to High of the LTF candle using the Dynamic Step
+                    float low_aligned = math.round(l / current_tick_step) * current_tick_step
+                    float high_aligned = math.round(h / current_tick_step) * current_tick_step
+                    
+                    // Count how many "steps" are in this candle
+                    int steps = int(math.round((high_aligned - low_aligned) / current_tick_step)) + 1
+                    
+                    // Safety clamp (should rarely be hit with dynamic scaling, but safe is safe)
+                    if steps > 500
+                        steps := 500
+                    
+                    // Volume per step
+                    float vol_per_step = v / steps
+                    
+                    // Add to ladder
+                    // Loop through price levels involved in this LTF candle
+                    for p = 0 to steps - 1
+                        float level_price = low_aligned + (p * current_tick_step)
+                        ladder.add_volume(level_price, vol_per_step, is_buy, is_neutral)
+
+        // ----------------------------------------------------------------------------------
+        // 5. RENDERING LOGIC
+        // ----------------------------------------------------------------------------------
+        // Now that the ladder for bar `i` is built, we draw it.
+        
+        // Calculate visuals
+        // Time width
+        int t_start = time[offset]
+        int t_end   = time_close[offset]
+        
+        // Fix for "Naked Ladder": Center the ladder on the candle timestamp (time[offset])
+        // Previous logic centered it between time and time_close, which shifted it to the right gap.
+        int bar_duration = t_end - t_start
+        int ladder_width_ms = int(bar_duration * (box_width_pct / 100))
+        
+        // Center around the bar's open time (which is the visual center of the candle)
+        int left_time = t_start - int(ladder_width_ms / 2)
+        int right_time = t_start + int(ladder_width_ms / 2)
+        
+        // Iterate through all levels in the ladder
+        // We need keys (prices) to iterate.
+        float[] prices = ladder.levels.keys()
+        
+        if array.size(prices) > 0
+            array.sort(prices) // Required for stacked imbalance detection
+            
+            // --------------------------------------------------------------------------
+            // Stacked Imbalance Detection (Diagonal)
+            // --------------------------------------------------------------------------
+            map<float, int> stack_map = map.new<float, int>() // 1=Bull, -1=Bear
+            
+            if show_stacked and array.size(prices) > 1
+                int run_dir = 0
+                int run_start_idx = 0
+                
+                // Helper to check DIAGONAL imbalance
+                // Bullish: Ask[i] (BuyVol) vs Bid[i-1] (SellVol of price below)
+                // Bearish: Bid[i] (SellVol) vs Ask[i+1] (BuyVol of price above)
+                for i = 0 to array.size(prices) - 1
+                    float p = array.get(prices, i)
+                    PriceLevel lvl = ladder.levels.get(p)
+                    
+                    int direction = 0
+                    
+                    // Zero Handling Logic: If vol is 0, we treat it as 1 for division but require significant volume
+                    // We also ensure the "Winning" side has some meaningful volume (>0)
+                    
+                    // Check Bullish Imbalance (Ask[i] vs Bid[i-1])
+                    if i > 0
+                        float p_below = array.get(prices, i-1)
+                        PriceLevel lvl_below = ladder.levels.get(p_below)
+                        
+                        // If Bid[i-1] is 0
+                        if lvl_below.sell_vol == 0
+                            // Absolute imbalance if BuyVol is significant
+                            if lvl.buy_vol > imb_min_vol
+                                direction := 1
+                        else
+                            if lvl.buy_vol > lvl_below.sell_vol * imb_ratio and lvl.buy_vol > imb_min_vol
+                                direction := 1
+                    
+                    // Check Bearish Imbalance (Bid[i] vs Ask[i+1])
+                    if i < array.size(prices) - 1
+                        float p_above = array.get(prices, i+1)
+                        PriceLevel lvl_above = ladder.levels.get(p_above)
+                        
+                        // If Ask[i+1] is 0
+                        if lvl_above.buy_vol == 0
+                            if lvl.sell_vol > imb_min_vol
+                                // Conflict check: if both diagonal comparisons trigger
+                                // For simplicity, Bear overrides Bull here if conflict, but rare
+                                direction := -1 
+                        else
+                            if lvl.sell_vol > lvl_above.buy_vol * imb_ratio and lvl.sell_vol > imb_min_vol
+                                direction := -1
+                                
+                    // Logic to track consecutive runs
+                    if direction != 0
+                        if run_dir == 0
+                            // Start new run
+                            run_dir := direction
+                            run_start_idx := i
+                        else if run_dir != direction
+                            // Direction flipped. 
+                            // Check if previous run was a valid stack
+                            if math.abs(i - run_start_idx) >= stack_count
+                                // Mark previous run
+                                for k = run_start_idx to i - 1
+                                    stack_map.put(array.get(prices, k), run_dir)
+                                // Draw Extension
+                                float p_top = array.get(prices, i - 1)
+                                float p_bot = array.get(prices, run_start_idx)
+                                color c_stack = run_dir == 1 ? col_imb_bull : col_imb_bear
+                                box.new(right_time, p_top + current_tick_step/2, right_time + 1000 * 60 * 60 * 24, p_bot - current_tick_step/2,
+                                         xloc=xloc.bar_time, border_width=0, bgcolor=color.new(c_stack, 85), extend=extend.right)
+                            
+                            // Start new run
+                            run_dir := direction
+                            run_start_idx := i
+                        else
+                            // Continuing run, do nothing
+                            int _ = 0
+
+                    else
+                        // Run ended by neutral/no-imbalance
+                        if run_dir != 0
+                            if math.abs(i - run_start_idx) >= stack_count
+                                for k = run_start_idx to i - 1
+                                    stack_map.put(array.get(prices, k), run_dir)
+                                float p_top = array.get(prices, i - 1)
+                                float p_bot = array.get(prices, run_start_idx)
+                                color c_stack = run_dir == 1 ? col_imb_bull : col_imb_bear
+                                box.new(right_time, p_top + current_tick_step/2, right_time + 1000 * 60 * 60 * 24, p_bot - current_tick_step/2,
+                                         xloc=xloc.bar_time, border_width=0, bgcolor=color.new(c_stack, 85), extend=extend.right)
+                            run_dir := 0
+                
+                // Check if run is active at the end of the loop
+                if run_dir != 0
+                    if math.abs(array.size(prices) - run_start_idx) >= stack_count
+                        for k = run_start_idx to array.size(prices) - 1
+                            stack_map.put(array.get(prices, k), run_dir)
+                        float p_top = array.get(prices, array.size(prices) - 1)
+                        float p_bot = array.get(prices, run_start_idx)
+                        color c_stack = run_dir == 1 ? col_imb_bull : col_imb_bear
+                        box.new(right_time, p_top + current_tick_step/2, right_time + 1000 * 60 * 60 * 24, p_bot - current_tick_step/2,
+                                 xloc=xloc.bar_time, border_width=0, bgcolor=color.new(c_stack, 85), extend=extend.right)
+
+            // --------------------------------------------------------------------------
+            // Drawing Loop
+            // --------------------------------------------------------------------------
+            for p_idx = 0 to array.size(prices) - 1
+                float p = array.get(prices, p_idx)
+                PriceLevel lvl = ladder.levels.get(p)
+                
+                float delta = lvl.delta()
+                float total = lvl.total()
+                
+                // Color Intensity based on Delta dominance relative to THIS bar's max volume
+                // A simple heatmap: 
+                // Alpha scales with Abs(Delta) / MaxVolumeLevel
+                float intensity = ladder.max_vol_level > 0 ? math.abs(delta) / ladder.max_vol_level : 0
+                // Clamp intensity
+                intensity := math.min(intensity, 1.0)
+                
+                // Base Color
+                color base_col = delta > 0 ? col_pos_delta : delta < 0 ? col_neg_delta : color.gray
+                
+                // Stacked Override
+                if stack_map.contains(p)
+                    int s_dir = stack_map.get(p)
+                    base_col := s_dir == 1 ? col_imb_bull : col_imb_bear
+                    intensity := 1.0 // Force full intensity for stack members
+                
+                float curved_intensity = math.sqrt(intensity)
+                float transp = 97 - (curved_intensity * 57) 
+                
+                // Stacked cells should be more solid
+                if stack_map.contains(p)
+                    transp := 30
+                    
+                color final_bg = color.new(base_col, int(transp))
+                
+                // Check if this is the POC level
+                bool is_poc = show_poc and (p == ladder.poc_price)
+                color border_c = is_poc ? col_poc : col_outline
+                int border_w = is_poc ? 2 : 1
+                
+                // Draw Box
+                // Use current_tick_step for height
+                box.new(left_time, p + current_tick_step/2, right_time, p - current_tick_step/2, 
+                         xloc=xloc.bar_time, 
+                         border_color=border_c, 
+                         border_width=border_w,
+                         bgcolor=final_bg)
+                         
+                // Draw Text (Delta Value)
+                if show_text and math.abs(delta) >= text_threshold
+                    string txt = str.tostring(delta, format.volume)
+                    color txt_col = delta > 0 ? col_text_pos : col_text_neg
+                    
+                    label.new(int((left_time + right_time)/2), p, txt, 
+                              xloc=xloc.bar_time, 
+                              style=label.style_none, 
+                              textcolor=txt_col, 
+                              size=text_size)

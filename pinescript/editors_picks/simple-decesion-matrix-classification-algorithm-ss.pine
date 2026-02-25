@@ -1,0 +1,268 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//  /$$$$$$   /$$                                                         /$$                                            
+// /$$__  $$ | $$                                                        | $$                                            
+//| $$  \__//$$$$$$    /$$$$$$  /$$    /$$ /$$$$$$   /$$$$$$   /$$$$$$$ /$$$$$$    /$$$$$$  /$$    /$$ /$$$$$$   /$$$$$$$
+//|  $$$$$$|_  $$_/   /$$__  $$|  $$  /$$//$$__  $$ /$$__  $$ /$$_____/|_  $$_/   /$$__  $$|  $$  /$$//$$__  $$ /$$_____/
+// \____  $$ | $$    | $$$$$$$$ \  $$/$$/| $$$$$$$$| $$  \__/|  $$$$$$   | $$    | $$$$$$$$ \  $$/$$/| $$$$$$$$|  $$$$$$ 
+// /$$  \ $$ | $$ /$$| $$_____/  \  $$$/ | $$_____/| $$       \____  $$  | $$ /$$| $$_____/  \  $$$/ | $$_____/ \____  $$
+//|  $$$$$$/ |  $$$$/|  $$$$$$$   \  $/  |  $$$$$$$| $$       /$$$$$$$/  |  $$$$/|  $$$$$$$   \  $/  |  $$$$$$$ /$$$$$$$/
+// \______/   \___/   \_______/    \_/    \_______/|__/      |_______/    \___/   \_______/    \_/    \_______/|_______/ 
+
+//@version=6
+indicator("Simple Decision Matrix Classification Algorithm [SS]", shorttitle = "DMCA [SS]", overlay=false)
+g1 = "Model Parameters",
+g2 = "EMA"
+g3 = "RSI"
+g4 = "MFI"
+g5 = "Z-Score"
+g6 = "ATR"
+training = input.int(850, "Training Length", group = g1)
+select_x1 = input.string("Stochastic", "Select Independent Variable X1", ["Stochastic", "RSI", "Z-Score", "MFI", "Volume", "EMA", "SMA"], group = g1)
+select_x2 = input.string("Volume", "Select Independent Variable X1", ["Stochastic", "RSI", "Z-Score", "MFI", "Volume", "EMA", "SMA"], group = g1)
+select_y = input.string("Red/Green Candle", "Select desired target Classification Prediction", ["Red/Green Candle", "Bullish / Bearish ATR", "ATR Range Breakout"], group = g1)
+showtable = input.bool(true, "Show Table", group = g1)
+// EMA 
+emalen = input.int(14, "EMA/SMA Length", group = g2),   emasrc = input.source(close, "EMA/ SMA Source", group = g2)
+// RSI 
+rsilen = input.int(14, "RSI Length", group = g3),       rsisrc = input.source(close, "RSI Source", group = g3)
+// MFI 
+mfilen = input.int(14, "MFI Length", group = g4),       mfisrc = input.source(hlc3, "MFI Source", group = g4)
+// Z-Score
+zlen = input.int(14, "Z-Score Length", group = g5),     zsrc = input.source(close, "Z-Score Source", group = g5)
+// atr 
+atrlen = input.int(14, "ATR Length", group = g6)
+
+
+
+atr = ta.atr(atrlen)
+sent = close > open ? 1 : 0
+sentiment = high - open > open - low ? 1 : 0 
+rsi = ta.rsi(rsisrc, rsilen) 
+sto = ta.stoch(close, high, low, 14) 
+mfi = ta.mfi(mfisrc, mfilen)
+z = (zsrc - ta.sma(zsrc,zlen)) / ta.stdev(zsrc, zlen)
+ema = ta.ema(emasrc, emalen)
+sma = ta.sma(emasrc, emalen)
+atr_breakout = high-open > atr or open-low < atr ? 1 : 0 
+
+float x1_input = switch select_x1 
+    "Stochastic" => sto 
+    "RSI" => rsi 
+    "Z-Score" => z 
+    "MFI" => mfi 
+    "Volume" => volume
+    "EMA" => close - ema 
+    "SMA" => close - sma 
+float x2_input = switch select_x2
+    "Stochastic" => sto 
+    "RSI" => rsi 
+    "Z-Score" => z 
+    "MFI" => mfi 
+    "Volume" => volume
+    "EMA" => close - ema 
+    "SMA" => close - sma 
+float y_input = switch select_y
+    "Red/Green Candle" => sent 
+    "Bullish / Bearish ATR" => sentiment 
+    "ATR Range Breakout" => atr_breakout 
+
+float x1_threshold = 0
+float x2_threshold = 0 
+if select_x1 == "Volume"
+    x1_threshold := ta.stdev(volume, 14) 
+else  if select_x1 == "Z-Score"
+    x1_threshold := 0.05
+else 
+    x1_threshold := 0.5
+
+if select_x2 == "Volume" 
+    x2_threshold := ta.stdev(volume, 14) 
+else if select_x2 == "Z-Score"
+    x2_threshold := 0.05
+else 
+    x2_threshold := 0.5
+// Function to shuffle a list of indices
+shuffle_indices(n) =>
+    indices = array.new_int(n)
+    for i = 0 to n - 1
+        array.set(indices, i, i)
+    for i = 0 to n - 1
+        rand_index = math.floor(math.random(0, n))
+        temp = array.get(indices, i)
+        array.set(indices, i, array.get(indices, rand_index))
+        array.set(indices, rand_index, temp)
+    indices
+
+// Function to shuffle the rows of a matrix
+shuffle_matrix(matrix, rows) =>
+    shuffled_matrix = matrix.new<float>(rows, matrix.columns(matrix), 0)
+    indices = shuffle_indices(rows)
+    for i = 0 to rows - 1
+        for j = 0 to matrix.columns(matrix) - 1
+            matrix.set(shuffled_matrix, i, j, matrix.get(matrix, array.get(indices, i), j))
+    shuffled_matrix
+
+radnom_forest_classification(x1, x2, y, train) => 
+    x1m = matrix.new<float>(train , 2, 0)
+    x2m = matrix.new<float>(train, 2, 0) 
+    lx1 = x1[1]
+    lx2 = x2[1]
+    ly = y
+    for i = 0 to train - 1
+        matrix.set(x1m, i, 0, lx1[i])
+        matrix.set(x1m, i, 1, ly[i])
+        matrix.set(x2m, i, 0, lx2[i])
+        matrix.set(x2m, i, 1, ly[i])
+    x1m_random = shuffle_matrix(x1m, train)
+    x2m_random = shuffle_matrix(x2m, train)
+    int y1_pass = 0 
+    int y1_fail = 0 
+    for i = 0 to train - 2
+        if matrix.get(x1m_random, i, 0) > 0
+            if matrix.get(x1m_random, i, 0) >= x1 - x1_threshold and matrix.get(x1m_random, i, 0) <= x1 + x1_threshold
+                if matrix.get(x1m_random, i, 1) == 1 
+                    y1_pass += 1 
+                else if matrix.get(x1m_random, i, 1) != 1 
+                    y1_fail += 1 
+    int y2_pass = 0 
+    int y2_fail = 0 
+    int x1_vote = y1_pass > y1_fail ? 1 : 0 
+    for i = 0 to train - 2 
+        if matrix.get(x2m_random, i, 0) >= x2 - x2_threshold and matrix.get(x2m_random, i, 0) <= x2 + x2_threshold
+            if matrix.get(x2m_random, i, 1) == 1 
+                y2_pass += 1 
+            else if matrix.get(x2m_random, i, 1) != 1 
+                y2_fail += 1 
+    passes = y1_pass + y2_pass 
+    
+    fails = y1_fail + y2_fail 
+    vote = passes > fails ? 1 : 0 
+    x2_vote = y2_pass > y2_fail ? 1 : 0 
+    // X1 independent accuracy 
+    int x1_ia_pass = 0 
+    int x1_ia_fail = 0 
+    int x2_ia_pass = 0 
+    int x2_ia_fail = 0
+    x2_vote_pass = x2_vote == y 
+    x1_vote_pass = x1_vote == y 
+    for i = 0 to train 
+        if x1_vote_pass[i]
+            x1_ia_pass += 1 
+        else 
+            x1_ia_fail += 1 
+        if x2_vote_pass[i]
+            x2_ia_pass += 1 
+        else 
+            x2_ia_fail += 1 
+
+    x1_accuracy = x1_ia_pass / (x1_ia_pass + x1_ia_fail) * 100 
+    x2_accuracy = x2_ia_pass / (x2_ia_pass + x2_ia_fail) * 100 
+    // Accuracy 
+    int success = 0 
+    int failure = 0 
+    for i = 0 to train - 1
+        if vote[i] == y[i]  
+            success += 1 
+        else if vote[i] != y[i] 
+            failure += 1 
+    accurcay = success / (success + failure) * 100 
+
+    [vote, accurcay, y1_pass, y1_fail, y2_pass, y2_fail, x1_vote, x2_vote, x1_accuracy, x2_accuracy] 
+
+
+[result, acc, y1p, y1f, y2p, y2f, x1v, x2v, x1a, x2a] = radnom_forest_classification(x1_input, x2_input, y_input, training)
+
+// Demographics 
+
+total_sorted_cases_x1 = y1p + y1f 
+total_sorted_cases_x2 = y2p + y2f 
+x1_voted_result = y1p > y1f ? 1 : 0 
+x2_voted_result = y2p > y2f ? 1 : 0 
+total_cases = total_sorted_cases_x1 + total_sorted_cases_x2 
+x1_total_weight = (total_sorted_cases_x1 / total_cases) * 100
+x2_total_weight = (total_sorted_cases_x2 / total_cases) * 100 
+
+string_Result = result == 1 ? "Bullish" : "Bearish" 
+
+if barstate.islast 
+    for lin in line.all
+        line.delete(lin) 
+    for txt in label.all
+        label.delete(txt) 
+
+// Feature Importance 
+
+feature_importance_color(current_variable, other_variable) => 
+    color feature_color = na 
+    if current_variable > other_variable 
+        if current_variable <= 45 
+            feature_color := color.rgb(5, 46, 7)
+        else if current_variable > 45 and current_variable <= 55 
+            feature_color := color.rgb(10, 99, 14)
+        else if current_variable > 55 
+            feature_color := color.rgb(5, 235, 15)
+    else if other_variable > current_variable 
+        if  current_variable > 50 and current_variable <= 55 
+            feature_color := color.rgb(22, 110, 26)
+        else if current_variable > 55 
+            feature_color := color.rgb(5, 235, 15)
+        else if current_variable <= 50 and current_variable > 45 
+            feature_color := color.rgb(89, 6, 31)
+        else if current_variable <= 45 
+            feature_color := color.rgb(247, 0, 75)
+    feature_color 
+if barstate.islast 
+    label.new(bar_index - 200, y = 20, text = str.tostring(select_x1), color = feature_importance_color(x1a, x2a), style = label.style_circle, size = size.large)
+    label.new(bar_index - 250, y = 10, text = str.tostring(y1p), color = color.lime, style = label.style_circle, size = size.large)
+    label.new(bar_index - 150, y = 10, text = str.tostring(y1f), color = color.red, style = label.style_circle, size = size.large)
+    label.new(bar_index - 200, y = 0, text = str.tostring(x1v), color = color.purple, style = label.style_circle, size = size.large)
+    line.new(bar_index - 200, y1 = 20, x2 = bar_index - 250, y2 = 10, color = color.gray, width = 3)
+    line.new(bar_index - 250, y1 = 10, x2 = bar_index - 200, y2 = 0, color = color.gray, width = 3)
+    line.new(bar_index - 200, y1 = 20, x2 = bar_index - 150, y2 = 10, color = color.gray, width = 3)
+    line.new(bar_index - 150, y1 = 10, x2 = bar_index - 200, y2 = 0, color = color.gray, width = 3)
+    line.new(bar_index, y1 = 20, x2 = bar_index - 50, y2 = 10, color = color.gray, width = 3)
+    line.new(bar_index - 50, y1 = 10, x2 = bar_index, y2 = 0, color = color.gray, width = 3)
+    line.new(bar_index, y1 = 20, x2 = bar_index + 50, y2 = 10, color = color.gray, width = 3)
+    line.new(bar_index + 50, y1 = 10, x2 = bar_index, y2 = 0, color = color.gray, width = 3)
+    label.new(bar_index, y = 20, text = str.tostring(select_x2), color = feature_importance_color(x2a, x1a), style = label.style_circle, size = size.large)
+    label.new(bar_index - 50, y = 10, text = str.tostring(y2p), color = color.lime, style = label.style_circle, size = size.large)
+    label.new(bar_index + 50, y = 10, text = str.tostring(y2f), color = color.red, style = label.style_circle, size = size.large)
+    label.new(bar_index, y = 0, text = str.tostring(x2v), color = color.purple, style = label.style_circle, size = size.large)
+    label.new(bar_index - 100, y = - 10,  text = str.tostring(result), color = color.orange, style = label.style_circle, size = size.large)
+    line.new(bar_index - 200, y1 = 0, x2 = bar_index - 100, y2 = -10, color = color.gray, width = 3)
+    line.new(bar_index, y1 = 0, x2 = bar_index - 100, y2 = -10, color = color.gray, width = 3)
+    label.new(bar_index - 100, y = 30, text = str.tostring(select_y), color = color.navy, style = label.style_circle, size = size.large)
+    line.new(bar_index - 100, y1 = 30, x2 = bar_index - 200, y2 = 20, color = color.gray, width = 3)
+    line.new(bar_index - 100, y1 = 30, x2 = bar_index, y2 = 20, color = color.gray, width = 3)
+    
+data = table.new(position.middle_left, 10, 10, bgcolor = color.rgb(0, 0, 0), frame_color = color.white, frame_width = 3) 
+
+if showtable
+    table.merge_cells(data, 1, 0, 2, 0)
+    table.merge_cells(data, 3, 0, 4, 0)
+    table.cell(data, 1, 0, text = str.tostring(select_x1), bgcolor = color.new(color.gray, 75), text_color = color.white, text_halign = text.align_center) 
+    table.cell(data, 3, 0, text = str.tostring(select_x2), bgcolor = color.new(color.gray, 75), text_color = color.white, text_halign = text.align_center) 
+    table.cell(data, 1, 1, text = "X1 Independent: ", text_color = color.white) 
+    table.cell(data, 2, 1, text = str.tostring(select_x1), text_color = color.white)
+    table.cell(data, 1, 2, text = "X1 Total Sorted Cases: ", text_color = color.white) 
+    table.cell(data, 2, 2, text = str.tostring(total_sorted_cases_x1), text_color = color.white)
+    table.cell(data, 1, 2, text = "X1 Weighted Impact: ", text_color = color.white) 
+    table.cell(data, 2, 2, text = str.tostring(math.round(x1_total_weight, 2)), text_color = color.white)
+    table.cell(data, 1, 3, text = "X1 Independent Accuracy: ", text_color = color.white) 
+    table.cell(data, 2, 3, text = str.tostring(math.round(x1a, 2)) + "%", text_color = color.white)
+    table.cell(data, 1, 4, text = "X1 Voted Result: ", text_color = color.white) 
+    table.cell(data, 2, 4, text = str.tostring(x1_voted_result), text_color = color.white)
+    table.cell(data, 3, 1, text = "X2 Independent: ", text_color = color.white) 
+    table.cell(data, 4, 1, text = str.tostring(select_x2), text_color = color.white)
+    table.cell(data, 3, 2, text = "X2 Total Sorted Cases: ", text_color = color.white) 
+    table.cell(data, 4, 2, text = str.tostring(total_sorted_cases_x2), text_color = color.white)
+    table.cell(data, 3, 2, text = "X2 Weighted Impact: ", text_color = color.white) 
+    table.cell(data, 4, 2, text = str.tostring(math.round(x2_total_weight, 2)), text_color = color.white)
+    table.cell(data, 3, 3, text = "X2 Independent Accuracy: ", text_color = color.white) 
+    table.cell(data, 4, 3, text = str.tostring(math.round(x2a, 2)) + "%", text_color = color.white)
+    table.cell(data, 3, 4, text = "X2 Voted Result: ", text_color = color.white) 
+    table.cell(data, 4, 4, text = str.tostring(x2_voted_result), text_color = color.white)
+    table.merge_cells(data, 1, 5, 4, 5)
+    table.cell(data, 1, 5, text = "Model Accuracy: " + str.tostring(math.round(acc, 2)), text_color = color.white, text_halign = text.align_center) 
+    table.merge_cells(data, 1, 6, 4, 6)
+    table.cell(data, 1, 6, text = "Model Prediction: " + str.tostring(string_Result), text_color = color.white, text_halign = text.align_center)

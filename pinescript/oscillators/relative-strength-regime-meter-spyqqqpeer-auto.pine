@@ -1,0 +1,440 @@
+//@version=6
+indicator("Relative Strength Regime Meter (SPY/QQQ/Peer Auto)",
+     shorttitle="RS Dash v2", overlay=false, max_labels_count=500)
+
+//========================
+// Inputs
+//========================
+maLen           = input.int(20,  "RS MA length", minval=1)
+useEMA          = input.bool(false, "Use EMA (else SMA)")
+requireRisingMA = input.bool(false, "Green only if MA rising too")
+
+plotMode = input.string("Signal (% vs RS MA)", "Plot mode",
+     options=["Signal (% vs RS MA)", "Indexed (Base 100)", "Raw (single)"])
+
+rawWhich = input.string("PEER", "Raw: show which ratio",
+     options=["SPY","QQQ","PEER"])
+
+showLines = input.bool(true, "Show RS lines")
+showMA    = input.bool(true, "Show MA (Indexed/Raw modes)")
+
+// Leadership line (score 0..3)
+showLeadership = input.bool(true, "Show Leadership line (score 0–3)")
+leadAmpSignal  = input.float(15.0, "Leadership amplitude (Signal mode)", step=0.5) // +/- band around 0
+leadAmpIndex   = input.float(6.0,  "Leadership amplitude (Indexed mode)", step=0.5) // +/- band around 100
+
+// Peer selection (Sector/Industry)
+peerMode = input.string("AUTO", "Peer mode", options=["AUTO","MANUAL"])
+
+manualPeerOpt = input.string("XLK - TECH", "Manual peer ETF", options=[
+     "XLB - MATERIALS",
+     "XLE - ENERGY",
+     "XLF - FINANCIALS",
+     "XLI - INDUSTRIALS",
+     "XLK - TECH",
+     "XLP - STAPLES",
+     "XLU - UTILITIES",
+     "XLV - HEALTHCARE",
+     "XLY - DISCRETIONARY",
+     "XLC - COMM SERVICES",
+     "XLRE - REAL ESTATE",
+     "SMH - SEMIS"
+])
+
+fallbackPeerOpt = input.string("XLK - TECH", "Auto fallback peer", options=[
+     "XLB - MATERIALS",
+     "XLE - ENERGY",
+     "XLF - FINANCIALS",
+     "XLI - INDUSTRIALS",
+     "XLK - TECH",
+     "XLP - STAPLES",
+     "XLU - UTILITIES",
+     "XLV - HEALTHCARE",
+     "XLY - DISCRETIONARY",
+     "XLC - COMM SERVICES",
+     "XLRE - REAL ESTATE",
+     "SMH - SEMIS"
+])
+
+// Auto-pick guardrails
+retLen      = input.int(5,   "Auto: return length (bars)", minval=1)
+corrLen     = input.int(90,  "Auto: correlation lookback", minval=20)
+minCorr     = input.float(0.20, "Auto: min corr (below = fallback)", step=0.01)
+switchDelta = input.float(0.05, "Auto: switch only if better by", step=0.01)
+
+// Divergences
+showDivergences = input.bool(true, "Show divergences (Price vs RS)")
+divBench        = input.string("PEER", "Divergence benchmark", options=["SPY","QQQ","PEER"])
+pivL            = input.int(5, "Pivot Left",  minval=1, maxval=50)
+pivR            = input.int(5, "Pivot Right", minval=1, maxval=50)
+
+//========================
+// Helpers
+//========================
+getClose(sym) => request.security(sym, timeframe.period, close)
+
+ma(src, len) => useEMA ? ta.ema(src, len) : ta.sma(src, len)
+
+greenCond(rs, m) =>
+    requireRisingMA ? (rs > m and m >= m[1]) : (rs > m)
+
+// Convert dropdown option -> ticker
+optToTicker(opt) =>
+    switch opt
+        "XLB - MATERIALS"       => "XLB"
+        "XLE - ENERGY"          => "XLE"
+        "XLF - FINANCIALS"      => "XLF"
+        "XLI - INDUSTRIALS"     => "XLI"
+        "XLK - TECH"            => "XLK"
+        "XLP - STAPLES"         => "XLP"
+        "XLU - UTILITIES"       => "XLU"
+        "XLV - HEALTHCARE"      => "XLV"
+        "XLY - DISCRETIONARY"   => "XLY"
+        "XLC - COMM SERVICES"   => "XLC"
+        "XLRE - REAL ESTATE"    => "XLRE"
+        => "SMH"
+
+// Convert ticker -> label
+tickerToLabel(tkr) =>
+    switch tkr
+        "XLB"  => "XLB - MATERIALS"
+        "XLE"  => "XLE - ENERGY"
+        "XLF"  => "XLF - FINANCIALS"
+        "XLI"  => "XLI - INDUSTRIALS"
+        "XLK"  => "XLK - TECH"
+        "XLP"  => "XLP - STAPLES"
+        "XLU"  => "XLU - UTILITIES"
+        "XLV"  => "XLV - HEALTHCARE"
+        "XLY"  => "XLY - DISCRETIONARY"
+        "XLC"  => "XLC - COMM SERVICES"
+        "XLRE" => "XLRE - REAL ESTATE"
+        => "SMH - SEMIS"
+
+//========================
+// Peer tickers from inputs
+//========================
+manualPeer   = optToTicker(manualPeerOpt)
+fallbackPeer = optToTicker(fallbackPeerOpt)
+
+//========================
+// Bench closes
+//========================
+cSPY = getClose("SPY")
+cQQQ = getClose("QQQ")
+
+//========================
+// Peer candidate closes
+//========================
+cXLB  = getClose("XLB")
+cXLE  = getClose("XLE")
+cXLF  = getClose("XLF")
+cXLI  = getClose("XLI")
+cXLK  = getClose("XLK")
+cXLP  = getClose("XLP")
+cXLU  = getClose("XLU")
+cXLV  = getClose("XLV")
+cXLY  = getClose("XLY")
+cXLC  = getClose("XLC")
+cXLRE = getClose("XLRE")
+cSMH  = getClose("SMH")
+
+//========================
+// Manual peer close
+//========================
+manualClose = switch manualPeer
+    "XLB"  => cXLB
+    "XLE"  => cXLE
+    "XLF"  => cXLF
+    "XLI"  => cXLI
+    "XLK"  => cXLK
+    "XLP"  => cXLP
+    "XLU"  => cXLU
+    "XLV"  => cXLV
+    "XLY"  => cXLY
+    "XLC"  => cXLC
+    "XLRE" => cXLRE
+    => cSMH
+
+//========================
+// Auto correlations
+//========================
+rSYMB = ta.roc(close, retLen)
+
+rXLB  = ta.roc(cXLB,  retLen)
+rXLE  = ta.roc(cXLE,  retLen)
+rXLF  = ta.roc(cXLF,  retLen)
+rXLI  = ta.roc(cXLI,  retLen)
+rXLK  = ta.roc(cXLK,  retLen)
+rXLP  = ta.roc(cXLP,  retLen)
+rXLU  = ta.roc(cXLU,  retLen)
+rXLV  = ta.roc(cXLV,  retLen)
+rXLY  = ta.roc(cXLY,  retLen)
+rXLC  = ta.roc(cXLC,  retLen)
+rXLRE = ta.roc(cXLRE, retLen)
+rSMH  = ta.roc(cSMH,  retLen)
+
+corrXLB  = ta.correlation(rSYMB, rXLB,  corrLen)
+corrXLE  = ta.correlation(rSYMB, rXLE,  corrLen)
+corrXLF  = ta.correlation(rSYMB, rXLF,  corrLen)
+corrXLI  = ta.correlation(rSYMB, rXLI,  corrLen)
+corrXLK  = ta.correlation(rSYMB, rXLK,  corrLen)
+corrXLP  = ta.correlation(rSYMB, rXLP,  corrLen)
+corrXLU  = ta.correlation(rSYMB, rXLU,  corrLen)
+corrXLV  = ta.correlation(rSYMB, rXLV,  corrLen)
+corrXLY  = ta.correlation(rSYMB, rXLY,  corrLen)
+corrXLC  = ta.correlation(rSYMB, rXLC,  corrLen)
+corrXLRE = ta.correlation(rSYMB, rXLRE, corrLen)
+corrSMH  = ta.correlation(rSYMB, rSMH,  corrLen)
+
+// Fallback close/corr
+fallbackClose = switch fallbackPeer
+    "XLB"  => cXLB
+    "XLE"  => cXLE
+    "XLF"  => cXLF
+    "XLI"  => cXLI
+    "XLK"  => cXLK
+    "XLP"  => cXLP
+    "XLU"  => cXLU
+    "XLV"  => cXLV
+    "XLY"  => cXLY
+    "XLC"  => cXLC
+    "XLRE" => cXLRE
+    => cSMH
+
+fallbackCorr = switch fallbackPeer
+    "XLB"  => corrXLB
+    "XLE"  => corrXLE
+    "XLF"  => corrXLF
+    "XLI"  => corrXLI
+    "XLK"  => corrXLK
+    "XLP"  => corrXLP
+    "XLU"  => corrXLU
+    "XLV"  => corrXLV
+    "XLY"  => corrXLY
+    "XLC"  => corrXLC
+    "XLRE" => corrXLRE
+    => corrSMH
+
+//========================
+// Best peer (per bar) — start from fallback
+//========================
+bestTickerNow = fallbackPeer
+bestCloseNow  = fallbackClose
+bestCorrNow   = fallbackCorr
+
+bestCorrCmp = nz(bestCorrNow, -1.0)
+
+if nz(corrXLB, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLB,  bestCloseNow := cXLB,  bestTickerNow := "XLB",  bestCorrCmp := nz(corrXLB, -1.0)
+if nz(corrXLE, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLE,  bestCloseNow := cXLE,  bestTickerNow := "XLE",  bestCorrCmp := nz(corrXLE, -1.0)
+if nz(corrXLF, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLF,  bestCloseNow := cXLF,  bestTickerNow := "XLF",  bestCorrCmp := nz(corrXLF, -1.0)
+if nz(corrXLI, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLI,  bestCloseNow := cXLI,  bestTickerNow := "XLI",  bestCorrCmp := nz(corrXLI, -1.0)
+if nz(corrXLK, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLK,  bestCloseNow := cXLK,  bestTickerNow := "XLK",  bestCorrCmp := nz(corrXLK, -1.0)
+if nz(corrXLP, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLP,  bestCloseNow := cXLP,  bestTickerNow := "XLP",  bestCorrCmp := nz(corrXLP, -1.0)
+if nz(corrXLU, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLU,  bestCloseNow := cXLU,  bestTickerNow := "XLU",  bestCorrCmp := nz(corrXLU, -1.0)
+if nz(corrXLV, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLV,  bestCloseNow := cXLV,  bestTickerNow := "XLV",  bestCorrCmp := nz(corrXLV, -1.0)
+if nz(corrXLY, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLY,  bestCloseNow := cXLY,  bestTickerNow := "XLY",  bestCorrCmp := nz(corrXLY, -1.0)
+if nz(corrXLC, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLC,  bestCloseNow := cXLC,  bestTickerNow := "XLC",  bestCorrCmp := nz(corrXLC, -1.0)
+if nz(corrXLRE, -1.0) > bestCorrCmp
+    bestCorrNow := corrXLRE, bestCloseNow := cXLRE, bestTickerNow := "XLRE", bestCorrCmp := nz(corrXLRE, -1.0)
+if nz(corrSMH, -1.0) > bestCorrCmp
+    bestCorrNow := corrSMH,  bestCloseNow := cSMH,  bestTickerNow := "SMH",  bestCorrCmp := nz(corrSMH, -1.0)
+
+//========================
+// Sticky AUTO selection state
+//========================
+var string pickedTicker = ""
+var float  pickedClose  = na
+var float  pickedCorr   = na
+
+if barstate.isfirst
+    pickedTicker := fallbackPeer
+    pickedClose  := fallbackClose
+    pickedCorr   := nz(fallbackCorr, -1.0)
+
+if peerMode == "AUTO"
+    if na(bestCorrNow)
+        pickedTicker := fallbackPeer
+        pickedClose  := fallbackClose
+        pickedCorr   := nz(fallbackCorr, -1.0)
+    else
+        if bestCorrNow < minCorr
+            pickedTicker := fallbackPeer
+            pickedClose  := fallbackClose
+            pickedCorr   := nz(fallbackCorr, -1.0)
+        else
+            if bestCorrNow >= pickedCorr + switchDelta
+                pickedTicker := bestTickerNow
+                pickedClose  := bestCloseNow
+                pickedCorr   := bestCorrNow
+
+peerTicker = peerMode == "AUTO" ? pickedTicker : manualPeer
+peerClose  = peerMode == "AUTO" ? pickedClose  : manualClose
+
+//========================
+// RS ratios + MA
+//========================
+rsSPY  = close / cSPY
+rsQQQ  = close / cQQQ
+rsPEER = close / peerClose
+
+maSPY  = ma(rsSPY,  maLen)
+maQQQ  = ma(rsQQQ,  maLen)
+maPEER = ma(rsPEER, maLen)
+
+//========================
+// Status + score (0..3)
+//========================
+gSPY  = greenCond(rsSPY,  maSPY)
+gQQQ  = greenCond(rsQQQ,  maQQQ)
+gPEER = greenCond(rsPEER, maPEER)
+score = (gSPY ? 1 : 0) + (gQQQ ? 1 : 0) + (gPEER ? 1 : 0)
+
+//========================
+// Dashboard table (bottom-left)
+//========================
+var table t = table.new(position.bottom_left, 2, 5, border_width=1)
+
+cell(col, row, txt, bg, tc) =>
+    table.cell(t, col, row, txt, bgcolor=bg, text_color=tc)
+
+bgOK  = color.new(color.green, 0)
+bgBAD = color.new(color.red,   0)
+bgHDR = color.new(color.gray,  80)
+bgN   = color.new(color.black, 0)
+
+fmtCorr(x) =>
+    na(x) ? "na" : str.format("{0,number,#.##}", x)
+
+if barstate.islast
+    table.clear(t, 0, 0, 1, 4)
+
+    cell(0, 0, "RS DASH v2", bgHDR, color.white)
+    cell(1, 0, "Score",      bgHDR, color.white)
+
+    cell(0, 1, "SPY", bgN, color.white)
+    cell(1, 1, gSPY ? "✅" : "❌", gSPY ? bgOK : bgBAD, color.white)
+
+    cell(0, 2, "QQQ", bgN, color.white)
+    cell(1, 2, gQQQ ? "✅" : "❌", gQQQ ? bgOK : bgBAD, color.white)
+
+    peerInfo = "PEER " + tickerToLabel(peerTicker) + (peerMode=="AUTO" ? " (Auto)" : " (Manual)")
+    if peerMode == "AUTO"
+        peerInfo += "  corr=" + fmtCorr(pickedCorr)
+
+    cell(0, 3, peerInfo, bgN, color.white)
+    cell(1, 3, gPEER ? "✅" : "❌", gPEER ? bgOK : bgBAD, color.white)
+
+    scoreBg = score == 3 ? color.new(color.green, 0) :
+              score == 2 ? color.new(color.lime,  0) :
+              score == 1 ? color.new(color.orange,0) :
+                           color.new(color.red,   0)
+
+    cell(0, 4, "Total", bgN, color.white)
+    cell(1, 4, str.tostring(score) + "/3", scoreBg, color.white)
+
+//========================
+// Plotting (single-scale safe)
+//========================
+signalMode = plotMode == "Signal (% vs RS MA)"
+indexMode  = plotMode == "Indexed (Base 100)"
+rawMode    = plotMode == "Raw (single)"
+
+// Signal series: % above/below RS MA (0 = at MA)
+sigSPY  = maSPY  == 0 ? na : 100.0 * (rsSPY  / maSPY  - 1.0)
+sigQQQ  = maQQQ  == 0 ? na : 100.0 * (rsQQQ  / maQQQ  - 1.0)
+sigPEER = maPEER == 0 ? na : 100.0 * (rsPEER / maPEER - 1.0)
+
+// Base values for indexing (Base 100)
+var float baseRS_SPY  = na
+var float baseRS_QQQ  = na
+var float baseRS_PEER = na
+
+if na(baseRS_SPY)
+    baseRS_SPY := rsSPY
+if na(baseRS_QQQ)
+    baseRS_QQQ := rsQQQ
+if na(baseRS_PEER)
+    baseRS_PEER := rsPEER
+
+idxSPY  = baseRS_SPY  == 0 ? na : 100.0 * rsSPY  / baseRS_SPY
+idxQQQ  = baseRS_QQQ  == 0 ? na : 100.0 * rsQQQ  / baseRS_QQQ
+idxPEER = baseRS_PEER == 0 ? na : 100.0 * rsPEER / baseRS_PEER
+
+idxMA_SPY  = baseRS_SPY  == 0 ? na : 100.0 * maSPY  / baseRS_SPY
+idxMA_QQQ  = baseRS_QQQ  == 0 ? na : 100.0 * maQQQ  / baseRS_QQQ
+idxMA_PEER = baseRS_PEER == 0 ? na : 100.0 * maPEER / baseRS_PEER
+
+// Zero line for signal mode
+plot(signalMode ? 0 : na, title="0 = RS at MA", color=color.new(color.gray, 70), linewidth=1)
+
+// --- Leadership step line (mapped to avoid wrecking scaling) ---
+leadSignal = (score - 1.5) * (leadAmpSignal / 1.5)        // score 0..3 -> -leadAmpSignal..+leadAmpSignal
+leadIndex  = 100 + (score - 1.5) * (leadAmpIndex / 1.5)   // score 0..3 -> around 100
+
+leadSeries = signalMode ? leadSignal : indexMode ? leadIndex : na
+plot(showLeadership and (signalMode or indexMode) ? leadSeries : na,
+     title="Leadership (score 0–3)", color=color.new(color.white, 0),
+     linewidth=2, style=plot.style_stepline)
+
+// --- Signal mode (recommended) ---
+plot(showLines and signalMode ? sigSPY  : na, title="SPY % vs MA",  color=color.gray)
+plot(showLines and signalMode ? sigQQQ  : na, title="QQQ % vs MA",  color=color.blue)
+plot(showLines and signalMode ? sigPEER : na, title="PEER % vs MA", color=color.orange)
+
+// --- Indexed mode (Base 100) ---
+plot(showLines and indexMode ? idxSPY  : na, title="SPY (Base100)",  color=color.gray)
+plot(showLines and indexMode ? idxQQQ  : na, title="QQQ (Base100)",  color=color.blue)
+plot(showLines and indexMode ? idxPEER : na, title="PEER (Base100)", color=color.orange)
+
+plot(showMA and showLines and indexMode ? idxMA_SPY  : na, title="MA SPY (Base100)",  color=color.new(color.gray, 0), linewidth=2)
+plot(showMA and showLines and indexMode ? idxMA_QQQ  : na, title="MA QQQ (Base100)",  color=color.new(color.blue, 0), linewidth=2)
+plot(showMA and showLines and indexMode ? idxMA_PEER : na, title="MA PEER (Base100)", color=color.new(color.orange, 0), linewidth=2)
+
+// --- Raw mode (single) ---
+rawLine = rawWhich == "SPY" ? rsSPY : rawWhich == "QQQ" ? rsQQQ : rsPEER
+rawMA   = rawWhich == "SPY" ? maSPY : rawWhich == "QQQ" ? maQQQ : maPEER
+
+plot(showLines and rawMode ? rawLine : na, title="Raw RS (selected)", color=color.white)
+plot(showMA and showLines and rawMode ? rawMA : na, title="Raw RS MA (selected)", color=color.new(color.white, 0), linewidth=2)
+
+//========================
+// Divergences (computed on RAW RS ratios)
+//========================
+rsPrimary = divBench == "SPY" ? rsSPY : divBench == "QQQ" ? rsQQQ : rsPEER
+
+plP = ta.pivotlow(close, pivL, pivR)
+phP = ta.pivothigh(close, pivL, pivR)
+
+plR = ta.pivotlow(rsPrimary, pivL, pivR)
+phR = ta.pivothigh(rsPrimary, pivL, pivR)
+
+var float prevPL_P = na
+var float prevPL_R = na
+var float prevPH_P = na
+var float prevPH_R = na
+
+bullDiv = false
+bearDiv = false
+
+if showDivergences and not na(plP) and not na(plR)
+    bullDiv := (not na(prevPL_P) and plP < prevPL_P and plR > prevPL_R)
+    prevPL_P := plP
+    prevPL_R := plR
+
+if showDivergences and not na(phP) and not na(phR)
+    bearDiv := (not na(prevPH_P) and phP > prevPH_P and phR < prevPH_R)
+    prevPH_P := phP
+    prevPH_R := phR
+
+plotshape(bullDiv, title="Bull Div", style=shape.triangleup,   location=location.bottom, offset=-pivR, size=size.tiny, text="BullDiv")
+plotshape(bearDiv, title="Bear Div", style=shape.triangledown, location=location.top,    offset=-pivR, size=size.tiny, text="BearDiv")

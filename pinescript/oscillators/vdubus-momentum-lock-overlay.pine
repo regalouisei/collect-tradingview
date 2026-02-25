@@ -1,0 +1,112 @@
+//@version=5
+indicator("Vdubus Momentum Lock (Overlay)", overlay=true, shorttitle="Vdubus Lock")
+
+// ==========================================
+// 1. INPUTS (Defaults from Image)
+// ==========================================
+group_trend = "Trend Settings"
+hmaPeriod   = input.int(100, "HMA Period", group=group_trend)
+hmaDivisor  = input.float(1.0, "HMA Divisor", step=0.1, minval=0.1, group=group_trend)
+trixLen     = input.int(34, "TRIX Length", group=group_trend)
+
+group_stoch = "Stochastic Trigger"
+periodK     = input.int(13, title="K Length", minval=1, group=group_stoch)
+smoothK     = input.int(9, title="K Smoothing", minval=1, group=group_stoch)
+upperLimit  = input.int(52, title="Upper Limit (Sell)", minval=50, group=group_stoch)
+lowerLimit  = input.int(48, title="Lower Limit (Buy)", maxval=50, group=group_stoch)
+
+group_control = "Discipline Rules"
+maxWinsPerTrend = input.int(3, "Max Winners Per Trend", tooltip="Stop signals after X wins.", group=group_control)
+
+// ==========================================
+// 2. CALCULATIONS
+// ==========================================
+// --- HMA ---
+halfPeriod = math.max(1, math.round(hmaPeriod / hmaDivisor))
+wmaFull    = ta.wma(close, hmaPeriod)
+wmaHalf    = ta.wma(close, halfPeriod)
+rawHull    = (2 * wmaHalf) - wmaFull
+hmaValue   = ta.wma(rawHull, math.round(math.sqrt(hmaPeriod)))
+
+isHmaGreen = hmaValue > hmaValue[1]
+isHmaRed   = hmaValue < hmaValue[1]
+
+// --- TRIX ---
+ema1 = ta.ema(math.log(close), trixLen)
+ema2 = ta.ema(ema1, trixLen)
+ema3 = ta.ema(ema2, trixLen)
+trixVal = (ema3 - ema3[1]) * 10000
+
+isTrixRising  = trixVal > trixVal[1]
+isTrixFalling = trixVal < trixVal[1]
+
+// --- STOCHASTIC ---
+stochK = ta.sma(ta.stoch(close, high, low, periodK), smoothK)
+
+// ==========================================
+// 3. VIRTUAL TRADE LOGIC (Simulation)
+// ==========================================
+var int   vPos          = 0    // 1=Long, -1=Short, 0=Flat
+var float vEntryPrice   = 0.0
+var bool  isLossLockout = false
+var int   winsInTrend   = 0
+var int   trendState    = 0    // 1=Green, -1=Red
+
+// Detect Trend Flip (Reset)
+if isHmaGreen and trendState != 1
+    trendState      := 1
+    isLossLockout   := false
+    winsInTrend     := 0
+    vPos            := 0 
+
+if isHmaRed and trendState != -1
+    trendState      := -1
+    isLossLockout   := false
+    winsInTrend     := 0
+    vPos            := 0 
+
+// --- CHECK EXITS (Momentum) ---
+if vPos == 1 and isTrixFalling
+    if close < vEntryPrice
+        isLossLockout := true 
+    else
+        winsInTrend := winsInTrend + 1 
+    vPos := 0 
+
+if vPos == -1 and isTrixRising
+    if close > vEntryPrice
+        isLossLockout := true 
+    else
+        winsInTrend := winsInTrend + 1 
+    vPos := 0 
+
+// --- CHECK ENTRIES ---
+canTrade = not isLossLockout and winsInTrend < maxWinsPerTrend and vPos == 0
+
+// Long Logic
+bullStoch = trendState == 1 and isTrixRising and ta.crossunder(stochK, lowerLimit)
+bullPulse = trendState == 1 and isTrixRising and isTrixFalling[1]
+if (bullStoch or bullPulse) and canTrade
+    vPos := 1
+    vEntryPrice := close
+
+// Short Logic
+bearStoch = trendState == -1 and isTrixFalling and ta.crossover(stochK, upperLimit)
+bearPulse = trendState == -1 and isTrixFalling and isTrixRising[1]
+if (bearStoch or bearPulse) and canTrade
+    vPos := -1
+    vEntryPrice := close
+
+// ==========================================
+// 4. VISUALS
+// ==========================================
+hmaColor = trendState == 1 ? color.green : color.red
+if isLossLockout or winsInTrend >= maxWinsPerTrend
+    hmaColor := color.gray
+
+plot(hmaValue, "HMA Trend", color=hmaColor, linewidth=3)
+
+plotshape((bullStoch or bullPulse) and canTrade, title="Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape((bearStoch or bearPulse) and canTrade, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+bgcolor(isTrixRising ? color.new(color.green, 95) : color.new(color.red, 95), title="Trix Bias")

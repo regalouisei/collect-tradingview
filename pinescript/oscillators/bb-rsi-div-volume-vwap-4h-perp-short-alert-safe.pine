@@ -1,0 +1,140 @@
+//@version=5
+indicator("4H Perp SHORT — Phase-Based + Exit at 10% Move", overlay=true, max_labels_count=500)
+
+//=========================
+// Inputs
+//=========================
+bbLen      = input.int(20,  "BB Length", minval=5)
+bbMult     = input.float(2.2, "BB StdDev", step=0.1)
+
+rsiLen     = input.int(14,  "RSI Length", minval=2)
+rsiMaType  = input.string("SMA", "RSI MA Type", options=["SMA","EMA","RMA"])
+rsiMaLen   = input.int(14,  "RSI MA Length", minval=2)
+
+rsiOB      = input.float(70.0, "RSI Overbought Level", step=0.5)
+rsiMin     = input.float(55.0, "Min RSI for Short (avoid late entries)", step=0.5)
+
+extLookbackBars = input.int(8,  "Extension Lookback Bars (BB touch window)", minval=1)
+obLookbackBars  = input.int(8,  "RSI>OB Lookback Bars (OB window)", minval=1)
+peakLookback    = input.int(8,  "RSI Peak Lookback (for rollover)", minval=2)
+
+requireCrossBelowVWAP = input.bool(true, "Require CROSS below VWAP (safer)")
+cooldownBars          = input.int(6, "Cooldown Bars after signal", minval=0)
+
+exitMovePct = input.float(10.0, "Exit after favorable move % (from entry)", step=0.5) / 100.0
+
+showSignalsOnChart = input.bool(true, "Show SHORT/EXIT labels on chart")
+showDebugMarks     = input.bool(false, "Show debug markers (EXT/OB states)")
+
+//=========================
+// Bollinger Bands (Upper=Red, Lower=Green, Basis=White dashed)
+//=========================
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+upper = basis + dev
+lower = basis - dev
+
+plot(upper, "Upper BB", color=color.red, linewidth=2)
+plot(lower, "Lower BB", color=color.new(color.green, 0), linewidth=2)
+plot(basis, "BB Basis", color=color.new(color.white, 0), linewidth=2, style=plot.style_linebr)
+
+//=========================
+// VWAP (Orange)
+//=========================
+vwap = ta.vwap(hlc3)
+plot(vwap, "VWAP", color=color.orange, linewidth=2)
+
+//=========================
+// RSI (Purple) + RSI-MA (Yellow) in separate pane
+//=========================
+rsi = ta.rsi(close, rsiLen)
+
+rsiMA = switch rsiMaType
+    "EMA" => ta.ema(rsi, rsiMaLen)
+    "RMA" => ta.rma(rsi, rsiMaLen)
+    => ta.sma(rsi, rsiMaLen)
+
+plot(rsi,   "RSI (Purple)", color=color.new(color.purple, 0), linewidth=2, display=display.pane)
+plot(rsiMA, "RSI-MA (Yellow)", color=color.new(color.yellow, 0), linewidth=2, display=display.pane)
+
+// hline() doesn't support display=display.pane
+hline(70, "RSI 70", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+hline(50, "RSI 50", color=color.new(color.gray, 70), linestyle=hline.style_dashed)
+hline(30, "RSI 30", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+//=========================
+// Phase-Based Entry Logic
+//=========================
+
+// Phase A: Extension happened recently (touch/ride upper BB)
+extNow = (high >= upper) or (close >= upper)
+var int lastExtBar = na
+if extNow
+    lastExtBar := bar_index
+extValid = not na(lastExtBar) and (bar_index - lastExtBar <= extLookbackBars)
+
+// Phase A2: RSI was overbought recently
+obNow = (rsi >= rsiOB)
+var int lastOBBar = na
+if obNow
+    lastOBBar := bar_index
+obValid = not na(lastOBBar) and (bar_index - lastOBBar <= obLookbackBars)
+
+// Phase B: VWAP loss (on CLOSE)
+vwapLoss = requireCrossBelowVWAP ? ta.crossunder(close, vwap) : (close < vwap)
+
+// Phase C: RSI rollover confirmation (not late)
+prevPeak     = ta.highest(rsi, peakLookback)[1]
+rsiLowerHigh = rsi < prevPeak
+rsiSlopeDown = rsi < rsi[1]
+rsiCrossDown = ta.crossunder(rsi, rsiMA)
+
+rsiInZone  = rsi >= rsiMin
+rsiConfirm = rsiInZone and (rsiCrossDown or rsiSlopeDown or rsiLowerHigh)
+
+// Cooldown to prevent repeated alerts
+var int lastEntrySignalBar = na
+inCooldown = not na(lastEntrySignalBar) and (bar_index - lastEntrySignalBar <= cooldownBars)
+
+// Track "in trade" so you don't re-signal while trade is active
+var bool  inShort = false
+var float entryPrice = na
+
+// FINAL Entry Signal (only if not in trade)
+shortSignal = (not inShort) and extValid and obValid and vwapLoss and rsiConfirm and not inCooldown
+
+if shortSignal
+    lastEntrySignalBar := bar_index
+    inShort := true
+    entryPrice := close  // entry at candle close
+
+    if showSignalsOnChart
+        label.new(bar_index, high, "🔻 SHORT", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0), size=size.large)
+
+//=========================
+// Exit Logic: Favorable 10% move from entry
+// For SHORT: favorable = price drops
+// Exit when close <= entryPrice * (1 - exitMovePct)
+//=========================
+exitPrice  = entryPrice * (1 - exitMovePct)
+exitSignal = inShort and not na(entryPrice) and close <= exitPrice
+
+if exitSignal
+    if showSignalsOnChart
+        label.new(bar_index, low, "✅ EXIT (+10%)", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0), size=size.large)
+
+    // Reset trade state
+    inShort := false
+    entryPrice := na
+
+//=========================
+// Debug markers (plotshape must be global scope)
+//=========================
+plotshape(showDebugMarks and extValid, title="EXT valid", style=shape.circle, location=location.top, color=color.new(color.red, 70), size=size.tiny, text="EXT")
+plotshape(showDebugMarks and obValid,  title="OB valid",  style=shape.circle, location=location.top, color=color.new(color.purple, 70), size=size.tiny, text="OB")
+
+//=========================
+// Alerts
+//=========================
+alertcondition(shortSignal, title="SHORT (Phase-Based)", message="🔻 SHORT | {{exchange}}:{{ticker}} | TF={{interval}} | Close={{close}}")
+alertcondition(exitSignal,  title="EXIT (+10% move)",    message="✅ EXIT (+10% move) | {{exchange}}:{{ticker}} | TF={{interval}} | Close={{close}}")

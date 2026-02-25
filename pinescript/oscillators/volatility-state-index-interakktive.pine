@@ -1,0 +1,156 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Interakktive
+
+//@version=6
+indicator("Volatility State Index [Interakktive]", shorttitle = "VSI", overlay = false, precision = 2, max_labels_count = 0, max_lines_count = 0, max_boxes_count = 0)
+
+//==============================================================================
+// SECTION 1: INPUTS
+//==============================================================================
+
+GRP_CORE = "Interakktive — Volatility State Index"
+GRP_STATE = "State Classification"
+GRP_VISUAL = "Visual Settings"
+GRP_EXPORT = "Data Window"
+
+// Core Inputs
+atrLen = input.int(14, "ATR Length", minval = 5, maxval = 100, group = GRP_CORE, tooltip = "Base volatility measurement period.")
+smoothLen = input.int(10, "Smoothing Length", minval = 3, maxval = 50, group = GRP_CORE, tooltip = "Smoothing applied to volatility series.")
+momLen = input.int(10, "Momentum Length", minval = 3, maxval = 50, group = GRP_CORE, tooltip = "Period for volatility momentum calculation.")
+
+// State Classification Inputs (thresholds in percent to match histogram)
+expansionThrPct = input.float(5.0, "Expansion Threshold (%)", minval = 0.1, maxval = 50.0, step = 0.1, group = GRP_STATE, tooltip = "Volatility momentum above this % = Expansion.")
+decayThrPct = input.float(-5.0, "Decay Threshold (%)", minval = -50.0, maxval = -0.1, step = 0.1, group = GRP_STATE, tooltip = "Volatility momentum below this % = Decay.")
+persistBars = input.int(3, "Persistence Bars", minval = 1, maxval = 10, group = GRP_STATE, tooltip = "Bars required to confirm state change (prevents flickering).")
+stabilityLen = input.int(20, "Stability Lookback", minval = 5, maxval = 100, group = GRP_STATE, tooltip = "Lookback for stability calculation.")
+stabilityThr = input.float(0.5, "Stability Threshold", minval = 0.1, maxval = 1.0, step = 0.05, group = GRP_STATE, tooltip = "Below this = Transition state (instability).")
+
+// Visual Inputs
+showHistogram = input.bool(true, "Show State Histogram", group = GRP_VISUAL, tooltip = "Display the primary state histogram.")
+showMomLine = input.bool(false, "Show Momentum Line", group = GRP_VISUAL, tooltip = "Display the volatility momentum confirmation line.")
+showZeroLine = input.bool(true, "Show Zero Line", group = GRP_VISUAL, tooltip = "Display the baseline reference.")
+showBgTint = input.bool(false, "Show Background Tint", group = GRP_VISUAL, tooltip = "Subtle background color by state (default OFF).")
+
+// Export Inputs
+showDataExports = input.bool(true, "Show Data Window Values", group = GRP_EXPORT, tooltip = "Export calculated values to the data window.")
+
+//==============================================================================
+// SECTION 2: CONSTANTS & HELPERS (compute-only)
+//==============================================================================
+
+// Brand Colors (Interakktive Visual Style Guide v1.0)
+colorExpansion = color.new(#26A69A, 0)    // Teal — volatility expanding
+colorDecay = color.new(#8A8A8A, 20)       // Muted grey — volatility withdrawing
+colorTransition = color.new(#FFB300, 0)   // Amber — indecisive momentum or unstable flips
+colorNeutral = color.new(#8A8A8A, 60)     // Neutral grey — reference lines
+colorMomLine = color.new(#E0E0E0, 30)     // Soft white — momentum line
+
+// Background tint versions (high transparency per style guide)
+colorBgExpansion = color.new(#26A69A, 90)
+colorBgTransition = color.new(#FFB300, 92)
+
+// State constants
+STATE_EXPANSION = 1
+STATE_DECAY = -1
+STATE_TRANSITION = 0
+
+safeDiv(num, denom) => (na(denom) or denom == 0.0) ? na : num / denom
+
+//==============================================================================
+// SECTION 3: CORE COMPUTATION
+//==============================================================================
+
+// --- Stage 1: Base Volatility Series ---
+volBase = ta.atr(atrLen)
+
+// --- Stage 2: Smoothed Volatility ---
+volSm = ta.ema(volBase, smoothLen)
+
+// --- Stage 3: Volatility Momentum (rate of change) ---
+volSmPrev = volSm[momLen]
+volMom = safeDiv(volSm - volSmPrev, volSmPrev)
+
+// Percent momentum (canonical value for histogram and threshold comparison)
+volMomPct = na(volMom) ? na : volMom * 100.0
+
+// --- Stage 4: Stability Filter (vectorised, readiness-aware) ---
+// Sign of momentum: +1 if >= 0, -1 if < 0, na if volMom is na
+momSign = na(volMom) ? na : (volMom >= 0.0 ? 1 : -1)
+momSignPrev = momSign[1]
+
+// Flip detection: 1 if sign changed, 0 if not, na if not computable
+flip = (not na(momSign) and not na(momSignPrev)) ? (momSign != momSignPrev ? 1.0 : 0.0) : na
+
+// Stability = 1 - average flip rate (bounded 0..1)
+flipRate = ta.sma(flip, stabilityLen)
+stabilityRaw = na(flipRate) ? na : 1.0 - flipRate
+stabilityScore = na(stabilityRaw) ? na : math.max(0.0, math.min(1.0, stabilityRaw))
+
+// --- Stage 5: State Classifier with Persistence ---
+// Readiness gate: all required values must be valid
+isReady = not na(volSmPrev) and not na(volMomPct) and not na(stabilityScore) ? true : false
+
+// Raw state based on percent momentum thresholds (true 3-state model)
+// Expansion: volMomPct >= expansionThrPct (strong positive) → Teal
+// Decay: volMomPct <= decayThrPct (strong negative) → Grey
+// Mid-zone: between thresholds → Transition (unclear/indecisive) → Amber
+rawState = (isReady and volMomPct >= expansionThrPct) ? STATE_EXPANSION : ((isReady and volMomPct <= decayThrPct) ? STATE_DECAY : STATE_TRANSITION)
+
+// Instability override: also triggers Transition (same state, reinforces amber)
+isUnstable = (isReady and stabilityScore < stabilityThr) ? true : false
+rawStateWithStability = isUnstable ? STATE_TRANSITION : rawState
+
+// Persistence logic: state must hold for N bars before confirming
+var int confirmedState = STATE_TRANSITION
+var int candidateState = STATE_TRANSITION
+var int candidateCount = 0
+
+if isReady
+    if rawStateWithStability == candidateState
+        candidateCount += 1
+    else
+        candidateState := rawStateWithStability
+        candidateCount := 1
+    
+    if candidateCount >= persistBars
+        confirmedState := candidateState
+
+// Final state output (na if not ready, otherwise confirmed)
+stateId = isReady ? confirmedState : na
+
+//==============================================================================
+// SECTION 4: VISUAL OUTPUT (global scope only)
+//==============================================================================
+
+// Histogram color based on confirmed state (3-way: na → neutral, expansion → teal, decay → grey, transition → amber)
+histColor = na(stateId) ? colorNeutral : (stateId == STATE_EXPANSION ? colorExpansion : (stateId == STATE_DECAY ? colorDecay : colorTransition))
+
+// State Histogram (primary visual) — plots percent momentum
+plot(showHistogram ? volMomPct : na, "Volatility State", color = histColor, style = plot.style_columns, linewidth = 2)
+
+// Momentum Line (secondary, subtle) — same percent scale
+plot(showMomLine ? volMomPct : na, "Volatility Momentum", color = colorMomLine, style = plot.style_line, linewidth = 1)
+
+// Zero Reference Line
+plot(showZeroLine ? 0.0 : na, "Zero Line", color = colorNeutral, style = plot.style_line, linewidth = 1)
+
+// Background Tint (state-driven, default OFF)
+bgColor = (showBgTint and isReady) ? (stateId == STATE_EXPANSION ? colorBgExpansion : (stateId == STATE_TRANSITION ? colorBgTransition : na)) : na
+bgcolor(bgColor, title = "State Background")
+
+//==============================================================================
+// SECTION 5: DATA WINDOW EXPORTS
+//==============================================================================
+
+plot(showDataExports ? volBase : na, "ATR (Raw)", display = display.data_window)
+plot(showDataExports ? volSm : na, "ATR (Smoothed)", display = display.data_window)
+plot(showDataExports ? volMomPct : na, "Volatility Momentum (%)", display = display.data_window)
+plot(showDataExports ? stabilityScore : na, "Stability Score", display = display.data_window)
+plot(showDataExports ? (isReady ? stateId * 1.0 : na) : na, "State (-1/0/1)", display = display.data_window)
+plot(showDataExports ? (isReady and stateId == STATE_EXPANSION ? 1.0 : 0.0) : na, "Is Expansion", display = display.data_window)
+plot(showDataExports ? (isReady and stateId == STATE_DECAY ? 1.0 : 0.0) : na, "Is Decay", display = display.data_window)
+plot(showDataExports ? (isReady and stateId == STATE_TRANSITION ? 1.0 : 0.0) : na, "Is Transition", display = display.data_window)
+
+//==============================================================================
+// END OF SCRIPT
+//==============================================================================

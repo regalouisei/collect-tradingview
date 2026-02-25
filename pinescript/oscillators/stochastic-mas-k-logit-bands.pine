@@ -1,0 +1,242 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © illbecmo
+
+//@version=5
+indicator(title="Stochastic MAs+ (K Logit Bands)", shorttitle="Stoch MAs+ K-Bands", format=format.price, precision=2, max_labels_count=500)
+
+//────────────────────────────────────────────────────────────
+// ① MA 선택 (K, D)
+//────────────────────────────────────────────────────────────
+grpMA = "MA"
+maK = input.string("EMA",  title="K MA 선택", options=["EMA", "ZEMA", "SMA", "KAMA"], group=grpMA)
+maD = input.string("KAMA", title="D MA 선택", options=["EMA", "ZEMA", "SMA", "KAMA"], group=grpMA)
+
+// ZEMA
+zema(src, l) =>
+    emas1 = ta.ema(src, l)
+    emas2 = ta.ema(emas1, l)
+    2.0 * emas1 - emas2
+
+// KAMA (math.sum 사용)
+kama(src, len) =>
+    fastend = 0.666
+    slowend = 0.0645
+    change  = math.abs(src - src[1])
+    nsignal = math.abs(src - src[len])
+    nnoise  = math.sum(change, len)
+    er      = nnoise != 0 ? nsignal / nnoise : 0.0
+    sc      = math.pow(er * (fastend - slowend) + slowend, 2)
+    var float out = na
+    out := na(out[1]) ? src : out[1] + sc * (src - out[1])
+    out
+
+// 안전한 MA 적용
+maApply(src, len, maType) =>
+    float out = na
+    if maType == "EMA"
+        out := ta.ema(src, len)
+    else if maType == "ZEMA"
+        out := zema(src, len)
+    else if maType == "KAMA"
+        out := kama(src, len)
+    else
+        out := ta.sma(src, len)
+    out
+
+//────────────────────────────────────────────────────────────
+// ② Stochastic 설정
+//────────────────────────────────────────────────────────────
+grpStoch = "Stoch"
+periodK = input.int(21, title="%K Length", minval=1, group=grpStoch)
+smoothK = input.int(3,  title="%K Smoothing", minval=1, group=grpStoch)
+periodD = input.int(7,  title="%D Smoothing", minval=1, group=grpStoch)
+
+st = ta.stoch(close, high, low, periodK)
+k  = maApply(st, smoothK, maK)
+d  = maApply(k,  periodD, maD)
+
+//────────────────────────────────────────────────────────────
+// ③ K 기준 Logit 퍼센타일 밴드
+//────────────────────────────────────────────────────────────
+grpBand = "K Logit Bands"
+useKLogitBands = input.bool(true, "Enable K Logit Percentile Bands", group=grpBand)
+
+bandLen       = input.int(200, "Band Length", minval=50, maxval=800, group=grpBand)
+lowPct        = input.float(0.15, "Low Percentile",  minval=0.01, maxval=0.49, step=0.01, group=grpBand)
+highPct       = input.float(0.85, "High Percentile", minval=0.51, maxval=0.99, step=0.01, group=grpBand)
+logitGain     = input.float(1.0, "Logit Gain", minval=0.1, maxval=5.0, step=0.1, group=grpBand)
+confirmedOnly = input.bool(true, "Confirmed Bars Only (for band buffer)", group=grpBand)
+
+f_logit(x) =>
+    xx = math.min(math.max(x, 1e-6), 99.999999)
+    math.log(xx / (100.0 - xx))
+
+f_logistic(y) =>
+    100.0 / (1.0 + math.exp(-y))
+
+var float[] kBuff = array.new_float()
+
+calcLogitBands(src, float[] buff) =>
+    confOk = confirmedOnly ? barstate.isconfirmed : true
+    sig = f_logit(src) * logitGain
+
+    if confOk
+        array.push(buff, sig)
+        if array.size(buff) > bandLen
+            array.shift(buff)
+
+    float loSig = na
+    float hiSig = na
+    float midSig = na
+
+    if array.size(buff) >= 20
+        tmp = array.copy(buff)
+        array.sort(tmp)
+        loSig  := array.percentile_nearest_rank(tmp, lowPct  * 100.0)
+        hiSig  := array.percentile_nearest_rank(tmp, highPct * 100.0)
+        midSig := (loSig + hiSig) / 2.0
+
+    [f_logistic(loSig), f_logistic(hiSig), f_logistic(midSig)]
+
+[kLo_raw, kHi_raw, kMid_raw] = calcLogitBands(k, kBuff)
+
+// 사용 여부 게이트
+kLo  = useKLogitBands ? kLo_raw  : na
+kHi  = useKLogitBands ? kHi_raw  : na
+kMid = useKLogitBands ? kMid_raw : na
+validKBands = useKLogitBands and not na(kLo) and not na(kHi) and not na(kMid)
+
+//────────────────────────────────────────────────────────────
+// ④ “극단부 근접 + 과매매 억제” 진입 신호 로직
+//     Long: (K가 kLo 아래 터치) → (kLo 위로 재진입) → (재진입 이후 첫 K>D 교차)
+//     Short: (K가 kHi 위 터치) → (kHi 아래 재진입) → (재진입 이후 첫 K<D 교차)
+//     + 쿨다운 + (재진입 후 K가 mid 넘으면 무효화)
+//────────────────────────────────────────────────────────────
+grpSig = "Signals"
+useSignals        = input.bool(true, "Enable Entry Signals", group=grpSig)
+cooldownBars      = input.int(8, "Cooldown Bars", minval=0, maxval=200, group=grpSig)
+maxWaitBars       = input.int(24, "Max Wait Bars (Touch→Signal)", minval=1, maxval=300, group=grpSig)
+useDDirConfirm    = input.bool(true, "Use D Direction Confirm", group=grpSig)
+confirmedSignals  = input.bool(true, "Signals on Confirmed Bar", group=grpSig)
+showLabels        = input.bool(true, "Show Signal Labels", group=grpSig)
+
+sigBarOk = confirmedSignals ? barstate.isconfirmed : true
+
+var int lastSigBar = na
+cooldownOk = cooldownBars == 0 ? true : (na(lastSigBar) ? true : (bar_index - lastSigBar > cooldownBars))
+
+var bool longArmed = false
+var bool longReIn  = false
+var int  longTouchBar = na
+
+var bool shortArmed = false
+var bool shortReIn  = false
+var int  shortTouchBar = na
+
+// ✅ 경고 제거: crossover/crossunder는 매 바마다 “먼저” 계산
+x_k_over_kLo  = ta.crossover(k, kLo)
+x_k_under_kLo = ta.crossunder(k, kLo)
+x_k_over_kHi  = ta.crossover(k, kHi)
+x_k_under_kHi = ta.crossunder(k, kHi)
+
+x_k_over_kMid  = ta.crossover(k, kMid)
+x_k_under_kMid = ta.crossunder(k, kMid)
+
+x_k_over_d  = ta.crossover(k, d)
+x_k_under_d = ta.crossunder(k, d)
+
+// 상태 업데이트
+if useSignals and validKBands and sigBarOk
+    // 1) 터치(극단부 도달) - 최초 1회만 터치바 기록
+    if (k < kLo) and not longArmed
+        longArmed := true
+        longTouchBar := bar_index
+
+    if (k > kHi) and not shortArmed
+        shortArmed := true
+        shortTouchBar := bar_index
+
+    // 2) 재진입(밴드 안으로 복귀)
+    if longArmed and x_k_over_kLo
+        longReIn := true
+
+    if shortArmed and x_k_under_kHi
+        shortReIn := true
+
+    // 3) 스테일(너무 오래 기다리면 무효)
+    if longArmed and not na(longTouchBar) and (bar_index - longTouchBar > maxWaitBars)
+        longArmed := false
+        longReIn  := false
+        longTouchBar := na
+
+    if shortArmed and not na(shortTouchBar) and (bar_index - shortTouchBar > maxWaitBars)
+        shortArmed := false
+        shortReIn  := false
+        shortTouchBar := na
+
+    // 4) 너무 늦은 신호 방지: 재진입 후 K가 mid를 넘어가면 해당 사이클 무효화
+    if longReIn and x_k_over_kMid
+        longArmed := false
+        longReIn  := false
+        longTouchBar := na
+
+    if shortReIn and x_k_under_kMid
+        shortArmed := false
+        shortReIn  := false
+        shortTouchBar := na
+
+// 최종 트리거 (첫 교차 1회 + 쿨다운)
+// - long: 재진입 후 K>D 교차 + K가 mid 아래 유지 + (옵션) D 상승
+// - short: 재진입 후 K<D 교차 + K가 mid 위 유지 + (옵션) D 하락
+baseCond   = useSignals and validKBands and sigBarOk and cooldownOk
+longCore   = longReIn  and x_k_over_d  and (k < kMid)
+shortCore  = shortReIn and x_k_under_d and (k > kMid)
+longDirOk  = (not useDDirConfirm) or (d > d[1])
+shortDirOk = (not useDDirConfirm) or (d < d[1])
+
+longSignal  = baseCond and longCore  and longDirOk
+shortSignal = baseCond and shortCore and shortDirOk
+
+// 신호 발생 시: 인라인 리셋 + 쿨다운 시작
+if longSignal or shortSignal
+    lastSigBar := bar_index
+    longArmed := false
+    longReIn  := false
+    longTouchBar := na
+    shortArmed := false
+    shortReIn  := false
+    shortTouchBar := na
+
+//────────────────────────────────────────────────────────────
+// ⑤ Plot
+//────────────────────────────────────────────────────────────
+kPlot = plot(k, title="%K", color=#7e57c2)
+dPlot = plot(d, title="%D", color=#ffeb3b)
+
+UpperBand = hline(80, "Upper Band", color=#787B86)
+midline   = hline(50, "Middle Band", color=color.new(#787B86, 50))
+LowerBand = hline(20, "Lower Band", color=#787B86)
+midLinePlot = plot(50, color=na, editable=false, display=display.none)
+
+fill(UpperBand, LowerBand, color=color.rgb(126, 87, 194, 90), title="배경색")
+fill(kPlot, midLinePlot, 100, 80, top_color=color.new(color.green, 0), bottom_color=color.new(color.green, 100), title="Overbought Gradient Fill")
+fill(kPlot, midLinePlot, 20,  0,  top_color=color.new(color.red, 100),   bottom_color=color.new(color.red, 0),   title="Oversold Gradient Fill")
+
+kLoPlot  = plot(validKBands ? kLo  : na, title="K Logit Low",  color=color.new(color.red, 0),  linewidth=1)
+kHiPlot  = plot(validKBands ? kHi  : na, title="K Logit High", color=color.new(color.lime, 0), linewidth=1)
+kMidPlot = plot(validKBands ? kMid : na, title="K Logit Mid",  color=color.new(color.gray, 0), linewidth=1)
+fill(kHiPlot, kLoPlot, color=validKBands ? color.rgb(126, 87, 194, 90) : na, title="K Logit Band Fill")
+
+// 원본 크로스 표시(참고용)
+plot(ta.cross(k, d) ? d : na, color=(d - k > 0 ? color.red : color.lime), style=plot.style_cross, linewidth=2, title="크로스")
+
+// ✅ v5에서 y 인자 불가 → 라벨로 “밴드 레벨(y)”에 찍기
+if showLabels and longSignal
+    label.new(bar_index, kLo, "L", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.white, size=size.tiny)
+
+if showLabels and shortSignal
+    label.new(bar_index, kHi, "S", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
+
+// 알림용
+alertcondition(longSignal,  title="LONG Signal",  message="Stoch K-Bands LONG")
+alertcondition(shortSignal, title="SHORT Signal", message="Stoch K-Bands SHORT")

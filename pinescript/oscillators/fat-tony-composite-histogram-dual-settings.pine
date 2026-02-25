@@ -1,0 +1,141 @@
+//@version=5
+indicator("Fat Tony Composite Histogram", overlay=false, precision=2)
+
+// === LENGTH SETTINGS ===
+length      = input.int(14, "Length", minval=1, group="Momentum Settings")
+fastLen     = input.int(12, "MACD Fast", minval=1, group="Momentum Settings")
+slowLen     = input.int(26, "MACD Slow", minval=1, group="Momentum Settings")
+sigLen      = input.int(9,  "MACD Signal", minval=1, group="Momentum Settings")
+rocLen      = input.int(10, "ROC Length", minval=1, group="Momentum Settings")
+stdevLen    = input.int(200, "MACD StDev Length", minval=20, maxval=500, group="Momentum Settings")
+
+// === LEVEL SETTINGS ===
+obLevel_mod = input.int(75,  "Overbought Moderate", minval=0, maxval=150, group="Levels")
+obLevel_ext = input.int(100,  "Overbought Extreme",  minval=0, maxval=150, group="Levels")
+osLevel_mod = input.int(-75, "Oversold Moderate",   minval=-150, maxval=0, group="Levels")
+osLevel_ext = input.int(-100, "Oversold Extreme",    minval=-150, maxval=0, group="Levels")
+
+// === VOLUME SETTINGS ===
+useVolume   = input.bool(true, "Enable Volume Weighting", group="Volume", tooltip="Amplifies signals by recent volume")
+volSensitivity = input.float(1.5, "Volume Sensitivity", minval=0.5, maxval=3.0, step=0.1, group="Volume", tooltip="Higher values = stronger volume impact")
+minVolume   = input.int(50000, "Min Avg Volume (5 bars)", minval=0, group="Volume", tooltip="Filter out low-volume signals")
+
+// === FEATURE TOGGLES ===
+useROC          = input.bool(true, "Include ROC Component", group="Components")
+useTrendFilter  = input.bool(false, "Enable Trend Filter", group="Components", tooltip="Only signals in direction of EMA-200")
+showDebug       = input.bool(false, "Show Component Plots", group="Components", tooltip="For tuning - hidden by default")
+
+// === TREND FILTER ===
+ema200 = ta.ema(close, 200)
+trendUp = close > ema200
+trendDown = close < ema200
+
+// === CUSTOM tanh FUNCTION ===
+tanh(x) =>
+    e2x = math.exp(2 * x)
+    (e2x - 1) / (e2x + 1)
+
+// === EARLY BAR VALIDATION ===
+validBars = bar_index >= math.max(length, slowLen, rocLen, stdevLen, 200)
+
+// === COMPONENT CALCULATIONS ===
+// Williams %R (-100..0) -> (-50..+50)
+wr_raw  = ta.wpr(length)
+wr_c    = wr_raw + 50
+
+// Stochastic %K (0..100) -> (-50..+50)
+k_raw   = ta.stoch(close, high, low, length)
+k_c     = k_raw - 50
+
+// MACD Histogram -> adaptive squash to (-50..+50)
+[macdLine, signalLine, hist] = ta.macd(close, fastLen, slowLen, sigLen)
+stdevHist = nz(ta.stdev(hist, stdevLen), 1e-6)
+macd_c    = tanh(hist / (2.0 * stdevHist)) * 50.0
+
+// ROC (Rate of Change) -> volatility-normalized to (-50..+50)
+atr = ta.atr(14)
+roc_raw = ta.roc(close, rocLen)
+roc_normalized = roc_raw / (atr / close)  // Normalize by volatility
+roc_c = math.max(-50, math.min(50, roc_normalized))
+
+// === COMPOSITE CALCULATION ===
+combo_raw = useROC ? (wr_c + k_c + macd_c + roc_c) / 4.0 : (wr_c + k_c + macd_c) / 3.0
+
+// === VOLUME WEIGHTING (Smooth & Log-Scaled) ===
+volSma   = ta.sma(volume, 20)
+volRatio = useVolume ? math.min(math.log(1 + volume / volSma) * volSensitivity, 2.0) : 1.0
+volRatio := ta.sma(volRatio, 3)  // Smooth the ratio
+combo = combo_raw * volRatio
+
+// === VOLUME FILTER (5-bar average) ===
+volAvg5 = ta.sma(volume, 5)
+volumeOK = useVolume ? volAvg5 >= minVolume : true
+
+// === DEBUG PLOTS (Hidden by default) ===
+plot(showDebug ? wr_c : na, "WPR Comp", color=color.new(color.gray, 70), display=display.pane)
+plot(showDebug ? k_c : na, "Stoch Comp", color=color.new(color.purple, 70), display=display.pane)
+plot(showDebug ? macd_c : na, "MACD Comp", color=color.new(color.orange, 70), display=display.pane)
+plot(showDebug ? roc_c : na, "ROC Comp", color=color.new(color.teal, 70), display=display.pane)
+
+// === MAIN PLOT (Histogram with Gradient & Dual Thresholds) ===
+var color COL_EXT_OB = color.new(color.red, 0)
+var color COL_MOD_OB = color.new(color.red, 70)
+var color COL_EXT_OS = color.new(color.green, 0)
+var color COL_MOD_OS = color.new(color.green, 70)
+var color COL_NEUTRL = color.new(color.orange, 60)
+var color COL_POS    = color.new(color.blue, 60)
+
+plotColor = COL_NEUTRL
+if   combo >= obLevel_ext
+    plotColor := COL_EXT_OB
+else if combo >= obLevel_mod
+    plotColor := COL_MOD_OB
+else if combo <= osLevel_ext
+    plotColor := COL_EXT_OS
+else if combo <= osLevel_mod
+    plotColor := COL_MOD_OS
+else if combo > 0
+    plotColor := COL_POS
+
+plot(combo, title="Composite Momentum", style=plot.style_columns,
+     color=plotColor, linewidth=3)
+
+// === REFERENCE LINES ===
+hline(obLevel_mod, "Overbought (Mod)", color=COL_MOD_OB, linestyle=hline.style_dotted)
+hline(obLevel_ext, "Overbought (Ext)", color=COL_EXT_OB, linestyle=hline.style_dashed)
+hline(0, "Neutral", color=color.gray)
+hline(osLevel_mod, "Oversold (Mod)", color=COL_MOD_OS, linestyle=hline.style_dotted)
+hline(osLevel_ext, "Oversold (Ext)", color=COL_EXT_OS, linestyle=hline.style_dashed)
+
+// === BACKGROUND COLORING ===
+bgcolor(combo >= obLevel_ext ? color.new(color.red, 90) :
+       combo >= obLevel_mod ? color.new(color.red, 98) :
+       combo <= osLevel_ext ? color.new(color.green, 90) :
+       combo <= osLevel_mod ? color.new(color.green, 98) : na,
+       title="Extreme/Mod Background")
+
+// === SIGNAL LOGIC ===
+longCondition      = ta.crossover(combo, osLevel_ext) and volumeOK and (not useTrendFilter or trendUp)
+shortCondition     = ta.crossunder(combo, obLevel_ext) and volumeOK and (not useTrendFilter or trendDown)
+longCondition_mod  = ta.crossover(combo, osLevel_mod) and not ta.crossover(combo, osLevel_ext) and volumeOK and (not useTrendFilter or trendUp)
+shortCondition_mod = ta.crossunder(combo, obLevel_mod) and not ta.crossunder(combo, obLevel_ext) and volumeOK and (not useTrendFilter or trendDown)
+
+// === EXIT SIGNALS (optional) ===
+longExit  = ta.crossunder(combo, 0) and combo[1] > 0
+shortExit = ta.crossover(combo, 0) and combo[1] < 0
+
+// === PLOT SIGNALS ===
+plotshape(longCondition,      title="Long Signal (Ext)", style=shape.triangleup,   location=location.bottom, size=size.small, color=color.new(color.green, 0))
+plotshape(shortCondition,     title="Short Signal (Ext)", style=shape.triangledown, location=location.top, size=size.small, color=color.new(color.red, 0))
+plotshape(longCondition_mod,  title="Long Signal (Mod)", style=shape.triangleup,   location=location.bottom, size=size.small, color=color.new(color.green, 50))
+plotshape(shortCondition_mod, title="Short Signal (Mod)", style=shape.triangledown, location=location.top, size=size.small, color=color.new(color.red, 50))
+plotshape(longExit and useTrendFilter,  title="Long Exit", style=shape.xcross, location=location.top, size=size.tiny, color=color.gray)
+plotshape(shortExit and useTrendFilter, title="Short Exit", style=shape.xcross, location=location.bottom, size=size.tiny, color=color.gray)
+
+// === ALERTS ===
+alertcondition(longCondition,      "Long Signal (Ext)",   "Composite crossed UP through extreme oversold with volume")
+alertcondition(longCondition_mod,  "Long Signal (Mod)",   "Composite crossed UP through moderate oversold with volume")
+alertcondition(shortCondition,     "Short Signal (Ext)",  "Composite crossed DOWN through extreme overbought with volume")
+alertcondition(shortCondition_mod, "Short Signal (Mod)",  "Composite crossed DOWN through moderate overbought with volume")
+alertcondition(longExit,           "Long Exit",           "Composite crossed below zero")
+alertcondition(shortExit,          "Short Exit",          "Composite crossed above zero")

@@ -1,0 +1,834 @@
+//@version=6
+indicator("Luxy Adaptive MA Cloud - Trend Strength & Signal Tracker V2", shorttitle="Luxy Adaptive MA Cloud", overlay=true, max_bars_back=500) 
+// By: @orenluxy
+// October 2025
+ 
+//======================================================
+//======================== GROUPS ======================
+//======================================================
+
+GROUP_MA = "Moving Averages ======================="
+GROUP_TABLE = "Dashboard ======================="
+
+//======================================================
+//======================== INPUTS ======================
+//======================================================
+
+const string maInfo = "MA Types:\n• EMA — Exponential; faster, more weight on recent price. Good for momentum entries.\n• SMA — Simple; smooth and slower, reduces noise.\n• WMA — Weighted; linearly weights recent bars, sits between EMA and SMA.\n• VWMA — Volume-weighted; reflects participation, useful on liquid/intraday.\n• RMA — Wilder's; smooth variant used in RSI/ADX, solid for trend filters.\n• HMA — Hull; very responsive with low lag, more whipsaws in chop.\n\nTypical lengths (guideline):\nScalp: Fast 5–8 | Medium 10–15 | Medium-Slow 40–80 | Slow 100–150\nDay: Fast 8–12 | Medium 12–21 | Medium-Slow 60–120 | Slow 150–200\nSwing: Fast 10–20 | Medium 20–34 | Medium-Slow 100–180 | Slow 200–400\n\nStyle guide:\nMomentum: EMA/HMA\nTrend: SMA/RMA\nBreakout: EMA/VWMA\n\nTip: Start simple:\nFast + Medium = EMA | Medium-Slow (visual) = any type you like | Slow = SMA(200).\nSwitch Slow to RMA for smoother bias, or use VWMA on tickers where volume regimes matter.\nHMA is an aggressive option.\n\nTip: keep Fast < Medium < Medium-Slow < Slow."
+
+showMAPlots = input.bool(true, "Show all MA Lines", group=GROUP_MA, tooltip="Master visual switch: turns all MA lines on/off.\n\n" +"Note: When Gradient Ribbon is enabled, MA lines change color dynamically based on momentum:\n" +"🟢 Green = Rising\n🟠 Orange = Weakening\n🔴 Red = Falling\n\n" +"When Gradient Ribbon is disabled, MA lines use your selected colors for easy identification.")
+
+showFastMA = input.bool(true, "Fast MA", group=GROUP_MA, inline="rowF")
+maShortLen = input.int(10, "", group=GROUP_MA, inline="rowF")
+maFastType = input.string("EMA", "Type", options=["EMA","SMA","WMA","VWMA","RMA","HMA"], group=GROUP_MA, inline="rowF")
+maFastColor = input.color(color.rgb(51,204,214), "", group=GROUP_MA, inline="rowF", tooltip=maInfo)
+
+showMedMA = input.bool(true, "Medium MA", group=GROUP_MA, inline="rowM")
+maMedLen = input.int(20, "", group=GROUP_MA, inline="rowM")
+maMedType = input.string("EMA", "Type", options=["EMA","SMA","WMA","VWMA","RMA","HMA"], group=GROUP_MA, inline="rowM")
+maMedColor = input.color(color.rgb(230,5,255), "",  group=GROUP_MA, inline="rowM", tooltip=maInfo)
+
+showSlowMA = input.bool(false, "Slow MA", group=GROUP_MA, inline="rowL")
+ma200Len = input.int(200, "", group=GROUP_MA, inline="rowL")
+maSlowType = input.string("SMA", "Type", options=["EMA","SMA","WMA","VWMA","RMA","HMA"], group=GROUP_MA, inline="rowL")
+maSlowColor = input.color(color.rgb(0,0,0,40), "", group=GROUP_MA, inline="rowL", tooltip=maInfo)
+
+const string ribbonInfo = "MA Gradient Ribbon - Trend Strength Indicator\n\nThe ribbon changes color based on market momentum:\n\n🟢 GREEN (Strong Bullish):\n• Fast MA above Medium MA\n• Both MAs rising strongly (momentum > 0.02%)\n• Action: Enter/hold LONG positions, strong uptrend\n\n🔵 BLUE (Weak Bullish):\n• Fast MA above Medium MA\n• Weak or flat momentum\n• Action: Caution - bullish but losing strength, consider trailing stops\n\n🟠 ORANGE (Weak Bearish):\n• Medium MA above Fast MA\n• Weak or flat momentum\n• Action: Warning - weakness developing, consider exits\n\n🔴 RED (Strong Bearish):\n• Medium MA above Fast MA\n• Both MAs falling strongly (momentum < -0.02%)\n• Action: Enter/hold SHORT positions, strong downtrend\n\nTransitions are smooth (8-bar EMA) to avoid false signals.\nThe gradient uses 26 layers with exponential density (center-focused, 75%-15% transparency range) for ultra-smooth cloud appearance."
+showRibbon = input.bool(true, "Show MA Gradient Ribbon", group=GROUP_MA, tooltip=ribbonInfo)
+
+const string mtfTooltip = "Multi-Timeframe Confluence Analysis\n\nAutomatically checks trend direction on higher timeframes to confirm your signal.\n\n🟢 GREEN = Trend aligned (Fast MA > Medium MA for LONG, or Fast MA < Medium MA for SHORT)\n🔴 RED = Trend opposite\n\nTimeframes are selected dynamically based on your current chart timeframe.\n\nExample:\n• If you're on 15m → checks 30m, 1H, 4H, D, W\n• If you're on 1H → checks 4H, D, W, M, 3M\n\nA signal with 4/5 or 5/5 confluence is stronger than 2/5."
+
+showMTF = input.bool(true, "Enable MTF Confluence", group=GROUP_MA, inline="mtf1", tooltip=mtfTooltip)
+freshCrossBars = input.int(5, "Fresh Cross Bars", minval=1, maxval=20, group=GROUP_MA, inline="mtf1", tooltip="How many bars back to check for 'fresh' crosses on higher timeframes\n\n⚙️ This setting affects:\n• MTF Row in Dashboard (only shows if MTF is enabled)\n• MTF Count on signal labels: [5/6], [4/6], etc.\n• Confluence detection for entry quality scoring\n\n💡 TIP: Default 5 bars works well for most setups")
+
+//  BASE: Show or Hide Table
+showComprehensiveLabel = input.bool(true, "Show Info Table", group=GROUP_TABLE, inline="dash1", tooltip="Toggle the entire dashboard table on/off\n\n✅ ON = Display trend analysis + MA distances + (optional) MTF confluence\n❌ OFF = Hide all tables\n\n💡 TIP: Keep this ON for most trading setups")
+
+//  TABLE APPEARANCE: Position and Size
+labelCorner = input.string("Bottom Right", "Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=GROUP_TABLE, inline="dash2", tooltip="Where to display the table on the chart\n\n📍 Choose position that doesn't block important price action")
+maFontSize = input.string("Normal", "Font Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=GROUP_TABLE, inline="dash2", tooltip="Font size for all table rows. Header will be one size larger.\n\n💡 TIP: Use 'Small' for 1m-5m charts, 'Normal' for daily charts")
+const string volTooltip = "Volume Analysis Settings\n\nVolume indicators help confirm trend strength:\n\n🔥 HIGH Volume = Strong institutional participation\n 📍 LOW Volume = Weak/questionable trend\n💥 SPIKE = Breakout/major event\n\nThresholds are multipliers of average volume."
+volAvgLength = input.int(20, "Volume Avg Length", minval=5, maxval=100, group=GROUP_TABLE, inline="dash3", tooltip=volTooltip)
+volHighThreshold = input.float(1.5, "High 🔥", minval=1.0, maxval=5.0, step=0.1, group=GROUP_TABLE, inline="dash4", tooltip="Multiplier for 'High Volume' 🔥 detection (default: 1.5x average)")
+volSpikeThreshold = input.float(2.5, "Spike 💥", minval=1.5, maxval=10.0, step=0.5, group=GROUP_TABLE, inline="dash4")
+volLowThreshold = input.float(0.5, "Low  📍", minval=0.1, maxval=1.0, step=0.1, group=GROUP_TABLE, inline="dash5", tooltip="Multiplier for 'Low Volume'  📍 detection (default: 0.5x average)")
+
+//======================================================
+//================ CONSTANTS & HELPERS =================
+//======================================================
+
+// VIBRANT BASE COLORS for gradient ribbon
+const color GREEN = color.green
+const color BLUE = color.aqua
+const color ORANGE = color.rgb(242, 107, 107)
+const color RED = color.red
+
+// Fixed timeframes for MTF analysis
+const string TF_5M = "5"
+const string TF_15M = "15"
+const string TF_1H = "60"
+const string TF_4H = "240"
+const string TF_1D = "D"
+const string TF_1W = "W"
+
+// Helper function: MA selector switch
+maSwitch(_src, _len, _type) =>
+    switch _type
+        "EMA" => ta.ema(_src, _len)
+        "SMA" => ta.sma(_src, _len)
+        "WMA" => ta.wma(_src, _len)
+        "VWMA" => ta.vwma(_src, _len)
+        "RMA" => ta.rma(_src, _len)
+        "HMA" => ta.hma(_src, _len)
+        => na
+
+// Helper function: Analyze volume
+getVolumeIcon(vol, tf_string) =>
+    if na(vol)
+        ""
+    else
+        vol_avg = request.security(syminfo.tickerid, tf_string, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off)
+        vol_ratio = vol / vol_avg
+        vol_ratio >= volSpikeThreshold ? " 💥" : vol_ratio >= volHighThreshold ? " 🔥" : vol_ratio <= volLowThreshold ? "  📍" : " ➖"
+
+// Helper function: Get MA momentum direction
+getMomentumIcon(fast_ma, med_ma) =>
+    if na(fast_ma) or na(med_ma)
+        ""
+    else
+        fast_change = ta.change(fast_ma, 5)
+        med_change = ta.change(med_ma, 5)
+        both_rising = fast_change > 0 and med_change > 0
+        both_falling = fast_change < 0 and med_change < 0
+        both_rising ? " ⬆" : both_falling ? " ⬇" : " ==="
+
+// Helper function: Convert label size string to Pine size
+getLabelSize(string sizeStr) =>
+    sizeStr == "Tiny" ? size.tiny : sizeStr == "Small" ? size.small : size.normal
+
+// Helper function: Get volume icon for display
+getVolumeDisplayIcon(float vol_ratio) =>
+    vol_ratio >= volSpikeThreshold ? "💥" : vol_ratio >= volHighThreshold ? "🔥" : vol_ratio <= volLowThreshold ? " 📍" : "➖"
+
+// Helper function: Calculate Entry Quality Score (0-100)
+// Returns [score, rating_text, rating_emoji]
+getEntryQualityScore(int mtf_count, float vol_ratio, float ribbon_score, float gap_pct, bool is_fresh_cross) =>
+    // Factor 1: MTF Confluence (30 points max)
+    float mtf_score = (mtf_count / 6.0) * 30
+    
+    // Factor 2: Volume Strength (20 points max)
+    float vol_score = vol_ratio >= volSpikeThreshold ? 20.0 : vol_ratio >= volHighThreshold ? 15.0 : vol_ratio >= 1.0 ? 10.0 : vol_ratio >= volLowThreshold ? 5.0 : 0.0
+    
+    // Factor 3: Ribbon Trend Strength (20 points max)
+    float ribbon_strength_score = math.abs(ribbon_score) * 20
+    
+    // Factor 4: MA Gap Size (15 points max) - bigger gap = stronger trend
+    float gap_score = math.min(math.abs(gap_pct) / 5.0 * 15, 15.0)
+    
+    // Factor 5: Cross Freshness (15 points max)
+    float fresh_score = is_fresh_cross ? 15.0 : 7.5
+    
+    // Total Score
+    float total_score = mtf_score + vol_score + ribbon_strength_score + gap_score + fresh_score
+    
+    // Rating
+    string rating = total_score >= 85 ? "EXCELLENT" : total_score >= 70 ? "GOOD" : total_score >= 55 ? "FAIR" : total_score >= 40 ? "WEAK" : "POOR"
+    string emoji = total_score >= 85 ? "⭐⭐⭐" : total_score >= 70 ? "⭐⭐" : total_score >= 55 ? "⭐" : total_score >= 40 ? "⚠️" : "🔴"
+    
+    [total_score, rating, emoji]
+
+//======================================================
+//=================== MA CALCULATION ===================
+//======================================================
+
+// Calculate only if needed
+maShort = (showMAPlots and showFastMA) ? maSwitch(close, maShortLen, maFastType) : na
+maMedium = (showMAPlots and showMedMA) ? maSwitch(close, maMedLen, maMedType) : na
+maSlow = (showMAPlots and showSlowMA) ? maSwitch(close, ma200Len, maSlowType) : na
+
+//======================================================
+//============ MULTI-TIMEFRAME ANALYSIS ================
+//======================================================
+
+// Fetch MTF data using tuples (optimized - 6 calls instead of 24)
+[_tf_5m_fast, _tf_5m_med, _tf_5m_vol, _tf_5m_vwap] = request.security(syminfo.tickerid, TF_5M, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+[_tf_15m_fast, _tf_15m_med, _tf_15m_vol, _tf_15m_vwap] = request.security(syminfo.tickerid, TF_15M, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+[_tf_1h_fast, _tf_1h_med, _tf_1h_vol, _tf_1h_vwap] = request.security(syminfo.tickerid, TF_1H, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+[_tf_4h_fast, _tf_4h_med, _tf_4h_vol, _tf_4h_vwap] = request.security(syminfo.tickerid, TF_4H, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+[_tf_1d_fast, _tf_1d_med, _tf_1d_vol, _tf_1d_vwap] = request.security(syminfo.tickerid, TF_1D, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+[_tf_1w_fast, _tf_1w_med, _tf_1w_vol, _tf_1w_vwap] = request.security(syminfo.tickerid, TF_1W, [maSwitch(close, maShortLen, maFastType), maSwitch(close, maMedLen, maMedType), volume, ta.vwap], lookahead=barmerge.lookahead_off)
+
+// Apply showMTF condition
+float tf_5m_fast = showMTF ? _tf_5m_fast : na
+float tf_5m_med = showMTF ? _tf_5m_med : na
+float tf_5m_vol = showMTF ? _tf_5m_vol : na
+float tf_5m_vwap = showMTF ? _tf_5m_vwap : na
+
+float tf_15m_fast = showMTF ? _tf_15m_fast : na
+float tf_15m_med = showMTF ? _tf_15m_med : na
+float tf_15m_vol = showMTF ? _tf_15m_vol : na
+float tf_15m_vwap = showMTF ? _tf_15m_vwap : na
+
+float tf_1h_fast = showMTF ? _tf_1h_fast : na
+float tf_1h_med = showMTF ? _tf_1h_med : na
+float tf_1h_vol = showMTF ? _tf_1h_vol : na
+float tf_1h_vwap = showMTF ? _tf_1h_vwap : na
+
+float tf_4h_fast = showMTF ? _tf_4h_fast : na
+float tf_4h_med = showMTF ? _tf_4h_med : na
+float tf_4h_vol = showMTF ? _tf_4h_vol : na
+float tf_4h_vwap = showMTF ? _tf_4h_vwap : na
+
+float tf_1d_fast = showMTF ? _tf_1d_fast : na
+float tf_1d_med = showMTF ? _tf_1d_med : na
+float tf_1d_vol = showMTF ? _tf_1d_vol : na
+float tf_1d_vwap = showMTF ? _tf_1d_vwap : na
+
+float tf_1w_fast = showMTF ? _tf_1w_fast : na
+float tf_1w_med = showMTF ? _tf_1w_med : na
+float tf_1w_vol = showMTF ? _tf_1w_vol : na
+float tf_1w_vwap = showMTF ? _tf_1w_vwap : na
+// Calculate MTF metrics for all timeframes
+// 5M Timeframe
+bool tf_5m_bullish = not na(tf_5m_fast) and not na(tf_5m_med) ? tf_5m_fast > tf_5m_med : false
+float tf_5m_gap = not na(tf_5m_fast) and not na(tf_5m_med) and close != 0 ? (tf_5m_fast - tf_5m_med) / close * 100 : 0.0
+string tf_5m_vol_icon = getVolumeIcon(tf_5m_vol, TF_5M)
+float tf_5m_vol_ratio = not na(tf_5m_vol) ? tf_5m_vol / request.security(syminfo.tickerid, TF_5M, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_5m_momentum = getMomentumIcon(tf_5m_fast, tf_5m_med)
+
+// 15M Timeframe
+bool tf_15m_bullish = not na(tf_15m_fast) and not na(tf_15m_med) ? tf_15m_fast > tf_15m_med : false
+float tf_15m_gap = not na(tf_15m_fast) and not na(tf_15m_med) and close != 0 ? (tf_15m_fast - tf_15m_med) / close * 100 : 0.0
+string tf_15m_vol_icon = getVolumeIcon(tf_15m_vol, TF_15M)
+float tf_15m_vol_ratio = not na(tf_15m_vol) ? tf_15m_vol / request.security(syminfo.tickerid, TF_15M, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_15m_momentum = getMomentumIcon(tf_15m_fast, tf_15m_med)
+
+// 1H Timeframe
+bool tf_1h_bullish = not na(tf_1h_fast) and not na(tf_1h_med) ? tf_1h_fast > tf_1h_med : false
+float tf_1h_gap = not na(tf_1h_fast) and not na(tf_1h_med) and close != 0 ? (tf_1h_fast - tf_1h_med) / close * 100 : 0.0
+string tf_1h_vol_icon = getVolumeIcon(tf_1h_vol, TF_1H)
+float tf_1h_vol_ratio = not na(tf_1h_vol) ? tf_1h_vol / request.security(syminfo.tickerid, TF_1H, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_1h_momentum = getMomentumIcon(tf_1h_fast, tf_1h_med)
+
+// 4H Timeframe
+bool tf_4h_bullish = not na(tf_4h_fast) and not na(tf_4h_med) ? tf_4h_fast > tf_4h_med : false
+float tf_4h_gap = not na(tf_4h_fast) and not na(tf_4h_med) and close != 0 ? (tf_4h_fast - tf_4h_med) / close * 100 : 0.0
+string tf_4h_vol_icon = getVolumeIcon(tf_4h_vol, TF_4H)
+float tf_4h_vol_ratio = not na(tf_4h_vol) ? tf_4h_vol / request.security(syminfo.tickerid, TF_4H, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_4h_momentum = getMomentumIcon(tf_4h_fast, tf_4h_med)
+
+// 1D Timeframe
+bool tf_1d_bullish = not na(tf_1d_fast) and not na(tf_1d_med) ? tf_1d_fast > tf_1d_med : false
+float tf_1d_gap = not na(tf_1d_fast) and not na(tf_1d_med) and close != 0 ? (tf_1d_fast - tf_1d_med) / close * 100 : 0.0
+string tf_1d_vol_icon = getVolumeIcon(tf_1d_vol, TF_1D)
+float tf_1d_vol_ratio = not na(tf_1d_vol) ? tf_1d_vol / request.security(syminfo.tickerid, TF_1D, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_1d_momentum = getMomentumIcon(tf_1d_fast, tf_1d_med)
+
+// 1W Timeframe
+bool tf_1w_bullish = not na(tf_1w_fast) and not na(tf_1w_med) ? tf_1w_fast > tf_1w_med : false
+float tf_1w_gap = not na(tf_1w_fast) and not na(tf_1w_med) and close != 0 ? (tf_1w_fast - tf_1w_med) / close * 100 : 0.0
+string tf_1w_vol_icon = getVolumeIcon(tf_1w_vol, TF_1W)
+float tf_1w_vol_ratio = not na(tf_1w_vol) ? tf_1w_vol / request.security(syminfo.tickerid, TF_1W, ta.sma(volume, volAvgLength), lookahead=barmerge.lookahead_off) : 0.0
+string tf_1w_momentum = getMomentumIcon(tf_1w_fast, tf_1w_med)
+
+// Count bullish/bearish timeframes
+int bullishCount = (tf_5m_bullish ? 1 : 0) + (tf_15m_bullish ? 1 : 0) + (tf_1h_bullish ? 1 : 0) + (tf_4h_bullish ? 1 : 0) + (tf_1d_bullish ? 1 : 0) + (tf_1w_bullish ? 1 : 0)
+int bearishCount = 6 - bullishCount
+
+//======================================================
+//====================== PLOTS =========================
+//======================================================
+
+// Calculate slopes for dynamic colors (needed before plotting)
+fastSlope = showMAPlots and showFastMA and not na(maShort) ? ta.change(maShort, 5) / maShort * 100 : 0
+medSlope = showMAPlots and showMedMA and not na(maMedium) ? ta.change(maMedium, 5) / maMedium * 100 : 0
+
+//======================================================
+//============== RIBBON & TREND CALCULATIONS ===========
+//======================================================
+
+// Calculate ribbon boundaries
+ribbonUpper = showMAPlots and showFastMA and showMedMA ? math.max(maShort, maMedium) : na
+ribbonLower = showMAPlots and showFastMA and showMedMA ? math.min(maShort, maMedium) : na
+
+// Calculate momentum for ribbon scoring (slopes already calculated above for dynamic colors)
+isFastAbove = not na(maShort) and not na(maMedium) ? maShort > maMedium : false
+combinedMomentum = (fastSlope + medSlope) / 2
+
+float rawScore = 0.0
+
+// Only calculate if both MAs exist
+if not na(maShort) and not na(maMedium)
+    if isFastAbove and combinedMomentum > 0.02
+        rawScore := 1.0
+    else if isFastAbove and combinedMomentum > -0.02
+        rawScore := 0.5
+    else if not isFastAbove and combinedMomentum < 0.02
+        rawScore := -0.5
+    else
+        rawScore := -1.0
+else
+    rawScore := 0.0  // Neutral when MAs unavailable
+
+// smoothScore is ALWAYS calculated (used by Entry Quality Score system)
+// showRibbon only controls visual display, NOT calculations
+var float smoothScore = 0.0
+smoothScore := ta.ema(rawScore, 8)
+
+// Determine base color based on smoothScore
+baseColor = smoothScore > 0.7 ? GREEN : smoothScore > 0.3 ? BLUE : smoothScore > -0.3 ? ORANGE : RED
+
+// 20-Layer EXPONENTIAL V-GRADIENT (67%-15%) - color calculations
+// Smooth cloud with center-focused density
+color c1 = color.new(baseColor, 67)
+color c2 = color.new(baseColor, 64)
+color c3 = color.new(baseColor, 60)
+color c4 = color.new(baseColor, 56)
+color c5 = color.new(baseColor, 51)
+color c6 = color.new(baseColor, 45)
+color c7 = color.new(baseColor, 38)
+color c8 = color.new(baseColor, 30)
+color c9 = color.new(baseColor, 21)
+color c10 = color.new(baseColor, 15)
+color c11 = color.new(baseColor, 21)
+color c12 = color.new(baseColor, 30)
+color c13 = color.new(baseColor, 38)
+color c14 = color.new(baseColor, 45)
+color c15 = color.new(baseColor, 51)
+color c16 = color.new(baseColor, 56)
+color c17 = color.new(baseColor, 60)
+color c18 = color.new(baseColor, 64)
+color c19 = color.new(baseColor, 67)
+color c20 = color.new(baseColor, 67)
+
+// Create 21 slices (20 layers) - calculated ONLY if ribbon is shown
+float s1 = showRibbon and not na(ribbonUpper) ? ribbonUpper : na
+float s2 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.95 + ribbonLower * 0.05 : na
+float s3 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.90 + ribbonLower * 0.10 : na
+float s4 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.85 + ribbonLower * 0.15 : na
+float s5 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.80 + ribbonLower * 0.20 : na
+float s6 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.75 + ribbonLower * 0.25 : na
+float s7 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.70 + ribbonLower * 0.30 : na
+float s8 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.65 + ribbonLower * 0.35 : na
+float s9 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.60 + ribbonLower * 0.40 : na
+float s10 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.55 + ribbonLower * 0.45 : na
+float s11 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.50 + ribbonLower * 0.50 : na
+float s12 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.45 + ribbonLower * 0.55 : na
+float s13 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.40 + ribbonLower * 0.60 : na
+float s14 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.35 + ribbonLower * 0.65 : na
+float s15 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.30 + ribbonLower * 0.70 : na
+float s16 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.25 + ribbonLower * 0.75 : na
+float s17 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.20 + ribbonLower * 0.80 : na
+float s18 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.15 + ribbonLower * 0.85 : na
+float s19 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.10 + ribbonLower * 0.90 : na
+float s20 = showRibbon and not na(ribbonUpper) ? ribbonUpper * 0.05 + ribbonLower * 0.95 : na
+float s21 = showRibbon and not na(ribbonLower) ? ribbonLower : na
+
+//======================================================
+//================ TABLE CALCULATIONS ==================
+//======================================================
+
+// Calculate distances
+fastDist = not na(maShort) ? (close - maShort) / close * 100 : na
+medDist = not na(maMedium) ? (close - maMedium) / close * 100 : na
+SlowDist = not na(maSlow) ? (close - maSlow) / close * 100 : na
+
+//======================================================
+//==================== PLOTS - MA LINES ================
+//======================================================
+
+// Dynamic MA Colors - ONLY when gradient is shown
+// When gradient is OFF, use original input colors
+
+// Fast MA color logic
+fastMA_color = not na(maShort) and showMAPlots and showFastMA ? (showRibbon ? (fastSlope > 0.05 ? color.new(#00ff00, 0) : fastSlope > 0 ? color.new(#00cc00, 0) : fastSlope > -0.05 ? color.new(#ff9900, 0) : color.new(#ff0000, 0)) : maFastColor) : na
+
+// Medium MA color logic
+medMA_color = not na(maMedium) and showMAPlots and showMedMA ? (showRibbon ? (medSlope > 0.05 ? color.new(#00ff00, 20) : medSlope > 0 ? color.new(#00cc00, 20) : medSlope > -0.05 ? color.new(#ff9900, 20) : color.new(#ff0000, 20)) : maMedColor) : na
+
+// Plot MAs with conditional colors
+maShortPlot = plot(maShort, "Fast MA", color=fastMA_color, linewidth=2)
+maMediumPlot = plot(maMedium, "Medium MA", color=medMA_color, linewidth=2, linestyle=plot.linestyle_dashed)
+plot(maSlow, "Slow MA", color=maSlowColor, linewidth=3, linestyle=plot.linestyle_dashed)
+
+//======================================================
+//============== PLOTS - GRADIENT RIBBON ===============
+//======================================================
+
+// Plot all 20 slices - conditional display
+p1 = plot(showRibbon ? s1 : na, display=display.none, editable=false)
+p2 = plot(showRibbon ? s2 : na, display=display.none, editable=false)
+p3 = plot(showRibbon ? s3 : na, display=display.none, editable=false)
+p4 = plot(showRibbon ? s4 : na, display=display.none, editable=false)
+p5 = plot(showRibbon ? s5 : na, display=display.none, editable=false)
+p6 = plot(showRibbon ? s6 : na, display=display.none, editable=false)
+p7 = plot(showRibbon ? s7 : na, display=display.none, editable=false)
+p8 = plot(showRibbon ? s8 : na, display=display.none, editable=false)
+p9 = plot(showRibbon ? s9 : na, display=display.none, editable=false)
+p10 = plot(showRibbon ? s10 : na, display=display.none, editable=false)
+p11 = plot(showRibbon ? s11 : na, display=display.none, editable=false)
+p12 = plot(showRibbon ? s12 : na, display=display.none, editable=false)
+p13 = plot(showRibbon ? s13 : na, display=display.none, editable=false)
+p14 = plot(showRibbon ? s14 : na, display=display.none, editable=false)
+p15 = plot(showRibbon ? s15 : na, display=display.none, editable=false)
+p16 = plot(showRibbon ? s16 : na, display=display.none, editable=false)
+p17 = plot(showRibbon ? s17 : na, display=display.none, editable=false)
+p18 = plot(showRibbon ? s18 : na, display=display.none, editable=false)
+p19 = plot(showRibbon ? s19 : na, display=display.none, editable=false)
+p20 = plot(showRibbon ? s20 : na, display=display.none, editable=false)
+p21 = plot(showRibbon ? s21 : na, display=display.none, editable=false)
+
+// Fill all 20 layers - exponential V-gradient (67%-15% range)
+fill(p20, p21, showRibbon ? c1 : na, editable=false)
+fill(p19, p20, showRibbon ? c2 : na, editable=false)
+fill(p18, p19, showRibbon ? c3 : na, editable=false)
+fill(p17, p18, showRibbon ? c4 : na, editable=false)
+fill(p16, p17, showRibbon ? c5 : na, editable=false)
+fill(p15, p16, showRibbon ? c6 : na, editable=false)
+fill(p14, p15, showRibbon ? c7 : na, editable=false)
+fill(p13, p14, showRibbon ? c8 : na, editable=false)
+fill(p12, p13, showRibbon ? c9 : na, editable=false)
+fill(p11, p12, showRibbon ? c10 : na, editable=false)
+fill(p10, p11, showRibbon ? c11 : na, editable=false)
+fill(p9, p10, showRibbon ? c12 : na, editable=false)
+fill(p8, p9, showRibbon ? c13 : na, editable=false)
+fill(p7, p8, showRibbon ? c14 : na, editable=false)
+fill(p6, p7, showRibbon ? c15 : na, editable=false)
+fill(p5, p6, showRibbon ? c16 : na, editable=false)
+fill(p4, p5, showRibbon ? c17 : na, editable=false)
+fill(p3, p4, showRibbon ? c18 : na, editable=false)
+fill(p2, p3, showRibbon ? c19 : na, editable=false)
+fill(p1, p2, showRibbon ? c20 : na, editable=false)
+
+//======================================================
+//================= TABLE BUILDING =====================
+//======================================================
+
+const string comprehensiveTooltip = "═══ TREND STRENGTH ═══\nShows current market momentum:\n\n🟢 STRONG Bullish: Fast MA > Medium MA, both rising strongly\n🔵 WEAK Bullish: Fast MA > Medium MA, weak momentum\n🟠 WEAK Bearish: Medium MA > Fast MA, weak momentum\n🔴 STRONG Bearish: Medium MA > Fast MA, both falling strongly\n\n═══ MA DISTANCE ═══\nFormula: (Price - MA) / Price × 100\n\nPositive % (Green): Price ABOVE MA\n• +2% to +5%: Healthy trend\n• +5% to +10%: Getting stretched\n• +10%+: Overextended - expect pullback\n\nNegative % (Red): Price BELOW MA\n• -2% to -5%: Testing support\n• -5% to -10%: Oversold zone\n• -10%+: Deep pullback or downtrend\n\nNear 0% (Gray): Price touching MA (rare)\n\n═══ YOUR MAs ═══\nShows distance for each enabled MA:\n• Fast MA: Short-term momentum\n• Medium MA: Medium-term trend\n• Mid-Slow MA: Swing position (if enabled)\n• Slow MA: Major trend direction\n\nOnly active MAs appear in the table."
+
+// Convert font size selection to Pine Script size
+maSize = maFontSize == "Tiny" ? size.tiny :
+         maFontSize == "Small" ? size.small :
+         maFontSize == "Normal" ? size.normal :
+         maFontSize == "Large" ? size.large : size.huge
+
+// Pre-calculate volume average for Quality Score (avoid calling ta.sma in if scope)
+float live_vol_avg = ta.sma(volume, volAvgLength)
+
+// Create unified table (Trend + MA Distance + MTF)
+var table infoTable = na
+
+if showComprehensiveLabel and barstate.islast
+    // Determine corner position
+    tablePosition = labelCorner == "Top Left" ? position.top_left : labelCorner == "Top Right" ? position.top_right :  labelCorner == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+    // Determine trend state
+    string trendIcon = ""
+    string trendText = ""
+    color trendBgColor = na
+
+    if smoothScore > 0.7
+        trendIcon := "⬆"
+        trendText := "STRONG Bullish"
+        trendBgColor := GREEN
+    else if smoothScore > 0.3
+        trendIcon := "⚠"
+        trendText := "WEAK Bullish"
+        trendBgColor := BLUE
+    else if smoothScore > -0.3
+        trendIcon := "⚠"
+        trendText := "WEAK Bearish"
+        trendBgColor := ORANGE
+    else
+        trendIcon := "⬇"
+        trendText := "STRONG Bearish"
+        trendBgColor := RED
+
+    // Initialize table - expanded for MTF section (4 columns, up to 20 rows)
+    if na(infoTable)
+        infoTable := table.new(tablePosition, 4, 20, border_width=1, border_color=color.gray)
+
+    // Clear table
+    table.clear(infoTable, 0, 0, 3, 19)
+
+    // Row counter
+    int row = 0
+
+    // Subheader: MA Distance (black background) - FIRST
+    table.cell(infoTable, 0, row, "MA Distance from price", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=comprehensiveTooltip)
+    table.merge_cells(infoTable, 0, row, 3, row)
+    row := row + 1
+
+    // Fast MA row
+    if showFastMA and not na(fastDist)
+        maName = maFastType + "(" + str.tostring(maShortLen) + ")"
+        distText = str.format("{0,number,+#.##;-#.##}%", fastDist)
+        rowBgColor = math.abs(fastDist) < 0.1 ? color.gray :
+                     fastDist > 0 ? color.green : color.red
+        table.cell(infoTable, 0, row, maName, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_left, tooltip=comprehensiveTooltip)
+        table.cell(infoTable, 2, row, distText, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=comprehensiveTooltip)
+        table.merge_cells(infoTable, 0, row, 1, row)
+        table.merge_cells(infoTable, 2, row, 3, row)
+        row := row + 1
+
+    // Medium MA row
+    if showMedMA and not na(medDist)
+        maName = maMedType + "(" + str.tostring(maMedLen) + ")"
+        distText = str.format("{0,number,+#.##;-#.##}%", medDist)
+        rowBgColor = math.abs(medDist) < 0.1 ? color.gray :
+                     medDist > 0 ? color.green : color.red
+        table.cell(infoTable, 0, row, maName, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_left, tooltip=comprehensiveTooltip)
+        table.cell(infoTable, 2, row, distText, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=comprehensiveTooltip)
+        table.merge_cells(infoTable, 0, row, 1, row)
+        table.merge_cells(infoTable, 2, row, 3, row)
+        row := row + 1
+
+    // Slow MA row
+    if showSlowMA and not na(SlowDist)
+        maName = maSlowType + "(" + str.tostring(ma200Len) + ")"
+        distText = str.format("{0,number,+#.##;-#.##}%", SlowDist)
+        rowBgColor = math.abs(SlowDist) < 0.1 ? color.gray :
+                     SlowDist > 0 ? color.green : color.red
+        table.cell(infoTable, 0, row, maName, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_left, tooltip=comprehensiveTooltip)
+        table.cell(infoTable, 2, row, distText, bgcolor=rowBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=comprehensiveTooltip)
+        table.merge_cells(infoTable, 0, row, 1, row)
+        table.merge_cells(infoTable, 2, row, 3, row)
+        row := row + 1
+
+    // Summary Row 1: Ribbon Status (Local Trend)
+    string ribbonIcon = smoothScore > 0.7 ? "🟢" : smoothScore > 0.3 ? "🔵" : smoothScore > -0.3 ? "🟠" : "🔴"
+    string ribbonText = smoothScore > 0.7 ? "STRONG Bullish" : smoothScore > 0.3 ? "WEAK Bullish" : smoothScore > -0.3 ? "WEAK Bearish" : "STRONG Bearish"
+    color ribbonBgColor = smoothScore > 0.7 ? GREEN : smoothScore > 0.3 ? BLUE : smoothScore > -0.3 ? ORANGE : RED
+    
+    string ribbonTooltip = "═══ LOCAL TREND (Ribbon) ═══\n\n" + 
+         "Current Status: " + ribbonIcon + " " + ribbonText + "\n" +
+         "Score: " + str.tostring(smoothScore, "#.##") + "\n\n" +
+         "Based on:\n" +
+         "• Fast MA vs Medium MA position\n" +
+         "• Combined momentum of both MAs\n" +
+         "• Smoothed over 8 bars\n\n" +
+         "🟢 STRONG Bullish (>0.7):\n   Fast > Medium + Both rising strongly\n\n" +
+         "🔵 WEAK Bullish (>0.3):\n   Fast > Medium + Weak momentum\n\n" +
+         "🟠 WEAK Bearish (>-0.3):\n   Medium > Fast + Weak momentum\n\n" +
+         "🔴 STRONG Bearish (<-0.3):\n   Medium > Fast + Both falling strongly"
+
+    table.cell(infoTable, 0, row, "Ribbon: " + ribbonIcon + " " + ribbonText, bgcolor=ribbonBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=ribbonTooltip)
+    table.merge_cells(infoTable, 0, row, 3, row)
+    row := row + 1
+
+    // Summary Row 2: MTF Risk Assessment
+    bool lower_tf_bullish = (tf_5m_bullish ? 1 : 0) + (tf_15m_bullish ? 1 : 0) + (tf_1h_bullish ? 1 : 0) >= 2
+    bool higher_tf_bullish = (tf_1d_bullish ? 1 : 0) + (tf_1w_bullish ? 1 : 0) >= 1
+    bool divergence = lower_tf_bullish != higher_tf_bullish
+
+    string riskIcon = bullishCount >= 5 ? "🟢" : bullishCount >= 4 ? "🟡" : "🔴"
+    string riskText = bullishCount >= 5 ? "LOW" : bullishCount >= 4 ? "MEDIUM" : "HIGH"
+    color mtfBgColor = bullishCount >= 4 ? color.new(color.green, 0) : bullishCount >= 3 ? color.new(color.orange, 0) : color.new(color.red, 0)
+
+    string mtfRiskLabel = "MTF Risk: " + riskIcon + " " + riskText + " - " + str.tostring(bullishCount) + "/6 Aligned" + (divergence ? " ⚠️" : "")
+
+    string mtfRiskTooltip = "═══ MULTI-TIMEFRAME RISK ═══\n\n" +
+         "Bullish TFs: " + str.tostring(bullishCount) + "/6 (" + str.tostring(math.round(bullishCount / 6 * 100)) + "%)\n" +
+         "Bearish TFs: " + str.tostring(bearishCount) + "/6 (" + str.tostring(math.round(bearishCount / 6 * 100)) + "%)\n\n" +
+         "Risk Level: " + riskIcon + " " + riskText + "\n" +
+         (divergence ? "⚠️ DIVERGENCE DETECTED!\n" + 
+          (lower_tf_bullish ? "Lower TFs bullish BUT higher TFs bearish\n→ Potential reversal zone" : 
+           "Lower TFs bearish BUT higher TFs bullish\n→ Potential pullback/bounce") + "\n\n" : "") +
+         "━━━━━━━━━━━━━━━━━━━━\n" +
+         "🟢 LOW RISK (5-6/6):\n" +
+         "   → Strong consensus\n" +
+         "   → High probability setup\n" +
+         "   → Good for aggressive entries\n\n" +
+         "🟡 MEDIUM RISK (4/6):\n" +
+         "   → Mixed signals\n" +
+         "   → Reduce position size\n" +
+         "   → Wait for confirmation\n\n" +
+         "🔴 HIGH RISK (<4/6):\n" +
+         "   → No consensus\n" +
+         "   → Avoid trading\n" +
+         "   → Wait for alignment"
+
+    table.cell(infoTable, 0, row, mtfRiskLabel, bgcolor=mtfBgColor, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=mtfRiskTooltip)
+    table.merge_cells(infoTable, 0, row, 3, row)
+    row := row + 1
+
+    // Entry Quality Score Row (always visible)
+    float live_vol_ratio = volume / live_vol_avg
+    float live_gap = ((maShort - maMedium) / maShort) * 100
+    bool live_ma_cross_up = not na(maShort) and not na(maMedium) and maShort > maMedium
+    int live_mtf_count = live_ma_cross_up ? bullishCount : bearishCount
+    bool live_fresh = true  // Always show as fresh in live view
+    [liveScore, liveRating, liveEmoji] = getEntryQualityScore(live_mtf_count, live_vol_ratio, smoothScore, live_gap, live_fresh)
+    
+    string qualityLabel = "Signal Quality: " + liveEmoji + " " + str.tostring(math.round(liveScore)) + "/100 - " + liveRating
+    color qualityBgColor = liveScore >= 85 ? color.new(color.green, 60) : liveScore >= 70 ? color.new(color.blue, 60) : liveScore >= 55 ? color.new(color.orange, 60) : color.new(color.red, 70)
+    
+    string qualityTooltip = "Entry Quality Score - Live Analysis\n\nReal-time quality assessment for current market condition.\n\n🎯 SCORING BREAKDOWN (100 points):\n" + "━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + "• MTF Confluence (30 pts max)\n  → More aligned timeframes = higher score\n  → 6/6 = 30pts | 5/6 = 25pts | 4/6 = 20pts\n\n" + "• Volume Strength (20 pts max)\n  → Spike 💥 (2.5x+) = 20pts\n  → High 🔥 (1.5x+) = 15pts\n  → Normal (1.0x+) = 10pts\n  → Low  📍 (<1.0x) = 5pts\n\n" + "• Ribbon Strength (20 pts max)\n  → Based on smoothScore (-1 to +1)\n  → Stronger trend = higher score\n  → |0.85| = 17pts | |0.50| = 10pts\n\n" + "• MA Gap Size (15 pts max)\n  → Bigger gap = stronger momentum\n  → 5%+ gap = 15pts | 2.5% = 7.5pts\n\n" + "• Cross Freshness (15 pts max)\n  → Fresh cross (within " + str.tostring(freshCrossBars) + " bars) = 15pts\n  → Old cross = 7.5pts\n\n" + "📊 QUALITY RATINGS:\n" + "⭐⭐⭐ 85-100 = EXCELLENT (enter with confidence)\n" + "⭐⭐ 70-84 = GOOD (solid setup)\n" + "⭐ 55-69 = FAIR (wait for confirmation)\n" + "⚠️ 40-54 = WEAK (caution advised)\n" + "🔴 0-39 = POOR (avoid entry)\n\n" + "💡 TIP: Focus on signals with 70+ score"
+    
+    table.cell(infoTable, 0, row, qualityLabel, bgcolor=qualityBgColor, text_color=color.black, text_size=maSize, text_halign=text.align_left, tooltip=qualityTooltip)
+    table.merge_cells(infoTable, 0, row, 3, row)
+    row := row + 1
+
+    // MTF Confluence Section (only if showMTF is true)
+    if showMTF
+        // MTF Header with info icon
+        const string mtf_header_tooltip = "Multi-Timeframe Confluence Analysis\n\nThis table shows trend alignment across 6 key timeframes to help identify high-probability setups.\n\n📊 HOW TO USE:\nHover over any cell for detailed information:\n• TF column: Timeframe basics\n• Trend column: MA values, volume confirmation\n• Gap column: MA separation analysis\n• Momentum column: MA direction & strength\n\n📍 KEY FEATURES:\n🟢/🔴 = Bullish/Bearish\n⭐ = Best entry setup\n🔥 📍💥 = Volume status\n⬆⬇ = Momentum direction\n\nHover over each cell for specific details →"
+
+        table.cell(infoTable, 0, row, "Multi-Timeframe Confluence ( ℹ )", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center, tooltip=mtf_header_tooltip)
+        table.merge_cells(infoTable, 0, row, 3, row)
+        row := row + 1
+
+        // MTF Column headers
+        table.cell(infoTable, 0, row, "  TF  ", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center)
+        table.cell(infoTable, 1, row, "Trend", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center)
+        table.cell(infoTable, 2, row, " Gap  ", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center)
+        table.cell(infoTable, 3, row, " Mmntm ", bgcolor=color.black, text_color=color.white, text_size=maSize, text_halign=text.align_center)
+        row := row + 1
+
+        // 5M Row
+        string tf_5m_trend = (tf_5m_bullish ? "🟢" : "🔴") + tf_5m_vol_icon
+        string tf_5m_mom_tooltip = "5M Momentum Analysis\n\n" +
+             "Direction: " + tf_5m_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_5m_fast - tf_5m_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_5m_med - tf_5m_med[5]), format.mintick) + "\n\n" +
+             (tf_5m_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong bullish momentum" : 
+              tf_5m_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong bearish momentum" : 
+              "⚠️ Mixed momentum\n→ Choppy/consolidating")
+        
+        table.cell(infoTable, 0, row, "5 Min", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="5 Minute Timeframe\n\n• 288 candles per day\n• Best for: Scalping, quick entries")
+        table.cell(infoTable, 1, row, tf_5m_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=(tf_5m_bullish ? "5M Bullish" : "5M Bearish") + "\n\nFast MA: " + str.tostring(tf_5m_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_5m_med, format.mintick) + "\nVolume: " + str.tostring(tf_5m_vol_ratio, "#.#x") + tf_5m_vol_icon)
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_5m_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="5M Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_5m_gap) + "\n\nMA Separation: " + (math.abs(tf_5m_gap) > 2 ? "Strong" : math.abs(tf_5m_gap) > 0.5 ? "Moderate" : "Weak"))
+        table.cell(infoTable, 3, row, tf_5m_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_5m_mom_tooltip)
+        row := row + 1
+
+        // 15M Row
+        string tf_15m_trend = (tf_15m_bullish ? "🟢" : "🔴") + tf_15m_vol_icon
+        string tf_15m_mom_tooltip = "15M Momentum Analysis\n\n" +
+             "Direction: " + tf_15m_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_15m_fast - tf_15m_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_15m_med - tf_15m_med[5]), format.mintick) + "\n\n" +
+             (tf_15m_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong bullish momentum" : 
+              tf_15m_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong bearish momentum" : 
+              "⚠️ Mixed momentum\n→ Choppy/consolidating")
+        
+        table.cell(infoTable, 0, row, "15 Min", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="15 Minute Timeframe\n\n• 96 candles per day\n• Best for: Scalping to day trading")
+        table.cell(infoTable, 1, row, tf_15m_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=(tf_15m_bullish ? "15M Bullish" : "15M Bearish") + "\n\nFast MA: " + str.tostring(tf_15m_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_15m_med, format.mintick) + "\nVolume: " + str.tostring(tf_15m_vol_ratio, "#.#x") + tf_15m_vol_icon)
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_15m_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="15M Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_15m_gap) + "\n\nMA Separation: " + (math.abs(tf_15m_gap) > 2 ? "Strong" : math.abs(tf_15m_gap) > 0.5 ? "Moderate" : "Weak"))
+        table.cell(infoTable, 3, row, tf_15m_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_15m_mom_tooltip)
+        row := row + 1
+
+        // 1H Row
+        string tf_1h_trend = (tf_1h_bullish ? "🟢" : "🔴") + tf_1h_vol_icon
+        string tf_1h_mom_tooltip = "1H Momentum Analysis\n\n" +
+             "Direction: " + tf_1h_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_1h_fast - tf_1h_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_1h_med - tf_1h_med[5]), format.mintick) + "\n\n" +
+             (tf_1h_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong bullish momentum" : 
+              tf_1h_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong bearish momentum" : 
+              "⚠️ Mixed momentum\n→ Choppy/consolidating")
+        
+        table.cell(infoTable, 0, row, "1 Hour", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="1 Hour Timeframe\n\n• 24 candles per day\n• Best for: Day trading to swing")
+        table.cell(infoTable, 1, row, tf_1h_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=(tf_1h_bullish ? "1H Bullish" : "1H Bearish") + "\n\nFast MA: " + str.tostring(tf_1h_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_1h_med, format.mintick) + "\nVolume: " + str.tostring(tf_1h_vol_ratio, "#.#x") + tf_1h_vol_icon)
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_1h_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="1H Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_1h_gap) + "\n\nMA Separation: " + (math.abs(tf_1h_gap) > 2 ? "Strong" : math.abs(tf_1h_gap) > 0.5 ? "Moderate" : "Weak"))
+        table.cell(infoTable, 3, row, tf_1h_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_1h_mom_tooltip)
+        row := row + 1
+ 
+        // 4H Row
+        string tf_4h_trend = (tf_4h_bullish ? "🟢" : "🔴") + tf_4h_vol_icon
+        string tf_4h_mom_tooltip = "4H Momentum Analysis\n\n" +
+             "Direction: " + tf_4h_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_4h_fast - tf_4h_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_4h_med - tf_4h_med[5]), format.mintick) + "\n\n" +
+             (tf_4h_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong bullish momentum" : 
+              tf_4h_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong bearish momentum" : 
+              "⚠️ Mixed momentum\n→ Choppy/consolidating")
+        
+        table.cell(infoTable, 0, row, "4 Hour", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="4 Hour Timeframe\n\n• 6 candles per day\n• Best for: Swing trading")
+        table.cell(infoTable, 1, row, tf_4h_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=(tf_4h_bullish ? "4H Bullish" : "4H Bearish") + "\n\nFast MA: " + str.tostring(tf_4h_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_4h_med, format.mintick) + "\nVolume: " + str.tostring(tf_4h_vol_ratio, "#.#x") + tf_4h_vol_icon)
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_4h_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="4H Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_4h_gap) + "\n\nMA Separation: " + (math.abs(tf_4h_gap) > 2 ? "Strong" : math.abs(tf_4h_gap) > 0.5 ? "Moderate" : "Weak"))
+        table.cell(infoTable, 3, row, tf_4h_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_4h_mom_tooltip)
+        row := row + 1
+
+        // 1D Row (Higher TF)
+        string tf_1d_trend = (tf_1d_bullish ? "🟢" : "🔴") + tf_1d_vol_icon
+        string tf_1d_mom_tooltip = "DAILY Momentum Analysis 📍\n\n" +
+             "Direction: " + tf_1d_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_1d_fast - tf_1d_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_1d_med - tf_1d_med[5]), format.mintick) + "\n\n" +
+             (tf_1d_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong DAILY bullish momentum\n→ Major uptrend in play" : 
+              tf_1d_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong DAILY bearish momentum\n→ Major downtrend in play" : 
+              "⚠️ Mixed momentum\n→ Daily consolidation\n→ Potential trend change")
+        
+        table.cell(infoTable, 0, row, "1 Day", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="Daily Timeframe 📍\n\n• KEY timeframe\n• Major trend direction\n• Respect this trend!")
+        table.cell(infoTable, 1, row, tf_1d_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="DAILY " + (tf_1d_bullish ? "Bullish" : "Bearish") + " 📍\n\nFast MA: " + str.tostring(tf_1d_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_1d_med, format.mintick) + "\nVolume: " + str.tostring(tf_1d_vol_ratio, "#.#x") + tf_1d_vol_icon + "\n\n⚠️ This is a KEY timeframe\nRespect this trend direction!")
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_1d_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="1D Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_1d_gap) + "\n\nDaily MA separation\nImportant for major trend")
+        table.cell(infoTable, 3, row, tf_1d_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_1d_mom_tooltip)
+        row := row + 1
+
+        // 1W Row (Higher TF)
+        string tf_1w_trend = (tf_1w_bullish ? "🟢" : "🔴") + tf_1w_vol_icon
+        string tf_1w_mom_tooltip = "WEEKLY Momentum Analysis 📍\n\n" +
+             "Direction: " + tf_1w_momentum + "\n" +
+             "Fast MA Change: " + str.tostring((tf_1w_fast - tf_1w_fast[5]), format.mintick) + "\n" +
+             "Med MA Change: " + str.tostring((tf_1w_med - tf_1w_med[5]), format.mintick) + "\n\n" +
+             (tf_1w_momentum == " ⬆" ? "✅ Both MAs rising\n→ Strong WEEKLY bullish momentum\n→ Long-term uptrend dominant" : 
+              tf_1w_momentum == " ⬇" ? "❌ Both MAs falling\n→ Strong WEEKLY bearish momentum\n→ Long-term downtrend dominant" : 
+              "⚠️ Mixed momentum\n→ Weekly consolidation\n→ Major trend shift possible")
+        
+        table.cell(infoTable, 0, row, "1 Week", bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="Weekly Timeframe 📍\n\n• KEY timeframe\n• Long-term trend\n• Ultimate direction")
+        table.cell(infoTable, 1, row, tf_1w_trend, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="WEEKLY " + (tf_1w_bullish ? "Bullish" : "Bearish") + " 📍\n\nFast MA: " + str.tostring(tf_1w_fast, format.mintick) + "\nMed MA: " + str.tostring(tf_1w_med, format.mintick) + "\nVolume: " + str.tostring(tf_1w_vol_ratio, "#.#x") + tf_1w_vol_icon + "\n\n⚠️ This is a KEY timeframe\nLong-term direction!")
+        table.cell(infoTable, 2, row, str.format("{0,number,+#.##;-#.##}%", tf_1w_gap), bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip="1W Gap: " + str.format("{0,number,+#.##;-#.##}%", tf_1w_gap) + "\n\nWeekly MA separation\nLong-term trend strength")
+        table.cell(infoTable, 3, row, tf_1w_momentum, bgcolor=color.black, text_color=color.white, text_size=maSize, tooltip=tf_1w_mom_tooltip)
+        row := row + 1
+
+
+// Delete table if disabled
+if not showComprehensiveLabel and not na(infoTable)
+    table.delete(infoTable)
+    infoTable := na
+
+//======================================================
+//=============== CONFLUENCE SIGNALS ===================
+//======================================================
+
+showSignals = input.bool(true, "Show BUY/SELL Signals", group=GROUP_MA, tooltip="Displays entry signals when Fast MA crosses Medium MA:\n\n🟢 BUY POINT: Fast MA crosses above Medium MA (Golden Cross)\n🔴 SELL POINT: Fast MA crosses below Medium MA (Death Cross)\n\nIncludes: Price, Volume strength, Entry Quality Score (0-100), MTF Confluence")
+shortLabelMode = input.bool(false, "Short Label", group=GROUP_MA, inline="lbl1", tooltip="When enabled, labels show only BUY/SELL with star rating.\nFull details move to tooltip.\n\n⭐⭐⭐ = Excellent (85+)\n⭐⭐ = Good (70-84)\n⭐ = Fair (55-69)\nNo stars = Weak (<55)")
+maxLabelsHistory = input.int(2, "| History", minval=1, maxval=50, group=GROUP_MA, inline="lbl1", tooltip="How many signal labels to keep on chart.\nDefault: 2 (last BUY + last SELL)\nMax: 50 labels")
+
+//======================================================
+//================= SIGNAL CALCULATIONS ================
+//======================================================
+
+// Signal label arrays for history management
+var array<label> signalLabels = array.new<label>()
+var int lastSignalBar = na
+
+// Helper function: Get star rating based on quality score
+getStarRating(float score) =>
+    score >= 85 ? "⭐⭐⭐" : score >= 70 ? "⭐⭐" : score >= 55 ? "⭐" : ""
+
+// Helper function: Manage label history (delete oldest if exceeds max)
+manageLabelHistory() =>
+    while array.size(signalLabels) > maxLabelsHistory
+        label oldLabel = array.shift(signalLabels)
+        label.delete(oldLabel)
+
+// Simple MA crossover detection
+bool fastAboveMedium = not na(maShort) and not na(maMedium) and maShort > maMedium
+bool fastAboveMedium_prev = not na(maShort[1]) and not na(maMedium[1]) and maShort[1] > maMedium[1]
+
+// Golden Cross: Fast crossed above Medium
+bool goldenCross = not fastAboveMedium_prev and fastAboveMedium and barstate.isconfirmed
+
+// Death Cross: Fast crossed below Medium
+bool deathCross = fastAboveMedium_prev and not fastAboveMedium and barstate.isconfirmed
+
+// Prevent spam: at least 5 bars between signals (adjustable)
+bool enoughGap = na(lastSignalBar) or (bar_index - lastSignalBar) >= 5
+
+// Calculate Entry Quality Score for current signal
+float current_vol_ratio = volume / ta.sma(volume, volAvgLength)
+float current_gap = ((maShort - maMedium) / maShort) * 100
+bool is_fresh = na(lastSignalBar) or (bar_index - lastSignalBar) >= freshCrossBars
+[qualityScore, qualityRating, qualityEmoji] = getEntryQualityScore(bullishCount, current_vol_ratio, smoothScore, current_gap, is_fresh)
+
+// Create BUY/SELL signals with detailed multi-line labels
+if showSignals and goldenCross and enoughGap
+    string volIcon = getVolumeDisplayIcon(current_vol_ratio)
+    string starRating = getStarRating(qualityScore)
+    string mtfDisplay = showMTF ? "\nMTF: " + str.tostring(bullishCount) + "/6 Aligned" : ""
+
+    // Full detailed text for normal mode
+    string fullSignalText = "🟢 BUY POINT\nPrice: " + str.tostring(close, format.mintick) + "\nVol: " + str.tostring(current_vol_ratio, "#.#x") + " " + volIcon + "\nScore: " + str.tostring(math.round(qualityScore)) + "/100 " + qualityEmoji + mtfDisplay
+
+    // Short text for compact mode: BUY + stars + volume emoji + quality emoji
+    string shortSignalText = "BUY\n" + starRating + (starRating != "" ? " " : "") + volIcon + " " + qualityEmoji
+
+    // Choose text based on mode
+    string signalText = shortLabelMode ? shortSignalText : fullSignalText
+
+    // Tooltip always contains full details
+    string signalTooltip = "🟢 BUY POINT\nPrice: " + str.tostring(close, format.mintick) + "\nVolume: " + str.tostring(current_vol_ratio, "#.#x") + " " + volIcon + "\n\nEntry Quality Score: " + str.tostring(math.round(qualityScore)) + "/100 - " + qualityRating + "\n\n🎯 BREAKDOWN:\n" + "• MTF Confluence: " + str.tostring(bullishCount) + "/6 (" + str.tostring(math.round((bullishCount/6.0)*30)) + "/30 pts)\n" + "• Volume: " + str.tostring(current_vol_ratio, "#.#x") + " (" + str.tostring(math.round(current_vol_ratio >= volSpikeThreshold ? 20 : current_vol_ratio >= volHighThreshold ? 15 : current_vol_ratio >= 1.0 ? 10 : 5)) + "/20 pts)\n" + "• Ribbon Strength: " + str.tostring(smoothScore, "#.##") + " (" + str.tostring(math.round(math.abs(smoothScore)*20)) + "/20 pts)\n" + "• MA Gap: " + str.tostring(current_gap, "#.#%") + " (" + str.tostring(math.round(math.min(math.abs(current_gap)/5.0*15, 15))) + "/15 pts)\n" + "• Cross Fresh: " + (is_fresh ? "Yes" : "No") + " (" + (is_fresh ? "15" : "7.5") + "/15 pts)\n\n" + (qualityScore >= 85 ? "✅ EXCELLENT setup - High probability\n→ Strong entry signal" : qualityScore >= 70 ? "✅ GOOD setup - Above average\n→ Consider entry with tight SL" : qualityScore >= 55 ? "⚠️ FAIR setup - Moderate quality\n→ Wait for confirmation" : "❌ WEAK setup - Low probability\n→ Avoid or wait for better")
+
+    label newLabel = label.new(bar_index, low, signalText, style=label.style_label_up, color=GREEN, textcolor=color.white, size=maSize, tooltip=signalTooltip)
+    array.push(signalLabels, newLabel)
+    manageLabelHistory()
+    lastSignalBar := bar_index
+
+if showSignals and deathCross and enoughGap
+    string volIcon = getVolumeDisplayIcon(current_vol_ratio)
+    string starRating = getStarRating(qualityScore)
+    string mtfDisplay = showMTF ? "\nMTF: " + str.tostring(bearishCount) + "/6 Aligned" : ""
+
+    // Full detailed text for normal mode
+    string fullSignalText = "🔴 SELL POINT\nPrice: " + str.tostring(close, format.mintick) + "\nVol: " + str.tostring(current_vol_ratio, "#.#x") + " " + volIcon + "\nScore: " + str.tostring(math.round(qualityScore)) + "/100 " + qualityEmoji + mtfDisplay
+
+    // Short text for compact mode: SELL + stars + volume emoji + quality emoji
+    string shortSignalText = "SELL \n" + starRating + (starRating != "" ? " " : "") + volIcon + " " + qualityEmoji
+
+    // Choose text based on mode
+    string signalText = shortLabelMode ? shortSignalText : fullSignalText
+
+    // Tooltip always contains full details
+    string signalTooltip = "🔴 SELL POINT\nPrice: " + str.tostring(close, format.mintick) + "\nVolume: " + str.tostring(current_vol_ratio, "#.#x") + " " + volIcon + "\n\nEntry Quality Score: " + str.tostring(math.round(qualityScore)) + "/100 - " + qualityRating + "\n\n🎯 BREAKDOWN:\n" + "• MTF Confluence: " + str.tostring(bearishCount) + "/6 (" + str.tostring(math.round((bearishCount/6.0)*30)) + "/30 pts)\n" + "• Volume: " + str.tostring(current_vol_ratio, "#.#x") + " (" + str.tostring(math.round(current_vol_ratio >= volSpikeThreshold ? 20 : current_vol_ratio >= volHighThreshold ? 15 : current_vol_ratio >= 1.0 ? 10 : 5)) + "/20 pts)\n" + "• Ribbon Strength: " + str.tostring(math.abs(smoothScore), "#.##") + " (" + str.tostring(math.round(math.abs(smoothScore)*20)) + "/20 pts)\n" + "• MA Gap: " + str.tostring(math.abs(current_gap), "#.#%") + " (" + str.tostring(math.round(math.min(math.abs(current_gap)/5.0*15, 15))) + "/15 pts)\n" + "• Cross Fresh: " + (is_fresh ? "Yes" : "No") + " (" + (is_fresh ? "15" : "7.5") + "/15 pts)\n\n" + (qualityScore >= 85 ? "✅ EXCELLENT setup - High probability\n→ Strong entry signal" : qualityScore >= 70 ? "✅ GOOD setup - Above average\n→ Consider entry with tight SL" : qualityScore >= 55 ? "⚠️ FAIR setup - Moderate quality\n→ Wait for confirmation" : "❌ WEAK setup - Low probability\n→ Avoid or wait for better")
+
+    label newLabel = label.new(bar_index, high, signalText, style=label.style_label_down, color=RED, textcolor=color.white, size=maSize, tooltip=signalTooltip)
+    array.push(signalLabels, newLabel)
+    manageLabelHistory()
+    lastSignalBar := bar_index
+
+// Alert conditions for automation (using placeholders for dynamic data)
+// Basic cross alerts
+alertcondition(goldenCross and enoughGap, title="🟢 BUY Signal (Any)", message="⬆ BUY Signal Detected\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n→ Check chart for Quality Score & MTF")
+alertcondition(deathCross and enoughGap, title="🔴 SELL Signal (Any)", message="⬇ SELL Signal Detected\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n→ Check chart for Quality Score & MTF")
+
+// Quality-filtered BUY alerts
+alertcondition(goldenCross and enoughGap and qualityScore >= 85, title="⭐⭐⭐ BUY - EXCELLENT (85+)", message="⬆ EXCELLENT BUY Signal ⭐⭐⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n✅ High probability setup\n→ Strong entry signal")
+alertcondition(goldenCross and enoughGap and qualityScore >= 70, title="⭐⭐ BUY - GOOD (70+)", message="⬆ GOOD BUY Signal ⭐⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n✅ Solid setup\n→ Consider entry with tight SL")
+alertcondition(goldenCross and enoughGap and qualityScore >= 55, title="⭐ BUY - FAIR (55+)", message="⬆ FAIR BUY Signal ⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n⚠️ Moderate quality\n→ Wait for confirmation")
+
+// Quality-filtered SELL alerts
+alertcondition(deathCross and enoughGap and qualityScore >= 85, title="⭐⭐⭐ SELL - EXCELLENT (85+)", message="⬇ EXCELLENT SELL Signal ⭐⭐⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n✅ High probability setup\n→ Strong entry signal")
+alertcondition(deathCross and enoughGap and qualityScore >= 70, title="⭐⭐ SELL - GOOD (70+)", message="⬇ GOOD SELL Signal ⭐⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n✅ Solid setup\n→ Consider entry with tight SL")
+alertcondition(deathCross and enoughGap and qualityScore >= 55, title="⭐ SELL - FAIR (55+)", message="⬇ FAIR SELL Signal ⭐\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n⚠️ Moderate quality\n→ Wait for confirmation")
+
+// Volume-filtered alerts
+alertcondition(goldenCross and enoughGap and current_vol_ratio >= volSpikeThreshold, title="💥 BUY + Volume Spike", message="⬆ BUY with VOLUME SPIKE 💥\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n🔥 High volume confirmation!")
+alertcondition(deathCross and enoughGap and current_vol_ratio >= volSpikeThreshold, title="💥 SELL + Volume Spike", message="⬇ SELL with VOLUME SPIKE 💥\n\n📊 {{ticker}} @ {{close}}\n⏰ {{timenow}}\n\n🔥 High volume confirmation!")
+
+//======================================================
+//============== TREND STATE ALERTS ====================
+//======================================================
+
+// Track previous trend state
+var int prevTrendState = 0  // 0=init, 1=strong_bull, 2=weak_bull, 3=weak_bear, 4=strong_bear
+
+// Determine current trend state (only if table is shown)
+int currentTrendState = 0
+if showComprehensiveLabel
+    if smoothScore > 0.7
+        currentTrendState := 1  // Strong Bullish
+    else if smoothScore > 0.3
+        currentTrendState := 2  // Weak Bullish
+    else if smoothScore > -0.3
+        currentTrendState := 3  // Weak Bearish
+    else
+        currentTrendState := 4  // Strong Bearish
+
+// Detect trend state changes
+bool trendChangedToStrongBull = currentTrendState == 1 and prevTrendState != 1 and prevTrendState != 0 and barstate.isconfirmed
+bool trendChangedToWeakBull = currentTrendState == 2 and prevTrendState != 2 and prevTrendState != 0 and barstate.isconfirmed
+bool trendChangedToWeakBear = currentTrendState == 3 and prevTrendState != 3 and prevTrendState != 0 and barstate.isconfirmed
+bool trendChangedToStrongBear = currentTrendState == 4 and prevTrendState != 4 and prevTrendState != 0 and barstate.isconfirmed
+
+// Update previous state
+if currentTrendState != 0
+    prevTrendState := currentTrendState
+
+// Alert conditions for trend changes
+alertcondition(trendChangedToStrongBull, title="⬆ STRONG Bullish Trend", message="🟢 Market entered STRONG Bullish trend (Score > 0.7)")
+alertcondition(trendChangedToWeakBull, title="⚠ WEAK Bullish Trend", message="🔵 Market entered WEAK Bullish trend (Score > 0.3)")
+alertcondition(trendChangedToWeakBear, title="⚠ WEAK Bearish Trend", message="🟠 Market entered WEAK Bearish trend (Score > -0.3)")
+alertcondition(trendChangedToStrongBear, title="⬇ STRONG Bearish Trend", message="🔴 Market entered STRONG Bearish trend (Score < -0.3)")
+
+//END 14:50 15/11/2025 - Removed entire SL/TP system (~400 lines) - now pure trend-following with BUY/SELL POINT entry signals only

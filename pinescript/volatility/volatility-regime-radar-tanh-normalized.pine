@@ -1,0 +1,108 @@
+//@version=6
+indicator(title="Volatility Regime Radar (tanh normalized)", shorttitle="DirATR-tanh", overlay=false)
+
+length = input.int(title="ATR Length", defval=14, minval=1)
+atrEmaLength = input.int(title="ATR EMA Length", defval=14, minval=1)
+normLength = input.int(title="Normalization Length", defval=50, minval=2)
+smoothing = input.string(title="ATR Smoothing", defval="RMA", options=["RMA", "SMA", "EMA", "WMA"])
+viewMode = input.string(title="View Mode", defval="All", options=["Up/Down", "Spread", "Smoothed Spread", "All"])
+histogramMode = input.bool(title="Histogram Mode", defval=true)
+spreadSmoothLength = input.int(title="Spread Smoothing Length", defval=9, minval=1)
+regimeThreshold = input.float(title="Regime Threshold", defval=0.20, minval=0.0, step=0.01)
+spreadLineColor = input.color(title="Spread Color", defval=color.new(color.yellow, 0))
+smoothedSpreadLineColor = input.color(title="Smoothed Spread Color", defval=color.new(color.aqua, 0))
+showStatsTable = input.bool(title="Show Stats Table", defval=true)
+
+ma_function(source, len) =>
+    switch smoothing
+        "RMA" => ta.rma(source, len)
+        "SMA" => ta.sma(source, len)
+        "EMA" => ta.ema(source, len)
+        => ta.wma(source, len)
+
+tanh_approx(x) =>
+    // Clamp input to keep exp numerically stable.
+    clamped = math.max(math.min(x, 10.0), -10.0)
+    exp2x = math.exp(2.0 * clamped)
+    (exp2x - 1.0) / (exp2x + 1.0)
+
+plotStyle = histogramMode ? plot.style_histogram : plot.style_line
+
+tr = ta.tr(true)
+
+// Directional volatility split: same/higher close -> up, lower close -> down.
+upTRraw = close >= close[1] ? tr : 0.0
+downTRraw = close < close[1] ? tr : 0.0
+
+upATR = ma_function(upTRraw, length)
+downATR = ma_function(downTRraw, length)
+
+upATRema = ta.ema(upATR, atrEmaLength)
+downATRema = ta.ema(downATR, atrEmaLength)
+
+upDist = upATR - upATRema
+downDist = downATR - downATRema
+
+upScale = math.max(nz(ta.stdev(upDist, normLength), 1e-10), 1e-10)
+downScale = math.max(nz(ta.stdev(downDist, normLength), 1e-10), 1e-10)
+
+upNorm = tanh_approx(upDist / upScale)
+downNorm = tanh_approx(downDist / downScale)
+downNormVisual = -downNorm
+
+// Use visual down series for intuitive spread range (approximately -2 to +2).
+spread = upNorm - downNormVisual
+smoothedSpread = ta.ema(spread, spreadSmoothLength)
+
+showUpDown = viewMode == "Up/Down" or viewMode == "All"
+showSpread = viewMode == "Spread" or viewMode == "All"
+showSmoothed = viewMode == "Smoothed Spread" or viewMode == "All"
+
+upColor = color.from_gradient(upNorm, -1.0, 1.0, color.new(color.gray, 70), color.new(color.lime, 0))
+downColor = color.from_gradient(downNormVisual, -1.0, 1.0, color.new(color.gray, 70), color.new(color.red, 0))
+spreadColor = spreadLineColor
+smoothedColor = smoothedSpreadLineColor
+
+bgColor = color.new(color.gray, 94)
+if smoothedSpread > regimeThreshold
+    bgColor := color.new(color.lime, 90)
+else if smoothedSpread < -regimeThreshold
+    bgColor := color.new(color.red, 90)
+bgcolor(bgColor, title="Regime Background")
+
+plot(showUpDown ? upNorm : na, title="Up Vol (tanh)", color=upColor, linewidth=2, style=plotStyle)
+plot(showUpDown ? downNormVisual : na, title="Down Vol (tanh, inverted)", color=downColor, linewidth=2, style=plotStyle)
+plot(showSpread ? spread : na, title="Spread", color=spreadColor, linewidth=2, style=plotStyle)
+plot(showSmoothed ? smoothedSpread : na, title="Smoothed Spread", color=smoothedColor, linewidth=2)
+
+hline(0, "Zero", color=color.gray)
+hline(regimeThreshold, "Regime +Threshold", color=color.new(color.lime, 70))
+hline(-regimeThreshold, "Regime -Threshold", color=color.new(color.red, 70))
+
+regimeText = smoothedSpread > regimeThreshold ? "Bull Vol" : smoothedSpread < -regimeThreshold ? "Bear Vol" : "Neutral"
+dominanceText = spread > 0 ? "Up" : spread < 0 ? "Down" : "Balanced"
+
+tableBg = color.new(color.black, 10)
+tableBorder = color.new(color.gray, 60)
+var table statsTable = table.new(position.top_right, 2, 8, border_width=1, border_color=tableBorder, frame_color=tableBorder)
+
+if barstate.islast
+    if showStatsTable
+        table.cell(statsTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.blue, 60))
+        table.cell(statsTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.blue, 60))
+        table.cell(statsTable, 0, 1, "Up Norm", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 1, str.tostring(upNorm, "#.###"), text_color=upColor, bgcolor=tableBg)
+        table.cell(statsTable, 0, 2, "Down Norm (vis)", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 2, str.tostring(downNormVisual, "#.###"), text_color=downColor, bgcolor=tableBg)
+        table.cell(statsTable, 0, 3, "Spread", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 3, str.tostring(spread, "#.###"), text_color=spreadColor, bgcolor=tableBg)
+        table.cell(statsTable, 0, 4, "Smoothed Spread", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 4, str.tostring(smoothedSpread, "#.###"), text_color=smoothedColor, bgcolor=tableBg)
+        table.cell(statsTable, 0, 5, "Threshold", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 5, str.tostring(regimeThreshold, "#.###"), text_color=color.new(color.silver, 0), bgcolor=tableBg)
+        table.cell(statsTable, 0, 6, "Dominance", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 6, dominanceText, text_color=spread > 0 ? color.lime : spread < 0 ? color.red : color.silver, bgcolor=tableBg)
+        table.cell(statsTable, 0, 7, "Regime", text_color=color.white, bgcolor=tableBg)
+        table.cell(statsTable, 1, 7, regimeText, text_color=smoothedSpread > regimeThreshold ? color.lime : smoothedSpread < -regimeThreshold ? color.red : color.silver, bgcolor=tableBg)
+    else
+        table.clear(statsTable, 0, 0, 1, 7)

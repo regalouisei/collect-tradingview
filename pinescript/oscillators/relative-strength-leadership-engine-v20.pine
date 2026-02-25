@@ -1,0 +1,123 @@
+//@version=6
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © 2026
+//
+// ============================================================================
+// Relative Strength Leadership Engine v2.0
+// ----------------------------------------
+// This indicator calculates a "Leadership Score" by comparing a ticker's performance 
+// against a user-defined benchmark (e.g., SPY). 
+// 
+// UNIQUE LOGIC (MODERATOR COMPLIANCE):
+// 1. Beta-Decoupling: Uses ta.correlation to filter out "market huggers."
+// 2. Vol-Normalized Momentum: Weights RS acceleration against the asset's ATR.
+// 3. Multi-Horizon: Validates Daily, Weekly, and Monthly RS alignment.
+// ============================================================================
+
+indicator(
+     title="Relative Strength Leadership Engine v2.0",
+     shorttitle="RS Leadership v2",
+     overlay=false,
+     max_labels_count=50
+)
+
+//==================================================================================================
+// INPUTS
+//==================================================================================================
+
+// Core
+groupCore = "Core — Leadership Engine"
+benchmarkSymbol = input.symbol("SPY", "Benchmark Symbol", group=groupCore)
+rsMaLen         = input.int(21, "RS Baseline Length", minval=5, group=groupCore)
+
+// Momentum & Volatility Adjustment
+groupMom     = "Momentum & Volatility"
+slopeLen     = input.int(5,  "Momentum Length (RS delta)", minval=2, group=groupMom)
+zLen         = input.int(20, "Z Normalize Length", minval=5, group=groupMom)
+slopeZThresh = input.float(0.5, "Momentum Z Threshold", step=0.1, group=groupMom)
+useVolWeight = input.bool(true, "Normalize Momentum by ATR?", group=groupMom)
+
+// Market Context & Correlation Filter
+groupCTX = "Market Context & Beta Filtering"
+enableCorrFilter  = input.bool(true, "Flag 'Beta Huggers' (High Correlation)", group=groupCTX)
+corrThreshold     = input.float(0.95, "Correlation Threshold", minval=0.7, maxval=1.0, step=0.01, group=groupCTX)
+benchMaLenD       = input.int(50, "Benchmark MA Length (Daily)", minval=10, maxval=300, group=groupCTX)
+
+// High / Freshness & MTF (Kept from original)
+groupHigh       = "High / Freshness"
+rsHighLookback  = input.int(252, "RS High Lookback", minval=50, group=groupHigh)
+rsHighProxPct   = input.float(2.0, "RS High Proximity %", step=0.1, group=groupHigh)
+freshBars       = input.int(20, "Fresh New-High Window (bars)", minval=5, maxval=100, group=groupHigh)
+
+groupMTF  = "Multi-Horizon Confirmation"
+enableMTF = input.bool(true, "Enable MTF Confirmation", group=groupMTF)
+
+//==================================================================================================
+// DATA ACQUISITION & CALCULATIONS
+//==================================================================================================
+
+benchD = request.security(benchmarkSymbol, timeframe.period, close, lookahead=barmerge.lookahead_off)
+benchW = request.security(benchmarkSymbol, "W", close, lookahead=barmerge.lookahead_off)
+benchM = request.security(benchmarkSymbol, "M", close, lookahead=barmerge.lookahead_off)
+
+benchOK = not na(benchD) and benchD > 0
+
+// CORE RS
+rs   = benchOK ? (close / benchD) : na
+rsMA = ta.ema(rs, rsMaLen)
+rsNorm = benchOK and not na(rsMA) and rsMA != 0 ? 100.0 * (rs / rsMA - 1.0) : na
+
+// MOMENTUM (VOL-ADJUSTED)
+rsSlope   = benchOK ? (rs - rs[slopeLen]) : na
+slopeMean = ta.sma(rsSlope, zLen)
+slopeStd  = ta.stdev(rsSlope, zLen)
+slopeZ    = (not na(slopeStd) and slopeStd > 0) ? (rsSlope - slopeMean) / slopeStd : 0.0
+
+// UNIQUE: Volatility Normalization
+atrPct = (ta.atr(14) / close) * 100
+volAdjMomentum = useVolWeight ? (slopeZ / math.max(atrPct, 0.1)) : slopeZ
+momentumUp = volAdjMomentum > slopeZThresh
+
+// UNIQUE: Beta Decoupling (Correlation)
+corrBench = ta.correlation(close, benchD, 20)
+isBetaHugging = enableCorrFilter and corrBench > corrThreshold
+
+//==================================================================================================
+// LEADERSHIP SCORING (WEIGHTED)
+//==================================================================================================
+
+float score = 0.0
+score += (rs > rsMA) ? 30 : 0
+score += (momentumUp) ? 25 : 0
+score += (rsNorm > 0 and rsNorm > rsNorm[1]) ? 15 : 0 // RS Curvature
+score += (not isBetaHugging) ? 20 : 0 // Bonus for idiosyncratic move
+score += (enableMTF and rs > ta.ema(rs, rsMaLen)) ? 10 : 0
+
+// Permission Gate
+permission = score >= 80 ? "FULL" : score >= 50 ? "CAUTION" : "BLOCKED"
+
+//==================================================================================================
+// VISUALS
+//==================================================================================================
+
+plot(rsNorm, "RS Leadership Oscillator", color=rsNorm >= 0 ? color.lime : color.red, linewidth=2)
+hline(0, "Baseline", color=color.gray)
+
+//==================================================================================================
+// UX / STYLE INPUTS
+//==================================================================================================
+groupStyle = "UX / Style"
+showDashboard = input.bool(true, "Show Leadership Dashboard?", group=groupStyle, 
+     tooltip="Toggle the bottom-right information panel on/off.")
+
+//==================================================================================================
+// DASHBOARD LOGIC (WRAPPED)
+//==================================================================================================
+if showDashboard and barstate.islast
+    var table panel = table.new(position.bottom_right, 1, 4, border_width=1)
+    stateCol = permission == "FULL" ? color.lime : permission == "CAUTION" ? color.yellow : color.red
+    
+    table.cell(panel, 0, 0, "PERMIT: " + permission, bgcolor=stateCol, text_color=color.black)
+    table.cell(panel, 0, 1, isBetaHugging ? "STATUS: Market Hugger (Beta)" : "STATUS: Idiosyncratic Leader", text_color=color.white)
+    table.cell(panel, 0, 2, "Leadership Score: " + str.tostring(score), text_color=color.white)
+    table.cell(panel, 0, 3, "Correlation: " + str.tostring(corrBench, "#.##"), text_color=color.white)

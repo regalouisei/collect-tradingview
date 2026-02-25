@@ -1,0 +1,223 @@
+//@version=6
+// © 2026 Ibotrade
+// Price Behavior vs Volatility
+// Market context / regime classification indicator.
+//
+// Compares price progress with volatility expansion to classify
+// the behavioral state of the market.
+//
+// Context tool only.
+// No buy/sell signals or automated trade execution.
+// Educational / informational use only.
+
+indicator("Price Behavior vs Volatility", shorttitle="PBvV", overlay=true)
+
+// =====================================================================
+// █ INPUTS
+// =====================================================================
+groupCalc = "Quant Metrics"
+lb        = input.int(10,  "Structural Lookback", minval=3, group=groupCalc)
+atrLen    = input.int(14,  "Volatility Baseline (ATR)", minval=1, group=groupCalc)
+effSmooth = input.int(5,   "Efficiency Smoothing", minval=1, group=groupCalc)
+
+groupGate = "Significance + Hysteresis"
+useSigGate      = input.bool(true, "Enable Neutral Buffer", group=groupGate)
+enterPriceMove  = input.float(0.35, "ENTER: Min Price Δ (%)", step=0.05, group=groupGate)
+enterVolMove    = input.float(6.0,  "ENTER: Min ATR% Δ (%)", step=0.5,  group=groupGate)
+exitPriceMove   = input.float(0.20, "EXIT:  Min Price Δ (%)", step=0.05, group=groupGate)
+exitVolMove     = input.float(3.5,  "EXIT:  Min ATR% Δ (%)", step=0.5,  group=groupGate)
+
+groupPersist = "Stability Control"
+usePersistence  = input.bool(true, "Require State Persistence", group=groupPersist)
+persistBars     = input.int(2, "Persistence Bars (N)", minval=1, maxval=10, group=groupPersist)
+
+groupRS = "Optional Relative Context"
+useBenchmark   = input.bool(true, "Show Benchmark RS Context", group=groupRS)
+benchSymbol    = input.symbol("SPY", "Benchmark Symbol", group=groupRS)
+rsLookback     = input.int(20, "RS Lookback", minval=5, group=groupRS)
+
+groupViz  = "UI/UX Configuration"
+showRibbon = input.bool(true, "Show Regime Ribbon", group=groupViz)
+ribbonPct  = input.int(70, "Ribbon Transparency (Default 70)", minval=0, maxval=100, group=groupViz)
+
+dashLoc    = input.string("Top Right", "Dashboard Position",
+     options=["Top Left", "Top Center", "Top Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=groupViz)
+
+textSizeOpt = input.string("Small", "Dashboard Text Size",
+     options=["Tiny", "Small", "Normal", "Large"], group=groupViz)
+
+// Map text size option to Pine size enum
+f_size(opt) =>
+    switch opt
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.large
+
+// =====================================================================
+// █ HELPERS
+// =====================================================================
+f_pos(opt) =>
+    switch opt
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Top Right"     => position.top_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+
+f_abs(x) => math.abs(x)
+f_max(a, b) => math.max(a, b)
+
+f_fmtPct(x) =>
+    na(x) ? "N/A" : str.tostring(x, "#.##") + "%"
+
+f_fmtNum(x) =>
+    na(x) ? "N/A" : str.tostring(x, "#.##")
+
+// =====================================================================
+// █ CORE CALCULATIONS
+// =====================================================================
+priceDelta = (ta.change(close, lb) / close[lb]) * 100.0
+
+atrPct   = (ta.atr(atrLen) / close) * 100.0
+volDelta = (ta.change(atrPct, lb) / f_max(atrPct[lb], 1e-6)) * 100.0
+
+effRaw   = f_abs(priceDelta) / f_max(atrPct, 1e-6)
+eff      = ta.sma(effRaw, effSmooth)
+
+enterSig = not useSigGate or (f_abs(priceDelta) >= enterPriceMove or f_abs(volDelta) >= enterVolMove)
+exitSig  = not useSigGate or (f_abs(priceDelta) >= exitPriceMove  or f_abs(volDelta) >= exitVolMove)
+
+benchClose = request.security(benchSymbol, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+rsLine     = close / benchClose
+rsDelta    = (ta.change(rsLine, rsLookback) / rsLine[rsLookback]) * 100.0
+
+// =====================================================================
+// █ REGIME ENUMERATION
+// =====================================================================
+enum Regime
+    NEUTRAL
+    COMPRESSION
+    EFFICIENT_ADV
+    FORCED_ADV
+    ABSORBED_DEC
+    DISORDER
+
+f_classify(_pd, _vd, _enterOk) =>
+    Regime s = Regime.NEUTRAL
+    if _enterOk and not na(_pd) and not na(_vd)
+        if _vd < 0 and f_abs(_pd) < enterPriceMove
+            s := Regime.COMPRESSION
+        else if _pd > 0
+            s := (_vd <= 0) ? Regime.EFFICIENT_ADV : Regime.FORCED_ADV
+        else if _pd < 0
+            s := (_vd <= 0) ? Regime.ABSORBED_DEC : Regime.DISORDER
+    s
+
+rawState = f_classify(priceDelta, volDelta, enterSig)
+
+// =====================================================================
+// █ STABILITY ENGINE (persistence + telemetry)
+// =====================================================================
+var Regime state = Regime.NEUTRAL
+var Regime prevState = Regime.NEUTRAL
+var int    barsInState = 0
+
+var Regime candidate = Regime.NEUTRAL
+var int    candCount = 0
+
+wantNeutral = not exitSig
+Regime nextCandidate = wantNeutral ? Regime.NEUTRAL : rawState
+
+if barstate.isnew
+    prevState := state
+
+    if usePersistence
+        if nextCandidate != candidate
+            candidate := nextCandidate
+            candCount := 1
+        else
+            candCount += 1
+
+        if candCount >= persistBars
+            state := candidate
+    else
+        state := nextCandidate
+
+    if state != prevState
+        barsInState := 1
+    else
+        barsInState += 1
+
+string stabilityTxt = barsInState >= 8 ? "HIGH" : barsInState >= 4 ? "MED" : "LOW"
+
+// =====================================================================
+// █ COLORS (Ribbon vs Header separated for legibility)
+// =====================================================================
+color ribbonColor = switch state
+    Regime.EFFICIENT_ADV => color.new(color.lime,   ribbonPct)
+    Regime.FORCED_ADV    => color.new(color.orange, ribbonPct)
+    Regime.ABSORBED_DEC  => color.new(color.teal,   ribbonPct)
+    Regime.DISORDER      => color.new(color.red,    ribbonPct)
+    Regime.COMPRESSION   => color.new(color.blue,   ribbonPct)
+    => color.new(color.gray, ribbonPct)
+
+color headerBg = switch state
+    Regime.EFFICIENT_ADV => color.new(color.lime,   0)
+    Regime.FORCED_ADV    => color.new(color.orange, 0)
+    Regime.ABSORBED_DEC  => color.new(color.teal,   0)
+    Regime.DISORDER      => color.new(color.red,    0)
+    Regime.COMPRESSION   => color.new(color.blue,   0)
+    => color.new(color.gray, 0)
+
+color headerTxt = color.white
+
+bgcolor(showRibbon ? ribbonColor : na)
+
+// =====================================================================
+// █ HUD (with configurable text size)
+// =====================================================================
+var table hud = table.new(position.top_right, 1, 7, border_width=1, frame_color=color.gray)
+
+if barstate.islast
+    table.set_position(hud, f_pos(dashLoc))
+    table.clear(hud, 0, 0, 0, 6)
+
+    textSz = f_size(textSizeOpt)
+    headerSz = (textSz == size.tiny) ? size.small : (textSz == size.small) ? size.normal : (textSz == size.normal) ? size.large : size.large
+    tinySz = size.tiny
+
+    [stateTxt, profileTxt, contextTxt] = switch state
+        Regime.EFFICIENT_ADV => ["EFFICIENT ADVANCE", "Orderly Markup", "Price progress with contained volatility; continuation-friendly."]
+        Regime.FORCED_ADV    => ["FORCED ADVANCE",    "High-Energy Push", "Volatility expanding with price; watch for exhaustion risk."]
+        Regime.ABSORBED_DEC  => ["ABSORBED DECLINE",  "Stabilizing Down", "Down move with fading volatility; potential stabilization."]
+        Regime.DISORDER      => ["MARKET DISORDER",   "Risk-Off Liquidation", "Down move with rising volatility; fragile conditions."]
+        Regime.COMPRESSION   => ["COMPRESSION / COIL","Energy Storage", "Volatility contracting with muted progress; expansion risk building."]
+        => ["NEUTRAL REGIME", "Equilibrium", "No meaningful expansion; wait for resolution."]
+
+    table.cell(hud, 0, 0, stateTxt, bgcolor=headerBg, text_color=headerTxt, text_size=headerSz)
+    table.cell(hud, 0, 1, "PROFILE: " + profileTxt, bgcolor=color.black, text_color=color.white, text_size=textSz)
+    table.cell(hud, 0, 2, "CONTEXT: " + contextTxt, bgcolor=color.black, text_color=color.silver, text_size=textSz)
+
+    string m1 = "Price Δ(" + str.tostring(lb) + "): " + f_fmtPct(priceDelta) + " | ATR%: " + f_fmtPct(atrPct) + " | ATR% Δ(" + str.tostring(lb) + "): " + f_fmtPct(volDelta)
+    table.cell(hud, 0, 3, m1, bgcolor=color.new(color.gray, 85), text_color=color.white, text_size=textSz)
+
+    string m2 = "Efficiency: " + f_fmtNum(eff) + " | Stability: " + stabilityTxt + " | Bars in State: " + str.tostring(barsInState)
+    table.cell(hud, 0, 4, m2, bgcolor=color.new(color.gray, 85), text_color=color.white, text_size=textSz)
+
+    string m3 = useBenchmark ? ("RS Δ vs " + benchSymbol + " (" + str.tostring(rsLookback) + "): " + f_fmtPct(rsDelta)) : "RS Context: OFF"
+    table.cell(hud, 0, 5, m3, bgcolor=color.new(color.gray, 88), text_color=color.white, text_size=textSz)
+
+    table.cell(hud, 0, 6, "Context Classifier — No signals — Educational only", bgcolor=color.black, text_color=color.new(color.white, 70), text_size=tinySz)
+
+// =====================================================================
+// █ ALERTS
+// =====================================================================
+stateChanged = state != prevState
+alertcondition(stateChanged, title="PBvV Regime Change", message="PBvV regime changed: {{ticker}} {{interval}}")
+alertcondition(state == Regime.COMPRESSION and stateChanged, title="PBvV -> COMPRESSION", message="PBvV -> COMPRESSION/COIL: {{ticker}} {{interval}}")
+alertcondition(state == Regime.EFFICIENT_ADV and stateChanged, title="PBvV -> EFFICIENT ADV", message="PBvV -> EFFICIENT ADVANCE: {{ticker}} {{interval}}")
+alertcondition(state == Regime.FORCED_ADV and stateChanged, title="PBvV -> FORCED ADV", message="PBvV -> FORCED ADVANCE: {{ticker}} {{interval}}")
+alertcondition(state == Regime.ABSORBED_DEC and stateChanged, title="PBvV -> ABSORBED DEC", message="PBvV -> ABSORBED DECLINE: {{ticker}} {{interval}}")
+alertcondition(state == Regime.DISORDER and stateChanged, title="PBvV -> DISORDER", message="PBvV -> MARKET DISORDER: {{ticker}} {{interval}}")

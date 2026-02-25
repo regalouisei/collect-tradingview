@@ -1,0 +1,122 @@
+//@version=6
+indicator("VIX Oscillator", shorttitle="VIX Osc", overlay=false, precision=2)
+
+// --- Inputs
+vixSymbol       = input.symbol("TVC:VIX", "VIX Symbol")
+voliSymbol      = input.symbol("NASDAQ:VOLI", "VOLI Symbol", tooltip="Front-end vol index used for timing.")
+referenceSymbol = input.symbol("SP:SPX", "Reference Index Symbol")
+sourceTf        = input.timeframe("", "Source Timeframe", tooltip="Leave blank to use the chart timeframe for all data requests.")
+baselineLen     = input.int(21, "Baseline Length", minval=1, tooltip="Simple moving average length used as the oscillator baseline.")
+smoothingLen    = input.int(3, "Oscillator Smoothing", minval=1, tooltip="Simple moving average applied to the normalized VIX series.")
+
+levelGroup          = "Alert Levels"
+upperAlertLevel     = input.float(25.0, "Upper Alert Level", group=levelGroup, tooltip="When VIX closes above this level the oscillator highlights fear extremes.")
+lowerAlertLevel     = input.float(17.0, "Lower Alert Level", group=levelGroup, tooltip="When VIX closes below this level the oscillator highlights complacency extremes.")
+showLevelHighlights = input.bool(true, "Highlight Level Breaches", group=levelGroup)
+showLevelBackground = input.bool(true, "Tint Background", inline="lvlViz", group=levelGroup)
+
+structureGroup  = "Structure & Divergence"
+pivotLen        = input.int(5, "Pivot Length", minval=1, group=structureGroup, tooltip="Bars on each side to confirm swing highs and lows.")
+showStructure   = input.bool(false, "Show Structure", group=structureGroup)
+showDivergence  = input.bool(true, "Show Divergences vs SPX", group=structureGroup)
+
+strategyGroup     = "Strategy Aids"
+vixRegimeCaution  = input.float(20.0, "VIX Regime Caution", group=strategyGroup, tooltip="Above this, avoid new short-dated credit spreads—regime is stressy.")
+voliFadeLookback  = input.int(3, "VOLI Fade Lookback", minval=1, group=strategyGroup, tooltip="Bars back to confirm VOLI was rising before rolling over.")
+showEntryCues     = input.bool(true, "Show Entry/Avoid Zones", group=strategyGroup)
+hudGroup          = "HUD"
+showHud           = input.bool(true, "Show HUD Panel", group=hudGroup)
+
+// --- Data
+requestTf   = sourceTf == "" ? timeframe.period : sourceTf
+vixSeries   = request.security(vixSymbol, requestTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+voliSeries  = request.security(voliSymbol, requestTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+spxSeries   = request.security(referenceSymbol, requestTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+vixClose    = nz(vixSeries, nz(vixSeries[1], 0.0))
+voliClose   = nz(voliSeries, nz(voliSeries[1], 0.0))
+spxClose    = nz(spxSeries, nz(spxSeries[1], 0.0))
+
+normalizeToBaseline(val, base) =>
+    na(val) or na(base) or base == 0.0 ? na : (val - base) / base * 100.0
+
+baselineRaw = ta.sma(vixClose, baselineLen)
+oscRaw      = normalizeToBaseline(vixClose, baselineRaw)
+oscillator  = smoothingLen > 1 ? ta.sma(oscRaw, smoothingLen) : oscRaw
+voliBase    = ta.sma(voliClose, baselineLen)
+voliRaw     = normalizeToBaseline(voliClose, voliBase)
+voliOsc     = smoothingLen > 1 ? ta.sma(voliRaw, smoothingLen) : voliRaw
+
+// --- Level mapping
+upperOscLevel = normalizeToBaseline(upperAlertLevel, baselineRaw)
+lowerOscLevel = normalizeToBaseline(lowerAlertLevel, baselineRaw)
+
+upperHit = ta.crossover(vixClose, upperAlertLevel)
+lowerHit = ta.crossunder(vixClose, lowerAlertLevel)
+
+// --- Plots & Styling
+zeroPlot       = plot(0, "Zero Line", color=color.new(color.gray, 75))
+posColor       = color.new(color.teal, 0)
+negColor       = color.new(color.red, 0)
+neutralColor   = color.new(color.gray, 0)
+oscColor       = oscillator > 0 ? posColor : oscillator < 0 ? negColor : neutralColor
+oscPlot        = plot(oscillator, "VIX Oscillator", color=oscColor, linewidth=2)
+voliColor      = color.new(color.blue, 0)
+voliPlot       = plot(voliOsc, "VOLI Oscillator", color=voliColor, linewidth=2)
+upperLevelPlot = plot(upperOscLevel, "Upper Alert (Osc)", color=color.new(color.orange, 40), linewidth=1)
+lowerLevelPlot = plot(lowerOscLevel, "Lower Alert (Osc)", color=color.new(color.orange, 40), linewidth=1)
+
+fill(oscPlot, upperLevelPlot, color=showLevelHighlights ? color.new(color.red, 85) : na, fillgaps=false, title="Upper Highlight")
+fill(oscPlot, lowerLevelPlot, color=showLevelHighlights ? color.new(color.green, 85) : na, fillgaps=false, title="Lower Highlight")
+
+// --- Structure & Divergences
+oscPivotHigh     = ta.pivothigh(oscillator, pivotLen, pivotLen)
+oscPivotLow      = ta.pivotlow(oscillator, pivotLen, pivotLen)
+oscPivotHighPlot = showStructure ? oscPivotHigh : na
+oscPivotLowPlot  = showStructure ? oscPivotLow : na
+
+plot(oscPivotHighPlot, "Osc Pivot High", style=plot.style_cross, color=color.new(color.red, 0), linewidth=2, offset=-pivotLen)
+plot(oscPivotLowPlot, "Osc Pivot Low", style=plot.style_cross, color=color.new(color.green, 0), linewidth=2, offset=-pivotLen)
+
+spxAtOscPivotHigh = not na(oscPivotHigh) ? spxClose[pivotLen] : na
+spxAtOscPivotLow  = not na(oscPivotLow) ? spxClose[pivotLen] : na
+
+prevOscPivotHigh      = ta.valuewhen(not na(oscPivotHigh), oscPivotHigh, 1)
+prevOscPivotLow       = ta.valuewhen(not na(oscPivotLow), oscPivotLow, 1)
+prevSpxAtOscPivotHigh = ta.valuewhen(not na(oscPivotHigh), spxClose[pivotLen], 1)
+prevSpxAtOscPivotLow  = ta.valuewhen(not na(oscPivotLow), spxClose[pivotLen], 1)
+
+// --- Strategy cues: VIX for regime, VOLI for timing
+vixTrendUp    = ta.rma(ta.change(vixClose), 3) > 0
+voliTrendUp   = ta.rma(ta.change(voliClose), 3) > 0
+voliWasRising = voliOsc > voliOsc[voliFadeLookback]
+voliRolling   = ta.change(voliOsc) < 0 and voliWasRising
+frontStress   = voliClose > vixClose
+
+entryWindow  = showEntryCues and vixClose < vixRegimeCaution and frontStress and voliRolling
+avoidWindow  = showEntryCues and ((vixClose > vixRegimeCaution and vixTrendUp) or (frontStress and voliTrendUp))
+
+// Single background with priority: entry > avoid > level background to prevent stacking tint
+bgColorLevel = showLevelBackground ? (vixClose > upperAlertLevel ? color.new(color.red, 88) : vixClose < lowerAlertLevel ? color.new(color.teal, 88) : na) : na
+bgColorFinal = entryWindow ? color.new(color.green, 87) : avoidWindow ? color.new(color.red, 87) : bgColorLevel
+bgcolor(bgColorFinal, title="Background (priority)")
+
+// --- HUD: simple status panel (regime + timing) stacked vertically
+var table hud = table.new(position.top_right, 1, 4, border_color=color.new(color.gray, 70), frame_color=color.new(color.gray, 70), bgcolor=color.new(color.black, 78))
+
+regimeTxt  = "Regime: " + (vixClose < vixRegimeCaution ? "Low Vol" : "High Vol")
+spreadTxt  = "Spread (VOLI-VIX): " + str.tostring(voliClose - vixClose, format.mintick)
+entryState = entryWindow ? "Short Premium" : avoidWindow ? "Avoid" : "Neutral"
+timingTxt  = "Timing: " + entryState
+stateColor = entryWindow ? color.new(color.green, 0) : avoidWindow ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+if showHud and barstate.islast
+    table.cell(hud, 0, 0, "VIX: " + str.tostring(vixClose, format.mintick), text_color=color.white)
+    table.cell(hud, 0, 1, "VOLI: " + str.tostring(voliClose, format.mintick), text_color=color.white)
+    table.cell(hud, 0, 2, spreadTxt, text_color=color.white)
+    table.cell(hud, 0, 3, regimeTxt + " | " + timingTxt, text_color=stateColor)
+else
+    table.clear(hud,0,0)
+
+// --- Alerts
+alertcondition(upperHit, "VIX Breaks Above Upper Level", "VIX has crossed above the configured upper alert level.")
+alertcondition(lowerHit, "VIX Breaks Below Lower Level", "VIX has crossed below the configured lower alert level.")

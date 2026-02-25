@@ -1,0 +1,221 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ChartPrime (modified & merged by HS for 승표)
+
+//@version=5
+indicator("SR HV Boxes (1H+ White) + RSI Exit & BB-RSI Combo", shorttitle="HV Boxes 1H+ + RSI/BB Combo", overlay=true, max_boxes_count=200)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 공통: 1시간봉 이상 여부
+// ──────────────────────────────────────────────────────────────────────────────
+is1hUp = timeframe.in_seconds(timeframe.period) >= 60*60
+
+// ──────────────────────────────────────────────────────────────────────────────
+// [A] 중요 매물대: 1H+에서만 생성/표시, 흰색 박스
+// ──────────────────────────────────────────────────────────────────────────────
+groupSet = "HV Boxes — Settings"
+lookbackPeriod = input.int(20, "Lookback Period", minval=1, group=groupSet)
+vol_len        = input.int(2,  "Delta Volume Filter Length", group=groupSet, tooltip="값이 클수록 박스가 덜 생깁니다")
+box_withd      = input.float(1, "Adjust Box Width (ATR×)", maxval=1000, minval=0, step=0.1, group=groupSet)
+
+groupImp  = "HV Boxes — Importance"
+str_mult  = input.float(2.0, "Min Strength Multiplier", step=0.1, group=groupImp,
+     tooltip="강도 = |DeltaVol| × (Range / ATR). 이 값 이상만 박스 생성")
+atr_len_s = input.int(50, "ATR Length for Strength", minval=1, group=groupImp)
+keep_sup  = input.int(6, "Keep Top-N Support Boxes", minval=1, maxval=50, group=groupImp)
+keep_res  = input.int(6, "Keep Top-N Resistance Boxes", minval=1, maxval=50, group=groupImp)
+
+groupCol  = "HV Boxes — White Style"
+alphaW       = input.int(90, "Fill Opacity (0=진함, 100=투명)", minval=0, maxval=100, group=groupCol)
+alphaBorder  = input.int(60, "Border Opacity", minval=0, maxval=100, group=groupCol)
+WHITE_FILL   = color.new(color.white, alphaW)
+WHITE_BORDER = color.new(color.white, alphaBorder)
+HIDE_FILL    = color.new(color.white, 100)   // 1H 미만에서 숨김용
+
+// 델타 볼륨(양봉=+, 음봉=-)
+upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    isBuyVolume = close >= open
+    if isBuyVolume
+        posVol += volume
+    else
+        negVol -= volume
+    posVol + negVol
+
+// 저장소
+var supBoxes   = array.new_box()
+var resBoxes   = array.new_box()
+var supScores  = array.new_float()
+var resScores  = array.new_float()
+
+// 계산 & 생성 (1H 이상에서만)
+if is1hUp
+    Vol    = upAndDownVolume()
+    vol_hi = ta.highest(Vol/2.5, vol_len)
+    vol_lo = ta.lowest(Vol/2.5,  vol_len)
+
+    pivotHigh = ta.pivothigh(close, lookbackPeriod, lookbackPeriod)
+    pivotLow  = ta.pivotlow (close, lookbackPeriod, lookbackPeriod)
+
+    atr200  = ta.atr(200)
+    withd   = atr200 * box_withd
+
+    rng      = high - low
+    atrS     = ta.atr(atr_len_s)
+    strength = math.abs(Vol) * (rng / math.max(atrS, 1e-10))
+    strong   = strength > ta.sma(math.abs(Vol), 20) * str_mult
+
+    // SUPPORT
+    if (not na(pivotLow)) and Vol > vol_hi and strong
+        supportLevel   = pivotLow
+        supportLevel_1 = supportLevel - withd
+        topLeft     = chart.point.from_index(bar_index - lookbackPeriod, supportLevel)
+        bottomRight = chart.point.from_index(bar_index, supportLevel_1)
+        sup = box.new(top_left=topLeft, bottom_right=bottomRight, border_color=WHITE_BORDER, border_width=1, bgcolor=WHITE_FILL, text="", text_color=na)
+        array.push(supBoxes, sup)
+        array.push(supScores, strength)
+        if array.size(supBoxes) > keep_sup
+            minIdx = 0
+            minVal = array.get(supScores, 0)
+            for i = 1 to array.size(supScores) - 1
+                sc = array.get(supScores, i)
+                if sc < minVal
+                    minVal := sc
+                    minIdx := i
+            box.delete(array.get(supBoxes, minIdx))
+            array.remove(supBoxes, minIdx)
+            array.remove(supScores, minIdx)
+
+    // RESISTANCE
+    if (not na(pivotHigh)) and Vol < vol_lo and strong
+        resistanceLevel   = pivotHigh
+        resistanceLevel_1 = resistanceLevel + withd
+        topLeft     = chart.point.from_index(bar_index - lookbackPeriod, resistanceLevel)
+        bottomRight = chart.point.from_index(bar_index, resistanceLevel_1)
+        res = box.new(top_left=topLeft, bottom_right=bottomRight, border_color=WHITE_BORDER, border_width=1, bgcolor=WHITE_FILL, text="", text_color=na)
+        array.push(resBoxes, res)
+        array.push(resScores, strength)
+        if array.size(resBoxes) > keep_res
+            minIdx2 = 0
+            minVal2 = array.get(resScores, 0)
+            for j = 1 to array.size(resScores) - 1
+                sc2 = array.get(resScores, j)
+                if sc2 < minVal2
+                    minVal2 := sc2
+                    minIdx2 := j
+            box.delete(array.get(resBoxes, minIdx2))
+            array.remove(resBoxes, minIdx2)
+            array.remove(resScores, minIdx2)
+
+// 우측 연장 + 가시성(1H 미만이면 숨김)
+if array.size(supBoxes) > 0
+    for i = 0 to array.size(supBoxes) - 1
+        bx = array.get(supBoxes, i)
+        box.set_right(bx, bar_index + 1)
+        box.set_bgcolor(bx, is1hUp ? WHITE_FILL : HIDE_FILL)
+        box.set_border_color(bx, is1hUp ? WHITE_BORDER : HIDE_FILL)
+
+if array.size(resBoxes) > 0
+    for i = 0 to array.size(resBoxes) - 1
+        bx = array.get(resBoxes, i)
+        box.set_right(bx, bar_index + 1)
+        box.set_bgcolor(bx, is1hUp ? WHITE_FILL : HIDE_FILL)
+        box.set_border_color(bx, is1hUp ? WHITE_BORDER : HIDE_FILL)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// [B] RSI Exit + BB-RSI Combo */
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1) RSI 과열/과매도 → 일반구간 마감 표시 (15m,30m,1h,4h,1D만)
+rsiLen = input.int(14, "RSI 기간", group="RSI Exit")
+ob     = input.float(70.0, "과열선(위)", group="RSI Exit")
+os     = input.float(30.0, "과매도선(아래)", group="RSI Exit")
+
+rsi = ta.rsi(close, rsiLen)
+
+// 허용 타임프레임 체크
+curTf = timeframe.period
+isRsiTf =
+     (curTf == "15" or curTf == "15m") or
+     (curTf == "30" or curTf == "30m") or
+     (curTf == "60" or curTf == "1H" or curTf == "1h") or
+     (curTf == "240" or curTf == "4H" or curTf == "4h") or
+     (curTf == "1D" or curTf == "D")
+
+// 과열/과매도 → 일반
+rsiExitOverbought = rsi[1] > ob and rsi < ob
+rsiExitOversold   = rsi[1] < os and rsi > os
+
+// 표시 (작은 'RSI' 텍스트)
+plotchar(isRsiTf and rsiExitOverbought,
+     title="RSI 과열 해제",
+     char="RSI",
+     location=location.abovebar,
+     color=color.new(color.red, 0),
+     size=size.tiny)
+
+plotchar(isRsiTf and rsiExitOversold,
+     title="RSI 과매도 해제",
+     char="RSI",
+     location=location.belowbar,
+     color=color.new(color.lime, 0),
+     size=size.tiny)
+
+// 알림
+alertcondition(isRsiTf and rsiExitOverbought, "RSI 과열→일반", "RSI가 과열권에서 일반구간으로 내려왔습니다.")
+alertcondition(isRsiTf and rsiExitOversold,   "RSI 과매도→일반", "RSI가 과매도권에서 일반구간으로 올라왔습니다.")
+
+// 2) RSI 다이버전스 + 볼밴 재진입 콤보 (1H+)
+bbLen  = input.int(20, "BB Length", group="BB-RSI Combo")
+bbMult = input.float(2.0, "BB Mult", group="BB-RSI Combo")
+
+bbBasis = ta.sma(close, bbLen)
+bbDev   = ta.stdev(close, bbLen) * bbMult
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+plot(bbBasis, "BB Basis", color=color.new(color.white, 80))
+plot(bbUpper, "BB Upper", color=color.new(color.red,   80))
+plot(bbLower, "BB Lower", color=color.new(color.green, 80))
+
+// 다이버전스 기준
+divExitOB  = rsi[1] > ob and rsi < ob
+barsFromOB = ta.barssince(rsi > ob)
+hasOB      = not na(barsFromOB)
+prevHighOB = hasOB and barsFromOB > 0 ? high[barsFromOB] : na
+prevRsiOB  = hasOB and barsFromOB > 0 ? rsi[barsFromOB]  : na
+bearDiv    = divExitOB and hasOB and barsFromOB > 0 and not na(prevHighOB) and not na(prevRsiOB) and high > prevHighOB and rsi < prevRsiOB
+
+divExitOS  = rsi[1] < os and rsi > os
+barsFromOS = ta.barssince(rsi < os)
+hasOS      = not na(barsFromOS)
+prevLowOS  = hasOS and barsFromOS > 0 ? low[barsFromOS] : na
+prevRsiOS  = hasOS and barsFromOS > 0 ? rsi[barsFromOS] : na
+bullDiv    = divExitOS and hasOS and barsFromOS > 0 and not na(prevLowOS) and not na(prevRsiOS) and low < prevLowOS and rsi > prevRsiOS
+
+// 볼밴 재진입 (몸통 기준)
+bbReBuy  = is1hUp and close[1] < bbLower[1] and close > bbLower
+bbReSell = is1hUp and close[1] > bbUpper[1] and close < bbUpper
+
+// 콤보
+comboBuy  = is1hUp and bullDiv and bbReBuy
+comboSell = is1hUp and bearDiv and bbReSell
+
+// 콤보 시그널 (작게)
+plotshape(comboBuy,
+     title="COMBO BUY",
+     style=shape.diamond,
+     location=location.belowbar,
+     color=color.new(color.lime, 0),
+     size=size.small)
+
+plotshape(comboSell,
+     title="COMBO SELL",
+     style=shape.diamond,
+     location=location.abovebar,
+     color=color.new(color.red, 0),
+     size=size.small)
+
+// 알림
+alertcondition(comboBuy,  "COMBO BUY",  "RSI 다이버전스 + 볼밴 재진입 매수")
+alertcondition(comboSell, "COMBO SELL", "RSI 다이버전스 + 볼밴 재진입 매도")

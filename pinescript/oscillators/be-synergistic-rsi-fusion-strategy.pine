@@ -1,0 +1,541 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TradeWiseWithEase
+
+//@version=6
+indicator("BE-Synergistic RSI Fusion Strategy", shorttitle="BE-SRSI", overlay=false, max_boxes_count=500, max_labels_count=500)
+
+// --- Inputs ---
+length = input.int(8, minval=1, title="RSI Length")
+h0_val = input.int(65, title="Overbought Level (h0)")
+h1_val = input.int(35, title="Oversold Level (h1)")
+max_peaks = input.int(5, minval=1, title="Max Local Peaks")
+atr_len = input.int(300, minval=1, title="ATR Length")
+atr_mult = input.float(1.0, minval=0.1, title="ATR Multiplier (Offset)")
+min_range_mult = input.float(3.0, minval=0.1, title="Min Box Range (ATR Mult)")
+
+// --- UDTs ---
+type Counter
+    int val = 0
+
+type TradeSetup
+    int uid 
+    float g_bottom
+    float g_top
+    float r_top
+    float r_bottom
+    bool traded_g
+    bool traded_r
+    box id_g
+    box id_r
+    int start_idx
+
+type DivState
+    int status = 0          
+    float p_rsi = na        
+    float p_price = na      
+    float p_trigger = na    
+    int p_idx = na          
+    int counts = 0          
+    bool updated = false    
+    float best_rsi = na     
+    float best_price = na   
+    int best_idx = 0        
+    float prev_local_price = na 
+    float trk_rsi = na      
+    float trk_price = na    
+    float trk_trigger = na
+    int trk_idx = 0
+    int wait = 0
+
+// --- Global State ---
+var bool in_trade = false
+var int trade_dir = 0 
+var float trade_sl_level = na
+var float trade_tp_level = na
+var box current_trade_box = na 
+var int current_trade_uid = -1 
+
+// Plotting Flags 
+bool plot_long_entry = false
+bool plot_short_entry = false
+bool plot_long_tp = false
+bool plot_long_sl = false
+bool plot_short_tp = false
+bool plot_short_sl = false
+
+// Statistics Tracking
+var int c_0_25 = 0
+var int c_25_50 = 0
+var int c_50_75 = 0
+var int c_75_99 = 0
+var int c_100 = 0
+
+var float trade_entry_price = na
+var float trade_target_range = na
+var float trade_highest_price = na 
+var float trade_lowest_price = na  
+
+// Alert State (varip to prevent flicker)
+varip bool achieved_25 = false
+varip bool achieved_50 = false
+varip bool achieved_75 = false
+
+var Counter uid_ctr = Counter.new()
+var array<TradeSetup> active_setups = array.new<TradeSetup>()
+
+// --- Logic Processing Method ---
+method process(DivState d, bool is_bear, bool start_signal, float rsi, float src_price, float src_trigger, float reset_lvl, int max_pks, float atr_val, float mult, float range_min_mult, Counter ctr) =>
+    bool signal_fired = false
+    
+    bool new_extreme = is_bear ? (rsi > d.trk_rsi) : (rsi < d.trk_rsi)
+    bool breakout = is_bear ? (close > d.p_trigger) : (close < d.p_trigger)
+    bool invalid_pivot = is_bear ? (rsi > d.p_rsi) : (rsi < d.p_rsi)
+    bool reset_condition = is_bear ? (rsi < reset_lvl) : (rsi > reset_lvl)
+    
+    if d.status == 0
+        if start_signal
+            d.status := 1
+            d.trk_rsi := rsi
+            d.trk_price := src_price
+            d.trk_trigger := src_trigger
+            d.trk_idx := bar_index
+            d.wait := 0
+
+    else if d.status == 1
+        if new_extreme
+            d.trk_rsi := rsi
+            d.trk_price := src_price
+            d.trk_trigger := src_trigger
+            d.trk_idx := bar_index
+            d.wait := 0
+        else
+            d.wait += 1
+        
+        if d.wait >= 5
+            d.p_rsi := d.trk_rsi
+            d.p_price := d.trk_price
+            d.p_trigger := d.trk_trigger
+            d.p_idx := d.trk_idx
+            d.status := 2
+
+    else if d.status == 2
+        if reset_condition
+            d.status := 0
+        else if invalid_pivot
+            d.status := 1
+            d.trk_rsi := rsi
+            d.trk_price := src_price
+            d.trk_trigger := src_trigger
+            d.trk_idx := bar_index
+            d.wait := 0
+        else if breakout
+            d.status := 3
+            d.counts := 0
+            d.best_rsi := is_bear ? 0.0 : 100.0
+            d.best_price := src_price
+            d.best_idx := 0
+            d.prev_local_price := na
+            d.trk_rsi := rsi
+            d.trk_price := src_price
+            d.trk_idx := bar_index
+            d.wait := 0
+            d.updated := false
+
+    else if d.status == 3
+        if reset_condition
+            d.status := 0
+        else if invalid_pivot
+            d.status := 1
+            d.trk_rsi := rsi
+            d.trk_price := src_price
+            d.trk_trigger := src_trigger
+            d.trk_idx := bar_index
+            d.wait := 0
+        else
+            if new_extreme
+                d.trk_rsi := rsi
+                d.trk_price := src_price
+                d.trk_idx := bar_index
+                d.wait := 0
+                d.updated := true
+            else
+                d.wait += 1
+            
+            if d.wait >= 2
+                if d.updated
+                    bool valid_div = is_bear ? (d.trk_rsi < d.p_rsi and d.trk_price > d.p_price) : (d.trk_rsi > d.p_rsi and d.trk_price < d.p_price)
+                    
+                    if valid_div
+                        d.counts += 1
+                        bool stop_early = false
+                        if d.counts > 1 and not na(d.prev_local_price)
+                            stop_early := is_bear ? (d.trk_price < d.prev_local_price) : (d.trk_price > d.prev_local_price)
+                        d.prev_local_price := d.trk_price
+                        
+                        bool is_better = is_bear ? (d.counts == 1 or d.trk_rsi > d.best_rsi) : (d.counts == 1 or d.trk_rsi < d.best_rsi)
+                        if is_better
+                            d.best_rsi := d.trk_rsi
+                            d.best_price := d.trk_price
+                            d.best_idx := d.trk_idx
+                        
+                        if d.counts >= max_pks or stop_early
+                            float range_val = math.abs(d.best_price - d.p_trigger)
+                            float min_req = atr_val * range_min_mult
+                            
+                            if range_val >= min_req
+                                signal_fired := true
+                                
+                                string txt = (is_bear ? "Bear" : "Bull") + " Div (" + str.tostring(d.counts) + ")"
+                                color c = is_bear ? color.red : color.green
+                                string s = is_bear ? label.style_label_down : label.style_label_up
+                                label.new(d.best_idx, d.best_rsi, txt, color=c, style=s, textcolor=color.white, size=size.small, force_overlay=false) 
+                                line.new(d.p_idx, d.p_rsi, d.best_idx, d.best_rsi, color=c, width=2, force_overlay=false)
+                                
+                                float offset = atr_val * mult
+                                float g_bottom = high + offset
+                                float g_top = g_bottom + range_val
+                                float r_top = low - offset
+                                float r_bottom = r_top - range_val
+                                
+                                box b_green = box.new(bar_index, g_top, bar_index + 5, g_bottom, border_color=color.green, bgcolor=color.new(color.green, 90), force_overlay=true)
+                                box b_red = box.new(bar_index, r_top, bar_index + 5, r_bottom, border_color=color.red, bgcolor=color.new(color.red, 90), force_overlay=true)
+                                
+                                ctr.val += 1
+                                TradeSetup new_setup = TradeSetup.new(ctr.val, g_bottom, g_top, r_top, r_bottom, false, false, b_green, b_red, bar_index)
+                                active_setups.push(new_setup)
+                            
+                            d.status := 0
+                        else
+                            d.trk_rsi := rsi
+                            d.trk_price := src_price
+                            d.trk_idx := bar_index
+                            d.wait := 0
+                            d.updated := false
+                    else
+                        d.status := 0
+                else
+                    d.trk_rsi := rsi
+                    d.trk_price := src_price
+                    d.trk_idx := bar_index
+                    d.wait := 0
+    signal_fired
+
+// --- RSI & ATR Calc ---
+ref_price = (bar_index == 0) ? open : close[1]
+change_val = close - ref_price 
+dist_from_low = close - low 
+dist_from_high = high - close 
+
+raw_gain = math.max(change_val, dist_from_low)
+raw_loss = math.max(-change_val, dist_from_high)
+
+avg_gain = ta.rma(raw_gain, length)
+avg_loss = ta.rma(raw_loss, length)
+
+rs = avg_gain / avg_loss
+hybrid_rsi = 100 - (100 / (1 + rs))
+
+atr_val = ta.atr(atr_len)
+
+// --- Plotting ---
+plot(hybrid_rsi, "Synergistic RSI", color=color.blue, linewidth=2)
+h0_line = hline(h0_val, "Overbought", color=color.gray, linestyle=hline.style_dashed)
+h1_line = hline(h1_val, "Oversold", color=color.gray, linestyle=hline.style_dashed)
+fill(h0_line, h1_line, color=color.new(color.blue, 90))
+
+// ==========================================
+// --- Execution & Trade Logic ---
+// ==========================================
+
+var DivState bear = DivState.new()
+var DivState bull = DivState.new()
+
+bool bear_sig = false
+bool bull_sig = false
+
+bool start_bear_cond = ta.crossover(hybrid_rsi, h0_val)
+bool start_bull_cond = ta.crossunder(hybrid_rsi, h1_val)
+
+if barstate.isconfirmed
+    bear_sig := bear.process(true, start_bear_cond, hybrid_rsi, high, low, h1_val, max_peaks, atr_val, atr_mult, min_range_mult, uid_ctr)
+    bull_sig := bull.process(false, start_bull_cond, hybrid_rsi, low, high, h0_val, max_peaks, atr_val, atr_mult, min_range_mult, uid_ctr)
+
+// --- Active Trade Management ---
+bool was_exit_this_bar = false
+float prev_sl_val = na
+int prev_trade_dir_val = 0
+
+if in_trade
+    // Track MFE
+    if trade_dir == 1
+        trade_highest_price := math.max(nz(trade_highest_price, high), high)
+    else
+        trade_lowest_price := math.min(nz(trade_lowest_price, low), low)
+
+    // Percentage Alerts
+    float cur_profit = trade_dir == 1 ? (high - trade_entry_price) : (trade_entry_price - low)
+    float cur_pct = trade_target_range > 0 ? (cur_profit / trade_target_range) * 100 : 0
+    
+    if not achieved_25 and cur_pct >= 25
+        achieved_25 := true
+        alert("Price reached 25% of Target", alert.freq_once_per_bar)
+    
+    if not achieved_50 and cur_pct >= 50
+        achieved_50 := true
+        alert("Price reached 50% of Target", alert.freq_once_per_bar)
+        
+    if not achieved_75 and cur_pct >= 75
+        achieved_75 := true
+        alert("Price reached 75% of Target", alert.freq_once_per_bar)
+
+    // Check Exits (Realtime)
+    if trade_dir == 1 
+        if high >= trade_tp_level
+            alert("Long TP Hit @ " + str.tostring(high), alert.freq_once_per_bar)
+            plot_long_tp := true
+            
+            if barstate.isconfirmed
+                in_trade := false 
+                box.set_right(current_trade_box, bar_index)
+                current_trade_box := na
+                current_trade_uid := -1
+                c_100 += 1
+                
+        else if low <= trade_sl_level
+            alert("Long SL Hit @ " + str.tostring(low), alert.freq_once_per_bar)
+            plot_long_sl := true
+            
+            was_exit_this_bar := true
+            prev_sl_val := trade_sl_level
+            prev_trade_dir_val := 1
+            
+            if barstate.isconfirmed
+                in_trade := false 
+                box.set_right(current_trade_box, bar_index)
+                box.set_bgcolor(current_trade_box, color.new(color.green, 90)) 
+                box.set_border_color(current_trade_box, color.new(color.green, 90))
+                current_trade_box := na
+                current_trade_uid := -1
+                
+                float mfe = trade_highest_price - trade_entry_price
+                float pct = trade_target_range > 0 ? (mfe / trade_target_range) * 100 : 0
+                if pct < 25
+                    c_0_25 += 1
+                else if pct < 50
+                    c_25_50 += 1
+                else if pct < 75
+                    c_50_75 += 1
+                else
+                    c_75_99 += 1
+            
+    else if trade_dir == -1
+        if low <= trade_tp_level
+            alert("Short TP Hit @ " + str.tostring(low), alert.freq_once_per_bar)
+            plot_short_tp := true
+            
+            if barstate.isconfirmed
+                in_trade := false 
+                box.set_right(current_trade_box, bar_index)
+                current_trade_box := na
+                current_trade_uid := -1
+                c_100 += 1
+                
+        else if high >= trade_sl_level
+            alert("Short SL Hit @ " + str.tostring(high), alert.freq_once_per_bar)
+            plot_short_sl := true
+            
+            was_exit_this_bar := true
+            prev_sl_val := trade_sl_level
+            prev_trade_dir_val := -1
+            
+            if barstate.isconfirmed
+                in_trade := false 
+                box.set_right(current_trade_box, bar_index)
+                box.set_bgcolor(current_trade_box, color.new(color.red, 90))
+                box.set_border_color(current_trade_box, color.new(color.red, 90))
+                current_trade_box := na
+                current_trade_uid := -1
+                
+                float mfe = trade_entry_price - trade_lowest_price
+                float pct = trade_target_range > 0 ? (mfe / trade_target_range) * 100 : 0
+                if pct < 25
+                    c_0_25 += 1
+                else if pct < 50
+                    c_25_50 += 1
+                else if pct < 75
+                    c_50_75 += 1
+                else
+                    c_75_99 += 1
+
+// 2. Manage Setups (Entries & Consumption)
+if active_setups.size() > 0
+    for i = active_setups.size() - 1 to 0
+        TradeSetup s = active_setups.get(i)
+        
+        // A. Expiration
+        if (bar_index - s.start_idx) > 150
+            if not s.traded_g
+                s.traded_g := true
+                box.set_right(s.id_g, bar_index)
+            if not s.traded_r
+                s.traded_r := true
+                box.set_right(s.id_r, bar_index)
+
+        // B. Extension
+        bool is_active_g = in_trade and s.uid == current_trade_uid and trade_dir == 1
+        bool is_active_r = in_trade and s.uid == current_trade_uid and trade_dir == -1
+        
+        if not s.traded_g or is_active_g
+            box.set_right(s.id_g, bar_index + 5)
+        if not s.traded_r or is_active_r
+            box.set_right(s.id_r, bar_index + 5)
+        
+        // C. Hit Checks
+        bool entry_valid_long = close >= s.g_bottom and close <= s.g_top
+        bool entry_valid_short = close <= s.r_top and close >= s.r_bottom
+        bool overshot_long = close > s.g_top
+        bool overshot_short = close < s.r_bottom
+        bool hit_long = entry_valid_long or overshot_long
+        bool hit_short = entry_valid_short or overshot_short
+        
+        // D. Counter-Trade Box Adjustment (Post-Exit)
+        bool adjusted_this_bar = false
+        if barstate.isconfirmed and was_exit_this_bar
+            if prev_trade_dir_val == -1 and s.g_bottom == prev_sl_val
+                float range_g = s.g_top - s.g_bottom
+                s.g_bottom := high 
+                s.g_top := s.g_bottom + range_g
+                box.set_bottom(s.id_g, s.g_bottom)
+                box.set_top(s.id_g, s.g_top)
+                adjusted_this_bar := true
+            else if prev_trade_dir_val == 1 and s.r_top == prev_sl_val
+                float range_r = s.r_top - s.r_bottom
+                s.r_top := low 
+                s.r_bottom := s.r_top - range_r
+                box.set_top(s.id_r, s.r_top)
+                box.set_bottom(s.id_r, s.r_bottom)
+                adjusted_this_bar := true
+
+        // E. Execution (Confirmed Bar)
+        if barstate.isconfirmed and not adjusted_this_bar
+            
+            // Overlapping setups consumption
+            if in_trade and not was_exit_this_bar
+                if hit_long and not s.traded_g
+                    if s.g_bottom != trade_sl_level
+                        s.traded_g := true
+                        box.set_right(s.id_g, bar_index)
+                        box.set_bgcolor(s.id_g, color.new(color.blue, 90))
+                        box.set_border_color(s.id_g, color.new(color.blue, 90))
+                
+                if hit_short and not s.traded_r
+                    if s.r_top != trade_sl_level
+                        s.traded_r := true
+                        box.set_right(s.id_r, bar_index)
+                        box.set_bgcolor(s.id_r, color.new(color.fuchsia, 90))
+                        box.set_border_color(s.id_r, color.new(color.fuchsia, 90))
+            
+            // New Entry
+            else
+                if not s.traded_g
+                    if entry_valid_long
+                        in_trade := true
+                        trade_dir := 1
+                        trade_tp_level := s.g_top
+                        trade_sl_level := s.r_top 
+                        s.traded_g := true
+                        
+                        current_trade_box := s.id_g
+                        current_trade_uid := s.uid
+                        box.set_bgcolor(s.id_g, color.new(color.green, 60))
+                        box.set_right(s.id_g, bar_index + 5)
+                        
+                        trade_entry_price := s.g_bottom
+                        trade_target_range := s.g_top - s.g_bottom
+                        trade_highest_price := high
+                        achieved_25 := false
+                        achieved_50 := false
+                        achieved_75 := false
+                        
+                        plot_long_entry := true
+                        alert("Long Entry Triggered", alert.freq_once_per_bar_close)
+                    
+                    else if overshot_long
+                        s.traded_g := true
+                        box.set_right(s.id_g, bar_index)
+                        box.set_bgcolor(s.id_g, color.new(color.blue, 90))
+                        box.set_border_color(s.id_g, color.new(color.blue, 90))
+
+                if not in_trade and not s.traded_r
+                    if entry_valid_short
+                        in_trade := true
+                        trade_dir := -1
+                        trade_tp_level := s.r_bottom
+                        trade_sl_level := s.g_bottom
+                        s.traded_r := true
+                        
+                        current_trade_box := s.id_r
+                        current_trade_uid := s.uid
+                        box.set_bgcolor(s.id_r, color.new(color.red, 60))
+                        box.set_right(s.id_r, bar_index + 5)
+                        
+                        trade_entry_price := s.r_top
+                        trade_target_range := s.r_top - s.r_bottom
+                        trade_lowest_price := low
+                        achieved_25 := false
+                        achieved_50 := false
+                        achieved_75 := false
+                        
+                        plot_short_entry := true
+                        alert("Short Entry Triggered", alert.freq_once_per_bar_close)
+                    
+                    else if overshot_short
+                        s.traded_r := true
+                        box.set_right(s.id_r, bar_index)
+                        box.set_bgcolor(s.id_r, color.new(color.fuchsia, 90))
+                        box.set_border_color(s.id_r, color.new(color.fuchsia, 90))
+        
+        // F. Cleanup
+        if s.traded_g and s.traded_r
+            active_setups.remove(i)
+
+// --- Visuals ---
+bool any_signal = bear_sig or bull_sig
+bgcolor(any_signal ? color.new(color.gray, 80) : na, title="Divergence Signal", force_overlay=true)
+
+plotshape(plot_long_entry, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, text="Long", size=size.small, force_overlay=true)
+plotshape(plot_short_entry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, text="Short", size=size.small, force_overlay=true)
+plotshape(plot_long_tp, title="Long TP", style=shape.circle, location=location.abovebar, color=color.green, text="TP", size=size.tiny, force_overlay=true)
+plotshape(plot_long_sl, title="Long SL", style=shape.cross, location=location.belowbar, color=color.red, text="SL", size=size.tiny, force_overlay=true)
+plotshape(plot_short_tp, title="Short TP", style=shape.circle, location=location.belowbar, color=color.green, text="TP", size=size.tiny, force_overlay=true)
+plotshape(plot_short_sl, title="Short SL", style=shape.cross, location=location.abovebar, color=color.red, text="SL", size=size.tiny, force_overlay=true)
+
+// --- Statistics Table ---
+var table stat_table = table.new(position.bottom_right, 3, 6, border_width=1, border_color=color.gray, frame_color=color.gray, frame_width=1, force_overlay=true)
+
+if barstate.islastconfirmedhistory or (not in_trade and in_trade[1])
+    int total = c_0_25 + c_25_50 + c_50_75 + c_75_99 + c_100
+    
+    table.cell(stat_table, 0, 0, "Range %", bgcolor=color.gray, text_color=color.white)
+    table.cell(stat_table, 1, 0, "Count", bgcolor=color.gray, text_color=color.white)
+    table.cell(stat_table, 2, 0, "Total %", bgcolor=color.gray, text_color=color.white)
+    
+    table.cell(stat_table, 0, 1, "100% (TP)", text_color=color.white, bgcolor=color.green)
+    table.cell(stat_table, 1, 1, str.tostring(c_100), text_color=color.white, bgcolor=color.green)
+    table.cell(stat_table, 2, 1, total > 0 ? str.tostring(math.round(c_100 * 100.0 / total, 1)) + "%" : "0%", text_color=color.white, bgcolor=color.green)
+    
+    table.cell(stat_table, 0, 2, "75-99%", text_color=color.white, bgcolor=color.new(color.green, 40))
+    table.cell(stat_table, 1, 2, str.tostring(c_75_99), text_color=color.white, bgcolor=color.new(color.green, 40))
+    table.cell(stat_table, 2, 2, total > 0 ? str.tostring(math.round(c_75_99 * 100.0 / total, 1)) + "%" : "0%", text_color=color.white, bgcolor=color.new(color.green, 40))
+    
+    table.cell(stat_table, 0, 3, "50-75%", text_color=color.white, bgcolor=color.new(color.orange, 30))
+    table.cell(stat_table, 1, 3, str.tostring(c_50_75), text_color=color.white, bgcolor=color.new(color.orange, 30))
+    table.cell(stat_table, 2, 3, total > 0 ? str.tostring(math.round(c_50_75 * 100.0 / total, 1)) + "%" : "0%", text_color=color.white, bgcolor=color.new(color.orange, 30))
+    
+    table.cell(stat_table, 0, 4, "25-50%", text_color=color.white, bgcolor=color.new(color.orange, 0))
+    table.cell(stat_table, 1, 4, str.tostring(c_25_50), text_color=color.white, bgcolor=color.new(color.orange, 0))
+    table.cell(stat_table, 2, 4, total > 0 ? str.tostring(math.round(c_25_50 * 100.0 / total, 1)) + "%" : "0%", text_color=color.white, bgcolor=color.new(color.orange, 0))
+    
+    table.cell(stat_table, 0, 5, "0-25%", text_color=color.white, bgcolor=color.red)
+    table.cell(stat_table, 1, 5, str.tostring(c_0_25), text_color=color.white, bgcolor=color.red)
+    table.cell(stat_table, 2, 5, total > 0 ? str.tostring(math.round(c_0_25 * 100.0 / total, 1)) + "%" : "0%", text_color=color.white, bgcolor=color.red)

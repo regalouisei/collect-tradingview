@@ -1,0 +1,468 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © joebaus
+//@version=5
+indicator(title = "Probability Cones", shorttitle = "Probability Cones", max_lines_count = 500, max_bars_back = 5000, overlay = true)
+
+//#region Constants
+
+// Long tooltip strings as constants prefixed with `TT_`.
+TT_FORECAST = "The number of bars to project the probability cones.\n\nAvoid visual errors by not projecting the indicator too far into the future!\n\nThe maximum value with all three upper and lower cone deviation lines and the mean enabled is 72.\n\nThis input can be greater than 72, and the indicator will not display visual errors, if some cone lines are toggled off."
+TT_MEAN = "Select a mean calculation for the cone.\n\nThe \"Auto\" setting will use an average for the Standard deviation, and median for Laplace and Absolute deviations."
+TT_DRIFT_TOGGLE = "Adds or removes the drift to the cones caused by the mean's increasing or decreasing value in the future. Turning \"Use Mean Drift\" off projects forward only the initial value of the mean, and shifts the values of the cone's deviation lines relative to the mean."
+TT_ANCHOR_LINES = "Draws the initial lines starting where the cone is anchored and begins calculations.\n\nThe cone's deviation lines will overlap at the mean's value if \"Stepped Cone Lines\" and this setting are both toggled on."
+
+// Group constants are prefixed with `G_`.
+G_SETTINGS = "🔧 Cone Settings"
+G_ANCHOR = "⚓ Anchor Settings"
+G_MEAN = "📏 Mean Settings"
+G_CONE1_SETTINGS = "1️⃣ First Cone's Settings"
+G_CONE2_SETTINGS = "2️⃣ Second Cone's Settings"
+G_CONE3_SETTINGS = "3️⃣ Third Cone's Settings"
+
+// Constants for i_deviation options.
+DEVIATION_STANDARD = "Standard"
+DEVIATION_LAPLACE = "Laplace"
+DEVIATION_MAD = "Absolute"
+
+// Constants for i_anchorType options.
+ANCHOR_BAR = "Bars Back"
+ANCHOR_DATE = "Select Date"
+ANCHOR_HTF = "Higher Timeframe"
+
+// Constants for i_meanCalculation options.
+MEAN_AUTO = "Auto"
+MEAN_AVERAGE = "Average"
+MEAN_MEDIAN = "Median"
+
+// Constants for lineStyle() options.
+LINE_STYLE_SOLID = "Solid"
+LINE_STYLE_DASHED = "Dashed"
+LINE_STYLE_DOTTED = "Dotted"
+
+// Inline constants are prefixed with `IL_`.
+IL_0 = "Inline 0"
+IL_1 = "Inline 1"
+IL_2 = "Inline 2"
+IL_3 = "Inline 3"
+IL_4 = "Inline 4"
+IL_5 = "Inline 5"
+
+//#endregion
+
+//#region Inputs
+// Inputs variables are prefixed with `i_`.
+
+//#region General Settings Inputs
+float i_source = input.source(defval = close, title = "Source", tooltip = "The data source to use for calculating the probability cones.", group = G_SETTINGS)
+string i_deviation = input.string(defval = DEVIATION_STANDARD, title = "Deviation", options = [DEVIATION_STANDARD, DEVIATION_LAPLACE, DEVIATION_MAD], tooltip = "Select the calculation method for the cone deviations.", group = G_SETTINGS) 
+int i_lookback = input.int(defval = 500, title = "Lookback", minval = 1, maxval = 5000, tooltip = "The number of bars sampled for the probability calculations.\n\nMinimum value: 1\nMaximum value: 5000", group = G_SETTINGS)
+int i_forecastBars = input.int(defval = 30, title = "Bar Forecast", minval = 1, tooltip = TT_FORECAST, group = G_SETTINGS, display = display.none)
+bool i_driftToggle = input.bool(defval = true, title = "Use Drift", tooltip = TT_DRIFT_TOGGLE, group = G_SETTINGS, display = display.none) 
+bool i_coneFill = input.bool(defval = true, title = "Show Fills", tooltip = "The background color highlights between cone lines.", group = G_SETTINGS, display = display.none) 
+bool i_steppedConeLines = input.bool(defval = false, title = "Stepped Cone Lines", tooltip = "Draws the cone's upper and lower deviation lines horizontally instead of making a curve by connecting end-to-end. Stepped lines can make it easier to see the value the cone is forecasting at a specific bar.", group = G_SETTINGS, display = display.none)
+//#endregion
+
+//#region Anchor Settings
+string i_anchorType = input.string(defval = ANCHOR_BAR, title = "Anchor Type", options = [ANCHOR_BAR, ANCHOR_DATE, ANCHOR_HTF], tooltip = "Select the method to anchor the probability cone origin.", group = G_ANCHOR, display = display.none) 
+int i_barsBack = input.int(defval = 20, title = "Bars Back", tooltip = "The number of bars + or - to position the probability cones when using the \"Bar\" Anchor Type.", group = G_ANCHOR, display = display.none) 
+bool i_coneLock = input.bool(defval = false, title = "Bars Back Lock", tooltip = "When \"Anchor Type\" is set to \"Bars Back\", this setting will keep the cones stationary (locked in the past) as new bars are printed.", group = G_ANCHOR, display = display.none)
+bool i_anchorDate = time == input.time(defval = timestamp(dateString = "2024-01-01"), title = "Date Anchor", tooltip = "Keeps the cone origin stationary at the selected date.", group = G_ANCHOR, display = display.none)
+string i_anchorTimeframe = input.timeframe(defval = "W", title = "Higher Timeframe Anchor", tooltip = "Sets the cone's origin to the beginning of a specified timeframe. Updates the cones automatically when a new period begins.", group = G_ANCHOR, display = display.none)
+int i_anchorOffset = input.int(defval = 1, title = "Anchor Offset", tooltip = "The number of bars + or - to position cones after being anchored. Using \"1\" place the cone's anchor one bar extra into the past, and \"-1\" will set the cone's anchor one bar extra into the future.", group = G_ANCHOR, display = display.none) 
+bool i_anchorLines = input.bool(defval = false, title = "Anchor Lines", tooltip = TT_ANCHOR_LINES, group = G_ANCHOR, display = display.none)
+bool i_anchorOpen = input.bool(defval = false, title = "Open Anchor", tooltip = "Uses the anchor point as the first bar in calculating volatility with `math.sqrt(1)` instead of `math.sqrt(0)`. Causing the cones to start \"open\" at the anchor point instead of closed and connected.", group = G_ANCHOR, display = display.none)
+//#endregion
+
+//#region Mean Input Settings
+bool i_meanToggle = input.bool(defval = true, title = "Show Mean", group = G_MEAN, display = display.none)
+string i_meanCalculation = input.string(defval = MEAN_AUTO, title = "Mean Calculation", options = [MEAN_AUTO, MEAN_AVERAGE, MEAN_MEDIAN], tooltip = TT_MEAN, group = G_MEAN, display = display.none) 
+color i_meanColor = input.color(defval = color.new(color.orange, 0), title = "Color", inline = IL_0, group = G_MEAN, display = display.none)
+int i_meanWidth = input.int(defval = 2, title = "Width", minval = 1, maxval = 4, inline = IL_0, group = G_MEAN, display = display.none) 
+string i_meanLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_0, group = G_MEAN, display = display.none)
+//#region
+
+// Here is how the cone input variable names are formatted: // {
+// Cone Order: `first`, `second`, or `third` cone.
+// Position: `Upper` or `Lower` line of the cone.
+// Attribute: `Toggle`, `Color`, `Deviation`, `Width`, `FillBool`, `Fill`.
+// E.g. `i_firstUpperColor` is the input for the `first` cone's `Upper` line `Color`.
+// }
+
+//#region First Cone's Input Settings
+bool i_firstUpperToggle = input.bool(defval = true, title = "Show Upper Line", inline = IL_0, group = G_CONE1_SETTINGS, display = display.none)
+bool i_firstLowerToggle = input.bool(defval = true, title = "Show Lower Line", inline = IL_0, group = G_CONE1_SETTINGS, display = display.none)
+color i_firstUpperColor = input.color(defval = color.new(color.green, 0), title = "Upper Cone Color", inline = IL_1, group = G_CONE1_SETTINGS, display = display.none)
+color i_firstLowerColor = input.color(defval = color.new(color.green, 0), title = "Lower Cone Color", inline = IL_1, group = G_CONE1_SETTINGS, display = display.none)
+color i_firstUpperFill = input.color(defval = color.new(color.green, 95), title = "Upper Fill Color", inline = IL_2, group = G_CONE1_SETTINGS, display = display.none)
+bool i_firstUpperFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE1_SETTINGS, display = display.none)
+color i_firstLowerFill = input.color(defval = color.new(color.green, 95), title = "Lower Fill Color", inline = IL_2, group = G_CONE1_SETTINGS, display = display.none)
+bool i_firstLowerFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE1_SETTINGS, display = display.none)
+float i_firstUpperDeviation = input.float(defval = 1, title = "Upper Deviation",step = 0.01, inline = IL_3, group = G_CONE1_SETTINGS, display = display.none)
+float i_firstLowerDeviation = input.float(defval = 1, title = "Lower Deviation",step = 0.01, inline = IL_3, group = G_CONE1_SETTINGS, display = display.none)
+string i_firstUpperLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Upper Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE1_SETTINGS, display = display.none)
+string i_firstLowerLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Lower Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE1_SETTINGS, display = display.none)
+int i_firstUpperWidth = input.int(defval = 2, title = "Upper Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE1_SETTINGS, display = display.none)
+int i_firstLowerWidth = input.int(defval = 2, title = "Lower Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE1_SETTINGS, display = display.none)
+//#region
+
+//#region Second Cone's Input Settings
+bool i_secondUpperToggle = input.bool(defval = true, title = "Show Upper Line", inline = IL_0, group = G_CONE2_SETTINGS, display = display.none)
+bool i_secondLowerToggle = input.bool(defval = true, title = "Show Lower Line", inline = IL_0, group = G_CONE2_SETTINGS, display = display.none)
+color i_secondUpperColor = input.color(defval = color.new(color.blue, 0), title = "Upper Cone Color", inline = IL_1, group = G_CONE2_SETTINGS, display = display.none)
+color i_secondLowerColor = input.color(defval = color.new(color.blue, 0), title = "Lower Cone Color", inline = IL_1, group = G_CONE2_SETTINGS, display = display.none)
+color i_secondUpperFill = input.color(defval = color.new(color.blue, 95), title = "Fill Upper Color", inline = IL_2, group = G_CONE2_SETTINGS, display = display.none)
+bool i_secondUpperFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE2_SETTINGS, display = display.none)
+color i_secondLowerFill = input.color(defval = color.new(color.blue, 95), title = "Fill Lower Color", inline = IL_2, group = G_CONE2_SETTINGS, display = display.none)
+bool i_secondLowerFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE2_SETTINGS, display = display.none)
+float i_secondUpperDeviation = input.float(defval = 2, title = "Upper Deviation", step = 0.01, inline = IL_3, group = G_CONE2_SETTINGS, display = display.none)
+float i_secondLowerDeviation = input.float(defval = 2, title = "Lower Deviation", step = 0.01, inline = IL_3, group = G_CONE2_SETTINGS, display = display.none)
+string i_secondUpperLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Upper Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE2_SETTINGS, display = display.none)
+string i_secondLowerLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Lower Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE2_SETTINGS, display = display.none)
+int i_secondUpperWidth = input.int(defval = 2, title = "Upper Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE2_SETTINGS, display = display.none)
+int i_secondLowerWidth = input.int(defval = 2, title = "Lower Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE2_SETTINGS, display = display.none)
+//#region
+
+//#region Third Cone's Input Settings
+bool i_thirdUpperToggle = input.bool(defval = true, title = "Show Upper Line", inline = IL_0, group = G_CONE3_SETTINGS, display = display.none)
+bool i_thirdLowerToggle = input.bool(defval = true, title = "Show Lower Line", inline = IL_0, group = G_CONE3_SETTINGS, display = display.none)
+color i_thirdUpperColor = input.color(defval = color.new(color.red, 0), title = "Upper Cone Color", inline = IL_1, group = G_CONE3_SETTINGS, display = display.none)
+color i_thirdLowerColor = input.color(defval = color.new(color.red, 0), title = "Lower Cone Color", inline = IL_1, group = G_CONE3_SETTINGS, display = display.none)
+color i_thirdUpperFill = input.color(defval = color.new(color.red, 95), title = "Fill Upper Color", inline = IL_2, group = G_CONE3_SETTINGS, display = display.none)
+bool i_thirdUpperFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE3_SETTINGS, display = display.none)
+color i_thirdLowerFill = input.color(defval = color.new(color.red, 95), title = "Fill Lower Color", inline = IL_2, group = G_CONE3_SETTINGS, display = display.none)
+bool i_thirdLowerFillBool = input.bool(defval = true, title = "", inline = IL_2, group = G_CONE3_SETTINGS, display = display.none)
+float i_thirdUpperDeviation = input.float(defval = 3, title = "Upper Deviation", step = 0.01, inline = IL_3, group = G_CONE3_SETTINGS, display = display.none)
+float i_thirdLowerDeviation = input.float(defval = 3, title = "Lower Deviation", step = 0.01, inline = IL_3, group = G_CONE3_SETTINGS, display = display.none)
+string i_thirdUpperLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Upper Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE3_SETTINGS, display = display.none)
+string i_thirdLowerLineStyle = input.string(defval = LINE_STYLE_DOTTED, title = "Lower Line Style", options = [LINE_STYLE_SOLID, LINE_STYLE_DASHED, LINE_STYLE_DOTTED], inline = IL_4, group = G_CONE3_SETTINGS, display = display.none)
+int i_thirdUpperWidth = input.int(defval = 2, title = "Upper Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE3_SETTINGS, display = display.none)
+int i_thirdLowerWidth = input.int(defval = 2, title = "Lower Cone Width", minval = 1, maxval = 4, inline = IL_5, group = G_CONE3_SETTINGS, display = display.none)
+//#endregion
+
+//#endregion
+
+//#region Types
+
+//@type Object that holds the calculated deviation value and each cone lines' input deviation multiple.
+//@field deviation The calculated deviation value based on `i_deviation`.
+//@field firstUpper The value to scale `deviation` by to get the cone's first upper deviation.
+//@field firstLower The value to scale `deviation` by to get the cone's first lower deviation.
+//@field secondUpper The value to scale `deviation` by to get the cone's second upper deviation.
+//@field secondLower The value to scale `deviation` by to get the cone's second lower deviation.
+//@field thirdUpper The value to scale `deviation` by to get the cone's third upper deviation.
+//@field thirdLower The value to scale `deviation` by to get the cone's third lower deviation.
+type deviations
+    float deviation
+    float firstUpper
+    float firstLower
+    float secondUpper
+    float secondLower
+    float thirdUpper
+    float thirdLower    
+
+//@type Object of all the arrays with the values for the cone's lines.
+//@field mean Array of forecasted mean values.
+//@field firstUpper Array of forecasted values for the upper line of the cone's first deviation.  
+//@field firstLower Array of forecasted values for the lower line of the cone's first deviation.  
+//@field secondUpper Array of forecasted values for the upper line of the cone's second deviation.  
+//@field secondLower Array of forecasted values for the lower line of the cone's second deviation.  
+//@field thirdUpper Array of forecasted values for the upper line of the cone's third deviation.  
+//@field thirdLower Array of forecasted values for the lower line of the cone's third deviation.  
+type coneValues
+    array<float> mean
+    array<float> firstUpper
+    array<float> firstLower
+    array<float> secondUpper
+    array<float> secondLower
+    array<float> thirdUpper
+    array<float> thirdLower
+
+//@type Object of style variables for a cone line.
+//@field lineColor The cone line's color.
+//@field lineStyle A pretty user input string of the line style to use.
+//@field lineWidth A cone's line width.
+//@field toggle Toggles a cone line's drawings. 
+type coneLineStyle
+    color lineColor
+    string lineStyle
+    int lineWidth
+    bool toggle
+//#endregion
+
+//#region Functions
+
+//@function Takes a pretty user input string and returns a built-in line style variable.
+//@param lineStyle A valid pretty user input string: `"Solid", "Dashed", "Dotted"`
+//@returns A built-in line style variable.
+method lineStyle(string lineStyle) => // {
+    string returns = switch lineStyle
+        LINE_STYLE_SOLID => line.style_solid 
+        LINE_STYLE_DASHED => line.style_dashed
+        LINE_STYLE_DOTTED => line.style_dotted
+// }
+
+//#region Probability Cone Functions
+
+//@function Calculates the values of the cone's mean and deviations.
+//@param sourceAnchor The anchored `i_source` variable.
+//@param driftToggle Toggles the cone's mean drift over the forecast period.
+//@param mean The calculated mean value.
+//@param forecastBars The number of bars to forecast the cones.
+//@param anchorOpenToggle Uses the anchor bar as the first bar in calculating volatility with `math.sqrt(1)` instead of `math.sqrt(0)`.
+//@param newDeviations A `deviations` object that holds the `deviation` calculation and scaling values for each cone line.
+//@returns A `coneValues` object holding arrays of size `forecastBars + 1` with values for the cone's mean and deviation lines.
+coneValues(float sourceAnchor, bool driftToggle, float mean, int forecastBars, bool anchorOpenToggle, deviations newDeviations) => // {
+    // Array variables are prefixed with `a_`.
+    a_meanValue = array.new<float>()
+    a_firstUpperValue = array.new<float>()
+    a_firstLowerValue = array.new<float>() 
+    a_secondUpperValue = array.new<float>()
+    a_secondLowerValue = array.new<float>() 
+    a_thirdUpperValue = array.new<float>()
+    a_thirdLowerValue = array.new<float>() 
+
+    //@variable Adds `1` to `math.sqrt(i)` to include the first forecast bar (anchor point) in the volatility estimation.
+    int anchorOpen = anchorOpenToggle ? 1 : 0
+
+    for i = 0 to forecastBars
+        float periodSqrt = math.sqrt(i + anchorOpen)
+
+        float coneMean = driftToggle ? mean * i : mean
+        float meanValue = sourceAnchor * math.exp(coneMean)
+        a_meanValue.push(meanValue) 
+
+        float firstUpperDeviation = newDeviations.firstUpper * newDeviations.deviation * periodSqrt
+        float firstUpperConeValue = sourceAnchor * math.exp(coneMean + firstUpperDeviation)
+        a_firstUpperValue.push(firstUpperConeValue) 
+        
+        float firstLowerDeviation = newDeviations.firstLower * newDeviations.deviation * periodSqrt
+        float firstLowerConeValue = sourceAnchor * math.exp(coneMean - firstLowerDeviation)
+        a_firstLowerValue.push(firstLowerConeValue) 
+
+        float secondUpperDeviation = newDeviations.secondUpper * newDeviations.deviation * periodSqrt
+        float secondUpperConeValue = sourceAnchor * math.exp(coneMean + secondUpperDeviation)
+        a_secondUpperValue.push(secondUpperConeValue) 
+
+        float secondLowerDeviation = newDeviations.secondLower * newDeviations.deviation * periodSqrt
+        float secondLowerConeValue = sourceAnchor * math.exp(coneMean - secondLowerDeviation)
+        a_secondLowerValue.push(secondLowerConeValue) 
+
+        float thirdUpperDeviation = newDeviations.thirdUpper * newDeviations.deviation * periodSqrt
+        float thirdUpperConeValue = sourceAnchor * math.exp(coneMean + thirdUpperDeviation)
+        a_thirdUpperValue.push(thirdUpperConeValue) 
+
+        float thirdLowerDeviation = newDeviations.thirdLower * newDeviations.deviation * periodSqrt
+        float thirdLowerConeValue = sourceAnchor * math.exp(coneMean - thirdLowerDeviation)
+        a_thirdLowerValue.push(thirdLowerConeValue) 
+
+    // Returns
+    coneValues newConeValues = coneValues.new(
+      mean = a_meanValue, 
+      firstUpper = a_firstUpperValue, 
+      firstLower = a_firstLowerValue, 
+      secondUpper = a_secondUpperValue, 
+      secondLower = a_secondLowerValue, 
+      thirdUpper = a_thirdUpperValue, 
+      thirdLower = a_thirdLowerValue)
+// }
+
+//@function Creates an array of lines for a single upper or lower cone segment.
+//@param a_coneValue An array of cone line values.
+//@param newConeLineStyle A `coneLineStyle` object with the user's style inputs for a cone line. 
+//@param forecastBars The number of bars to forecast the cones.
+//@param anchorIndex The `bar_index` that the current Anchor Type setting starts drawing the cone from.
+//@param anchorLinesToggle Toggles drawing the cone lines which start from the anchor point. 
+//@returns A `var array<line>` that makes up a single cone line.
+coneLine(array<float> a_coneValue, coneLineStyle newConeLineStyle, int forecastBars, int anchorIndex, bool anchorLinesToggle) => // {
+    var a_coneLines = array.new<line>(size = forecastBars + 1, initial_value = na)
+
+    if newConeLineStyle.toggle and (a_coneValue.size() == a_coneLines.size())
+        for i = 0 to forecastBars - 1
+            bool drawInitialLines = not anchorLinesToggle and i == 0
+            if drawInitialLines
+                continue // Skips the `i == 0` iteration.
+
+            // Calculate line `x1, y1, x2, y2` arguments.
+            int lineX1 = anchorIndex + i
+            int lineX2 = anchorIndex + (i + 1)
+            float lineY1 = a_coneValue.get(i)
+            //@variable Uses the same index as `lineY1` when `i_steppedConeLines == true`. Uses the next `a_coneValue` index `i + 1` for a curved cone line.
+            int yIndex = i_steppedConeLines ? i : i + 1
+            float lineY2 = a_coneValue.get(yIndex)
+
+            line getConeLine = a_coneLines.get(i)   
+            if na(getConeLine) // If `getConeLine` does not exist, initialize a new line.
+                line coneLine = line.new(
+                  x1 = lineX1, 
+                  y1 = lineY1, 
+                  x2 = lineX2, 
+                  y2 = lineY2, 
+                  xloc = xloc.bar_index,
+                  extend = extend.none, 
+                  color = newConeLineStyle.lineColor, 
+                  style = newConeLineStyle.lineStyle.lineStyle(), 
+                  width = newConeLineStyle.lineWidth)
+
+                a_coneLines.set(i, coneLine)
+
+            else // If `getConeLine` already exists (not na), update it.
+                getConeLine.set_xy1(x = lineX1, y = lineY1)
+                getConeLine.set_xy2(x = lineX2, y = lineY2)
+
+    a_coneLines // Returns
+// }
+
+//@function Draws and applies styles to line fills between `a_coneLines1` and `a_coneLines2`.
+//@param a_coneLines1 An array of cone line drawings.
+//@param a_coneLines2 An array of cone line drawings.
+//@param fillColor The fill color between both line arrays.
+//@param fillToggle Toggles the cone fill feature. 
+//@returns A `var array<linefill>` that draws the line fills between `a_coneLines1` and `a_coneLines2`.
+coneFill(array<line> a_coneLines1, array<line> a_coneLines2, color fillColor, bool fillToggle) => // {
+    var a_lineFills = array.new<linefill>()
+    bool emptyLineFillArray = a_lineFills.size() == 0
+
+    if fillToggle and emptyLineFillArray and (a_coneLines1.size() == a_coneLines2.size())
+        for i = 0 to (a_coneLines1.size() - 1)
+            line getLine1 = a_coneLines1.get(i) 
+            line getLine2 = a_coneLines2.get(i)
+            linefill coneLineFill = linefill.new(line1 = getLine1, line2 = getLine2, color = fillColor)
+            a_lineFills.push(coneLineFill) 
+            // Every `linefill` initialized will update their positions as the lines are updated with `set` methods in `coneLine()`.
+            // No need to delete/update the `linefill`s once they're initialized!
+    
+    a_lineFills // Returns
+// }
+
+//#endregion
+
+//@function Calculates the absolute deviation of `source` from a `mean` value over a `lookback` period.
+//@param source The series to calculate the absolute deviation from.
+//@param mean The mean (average, median) value to compare against the `source` values. 
+//@param lookback The number of historical `source` bars to sample. 
+//@returns An absolute deviation `series float`. 
+absoluteDeviation(float source, float mean, int lookback) => // {
+    a_absoluteDeviation = array.new<float>(size = lookback, initial_value = na) 
+
+    for i = 0 to lookback - 1
+        float absoluteDeviation = math.abs(source[i] - mean)
+        a_absoluteDeviation.set(i, absoluteDeviation) 
+
+    float absoluteDeviation = a_absoluteDeviation.avg() // Returns
+// }
+
+//#endregion 
+
+//#region Calculations
+
+//#region Cone Anchor Calculations
+
+//@variable Locks the cones in place at the bar the indicator is initialized on.
+int barLock = ta.valuewhen(barstate.isnew, bar_index, 0)
+
+//@variable Contains the `bar_index` when the input `i_anchorDate` is reached and locks the cones at that date. RicardoSantos contribution!
+var int anchorDate = i_anchorDate ? bar_index : na
+
+//@variable Find the numbers of bars since the start an `i_anchorTimeframe` timeframe change.
+int anchorBarssince = ta.barssince(timeframe.change(i_anchorTimeframe))
+
+//@variable Calculates the `bar_index` to anchor the cones based on the Anchor Type.
+int anchorIndex = switch i_anchorType
+    ANCHOR_BAR => 
+        i_coneLock 
+          ? bar_index - i_barsBack - (bar_index - barLock[1] - 1) - i_anchorOffset 
+          : bar_index - i_barsBack - i_anchorOffset
+
+    ANCHOR_DATE => anchorDate - i_anchorOffset
+    ANCHOR_HTF => bar_index - anchorBarssince - i_anchorOffset
+
+//@variable Calculates the subscript `[]` index for a series to start calculating from the same bar as `anchorIndex`.
+int anchorSubscript = switch i_anchorType
+    ANCHOR_BAR => 
+        i_coneLock 
+          ? i_barsBack + (bar_index - barLock[1] - 1) + i_anchorOffset 
+          : i_barsBack + i_anchorOffset
+
+    ANCHOR_DATE => bar_index - anchorDate + i_anchorOffset
+    ANCHOR_HTF => anchorBarssince + i_anchorOffset
+
+//#endregion
+
+//#region Mean and Deviation Calculations
+
+// Log Return Calculations
+float logReturns = math.log(i_source / i_source[1])
+float logReturnsMedian = ta.median(logReturns, i_lookback)
+float logReturnsAverage = ta.sma(logReturns, i_lookback)
+float logReturnsStdev = ta.stdev(logReturns, i_lookback)
+
+//@variable Switch mean calculations automatically based on `i_deviation`.
+float meanAuto = switch i_deviation
+    DEVIATION_STANDARD => logReturnsAverage
+    DEVIATION_LAPLACE => logReturnsMedian
+    DEVIATION_MAD => logReturnsMedian
+
+//@variable Switch the mean calculation for the cones based on `i_meanCalculation`.
+float meanSwitch = switch i_meanCalculation
+    MEAN_AUTO => meanAuto
+    MEAN_AVERAGE => logReturnsAverage
+    MEAN_MEDIAN => logReturnsMedian
+
+float absoluteDeviation = absoluteDeviation(logReturns, meanSwitch, i_lookback) 
+float laplaceDeviation = math.sqrt(2 * math.pow(absoluteDeviation, 2))
+
+//@variable Switch deviation calculations for the cones based on `i_deviation`.
+float deviationSwitch = switch i_deviation
+    DEVIATION_STANDARD => logReturnsStdev
+    DEVIATION_LAPLACE => laplaceDeviation
+    DEVIATION_MAD => absoluteDeviation
+
+//#endregion
+
+//#endregion
+
+//#region Drawings
+if barstate.islast
+    // Initialize Objects
+    deviations newDeviations = deviations.new(
+      deviation = deviationSwitch[anchorSubscript], 
+      firstUpper = i_firstUpperDeviation, 
+      firstLower = i_firstLowerDeviation, 
+      secondUpper = i_secondUpperDeviation, 
+      secondLower = i_secondLowerDeviation, 
+      thirdUpper = i_thirdUpperDeviation, 
+      thirdLower = i_thirdLowerDeviation)
+
+    coneLineStyle meanLineStyle = coneLineStyle.new(i_meanColor, i_meanLineStyle, i_meanWidth, i_meanToggle)
+    coneLineStyle firstUpperLineStyle = coneLineStyle.new(i_firstUpperColor, i_firstUpperLineStyle, i_firstUpperWidth, i_firstUpperToggle)
+    coneLineStyle firstLowerLineStyle = coneLineStyle.new(i_firstLowerColor, i_firstLowerLineStyle, i_firstLowerWidth, i_firstLowerToggle)
+    coneLineStyle secondUpperLineStyle = coneLineStyle.new(i_secondUpperColor, i_secondUpperLineStyle, i_secondUpperWidth, i_secondUpperToggle)
+    coneLineStyle secondLowerLineStyle = coneLineStyle.new(i_secondLowerColor, i_secondLowerLineStyle, i_secondLowerWidth, i_secondLowerToggle)
+    coneLineStyle thirdUpperLineStyle = coneLineStyle.new(i_thirdUpperColor, i_thirdUpperLineStyle, i_thirdUpperWidth, i_thirdUpperToggle)
+    coneLineStyle thirdLowerLineStyle = coneLineStyle.new(i_thirdLowerColor, i_thirdLowerLineStyle, i_thirdLowerWidth, i_thirdLowerToggle)
+
+    // Initialize Probability Cones
+    coneValues newConeValues = coneValues(
+      sourceAnchor = i_source[anchorSubscript], 
+      driftToggle = i_driftToggle, 
+      mean = meanSwitch[anchorSubscript], 
+      forecastBars = i_forecastBars, 
+      anchorOpenToggle = i_anchorOpen, 
+      newDeviations = newDeviations) 
+
+    array<line> a_meanLines = coneLine(newConeValues.mean, meanLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_firstUpperLines = coneLine(newConeValues.firstUpper, firstUpperLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_firstLowerLines = coneLine(newConeValues.firstLower, firstLowerLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_secondUpperLines = coneLine(newConeValues.secondUpper, secondUpperLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_secondLowerLines = coneLine(newConeValues.secondLower, secondLowerLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_thirdUpperLines = coneLine(newConeValues.thirdUpper, thirdUpperLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+    array<line> a_thirdLowerLines = coneLine(newConeValues.thirdLower, thirdLowerLineStyle, i_forecastBars, anchorIndex, i_anchorLines)
+
+    array<linefill> a_firstUpperLineFills = coneFill(a_meanLines, a_firstUpperLines, i_firstUpperFill, i_firstUpperFillBool)
+    array<linefill> a_firstLowerLineFills = coneFill(a_meanLines, a_firstLowerLines, i_firstLowerFill, i_firstLowerFillBool)
+    array<linefill> a_secondUpperLineFills = coneFill(a_firstUpperLines, a_secondUpperLines, i_secondUpperFill, i_secondUpperFillBool)
+    array<linefill> a_secondLowerLineFills = coneFill(a_firstLowerLines, a_secondLowerLines, i_secondLowerFill, i_secondLowerFillBool)
+    array<linefill> a_thirdUpperLineFills = coneFill(a_secondUpperLines, a_thirdUpperLines, i_thirdUpperFill, i_thirdUpperFillBool)
+    array<linefill> a_thirdLowerLineFills = coneFill(a_secondLowerLines, a_thirdLowerLines, i_thirdLowerFill, i_thirdLowerFillBool)
+
+//#endregion

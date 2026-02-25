@@ -1,0 +1,194 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © hapharmonic
+
+//@version=6
+indicator("FlowScope [Hapharmonic]", "Hapharmonic - FlowScope", overlay=true, max_boxes_count=500, max_lines_count=500, max_bars_back=1000)
+
+int FOOTPRINT_BLOCKS_PER_BAR = 10
+
+enum ColorMode
+    CUSTOM = "Custom Gradient"
+    CANDLE = "Candle Color"
+
+enum Palette
+    SOLAR_FLARE     = "Solar Flare"
+    DEEP_SPACE      = "Deep Space"
+    EMERALD_SEA     = "Emerald Sea"
+    ROYAL_GOLD      = "Royal Gold"
+    CYBERPUNK_NIGHT = "Cyberpunk Night"
+    PHOENIX_FIRE    = "Phoenix Fire"
+    ARCTIC_DAWN     = "Arctic Dawn"
+    STARLIGHT       = "Starlight"
+    NEON_GLOW       = "Neon Glow"
+    GILDED_ONYX     = "Gilded Onyx"
+
+type CandleProfile
+    float profileHigh
+    float profileLow
+    int   numBoxes
+    float boxHeight
+    array<float> volumeDistribution
+    float maxVolumeInProfile
+    int   maxVolumeIndex
+
+// --- Inputs ---
+string GRP_PROFILE = "Profile Settings"
+int    groupSizeInput = input.int(1, "Group Candles"     , minval=1, maxval=10, group=GRP_PROFILE, tooltip="Number of candles to aggregate into a single profile. 1 = default behavior.")
+int    maxBoxesInput  = input.int(50, "Max Profile Boxes", minval=5, maxval=200, group=GRP_PROFILE, tooltip="Sets the maximum number of volume boxes per profile to maintain readability.")
+
+string    GRP_STYLE       = "Style"
+bool      showBoxBgInput  = input.bool(false, "Show Profile BG", group=GRP_STYLE)
+ColorMode colorModeInput  = input.enum(ColorMode.CUSTOM, "Color Mode", group=GRP_STYLE)
+
+bool isCustomColorMode = colorModeInput == ColorMode.CUSTOM
+bool isCandleColorMode = colorModeInput == ColorMode.CANDLE
+
+// --- Conditional Color Inputs ---
+string GRP_COLORS     = "Profile Colors"
+bool   usePresetInput = input.bool(false, "Use Preset Palette", group=GRP_COLORS, tooltip="If checked, uses a predefined color palette. If unchecked, allows custom color selection below.")
+
+Palette presetPaletteInput = input.enum(Palette.SOLAR_FLARE, "Palette", group=GRP_COLORS, active=usePresetInput)
+
+color startColorInput = input.color(color.new(#00BCD4, 0), "Low Price", group=GRP_COLORS, inline="custom", active=not usePresetInput and isCustomColorMode)
+color midColorInput   = input.color(color.new(#FFEB3B, 0), "Mid Price", group=GRP_COLORS, inline="custom", active=not usePresetInput and isCustomColorMode)
+color endColorInput   = input.color(color.new(#F44336, 0), "High Price", group=GRP_COLORS, inline="custom", active=not usePresetInput and isCustomColorMode)
+
+int fadePercentageInput = input.int(95, "Gradient Fade %", minval=0, maxval=95, step=5, group=GRP_STYLE, 
+     tooltip="Controls the transparency of the gradient in 'Candle Color' mode.", 
+     active=isCandleColorMode)
+color summaryBgColorInput = input.color(color.new(#673AB7, 75), "Summary Box BG", group=GRP_STYLE)
+
+string GRP_CANDLE          = "Candle Display"
+bool  showWickInput        = input.bool(true, "Show Custom Candle", group=GRP_CANDLE)
+bool  showBodyInput        = input.bool(true, "Show Body", group=GRP_CANDLE, active=showWickInput)
+int   wickWidthInput       = input.int(1, "Wick Width", minval=1, maxval=5, group=GRP_CANDLE, active=showWickInput)
+int   bodyWidthInput       = input.int(7, "Body Width", minval=1, maxval=10, group=GRP_CANDLE, active=showBodyInput)
+color candleUpColorInput   = input.color(color.green, "Up Color", group=GRP_CANDLE, inline="candlecolor", active=showWickInput)
+color candleDownColorInput = input.color(color.red, "Down Color", group=GRP_CANDLE, inline="candlecolor", active=showWickInput)
+
+// --- Final Color Selection Logic ---
+color finalStartColor = na, color finalMidColor = na, color finalEndColor = na
+if usePresetInput
+    [s, m, e] = switch presetPaletteInput
+        Palette.SOLAR_FLARE     => [color.new(#780000, 0), color.new(#FF4500, 0), color.new(#FFD700, 0)]
+        Palette.DEEP_SPACE      => [color.new(#4B0082, 0), color.new(#FF00FF, 0), color.new(#00FFFF, 0)]
+        Palette.EMERALD_SEA     => [color.new(#004D40, 0), color.new(#00C853, 0), color.new(#A7FFEB, 0)]
+        Palette.ROYAL_GOLD      => [color.new(#4A148C, 0), color.new(#FFD700, 0), color.new(#FFF8E1, 0)]
+        Palette.CYBERPUNK_NIGHT => [color.new(#00BFFF, 0), color.new(#FF69B4, 0), color.new(#E6E6FA, 0)]
+        Palette.PHOENIX_FIRE    => [color.new(#FEEA3B, 0), color.new(#DC143C, 0), color.new(#4B0082, 0)]
+        Palette.ARCTIC_DAWN     => [color.new(#483D8B, 0), color.new(#87CEEB, 0), color.new(#F0FFFF, 0)]
+        Palette.STARLIGHT       => [color.new(#2C3E50, 0), color.new(#BDC3C7, 0), color.new(#FFFFFF, 0)]
+        Palette.NEON_GLOW       => [color.new(#FF007F, 0), color.new(#00FFFF, 0), color.new(#ADFF2F, 0)]
+        Palette.GILDED_ONYX     => [color.new(#1C1C1C, 0), color.new(#D4AF37, 0), color.new(#F5F5DC, 0)]
+    finalStartColor := s, finalMidColor := m, finalEndColor := e
+else
+    finalStartColor := startColorInput, finalMidColor := midColorInput, finalEndColor := endColorInput
+
+// --- State Variables ---
+var array<float> groupLtfHighs = array.new<float>(), var array<float> groupLtfLows = array.new<float>(), var array<float> groupLtfVolumes = array.new<float>()
+var array<float> groupBuyVolumes = array.new<float>(), var array<float> groupSellVolumes = array.new<float>()
+var float groupHigh = na, var float groupLow = na, var float groupOpen = na, var float groupClose = na
+
+// --- Functions & Methods ---
+f_buildVolumeBar(int filledBlocks, int totalBlocks) =>
+    string result = ""
+    for i = 1 to totalBlocks
+        result += i <= filledBlocks ? "█" : "░"
+    result
+
+f_createProfile(float candleHigh, float candleLow, float targetBoxHeight, array<float> ltfH, array<float> ltfL, array<float> ltfV) =>
+    float barRange = candleHigh - candleLow
+    int numBoxes = math.max(1, int(math.round(barRange / targetBoxHeight)))
+    float adjustedBoxHeight = barRange / numBoxes
+    array<float> volDist = array.new_float(numBoxes, 0.0)
+    for i = 0 to array.size(ltfH) - 1
+        float ltfBarH = array.get(ltfH, i), float ltfBarL = array.get(ltfL, i), float ltfBarV = array.get(ltfV, i)
+        float ltfBarRange = math.max(ltfBarH - ltfBarL, syminfo.mintick)
+        for boxIndex = 0 to numBoxes - 1
+            float boxBottom = candleLow + (boxIndex * adjustedBoxHeight), float boxTop = boxBottom + adjustedBoxHeight
+            float overlapHeight = math.max(0, math.min(boxTop, ltfBarH) - math.max(boxBottom, ltfBarL))
+            if overlapHeight > 0
+                array.set(volDist, boxIndex, array.get(volDist, boxIndex) + ltfBarV * (overlapHeight / ltfBarRange))
+    float maxVolume = array.max(volDist)
+    int maxVolIdx = array.indexof(volDist, maxVolume)
+    CandleProfile.new(candleHigh, candleLow, numBoxes, adjustedBoxHeight, volDist, maxVolume, maxVolIdx)
+
+method draw(CandleProfile this, int startBar, int endBar, int groupSize, ColorMode mode, int fadePercentage, color startC, color midC, color endC, float totalBuyVol, float totalSellVol) =>
+    int maxVolIdx = this.maxVolumeIndex
+    int totalBlocks = int(FOOTPRINT_BLOCKS_PER_BAR + (FOOTPRINT_BLOCKS_PER_BAR * 0.3 * (groupSize - 1)))
+    for i = 0 to this.numBoxes - 1
+        float boxBottom = this.profileLow + (i * this.boxHeight), float boxTop = boxBottom + this.boxHeight
+        float currentBoxVolume = array.get(this.volumeDistribution, i)
+        if currentBoxVolume > 0
+            int filledBlocks = this.maxVolumeInProfile > 0 ? int(math.round((currentBoxVolume / this.maxVolumeInProfile) * totalBlocks)) : 0
+            string boxText = f_buildVolumeBar(filledBlocks, totalBlocks) + " " + str.tostring(currentBoxVolume, format.volume)
+            color textColor = na
+            if mode == ColorMode.CUSTOM
+                if i < maxVolIdx
+                    textColor := color.from_gradient(i, 0, maxVolIdx, startC, midC)
+                else if i > maxVolIdx
+                    textColor := color.from_gradient(i, maxVolIdx, this.numBoxes - 1, midC, endC)
+                else
+                    textColor := midC
+            else // CANDLE mode
+                color midColor  = groupClose > groupOpen ? color.new(color.green, 0) : color.new(color.red, 0)
+                color fadeColor = color.new(midColor, fadePercentage)
+                if i < maxVolIdx
+                    textColor := color.from_gradient(i, 0, maxVolIdx, fadeColor, midColor)
+                else if i > maxVolIdx
+                    textColor := color.from_gradient(i, maxVolIdx, this.numBoxes - 1, midColor, fadeColor)
+                else
+                    textColor := midColor
+            color boxBgColor = showBoxBgInput ? color.new(textColor, 80) : color(na)
+            box.new(startBar, boxTop, endBar + 1, boxBottom, bgcolor=boxBgColor, border_color=na, text=boxText, text_color=textColor, text_halign=text.align_left, text_valign=text.align_center)
+    float totalVolume = array.sum(this.volumeDistribution)
+    if totalVolume > 0
+        float buyPercent   = totalVolume > 0 ? (totalBuyVol / totalVolume) * 100 : 0
+        float sellPercent  = totalVolume > 0 ? (totalSellVol / totalVolume) * 100 : 0
+        string summaryText = "Σ: " + str.tostring(totalVolume, format.volume) + "\n" +
+             "B: " + str.tostring(totalBuyVol, format.volume) + " (" + str.tostring(buyPercent, "#.##") + "%) \n " +
+             "S: " + str.tostring(totalSellVol, format.volume) + " (" + str.tostring(sellPercent, "#.##") + "%)"
+        box.new(startBar, this.profileLow, endBar + 1, this.profileLow - (this.boxHeight * 1.5), bgcolor=summaryBgColorInput, border_color=color.new(color.white, 50), text=summaryText, text_color=color.white, text_halign=text.align_center, text_valign=text.align_center, text_formatting=text.format_bold)
+
+barcolor(showWickInput ? color.new(color.black, 100) : na)
+
+// --- Data Retrieval & Accumulation ---
+[ltfOpens, ltfHighs, ltfLows, ltfCloses, ltfVolumes] = request.security_lower_tf(syminfo.tickerid, "1", [open, high, low, close, volume])
+if array.size(ltfHighs) > 0
+    groupLtfHighs.concat(ltfHighs), groupLtfLows.concat(ltfLows), groupLtfVolumes.concat(ltfVolumes)
+    for i = 0 to array.size(ltfVolumes) - 1
+        float ltfH     = array.get(ltfHighs, i), float ltfL = array.get(ltfLows, i), float ltfC = array.get(ltfCloses, i), float ltfV = array.get(ltfVolumes, i)
+        float ltfRange = math.max(ltfH - ltfL, syminfo.mintick)
+        float buyVol   = ltfV * (ltfC - ltfL) / ltfRange
+        float sellVol  = ltfV * (ltfH - ltfC) / ltfRange
+        groupBuyVolumes.push(buyVol)
+        groupSellVolumes.push(sellVol)
+    if na(groupOpen)
+        groupOpen := open
+    groupHigh := na(groupHigh) ? high : math.max(groupHigh, high)
+    groupLow := na(groupLow) ? low : math.min(groupLow, low)
+    groupClose := close
+
+// --- Trigger, Draw, and Reset Logic ---
+bool isGroupEnd = (bar_index + 1) % groupSizeInput == 0
+bool canDraw    = groupLtfHighs.size() > 0 and (groupHigh - groupLow) > syminfo.mintick
+if (isGroupEnd or barstate.islast) and canDraw
+    int actualGroupSize   = barstate.islast ? (bar_index % groupSizeInput) + 1 : groupSizeInput
+    int endBar = bar_index, int startBar = endBar - actualGroupSize + 1
+    float totalBuyVolume  = array.sum(groupBuyVolumes)
+    float totalSellVolume = array.sum(groupSellVolumes)
+    float baseBoxHeight   = ta.atr(14) / 10, float groupRange = groupHigh - groupLow
+    float targetBoxHeight = (groupRange / baseBoxHeight) > maxBoxesInput ? groupRange / maxBoxesInput : baseBoxHeight
+    CandleProfile profile = f_createProfile(groupHigh, groupLow, targetBoxHeight, groupLtfHighs, groupLtfLows, groupLtfVolumes)
+    profile.draw(startBar, endBar, actualGroupSize, colorModeInput, fadePercentageInput, finalStartColor, finalMidColor, finalEndColor, totalBuyVolume, totalSellVolume)
+
+    if showWickInput
+        color wickColor = groupClose > groupOpen ? candleUpColorInput : candleDownColorInput
+        line.new(startBar, groupHigh, startBar, groupLow, xloc.bar_index, extend.none, wickColor, width=wickWidthInput)
+        if showBodyInput
+            line.new(startBar, groupOpen, startBar, groupClose, xloc.bar_index, extend.none, wickColor, width=bodyWidthInput)
+
+    // Reset state for the next group
+    groupLtfHighs.clear(), groupLtfLows.clear(), groupLtfVolumes.clear()
+    groupBuyVolumes.clear(), groupSellVolumes.clear()
+    groupHigh := na, groupLow := na, groupOpen := na, groupClose := na

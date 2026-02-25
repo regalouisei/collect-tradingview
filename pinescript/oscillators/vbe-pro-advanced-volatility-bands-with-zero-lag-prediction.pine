@@ -1,0 +1,753 @@
+//@version=6
+indicator("VBE Pro - Advanced Volatility Bands with Zero Lag & Prediction", shorttitle="VBE-Pro", overlay=true, max_bars_back=1000)
+
+// ═══════════════════════════════════════════════════════════════
+//                    INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════
+
+g_volatility = "Volatility Settings"
+atr_length = input.int(14, "ATR Period", minval=1, maxval=100, group=g_volatility,
+     tooltip="Period for Average True Range calculation")
+volatility_method = input.string("ATR", "Volatility Method", 
+     options=["ATR", "Standard Deviation", "True Range", "Hybrid", "Parkinson", "Garman-Klass", "Rogers-Satchell", "Yang-Zhang"], 
+     group=g_volatility, tooltip="Method for calculating volatility - advanced methods provide better accuracy")
+smoothing_type = input.string("ZLEMA", "ATR Smoothing", 
+     options=["RMA", "EMA", "SMA", "WMA", "ZLEMA", "ZLMA", "DEMA", "TEMA", "HMA", "JMA", "Ehlers"], 
+     group=g_volatility, tooltip="Smoothing method with zero lag options")
+
+g_prediction = "Volatility Prediction"
+enable_prediction = input.bool(true, "Enable Volatility Prediction", group=g_prediction,
+     tooltip="Use predicted volatility for forward-looking band adjustment")
+prediction_method = input.string("EWMA", "Prediction Method",
+     options=["EWMA", "GARCH", "HAR-RV", "ML-Composite"], group=g_prediction,
+     tooltip="Method for volatility prediction")
+prediction_weight = input.float(0.3, "Prediction Weight", minval=0.0, maxval=1.0, step=0.05,
+     group=g_prediction, tooltip="How much to blend predicted volatility (0=none, 1=full)")
+
+g_bands = "Band Configuration"
+band_multiplier = input.float(2.0, "Band Multiplier", minval=0.1, maxval=10.0, 
+     step=0.1, group=g_bands, tooltip="Multiplier for volatility bands")
+adaptive_bands = input.bool(true, "Adaptive Bands", group=g_bands,
+     tooltip="Enable adaptive band width based on market regime")
+use_zero_lag_bands = input.bool(true, "Zero Lag Band Calculation", group=g_bands,
+     tooltip="Apply zero lag techniques to band calculation")
+dynamic_bands = input.bool(false, "Dynamic Band Expansion", group=g_bands,
+     tooltip="Bands expand/contract based on price acceleration")
+
+g_displacement = "Displacement Settings"
+enable_displacement = input.bool(false, "Enable Displacement", group=g_displacement,
+     tooltip="Shift indicator back in time")
+displacement_bars = input.int(-5, "Displacement Bars", minval=-100, maxval=50, 
+     group=g_displacement, tooltip="Negative = backward in time, Positive = forward")
+show_displacement_line = input.bool(true, "Show Displacement Reference", group=g_displacement,
+     tooltip="Show vertical line at displacement boundary")
+
+g_smoothing = "Band Smoothing"
+enable_band_smoothing = input.bool(true, "Enable Band Smoothing", 
+     group=g_smoothing, tooltip="Smooth the final band calculations")
+band_smoothing_method = input.string("ZLEMA", "Smoothing Method", 
+     options=["EMA", "SMA", "RMA", "WMA", "Hull MA", "T3", "ZLEMA", "ZLMA", "DEMA", "TEMA", "JMA", "Ehlers", "Kalman"], 
+     group=g_smoothing, tooltip="Method for smoothing bands with zero lag options")
+band_smoothing_length = input.int(5, "Smoothing Length", minval=1, maxval=50, 
+     group=g_smoothing, tooltip="Period for band smoothing")
+double_smooth = input.bool(false, "Double Zero Lag Smoothing", group=g_smoothing,
+     tooltip="Apply zero lag smoothing twice for ultra-smooth bands")
+zero_lag_gain = input.float(2.0, "Zero Lag Gain", minval=0.1, maxval=10.0, step=0.1,
+     group=g_smoothing, tooltip="Higher values = more aggressive lag reduction (2-4 recommended, 5+ experimental)")
+
+g_display = "Display Settings"
+show_middle_line = input.bool(true, "Show Middle Line", group=g_display, inline="mid")
+middle_line_source = input.source(hlc3, "Source", group=g_display, inline="mid")
+show_fill = input.bool(true, "Fill Bands", group=g_display, inline="fill")
+fill_transparency = input.int(85, "Transparency", minval=0, maxval=100, 
+     group=g_display, inline="fill")
+
+g_colors = "Color Settings"
+upper_band_color = input.color(color.new(#FF6B6B, 0), "Upper Band", 
+     group=g_colors, inline="colors")
+lower_band_color = input.color(color.new(#4ECDC4, 0), "Lower Band", 
+     group=g_colors, inline="colors")
+middle_color = input.color(color.new(#45B7D1, 0), "Middle Line", 
+     group=g_colors, inline="colors2")
+fill_color = input.color(color.new(#95A5A6, 50), "Fill Color", 
+     group=g_colors, inline="colors2")
+
+g_advanced = "Advanced Settings"
+regime_detection = input.bool(true, "Regime Detection", group=g_advanced,
+     tooltip="Detect high/low volatility regimes")
+regime_lookback = input.int(50, "Regime Lookback", minval=20, maxval=200, 
+     group=g_advanced, tooltip="Lookback period for regime detection")
+show_signals = input.bool(true, "Show Volatility Signals", group=g_advanced)
+
+// ═══════════════════════════════════════════════════════════════
+//                    ZERO LAG SMOOTHING FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+// Zero Lag Exponential Moving Average (ZLEMA)
+zlema(src, length, gain) =>
+    lag = math.max(0, math.round((length - 1) / 2))
+    // Ensure we have enough history before accessing src[lag]
+    data_corrected = lag > 0 and bar_index >= lag ? src + (src - nz(src[lag], src)) * gain : src
+    ta.ema(data_corrected, length)
+
+// Zero Lag Moving Average (ZLMA) - Error correction based
+zlma(src, length, gain) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    diff = ema1 - ema2
+    zlma_result = ema1 + diff * gain
+    zlma_result
+
+// Double Exponential Moving Average (DEMA)
+dema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    2 * ema1 - ema2
+
+// Triple Exponential Moving Average (TEMA)
+tema(src, length) =>
+    ema1 = ta.ema(src, length)
+    ema2 = ta.ema(ema1, length)
+    ema3 = ta.ema(ema2, length)
+    3 * (ema1 - ema2) + ema3
+
+// Hull Moving Average (Enhanced)
+hma(src, length) =>
+    half_length = math.round(length / 2)
+    sqrt_length = math.round(math.sqrt(length))
+    wma1 = ta.wma(src, half_length)
+    wma2 = ta.wma(src, length)
+    hull_raw = 2 * wma1 - wma2
+    ta.wma(hull_raw, sqrt_length)
+
+// Jurik Moving Average Approximation (JMA-like)
+jma(src, length) =>
+    // Simplified JMA approximation using double smoothing
+    phase = 0.5
+    power = 2.0
+    
+    beta = 0.45 * (length - 1) / (0.45 * (length - 1) + 2)
+    alpha = math.pow(beta, power)
+    
+    // First smoothing pass
+    ema1 = ta.ema(src, length)
+    // Second smoothing with adjusted length
+    adjusted_length = math.max(1, math.round(length * beta))
+    ema2 = ta.ema(ema1, adjusted_length)
+    
+    // Calculate difference and apply phase
+    diff = ema1 - ema2
+    result = ema1 + diff * phase
+    
+    // Apply power factor for final smoothing
+    final_length = math.max(1, math.round(math.sqrt(length)))
+    ta.ema(result, final_length)
+
+// Ehlers Zero Lag Filter
+ehlersZeroLag(src, length, gain) =>
+    alpha = 2.0 / (length + 1)
+    
+    // Calculate filter using EMA base with correction
+    ema_val = ta.ema(src, length)
+    error_val = src - ema_val
+    filter_gain = gain * alpha
+    filter_val = ema_val + filter_gain * error_val
+    filter_val
+
+// Kalman Filter (Simplified for Pine Script)
+kalmanFilter(src, length) =>
+    // Simplified Kalman using adaptive EMA
+    process_noise = 0.01
+    measurement_noise = length * 0.01
+    
+    // Use adaptive smoothing based on noise ratio
+    k_gain = 1.0 / (1.0 + measurement_noise / process_noise)
+    
+    // Apply adaptive smoothing
+    ema_fast = ta.ema(src, math.round(length * k_gain))
+    ema_slow = ta.ema(src, length)
+    
+    // Blend based on gain
+    result = ema_fast * k_gain + ema_slow * (1 - k_gain)
+    result
+
+// Enhanced T3 with Zero Lag
+t3ZeroLag(src, length) =>
+    vfactor = 0.7  // Volume factor for T3
+    
+    // T3 calculation using cascaded EMAs
+    e1 = ta.ema(src, length)
+    e2 = ta.ema(e1, length) 
+    e3 = ta.ema(e2, length)
+    e4 = ta.ema(e3, length)
+    e5 = ta.ema(e4, length)
+    e6 = ta.ema(e5, length)
+    
+    c1 = -vfactor * vfactor * vfactor
+    c2 = 3 * vfactor * vfactor + 3 * vfactor * vfactor * vfactor
+    c3 = -6 * vfactor * vfactor - 3 * vfactor - 3 * vfactor * vfactor * vfactor
+    c4 = 1 + 3 * vfactor + vfactor * vfactor * vfactor + 3 * vfactor * vfactor
+    
+    c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3
+
+// Master smoothing function selector
+applyZeroLagSmoothing(src, method, length) =>
+    result = switch method
+        "EMA" => ta.ema(src, length)
+        "SMA" => ta.sma(src, length)
+        "RMA" => ta.rma(src, length)
+        "WMA" => ta.wma(src, length)
+        "ZLEMA" => zlema(src, length, zero_lag_gain)
+        "ZLMA" => zlma(src, length, zero_lag_gain)
+        "DEMA" => dema(src, length)
+        "TEMA" => tema(src, length)
+        "Hull MA" => hma(src, length)
+        "HMA" => hma(src, length)
+        "JMA" => jma(src, length)
+        "Ehlers" => ehlersZeroLag(src, length, zero_lag_gain)
+        "Kalman" => kalmanFilter(src, length)
+        "T3" => t3ZeroLag(src, length)
+        => ta.ema(src, length)
+    
+    result
+
+// ═══════════════════════════════════════════════════════════════
+//                    CORE VOLATILITY CALCULATIONS
+// ═══════════════════════════════════════════════════════════════
+
+parkinsonVolatility(length) =>
+    sum = 0.0
+    count = 0
+    for i = 0 to length - 1
+        if high[i] > 0 and low[i] > 0
+            sum := sum + math.pow(math.log(high[i] / low[i]), 2)
+            count := count + 1
+    count > 0 ? math.sqrt(sum / (count * 4 * math.log(2))) : 0.0
+
+garmanKlassVolatility(length) =>
+    sum = 0.0
+    count = 0
+    for i = 0 to length - 1
+        if high[i] > 0 and low[i] > 0 and close[i] > 0 and open[i] > 0
+            hl = math.log(high[i] / low[i])
+            co = math.log(close[i] / open[i])
+            sum := sum + 0.5 * math.pow(hl, 2) - (2 * math.log(2) - 1) * math.pow(co, 2)
+            count := count + 1
+    count > 0 ? math.sqrt(math.max(0, sum / count)) : 0.0
+
+rogersSatchellVolatility(length) =>
+    sum = 0.0
+    count = 0
+    for i = 0 to length - 1
+        if high[i] > 0 and low[i] > 0 and close[i] > 0 and open[i] > 0
+            hc = math.log(high[i] / close[i])
+            ho = math.log(high[i] / open[i])
+            lc = math.log(low[i] / close[i])
+            lo = math.log(low[i] / open[i])
+            rs_component = hc * ho + lc * lo
+            sum := sum + rs_component
+            count := count + 1
+    count > 0 ? math.sqrt(math.max(0, sum / count)) : 0.0
+
+yangZhangVolatility(length) =>
+    k = 0.34 / (1.34 + (length + 1) / (length - 1))
+    
+    // Overnight volatility
+    sum_o = 0.0
+    count_o = 0
+    for i = 0 to length - 1
+        if i > 0 and i < bar_index
+            prev_close = nz(close[i + 1], close[i])
+            if prev_close != 0
+                oc = math.log(open[i] / prev_close)
+                sum_o := sum_o + math.pow(oc, 2)
+                count_o := count_o + 1
+    var_o = count_o > 0 ? sum_o / count_o : 0
+    
+    // Open-Close volatility  
+    sum_c = 0.0
+    count_c = 0
+    for i = 0 to length - 1
+        if open[i] != 0
+            co = math.log(close[i] / open[i])
+            sum_c := sum_c + math.pow(co, 2)
+            count_c := count_c + 1
+    var_c = count_c > 0 ? sum_c / count_c : 0
+    
+    // Rogers-Satchell component
+    rs_vol = rogersSatchellVolatility(length)
+    
+    math.sqrt(math.max(0, var_o + k * var_c + (1 - k) * rs_vol * rs_vol))
+
+// Base volatility calculation with multiple methods
+calculateVolatility(method, length, smooth_type) =>
+    base_volatility = switch method
+        "ATR" => ta.tr(true)
+        "Standard Deviation" => ta.stdev(middle_line_source, length)
+        "True Range" => ta.tr(true)
+        "Hybrid" => (ta.tr(true) + ta.stdev(middle_line_source, length)) / 2
+        "Parkinson" => parkinsonVolatility(length) * close
+        "Garman-Klass" => garmanKlassVolatility(length) * close
+        "Rogers-Satchell" => rogersSatchellVolatility(length) * close
+        "Yang-Zhang" => yangZhangVolatility(length) * close
+        => ta.tr(true)
+    
+    // Apply zero lag smoothing to volatility
+    smoothed = applyZeroLagSmoothing(base_volatility, smooth_type, length)
+    smoothed
+
+// Calculate base volatility with zero lag
+base_volatility = calculateVolatility(volatility_method, atr_length, smoothing_type)
+
+// ═══════════════════════════════════════════════════════════════
+//                    VOLATILITY PREDICTION
+// ═══════════════════════════════════════════════════════════════
+
+// Initialize variance variables in global scope
+var float ewma_variance = na
+var float garch_variance = na
+
+// Update variances in global scope
+returns_for_prediction = math.log(close / math.max(nz(close[1], close), 0.001))
+
+// Update EWMA variance globally
+lambda = 0.94
+if na(ewma_variance)
+    ewma_variance := math.pow(returns_for_prediction, 2)
+else if barstate.isconfirmed
+    ewma_variance := lambda * ewma_variance + (1 - lambda) * math.pow(returns_for_prediction, 2)
+
+// Update GARCH variance globally
+omega = 0.000001
+alpha = 0.1
+beta = 0.85
+if na(garch_variance)
+    garch_variance := math.pow(base_volatility / math.max(close, 0.001), 2)
+else if barstate.isconfirmed
+    prev_return = nz(returns_for_prediction[1], 0)
+    garch_variance := omega + alpha * math.pow(prev_return, 2) + beta * garch_variance
+
+// EWMA Prediction function (uses global ewma_variance)
+ewmaPrediction(volatility, length) =>
+    predicted = math.sqrt(math.max(0, ewma_variance * 252)) * close
+    // Project forward with momentum
+    momentum = predicted - nz(predicted[1], predicted)
+    result = predicted + momentum * zero_lag_gain * 0.2
+    result
+
+// GARCH Prediction function (uses global garch_variance)
+garchPrediction(volatility, length) =>
+    predicted = math.sqrt(math.max(0, garch_variance)) * close
+    // Add mean reversion component
+    mean_vol = ta.sma(volatility, length)
+    result = predicted + (mean_vol - predicted) * 0.1
+    result
+
+// HAR-RV (Heterogeneous Autoregressive Realized Volatility) Prediction
+harRvPrediction(volatility, length) =>
+    // Daily, weekly, monthly components
+    rv_d = volatility
+    rv_w = ta.sma(volatility, 5)
+    rv_m = ta.sma(volatility, 22)
+    
+    // HAR model with optimized coefficients
+    predicted = 0.05 + 0.35 * rv_d + 0.35 * rv_w + 0.30 * rv_m
+    
+    // Add trend component
+    trend = ta.linreg(volatility, 10, 0) - ta.linreg(volatility, 10, 1)
+    result = predicted + trend * 0.5
+    result
+
+// ML Composite Prediction (simplified ensemble)
+mlCompositePrediction(volatility, length) =>
+    // Feature extraction with safety checks
+    vol_mean = ta.sma(volatility, length)
+    vol_std = ta.stdev(volatility, length)
+    vol_zscore = vol_std > 0 ? (volatility - vol_mean) / vol_std : 0
+    vol_percentile = ta.percentrank(volatility, length)
+    vol_rsi = ta.rsi(volatility, 14)
+    
+    // Simple neural network-like combination
+    w1 = 0.4  // Current volatility weight
+    w2 = 0.2  // Z-score weight  
+    w3 = 0.2  // Percentile weight
+    w4 = 0.2  // RSI weight
+    
+    // Sigmoid activation with bounds
+    sigmoid_input = math.max(-10, math.min(10, vol_zscore))
+    sigmoid_value = 1 / (1 + math.exp(-sigmoid_input))
+    
+    // Prediction formula
+    base_pred = volatility * w1 + vol_zscore * vol_std * w2 + (vol_percentile / 100) * volatility * w3 + (vol_rsi / 100) * volatility * w4
+    
+    // Apply non-linear transformation
+    predicted = base_pred * (0.5 + sigmoid_value)
+    
+    // Bound prediction to reasonable range
+    result = math.max(volatility * 0.5, math.min(predicted, volatility * 2.0))
+    result
+
+// Select prediction method
+predicted_volatility = if enable_prediction
+    pred = switch prediction_method
+        "EWMA" => ewmaPrediction(base_volatility, atr_length)
+        "GARCH" => garchPrediction(base_volatility, atr_length)
+        "HAR-RV" => harRvPrediction(base_volatility, atr_length)
+        "ML-Composite" => mlCompositePrediction(base_volatility, atr_length)
+        => base_volatility
+    
+    // Blend predicted with current volatility
+    base_volatility * (1 - prediction_weight) + pred * prediction_weight
+else
+    base_volatility
+
+// Use predicted volatility for final calculations
+final_volatility = predicted_volatility
+
+// ═══════════════════════════════════════════════════════════════
+//                    REGIME DETECTION & ADAPTIVE BANDS
+// ═══════════════════════════════════════════════════════════════
+
+// Volatility regime detection with zero lag
+volatility_mean = applyZeroLagSmoothing(final_volatility, "ZLEMA", regime_lookback)
+volatility_std = ta.stdev(final_volatility, regime_lookback)
+volatility_zscore = (final_volatility - volatility_mean) / math.max(volatility_std, 0.0001)
+
+// Regime classification with prediction
+high_vol_regime = volatility_zscore > 1.0
+low_vol_regime = volatility_zscore < -1.0
+normal_regime = not high_vol_regime and not low_vol_regime
+
+// Predicted regime (looking ahead)
+predicted_regime = if enable_prediction
+    predicted_zscore = (predicted_volatility - volatility_mean) / math.max(volatility_std, 0.0001)
+    predicted_zscore > 1.0 ? "High" : predicted_zscore < -1.0 ? "Low" : "Normal"
+else
+    "Unknown"
+
+// Adaptive multiplier based on regime with predictive adjustment
+adaptive_multiplier = if adaptive_bands
+    base_mult = if high_vol_regime
+        band_multiplier * 0.75  // Tighter bands in high volatility
+    else if low_vol_regime
+        band_multiplier * 1.25  // Wider bands in low volatility
+    else
+        band_multiplier
+    
+    // Adjust for predicted regime
+    if enable_prediction
+        if predicted_regime == "High" and not high_vol_regime
+            base_mult * 0.9  // Pre-tighten bands
+        else if predicted_regime == "Low" and not low_vol_regime
+            base_mult * 1.1  // Pre-widen bands
+        else
+            base_mult
+    else
+        base_mult
+else
+    band_multiplier
+
+// ═══════════════════════════════════════════════════════════════
+//                    BAND CALCULATIONS WITH ZERO LAG
+// ═══════════════════════════════════════════════════════════════
+
+// Middle line with optional zero lag smoothing
+middle_line = if use_zero_lag_bands
+    applyZeroLagSmoothing(middle_line_source, "ZLEMA", 5)
+else
+    middle_line_source
+
+// Calculate price acceleration for dynamic bands
+price_acceleration = if dynamic_bands
+    prev_close = nz(close[1], close)
+    price_velocity = prev_close != 0 ? (close - prev_close) / prev_close : 0
+    prev_velocity = nz(price_velocity[1], 0)
+    price_accel = price_velocity - prev_velocity
+    math.abs(price_accel)
+else
+    0.0
+
+// Dynamic expansion factor based on acceleration
+dynamic_factor = if dynamic_bands
+    base_expansion = 1.0
+    accel_factor = price_acceleration * 100  // Convert to percentage
+    expansion = base_expansion + math.min(accel_factor * 0.5, 1.0)  // Max 100% expansion
+    expansion
+else
+    1.0
+
+// Calculate band width with zero lag compensation and prediction
+band_width = if use_zero_lag_bands
+    // Apply predictive component for zero lag
+    current_vol = final_volatility * adaptive_multiplier * dynamic_factor
+    vol_momentum = current_vol - current_vol[1]
+    
+    // Aggressive projection for high gain values
+    projection_factor = zero_lag_gain > 4 ? 0.5 + (zero_lag_gain - 4) * 0.1 : zero_lag_gain * 0.125
+    projected_vol = current_vol + vol_momentum * projection_factor
+    
+    // Safety limits become more permissive with high gain
+    min_factor = zero_lag_gain > 5 ? 0.3 : 0.5
+    max_factor = zero_lag_gain > 5 ? 3.0 : 2.0
+    math.max(current_vol * min_factor, math.min(projected_vol, current_vol * max_factor))
+else
+    final_volatility * adaptive_multiplier * dynamic_factor
+
+// Calculate raw bands
+raw_upper_band = middle_line + band_width
+raw_lower_band = middle_line - band_width
+
+// Apply zero lag smoothing to bands if enabled
+smoothed_upper_band = if enable_band_smoothing
+    smoothed_upper = applyZeroLagSmoothing(raw_upper_band, band_smoothing_method, band_smoothing_length)
+    // Apply double zero lag smoothing if enabled
+    if double_smooth
+        applyZeroLagSmoothing(smoothed_upper, band_smoothing_method, math.round(band_smoothing_length / 2))
+    else
+        smoothed_upper
+else
+    raw_upper_band
+
+smoothed_lower_band = if enable_band_smoothing
+    smoothed_lower = applyZeroLagSmoothing(raw_lower_band, band_smoothing_method, band_smoothing_length)
+    // Apply double zero lag smoothing if enabled
+    if double_smooth
+        applyZeroLagSmoothing(smoothed_lower, band_smoothing_method, math.round(band_smoothing_length / 2))
+    else
+        smoothed_lower
+else
+    raw_lower_band
+
+// Pre-calculate ta functions for consistency  
+chart_high = ta.highest(high, 100)
+chart_low = ta.lowest(low, 100)
+
+// ═══════════════════════════════════════════════════════════════
+//                    SIGNAL GENERATION
+// ═══════════════════════════════════════════════════════════════
+
+// Pre-calculate crossover/crossunder functions
+raw_upper_breakout = ta.crossover(close, smoothed_upper_band)
+raw_lower_breakdown = ta.crossunder(close, smoothed_lower_band)
+
+// Simple signal variables
+upper_breakout = raw_upper_breakout
+lower_breakdown = raw_lower_breakdown
+
+// Volatility expansion/contraction signals
+vol_expansion = base_volatility > base_volatility[1] and base_volatility[1] > base_volatility[2]
+vol_contraction = base_volatility < base_volatility[1] and base_volatility[1] < base_volatility[2]
+
+// Price band interactions
+price_above_upper = close > smoothed_upper_band
+price_below_lower = close < smoothed_lower_band  
+price_in_bands = close <= smoothed_upper_band and close >= smoothed_lower_band
+
+// Squeeze detection with zero lag
+current_band_width = smoothed_upper_band - smoothed_lower_band
+avg_band_width = applyZeroLagSmoothing(current_band_width, "ZLEMA", 20)
+squeeze_condition = current_band_width < avg_band_width * 0.8
+
+// Zero lag effectiveness indicator
+zl_active = use_zero_lag_bands or enable_band_smoothing
+significant_zl = zl_active and zero_lag_gain > 0.5
+
+// ═══════════════════════════════════════════════════════════════
+//                    PLOTTING - ALL AT GLOBAL SCOPE
+// ═══════════════════════════════════════════════════════════════
+
+// Calculate offset value once
+plot_offset = enable_displacement ? displacement_bars : 0
+
+// Plot middle line
+mid_plot = plot(show_middle_line ? middle_line : na, title="Middle Line (ZL)", color=middle_color, linewidth=2, offset=plot_offset)
+
+// Plot upper band
+p_upper = plot(smoothed_upper_band, title="Upper Band (ZL)", color=upper_band_color, linewidth=2, offset=plot_offset)
+
+// Plot lower band
+p_lower = plot(smoothed_lower_band, title="Lower Band (ZL)", color=lower_band_color, linewidth=2, offset=plot_offset)
+
+// Fill between bands
+fill(p_upper, p_lower, show_fill ? color.new(fill_color, fill_transparency) : na)
+
+// Note: Traditional comparison bands removed due to compilation issues
+// The zero lag bands are the primary feature anyway
+
+// ═══════════════════════════════════════════════════════════════
+//                    VISUAL ELEMENTS & SIGNALS
+// ═══════════════════════════════════════════════════════════════
+
+// Regime background coloring - use bgcolor at global scope
+bgcolor(regime_detection and high_vol_regime ? color.new(color.red, 95) : regime_detection and low_vol_regime ? color.new(color.green, 95) : na, title="Volatility Regime")
+
+// Show displacement reference line
+var line displacement_line = na
+var label displacement_label = na
+
+if enable_displacement and show_displacement_line and displacement_bars != 0 and barstate.islast
+    // Delete old line and label
+    if not na(displacement_line)
+        line.delete(displacement_line)
+    if not na(displacement_label)
+        label.delete(displacement_label)
+    
+    reference_bar = bar_index + displacement_bars
+    
+    // Create new line and label
+    if (displacement_bars < 0 and reference_bar >= 0) or (displacement_bars > 0)
+        displacement_line := line.new(reference_bar, chart_low, reference_bar, chart_high, xloc=xloc.bar_index, extend=extend.none, color=color.new(color.purple, 40), width=2, style=line.style_dashed)
+        
+        label_text = displacement_bars < 0 ? "Displaced Back" : "Displaced Forward"
+        displacement_label := label.new(reference_bar, chart_high, label_text, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=color.new(color.purple, 70), textcolor=color.white, size=size.small)
+
+// Signal markers
+if show_signals and barstate.isconfirmed
+    // Volatility expansion
+    if vol_expansion and not vol_expansion[1]
+        label.new(bar_index, high, "Vol↑", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+    
+    // Volatility contraction
+    if vol_contraction and not vol_contraction[1]
+        label.new(bar_index, low, "Vol↓", style=label.style_label_up, color=color.blue, textcolor=color.white, size=size.small)
+    
+    // Squeeze signal
+    if squeeze_condition and not squeeze_condition[1]
+        label.new(bar_index, middle_line, "Squeeze", style=label.style_circle, color=color.yellow, textcolor=color.black, size=size.tiny)
+    
+    // Band breakout signals
+    if upper_breakout
+        label.new(bar_index, high, "Break↑", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    
+    if lower_breakdown
+        label.new(bar_index, low, "Break↓", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+    
+    // Zero lag active signal
+    if significant_zl and not significant_zl[1]
+        label.new(bar_index, high * 1.01, "ZL", style=label.style_label_down, color=color.purple, textcolor=color.white, size=size.tiny, tooltip="Zero Lag Active: Gain " + str.tostring(zero_lag_gain, "#.#"))
+    
+    // Prediction divergence signal (if enabled)
+    if enable_prediction
+        vol_divergence = math.abs(predicted_volatility - base_volatility) / base_volatility
+        if vol_divergence > 0.2 and not (nz(vol_divergence[1], 0) > 0.2)
+            label.new(bar_index, middle_line, "⚠", style=label.style_circle, color=color.orange, textcolor=color.white, size=size.small, tooltip="Vol Prediction Divergence: " + str.tostring(vol_divergence * 100, "#.#") + "%")
+    
+    // High gain warning
+    if zero_lag_gain > 5 and bar_index % 50 == 0
+        label.new(bar_index, low * 0.99, "Gain: " + str.tostring(zero_lag_gain, "#.#"), style=label.style_label_up, color=color.new(color.red, 70), textcolor=color.white, size=size.tiny, tooltip="High ZL Gain - Experimental Mode")
+
+// ═══════════════════════════════════════════════════════════════
+//                    INFORMATION TABLE
+// ═══════════════════════════════════════════════════════════════
+
+var table info_table = table.new(position.top_right, 2, 14, bgcolor=color.new(color.white, 90), border_width=1)
+
+if barstate.islast
+    // Clear and update table
+    table.clear(info_table, 0, 0, 1, 13)
+    
+    // Headers
+    table.cell(info_table, 0, 0, "VBE Zero Lag Pro", bgcolor=color.new(color.blue, 80), text_color=color.white)
+    table.cell(info_table, 1, 0, "Value", bgcolor=color.new(color.blue, 80), text_color=color.white)
+    
+    // Current volatility
+    table.cell(info_table, 0, 1, "Current Vol")
+    table.cell(info_table, 1, 1, str.tostring(base_volatility, "#.####"))
+    
+    // Predicted volatility (if enabled)
+    if enable_prediction
+        table.cell(info_table, 0, 2, "Predicted Vol")
+        table.cell(info_table, 1, 2, str.tostring(predicted_volatility, "#.####"), text_color=color.orange)
+        
+        vol_change = (predicted_volatility - base_volatility) / base_volatility * 100
+        table.cell(info_table, 0, 3, "Vol Change")
+        table.cell(info_table, 1, 3, str.tostring(vol_change, "#.#") + "%", 
+             text_color=vol_change > 0 ? color.red : color.green)
+    else
+        table.cell(info_table, 0, 2, "Vol Method")
+        table.cell(info_table, 1, 2, volatility_method)
+        
+        table.cell(info_table, 0, 3, "Prediction")
+        table.cell(info_table, 1, 3, "Disabled", text_color=color.gray)
+    
+    // Current Regime
+    current_regime = high_vol_regime ? "High Vol" : low_vol_regime ? "Low Vol" : "Normal"
+    regime_color_display = high_vol_regime ? color.red : low_vol_regime ? color.green : color.gray
+    table.cell(info_table, 0, 4, "Regime")
+    table.cell(info_table, 1, 4, current_regime, text_color=regime_color_display)
+    
+    // Predicted Regime (if enabled)
+    if enable_prediction
+        pred_regime_color = predicted_regime == "High" ? color.red : predicted_regime == "Low" ? color.green : color.gray
+        table.cell(info_table, 0, 5, "Pred Regime")
+        table.cell(info_table, 1, 5, predicted_regime, text_color=pred_regime_color)
+    else
+        table.cell(info_table, 0, 5, "Band Width")
+        table.cell(info_table, 1, 5, str.tostring(current_band_width, "#.##"))
+    
+    // Price position
+    price_position = price_above_upper ? "Above Bands" : price_below_lower ? "Below Bands" : "In Bands"
+    position_color = price_above_upper ? color.red : price_below_lower ? color.green : color.gray
+    table.cell(info_table, 0, 6, "Price Position")
+    table.cell(info_table, 1, 6, price_position, text_color=position_color)
+    
+    // Squeeze status
+    table.cell(info_table, 0, 7, "Squeeze")
+    table.cell(info_table, 1, 7, squeeze_condition ? "Yes" : "No", text_color=squeeze_condition ? color.orange : color.gray)
+    
+    // Multiplier
+    table.cell(info_table, 0, 8, "Multiplier")
+    table.cell(info_table, 1, 8, str.tostring(adaptive_multiplier, "#.##"))
+    
+    // Zero Lag Method
+    table.cell(info_table, 0, 9, "ZL Method")
+    table.cell(info_table, 1, 9, smoothing_type, text_color=color.purple)
+    
+    // Band smoothing method
+    table.cell(info_table, 0, 10, "Band Method")
+    smoothing_status = enable_band_smoothing ? band_smoothing_method : "Off"
+    table.cell(info_table, 1, 10, smoothing_status, text_color=enable_band_smoothing ? color.green : color.gray)
+    
+    // Zero Lag Gain with warning for high values
+    gain_color = zero_lag_gain > 5 ? color.red : zero_lag_gain > 3 ? color.orange : color.purple
+    gain_text = str.tostring(zero_lag_gain, "#.#") + (zero_lag_gain > 5 ? " ⚠" : "")
+    table.cell(info_table, 0, 11, "ZL Gain")
+    table.cell(info_table, 1, 11, gain_text, text_color=gain_color)
+    
+    // Lag Reduction estimate
+    lag_reduction_pct = zero_lag_gain * 12.0 + (zero_lag_gain > 4 ? (zero_lag_gain - 4) * 8 : 0)
+    lag_reduction_pct := math.min(lag_reduction_pct, 95)  // Cap at 95%
+    table.cell(info_table, 0, 12, "Est. Lag Reduction")
+    table.cell(info_table, 1, 12, str.tostring(lag_reduction_pct, "#.#") + "%", text_color=color.purple)
+    
+    // Double smoothing indicator
+    table.cell(info_table, 0, 13, "Double ZL")
+    table.cell(info_table, 1, 13, double_smooth ? "Yes" : "No", text_color=double_smooth ? color.green : color.gray)
+
+// ═══════════════════════════════════════════════════════════════
+//                    ALERT CONDITIONS
+// ═══════════════════════════════════════════════════════════════
+
+// Volatility regime alerts
+alertcondition(high_vol_regime and not high_vol_regime[1], "High Volatility Regime", "Entered high volatility regime")
+alertcondition(low_vol_regime and not low_vol_regime[1], "Low Volatility Regime", "Entered low volatility regime")
+
+// Band interaction alerts
+alertcondition(upper_breakout, "Upper Band Breakout", "Price broke above upper volatility band")
+alertcondition(lower_breakdown, "Lower Band Breakdown", "Price broke below lower volatility band")
+
+// Squeeze alerts
+alertcondition(squeeze_condition and not squeeze_condition[1], "Volatility Squeeze", "Volatility bands are contracting")
+
+// Expansion alerts
+alertcondition(vol_expansion and not vol_expansion[1], "Volatility Expansion", "Volatility is expanding")
+
+// Zero lag specific alert
+alertcondition(significant_zl and not significant_zl[1], "Zero Lag Active", "Zero lag smoothing activated with significant gain")
+
+// Predicted volatility alerts (if enabled)
+pred_vol_spike = enable_prediction and (predicted_volatility > base_volatility * 1.3)
+pred_vol_drop = enable_prediction and (predicted_volatility < base_volatility * 0.7)
+
+alertcondition(pred_vol_spike and not pred_vol_spike[1], "Predicted Vol Spike", "Volatility predicted to increase significantly")
+alertcondition(pred_vol_drop and not pred_vol_drop[1], "Predicted Vol Drop", "Volatility predicted to decrease significantly")

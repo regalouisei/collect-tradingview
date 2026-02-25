@@ -1,0 +1,130 @@
+//@version=6
+indicator("RSI Regime & Reversals (Leading) — Bull/Bear Trend Finder", overlay=true)
+
+// ====== Inputs
+src            = input.source(close, "RSI Source")
+rsiLen         = input.int(14, "RSI Length", minval=2)
+rsiSmoothing   = input.int(5,  "RSI EMA Smooth", minval=1)
+regimeWindow   = input.int(50, "Regime Window (bars)", minval=10)
+bullFloor      = input.float(40.0, "Bull Regime Floor (RSI range shift)", minval=0, maxval=100)
+bearCeil       = input.float(60.0, "Bear Regime Ceiling (RSI range shift)", minval=0, maxval=100)
+useRSIMidline  = input.bool(true, "Require RSI > 50 for Bull / < 50 for Bear")
+pivotL         = input.int(5, "Pivot Left Bars", minval=1)
+pivotR         = input.int(5, "Pivot Right Bars", minval=1)
+showLabels     = input.bool(true, "Show Signal Labels")
+showBackground = input.bool(true, "Shade Background by Regime")
+
+// ====== RSI & helpers
+rsiRaw = ta.rsi(src, rsiLen)
+rsi    = ta.ema(rsiRaw, rsiSmoothing)
+rsiHi  = ta.highest(rsi, regimeWindow)
+rsiLo  = ta.lowest(rsi, regimeWindow)
+
+// Regime detection via RSI range shift (Cardwell-style)
+bullRegime     = (rsiLo >= bullFloor) and (useRSIMidline ? rsi > 50 : true)
+bearRegime     = (rsiHi <= bearCeil)   and (useRSIMidline ? rsi < 50 : true)
+neutralRegime  = not bullRegime and not bearRegime
+
+// ====== Pivot detection (confirmed pivots)
+pl = ta.pivotlow(low,  pivotL, pivotR)
+ph = ta.pivothigh(high, pivotL, pivotR)
+
+pivotLowConfirmed  = not na(pl)
+pivotHighConfirmed = not na(ph)
+pivotLowBarIndex   = pivotLowConfirmed  ? (bar_index - pivotR) : na
+pivotHighBarIndex  = pivotHighConfirmed ? (bar_index - pivotR) : na
+
+// Capture RSI at pivot bars (must reference historic RSI)
+rsiAtPivotLow  = pivotLowConfirmed  ? rsi[pivotR] : na
+rsiAtPivotHigh = pivotHighConfirmed ? rsi[pivotR] : na
+
+// ====== Arrays to keep last pivots (bounded)
+var plPrices = array.new_float()
+var plRsi    = array.new_float()
+var plBars   = array.new_int()
+
+var phPrices = array.new_float()
+var phRsi    = array.new_float()
+var phBars   = array.new_int()
+
+// Keep arrays small
+var int maxArr = 120
+
+if pivotLowConfirmed
+    array.push(plPrices, pl)
+    array.push(plRsi,    rsiAtPivotLow)
+    array.push(plBars,   pivotLowBarIndex)
+    if array.size(plPrices) > maxArr
+        array.shift(plPrices)
+        array.shift(plRsi)
+        array.shift(plBars)
+
+if pivotHighConfirmed
+    array.push(phPrices, ph)
+    array.push(phRsi,    rsiAtPivotHigh)
+    array.push(phBars,   pivotHighBarIndex)
+    if array.size(phPrices) > maxArr
+        array.shift(phPrices)
+        array.shift(phRsi)
+        array.shift(phBars)
+
+// ====== Helpers to get last two elements
+f_last2_float(arr) =>
+    sz = array.size(arr)
+    [sz >= 2 ? array.get(arr, sz-2) : na, sz >= 2 ? array.get(arr, sz-1) : na]
+
+f_last2_int(arr) =>
+    sz = array.size(arr)
+    [sz >= 2 ? array.get(arr, sz-2) : na, sz >= 2 ? array.get(arr, sz-1) : na]
+
+// Last two lows
+[plPricePrev, plPriceLast] = f_last2_float(plPrices)
+[plRsiPrev,   plRsiLast]   = f_last2_float(plRsi)
+[plBarPrev,   plBarLast]   = f_last2_int(plBars)
+
+// Last two highs
+[phPricePrev, phPriceLast] = f_last2_float(phPrices)
+[phRsiPrev,   phRsiLast]   = f_last2_float(phRsi)
+[phBarPrev,   phBarLast]   = f_last2_int(phBars)
+
+// ====== Signal logic
+// Classic divergences
+bullDiv = na(plPricePrev) ? false : (plPriceLast < plPricePrev and plRsiLast > plRsiPrev)   // price LL, RSI HL
+bearDiv = na(phPricePrev) ? false : (phPriceLast > phPricePrev and phRsiLast < phRsiPrev)   // price HH, RSI LH
+
+// Cardwell reversals (often leading)
+posRev  = na(plPricePrev) ? false : (plPriceLast > plPricePrev and plRsiLast < plRsiPrev)   // Positive reversal (bullish)
+negRev  = na(phPricePrev) ? false : (phPriceLast < phPricePrev and phRsiLast > phRsiPrev)   // Negative reversal (bearish)
+
+// Gate signals by regime (reduce noise)
+bullSignal = (posRev or bullDiv) and (bullRegime or neutralRegime)
+bearSignal = (negRev or bearDiv) and (bearRegime or neutralRegime)
+
+// Match signals to the bar where the *latest* pivot confirmed
+bullBarMatch = not na(plBarLast) and bar_index == plBarLast
+bearBarMatch = not na(phBarLast) and bar_index == phBarLast
+
+// ====== Plot styling
+// Background shading — build color in local logic, call bgcolor() once in global scope
+color bgCol = na
+if showBackground
+    if bullRegime
+        bgCol := color.new(color.teal, 88)
+    else if bearRegime
+        bgCol := color.new(color.red, 88)
+bgcolor(bgCol)
+
+// Mark pivot points lightly (optional tiny dots)
+plot(pivotLowConfirmed  ? pl : na,  "Pivot Low",  color=color.new(color.teal, 70),  style=plot.style_circles, offset=-pivotR, linewidth=1)
+plot(pivotHighConfirmed ? ph : na,  "Pivot High", color=color.new(color.red,  70),  style=plot.style_circles, offset=-pivotR, linewidth=1)
+
+// Bullish/Bearish labels (single-line to avoid EOL continuation issues)
+if showLabels and bullSignal and bullBarMatch
+    label.new(plBarLast, plPriceLast, text="▲ Bull lead\n" + (posRev ? "Pos. Reversal" : "Bull Div"), style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white)
+
+if showLabels and bearSignal and bearBarMatch
+    label.new(phBarLast, phPriceLast, text="▼ Bear lead\n" + (negRev ? "Neg. Reversal" : "Bear Div"), style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+// ====== Alerts
+alertcondition(bullSignal and bullBarMatch, title="Bullish Leading Signal", message="RSI Leading Bullish Signal: Positive Reversal or Bullish Divergence")
+alertcondition(bearSignal and bearBarMatch, title="Bearish Leading Signal", message="RSI Leading Bearish Signal: Negative Reversal or Bearish Divergence")

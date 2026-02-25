@@ -1,0 +1,184 @@
+//@version=6
+indicator("CNE - Efficient Swing Structure + Momentum", overlay=false, precision=2)
+
+// ── Inputs
+grp_struc = "Structure Settings"
+atrLen    = input.int(14, "ATR Length", group=grp_struc)
+atrMult   = input.float(2.0, "ATR Filter Multiplier", minval=0.1, step=0.1, tooltip="Higher = ignores larger ranges/pullbacks. 2.0 is standard.", group=grp_struc)
+
+grp_disp  = "Display Settings"
+asPct     = input.bool(true, "Show % change", group=grp_disp)
+showBands = input.bool(true, "Show ±1σ / ±2σ bands", group=grp_disp)
+showDiv   = input.bool(true, "Show Divergence Signals", group=grp_disp)
+bullColor = input.color(color.new(color.lime, 0), "Bullish Divergence Colour", group=grp_disp)
+bearColor = input.color(color.new(color.red,  0), "Bearish Divergence Colour", group=grp_disp)
+
+grp_avg   = "Average Extension/Drawdown Lines"
+showAvgs  = input.bool(true, "Show Average Swing Lines", group=grp_avg)
+colAvgPos = input.color(color.new(color.teal, 30), "Avg Up Extension Color", group=grp_avg)
+colAvgNeg = input.color(color.new(color.maroon, 30), "Avg Down Drawdown Color", group=grp_avg)
+
+// σ band colour options
+colInside = input.color(color.new(color.gray, 70), "Colour inside ±1σ", group=grp_disp)
+col1Pos   = input.color(color.new(color.orange, 0), "+1σ to +2σ Colour", group=grp_disp)
+col1Neg   = input.color(color.new(color.teal, 0), "-1σ to -2σ Colour", group=grp_disp)
+col2Pos   = input.color(color.new(color.red, 0), "> +2σ Colour", group=grp_disp)
+col2Neg   = input.color(color.new(color.lime, 0), "< -2σ Colour", group=grp_disp)
+
+// ── Dynamic lookback based on timeframe (for Bands)
+int length = na
+switch timeframe.period
+    "D"  => length := 20
+    "65" => length := 70
+    "15" => length := 250
+    "5"  => length := 385
+    => length := 20
+
+// ── 1. Efficient Swing Detection Logic
+atr = ta.atr(atrLen)
+
+// Trend: 1 = Uptrend, -1 = Downtrend
+var int trend = 1 
+
+var float currentSeqHigh = 0.0      
+var float currentSeqLow  = 1000000.0 
+var float startPrice     = close    
+
+// Stats variables (Using cumulative running sums for O(1) efficiency)
+var float sumExtPos    = 0.0
+var int   cntExtPos    = 0
+var float avgExtPos    = 0.0
+var float recentExtPos = 0.0 // Weighted average for recent context
+
+var float sumExtNeg    = 0.0
+var int   cntExtNeg    = 0
+var float avgExtNeg    = 0.0
+var float recentExtNeg = 0.0 // Weighted average for recent context
+
+// Update Swing Extremes continuously
+currentSeqHigh := math.max(currentSeqHigh, high)
+currentSeqLow  := math.min(currentSeqLow, low)
+
+// -- Logic: Switch to Downtrend? -- 
+if trend == 1
+    threshold = currentSeqHigh - (atr * atrMult)
+    if close < threshold
+        // Trend Flipping from UP to DOWN. 
+        // We just finished an UP leg. Calculate the Extension of that leg.
+        // The leg started at 'startPrice' (Low) and peaked at 'currentSeqHigh'.
+        
+        moveVal = asPct ? ((currentSeqHigh - startPrice) / startPrice * 100) : (currentSeqHigh - startPrice)
+        
+        // Update Historical Average (Cumulative)
+        sumExtPos += moveVal
+        cntExtPos += 1
+        avgExtPos := sumExtPos / cntExtPos
+        
+        // Update Recent Average (Weighted decay, approx last 5 swings)
+        // If it's the first value, set it directly, otherwise smooth it
+        recentExtPos := (cntExtPos == 1) ? moveVal : ((recentExtPos * 4) + moveVal) / 5
+        
+        trend := -1
+        startPrice := currentSeqHigh 
+        currentSeqLow := low 
+
+// -- Logic: Switch to Uptrend? --
+if trend == -1
+    threshold = currentSeqLow + (atr * atrMult)
+    if close > threshold
+        // Trend Flipping from DOWN to UP.
+        // We just finished a DOWN leg. Calculate the Drawdown of that leg.
+        // The leg started at 'startPrice' (High) and bottomed at 'currentSeqLow'.
+        
+        moveVal = asPct ? ((currentSeqLow - startPrice) / startPrice * 100) : (currentSeqLow - startPrice)
+        
+        // Update Historical Average (Cumulative)
+        sumExtNeg += moveVal
+        cntExtNeg += 1
+        avgExtNeg := sumExtNeg / cntExtNeg
+        
+        // Update Recent Average (Weighted decay)
+        recentExtNeg := (cntExtNeg == 1) ? moveVal : ((recentExtNeg * 4) + moveVal) / 5
+        
+        trend := 1
+        startPrice := currentSeqLow
+        currentSeqHigh := high
+
+// ── 2. Calculation (Pivot-to-Pivot Momentum)
+float anchor = na(startPrice) ? close : startPrice
+float cumChange = close - anchor
+chgDisplay = asPct ? (anchor != 0 ? cumChange / anchor * 100 : na) : cumChange
+
+// ── 3. Stats & Bands
+meanChg = ta.sma(chgDisplay, length)
+stdChg  = ta.stdev(chgDisplay, length)
+upper1  = meanChg + stdChg
+lower1  = meanChg - stdChg
+upper2  = meanChg + 2 * stdChg
+lower2  = meanChg - 2 * stdChg
+
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dashed)
+
+// Plot Bands
+plot(showBands ? upper1 : na, "+1σ", color=color.new(color.gray, 70))
+plot(showBands ? lower1 : na, "-1σ", color=color.new(color.gray, 70))
+plot(showBands ? upper2 : na, "+2σ", color=color.new(color.gray, 50))
+plot(showBands ? lower2 : na, "-2σ", color=color.new(color.gray, 50))
+plot(meanChg, "Mean", color=color.new(color.blue, 0), linewidth=2)
+
+// Plot Averages (New Feature)
+// We prevent plotting 0 lines at the very start of data before any swings are recorded
+plot(showAvgs and avgExtPos != 0 ? avgExtPos : na, "Avg Up Extension", color=colAvgPos, linewidth=1, style=plot.style_stepline)
+plot(showAvgs and recentExtPos != 0 ? recentExtPos : na, "Recent Up Extension", color=colAvgPos, linewidth=1, style=plot.style_stepline, offset=0)
+// To make the Recent line dashed, we can't use standard style with stepline easily in one go, 
+// but using a different transparency/shade helps distinguish them.
+// Solid line = All Time Average. 
+// We will add a dashed visual for the recent average by plotting points or standard line.
+plot(showAvgs and recentExtPos != 0 ? recentExtPos : na, "Recent Up Ext (Dashed)", color=colAvgPos, linewidth=1, style=plot.style_circles)
+
+plot(showAvgs and avgExtNeg != 0 ? avgExtNeg : na, "Avg Down Drawdown", color=colAvgNeg, linewidth=1, style=plot.style_stepline)
+plot(showAvgs and recentExtNeg != 0 ? recentExtNeg : na, "Recent Down Drawdown", color=colAvgNeg, linewidth=1, style=plot.style_circles)
+
+// ── 4. Divergence (Based on Structure Flips)
+bool bearSignal = false
+bool bullSignal = false
+var float lastTrendHighVal = na
+var float lastTrendLowVal  = na
+var float prevTrendHighVal = na
+var float prevTrendLowVal  = na
+
+if ta.change(trend) != 0 
+    if trend == -1 // Just confirmed a TOP
+        prevTrendHighVal := lastTrendHighVal
+        lastTrendHighVal := chgDisplay[1] 
+        if not na(prevTrendHighVal) and lastTrendHighVal < prevTrendHighVal
+            bearSignal := true
+            
+    if trend == 1 // Just confirmed a BOTTOM
+        prevTrendLowVal := lastTrendLowVal
+        lastTrendLowVal := chgDisplay[1]
+        if not na(prevTrendLowVal) and lastTrendLowVal > prevTrendLowVal
+            bullSignal := true
+
+// ── 5. Colouring & Plotting
+in1Sigma  = chgDisplay <= upper1 and chgDisplay >= lower1
+pos1to2   = chgDisplay > upper1 and chgDisplay <= upper2
+neg1to2   = chgDisplay < lower1 and chgDisplay >= lower2
+pos2plus  = chgDisplay > upper2
+neg2plus  = chgDisplay < lower2
+
+bandCol = in1Sigma ? colInside :
+           pos1to2  ? col1Pos   :
+           neg1to2  ? col1Neg   :
+           pos2plus ? col2Pos   :
+           neg2plus ? col2Neg   :
+           color.gray
+
+sigCol  = showDiv ? (bullSignal ? bullColor : bearSignal ? bearColor : na) : na
+plotCol = na(sigCol) ? bandCol : sigCol
+
+plot(chgDisplay, "Pivot-to-Pivot Change", style=plot.style_columns, color=plotCol)
+
+// ── Alerts
+alertcondition(bullSignal, "Bullish Divergence", "Efficient Structure bullish divergence")
+alertcondition(bearSignal, "Bearish Divergence", "Efficient Structure bearish divergence")

@@ -1,0 +1,346 @@
+//@version=6
+indicator("Smart Options Regime & Strategy Engine [KedArc Quant]", overlay=false, max_bars_back=2000)
+
+//--------------------
+// Inputs - Volatility
+//--------------------
+groupVol = "Volatility Engine (Daily RV + Daily IV)"
+
+rvLen       = input.int(20, "RV Lookback (days)", minval=5, maxval=200, group=groupVol)
+tradingDays = input.int(252, "Trading days per year", minval=200, maxval=260, group=groupVol)
+
+ivMode = input.string("Auto (US/India)", "IV Proxy Mode",
+     options=["Auto (US/India)", "CBOE:VIX", "NSE:INDIAVIX", "Custom", "Manual"],
+     group=groupVol)
+
+ivCustomSymbol = input.string("CBOE:VIX", "Custom IV Symbol", group=groupVol)
+ivManual       = input.float(12.0, "Manual ATM IV (%) (used when IV Mode = Manual)", step=0.1, group=groupVol)
+
+ivPctLookback  = input.int(252, "IV Percentile Lookback (days)", minval=50, maxval=2000, group=groupVol)
+
+hiVrp  = input.float(12.0, "VRP HIGH threshold", step=0.5, group=groupVol)
+midVrp = input.float(5.0,  "VRP MID threshold",  step=0.5, group=groupVol)
+
+//--------------------
+// Inputs - Direction / Regime
+//--------------------
+groupTrend = "Direction Engine (Trend vs Sideways)"
+
+useHTFTrend = input.bool(true, "Use Higher Timeframe for trend filter", group=groupTrend)
+trendTF     = input.timeframe("60", "Trend timeframe (HTF)", group=groupTrend)
+
+emaFastLen = input.int(20, "EMA Fast", minval=5, maxval=200, group=groupTrend)
+emaSlowLen = input.int(50, "EMA Slow", minval=10, maxval=300, group=groupTrend)
+
+adxLen       = input.int(14, "ADX Length", minval=5, maxval=50, group=groupTrend)
+adxSmoothing = input.int(14, "ADX Smoothing", minval=5, maxval=50, group=groupTrend)
+adxSideways  = input.float(18.0, "Sideways if ADX below", step=0.5, group=groupTrend)
+
+bandPct = input.float(0.15, "Sideways band (% between EMAs)", step=0.01, group=groupTrend)
+
+//--------------------
+// Inputs - Execution / Dashboard
+//--------------------
+groupUI = "Dashboard / Outputs"
+
+minScoreForSell = input.int(6, "Min Score to allow premium selling (0-8)", minval=0, maxval=8, group=groupUI)
+
+dashPos  = input.string("Top Right", "Dashboard Position",
+          options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group=groupUI)
+
+dashFont = input.string("Normal", "Dashboard Font Size",
+          options=["Tiny","Small","Normal","Large"], group=groupUI)
+
+dashMode = input.string("Compact", "Dashboard Mode",
+          options=["Compact","Full"], group=groupUI)
+
+showFlipMarkers = input.bool(false, "Show markers only when FINAL RECO changes", group=groupUI)
+
+//====================================================================
+// Helper mappings
+//====================================================================
+dashPosition =
+     dashPos == "Top Left"     ? position.top_left :
+     dashPos == "Bottom Right" ? position.bottom_right :
+     dashPos == "Bottom Left"  ? position.bottom_left :
+     dashPos == "Middle Right" ? position.middle_right :
+                                 position.top_right
+
+dashTextSize =
+     dashFont == "Tiny"  ? size.tiny  :
+     dashFont == "Small" ? size.small :
+     dashFont == "Large" ? size.large :
+                           size.normal
+
+// Robust India detection
+isIndiaByTicker = str.contains(syminfo.tickerid, "NSE:") or str.contains(syminfo.tickerid, "BSE:")
+isIndiaByCcy    = (syminfo.currency == "INR")
+isIndia         = isIndiaByTicker or isIndiaByCcy
+
+autoIvSymbol = isIndia ? "NSE:INDIAVIX" : "CBOE:VIX"
+
+ivSymbolUsed =
+     ivMode == "Auto (US/India)" ? autoIvSymbol :
+     ivMode == "CBOE:VIX"        ? "CBOE:VIX" :
+     ivMode == "NSE:INDIAVIX"    ? "NSE:INDIAVIX" :
+     ivMode == "Custom"          ? ivCustomSymbol :
+                                   ""
+
+//====================================================================
+// DAILY RV
+//====================================================================
+dClose = request.security(syminfo.tickerid, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+dRet   = math.log(dClose / dClose[1])
+rvDaily  = ta.stdev(dRet, rvLen)
+rvAnnual = rvDaily * math.sqrt(tradingDays) * 100.0
+
+//====================================================================
+// DAILY IV (Proxy) or Manual
+//====================================================================
+ivProxyD = ivMode == "Manual" ? na : request.security(ivSymbolUsed, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+ivUsed   = ivMode == "Manual" ? ivManual : ivProxyD
+
+//====================================================================
+// VRP
+//====================================================================
+vrp = ivUsed - rvAnnual
+
+string vrpState = vrp > 0 ? "POSITIVE (IV > RV)" : "NEGATIVE (IV < RV)"
+
+//====================================================================
+// Dynamic IV Percentile
+//====================================================================
+ivMin = ta.lowest(ivUsed, ivPctLookback)
+ivMax = ta.highest(ivUsed, ivPctLookback)
+ivPct = (ivMax != ivMin) ? (100.0 * (ivUsed - ivMin) / (ivMax - ivMin)) : 50.0
+ivPct := math.max(0.0, math.min(100.0, ivPct))
+
+//====================================================================
+// RV/IV trend flags
+//====================================================================
+rvRising = rvAnnual > rvAnnual[5]
+ivRising = ivUsed   > ivUsed[5]
+
+//====================================================================
+// VOL SCORE (0-8)
+//====================================================================
+scoreIVP = ivPct < 40 ? 0 : ivPct < 70 ? 1 : 2
+scoreVRP = vrp < 0 ? 0 : vrp < 2 ? 1 : vrp < 4 ? 2 : 3
+scoreIVX = ivPct < 50 ? 0 : ivPct < 75 ? 1 : ivPct < 90 ? 2 : 3
+totalScore = scoreIVP + scoreVRP + scoreIVX
+
+sellEdge = (vrp > 0) and (totalScore >= minScoreForSell)
+
+//====================================================================
+// TREND REGIME (NEW: LTF + HTF shown separately)
+//====================================================================
+
+// LTF = chart timeframe
+ltfTF = timeframe.period
+ltfClose = request.security(syminfo.tickerid, ltfTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+ltfEmaFast = request.security(syminfo.tickerid, ltfTF, ta.ema(close, emaFastLen), barmerge.gaps_off, barmerge.lookahead_off)
+ltfEmaSlow = request.security(syminfo.tickerid, ltfTF, ta.ema(close, emaSlowLen), barmerge.gaps_off, barmerge.lookahead_off)
+[ltfPDI, ltfMDI, ltfAdx] = request.security(syminfo.tickerid, ltfTF, ta.dmi(adxLen, adxSmoothing), barmerge.gaps_off, barmerge.lookahead_off)
+
+ltfSpreadPct = (ltfClose != 0) ? (math.abs(ltfEmaFast - ltfEmaSlow) / ltfClose * 100.0) : 0.0
+ltfSideways = (ltfAdx < adxSideways) or (ltfSpreadPct < bandPct)
+ltfBull = (ltfEmaFast > ltfEmaSlow) and not ltfSideways
+ltfBear = (ltfEmaFast < ltfEmaSlow) and not ltfSideways
+string ltfTrendRegime = ltfSideways ? "SIDEWAYS" : ltfBull ? "BULLISH" : ltfBear ? "BEARISH" : "MIXED"
+
+// HTF = chosen filter timeframe
+htfTF = trendTF
+htfClose = request.security(syminfo.tickerid, htfTF, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaFast = request.security(syminfo.tickerid, htfTF, ta.ema(close, emaFastLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfEmaSlow = request.security(syminfo.tickerid, htfTF, ta.ema(close, emaSlowLen), barmerge.gaps_off, barmerge.lookahead_off)
+[htfPDI, htfMDI, htfAdx] = request.security(syminfo.tickerid, htfTF, ta.dmi(adxLen, adxSmoothing), barmerge.gaps_off, barmerge.lookahead_off)
+
+htfSpreadPct = (htfClose != 0) ? (math.abs(htfEmaFast - htfEmaSlow) / htfClose * 100.0) : 0.0
+htfSideways = (htfAdx < adxSideways) or (htfSpreadPct < bandPct)
+htfBull = (htfEmaFast > htfEmaSlow) and not htfSideways
+htfBear = (htfEmaFast < htfEmaSlow) and not htfSideways
+string htfTrendRegime = htfSideways ? "SIDEWAYS" : htfBull ? "BULLISH" : htfBear ? "BEARISH" : "MIXED"
+
+// Existing logic uses either HTF or LTF depending on toggle (NO MAJOR CHANGE)
+string trendRegime = useHTFTrend ? htfTrendRegime : ltfTrendRegime
+isSideways = useHTFTrend ? htfSideways : ltfSideways
+isBull     = useHTFTrend ? htfBull : ltfBull
+isBear     = useHTFTrend ? htfBear : ltfBear
+
+// Bias label for dashboard (HTF wins; if HTF sideways, use LTF)
+string bias =
+     (htfTrendRegime != "SIDEWAYS") ? ("HTF " + htfTrendRegime) :
+     (ltfTrendRegime != "SIDEWAYS") ? ("LTF " + ltfTrendRegime) :
+                                      "NEUTRAL / SIDEWAYS"
+
+//====================================================================
+// VOL REGIME
+//====================================================================
+string volRegime = ""
+if vrp <= 0
+    volRegime := (ivRising or rvRising) ? "VOL EXPANSION" : "NO EDGE"
+else
+    if (vrp >= hiVrp) and not rvRising
+        volRegime := "HIGH VRP"
+    else if (vrp >= midVrp)
+        volRegime := "MODERATE VRP"
+    else
+        volRegime := "LOW VRP"
+
+//====================================================================
+// FINAL RECO (with a small realism override)
+//====================================================================
+string reco = ""
+
+if vrp <= 0
+    if isBull
+        reco := "DEBIT SPREAD (BULLISH)"
+    else if isBear
+        reco := "DEBIT SPREAD (BEARISH)"
+    else
+        reco := "AVOID / WAIT (NO EDGE)"
+else
+    if not sellEdge
+        if (totalScore == minScoreForSell - 1) and (vrp > 0)
+            if isBull
+                reco := "SMALL SELL PUT SPREAD (BULLISH)"
+            else if isBear
+                reco := "SMALL SELL CALL SPREAD (BEARISH)"
+            else
+                reco := "SMALL CREDIT SPREAD / WAIT"
+        else
+            reco := "SMALL CREDIT SPREAD / WAIT"
+    else
+        if isSideways and (volRegime == "HIGH VRP" or volRegime == "MODERATE VRP")
+            reco := "IRON CONDOR (DEFINED RISK)"
+        else
+            if isBull
+                reco := "SELL PUT SPREAD (BULLISH)"
+            else if isBear
+                reco := "SELL CALL SPREAD (BEARISH)"
+            else
+                reco := "CREDIT SPREAD (DEFINED RISK)"
+
+//====================================================================
+// Delta Recommendation Layer
+//====================================================================
+var string deltaSell = ""
+var string deltaBuy  = ""
+
+if str.contains(reco, "SELL PUT SPREAD")
+    deltaSell := "Sell PE delta: 0.15 to 0.25"
+    deltaBuy  := "Buy PE delta: 0.05 to 0.10"
+else if str.contains(reco, "SELL CALL SPREAD")
+    deltaSell := "Sell CE delta: -0.15 to -0.25"
+    deltaBuy  := "Buy CE delta: -0.05 to -0.10"
+else if str.contains(reco, "IRON CONDOR")
+    deltaSell := "Sell delta: +/-0.10 to +/-0.20"
+    deltaBuy  := "Buy delta: +/-0.03 to +/-0.08"
+else if str.contains(reco, "DEBIT SPREAD")
+    deltaSell := "Buy delta: 0.40 to 0.60"
+    deltaBuy  := "Sell hedge: 0.20 to 0.40"
+else
+    deltaSell := "No trade"
+    deltaBuy  := ""
+
+//====================================================================
+// MARKERS (optional)
+//====================================================================
+recoChanged = reco != reco[1]
+plotshape(showFlipMarkers and recoChanged, title="Reco Changed", style=shape.labeldown, text="RECO", location=location.top, size=size.tiny, color=color.new(color.blue, 0), textcolor=color.white)
+
+//====================================================================
+// PLOTS
+//====================================================================
+plot(rvAnnual, title="RV % (Annualized, Daily)", linewidth=2)
+plot(ivUsed,   title="IV % (Daily proxy or manual)", linewidth=2)
+hline(0, "VRP Zero", color=color.new(color.gray, 60))
+vrpColor = vrp > 0 ? color.new(color.green, 0) : color.new(color.red, 0)
+plot(vrp, title="VRP (IV - RV)", style=plot.style_columns, color=vrpColor)
+
+//====================================================================
+// DASHBOARD TABLE (Compact vs Full)
+//====================================================================
+// Minimal add: +2 rows for LTF/HTF +1 for Bias
+rows = dashMode == "Full" ? 21 : 16
+var table dash = table.new(dashPosition, 2, rows, border_width=1)
+
+f_cell(_c, _r, _txt, _bg) =>
+    table.cell(dash, _c, _r, _txt, text_color=color.white, bgcolor=_bg, text_size=dashTextSize)
+
+if barstate.islast
+    bg =         sellEdge ? color.new(color.green, 75) :         (vrp > 0) ? color.new(color.orange, 75) :                    color.new(color.red, 75)
+
+    // Header
+    f_cell(0, 0, "OPTIONS REGIME & TRADE RECO", bg)
+    f_cell(1, 0, "EDGE SCORE " + str.tostring(totalScore) + "/8", bg)
+
+    f_cell(0, 1, "RV (" + str.tostring(rvLen) + "D)", color.new(color.black, 0))
+    f_cell(1, 1, "  " + str.tostring(rvAnnual, format.mintick) + " %", color.new(color.black, 0))
+
+    f_cell(0, 2, (ivMode == "Manual" ? "IV (Manual)" : "IV (Proxy D)"), color.new(color.black, 0))
+    f_cell(1, 2, "  " + str.tostring(ivUsed, format.mintick) + " %", color.new(color.black, 0))
+
+    f_cell(0, 3, "VRP (IV-RV)", color.new(color.black, 0))
+    f_cell(1, 3, "  " + str.tostring(vrp, format.mintick) + " %", color.new(color.black, 0))
+
+    vrpBg = (vrp > 0) ? color.new(color.green, 80) : color.new(color.red, 80)
+    f_cell(0, 4, "VRP State", vrpBg)
+    f_cell(1, 4, "  " + vrpState, vrpBg)
+
+    f_cell(0, 5, "IV %ile (dyn)", color.new(color.black, 0))
+    f_cell(1, 5, "  " + str.tostring(ivPct, format.mintick), color.new(color.black, 0))
+
+    f_cell(0, 6, "Vol Regime", bg)
+    f_cell(1, 6, "  " + volRegime, bg)
+
+    f_cell(0, 7, "Sell Edge", bg)
+    f_cell(1, 7, sellEdge ? "  YES" : "  NO", bg)
+
+    // NEW: Bias + both trend regimes
+    f_cell(0, 8, "Bias", color.new(color.black, 0))
+    f_cell(1, 8, "  " + bias, color.new(color.black, 0))
+
+    f_cell(0, 9, "LTF Trend (" + ltfTF + ")", color.new(color.black, 0))
+    f_cell(1, 9, "  " + ltfTrendRegime, color.new(color.black, 0))
+
+    f_cell(0,10, "HTF Trend (" + htfTF + ")", color.new(color.black, 0))
+    f_cell(1,10, "  " + htfTrendRegime, color.new(color.black, 0))
+
+    // Shift remaining rows down
+    f_cell(0,11, "FINAL RECO", bg)
+    f_cell(1,11, "  " + reco, bg)
+
+    f_cell(0,12, "Sell Leg Delta", color.new(color.black, 0))
+    f_cell(1,12, "  " + deltaSell, color.new(color.black, 0))
+
+    f_cell(0,13, "IV Source", color.new(color.black, 0))
+    f_cell(1,13, (ivMode == "Manual") ? "  Manual" : ("  " + ivSymbolUsed), color.new(color.black, 0))
+
+    // FULL mode extra rows
+    if dashMode == "Full"
+        f_cell(0,14, "Hedge Leg Delta", color.new(color.black, 0))
+        f_cell(1,14, "  " + deltaBuy, color.new(color.black, 0))
+
+        f_cell(0,15, "RV Trend", color.new(color.black, 0))
+        f_cell(1,15, rvRising ? "  Rising" : "  Flat/Down", color.new(color.black, 0))
+
+        f_cell(0,16, "IV Trend", color.new(color.black, 0))
+        f_cell(1,16, ivRising ? "  Rising" : "  Flat/Down", color.new(color.black, 0))
+
+        // Show the ADX/spread of the ACTIVE filter TF (same as before, but now clear)
+        activeAdx = useHTFTrend ? htfAdx : ltfAdx
+        activeSpr = useHTFTrend ? htfSpreadPct : ltfSpreadPct
+        activeTF  = useHTFTrend ? htfTF : ltfTF
+
+        f_cell(0,17, "ADX (" + activeTF + ")", color.new(color.black, 0))
+        f_cell(1,17, "  " + str.tostring(activeAdx, format.mintick), color.new(color.black, 0))
+
+        f_cell(0,18, "EMA Spread % (" + activeTF + ")", color.new(color.black, 0))
+        f_cell(1,18, "  " + str.tostring(activeSpr, format.mintick), color.new(color.black, 0))
+
+        // Keep unused rows safe
+        f_cell(0,19, "", color.new(color.black, 100))
+        f_cell(1,19, "", color.new(color.black, 100))
+        f_cell(0,20, "", color.new(color.black, 100))
+        f_cell(1,20, "", color.new(color.black, 100))

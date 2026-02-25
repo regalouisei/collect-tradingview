@@ -1,0 +1,440 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DefinedEdge
+
+//@version=6
+indicator("SuperTrend AI [Adaptive]", "ST AI ◈", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// --- SuperTrend Core ---
+GRP_ST  = "◈ SuperTrend"
+i_atLen = input.int(10,    "ATR Length",        minval=1, maxval=50, group=GRP_ST)
+i_bMult = input.float(3.0, "Base Multiplier",   minval=0.5, maxval=10.0, step=0.1, group=GRP_ST, tooltip="Base multiplier before regime adaptation. The AI engine adjusts this dynamically based on market conditions.")
+i_src   = input.source(hl2, "Source",           group=GRP_ST)
+
+// --- Regime Detection ---
+GRP_REG  = "◈ Regime Detection"
+i_regLen = input.int(40,    "Regime Lookback",   minval=10, maxval=100, group=GRP_REG, tooltip="Period for measuring ATR expansion/compression to classify market regime.")
+i_adxLen = input.int(14,    "ADX Length",        minval=5,  maxval=50,  group=GRP_REG)
+i_adxThr = input.float(20,  "ADX Trend Threshold", minval=10, maxval=40, step=1, group=GRP_REG, tooltip="ADX above this = trending. Below = ranging.")
+i_adapt  = input.bool(true, "Adaptive Multiplier", group=GRP_REG, tooltip="When enabled, the multiplier auto-adjusts based on regime. Wider in volatile markets, tighter in calm ones.")
+
+// --- AI Scoring ---
+GRP_AI   = "◈ AI Engine"
+i_trendLen = input.int(50,  "Trend EMA Length",  minval=10, maxval=200, group=GRP_AI)
+i_volLen   = input.int(20,  "Volume MA Length",   minval=5,  maxval=50, group=GRP_AI)
+i_minSc    = input.int(40,  "Min Signal Score",   minval=0,  maxval=90, group=GRP_AI, tooltip="Minimum AI score to display a signal. Lower = more signals, higher = stricter filter.")
+
+// --- Signals ---
+GRP_SIG  = "◈ Signals"
+i_sSig   = input.bool(true, "Show Signals",       group=GRP_SIG)
+i_hiBrt  = input.int(70,    "Bright Threshold",   minval=40, maxval=95, group=GRP_SIG, tooltip="Signals above this score show as bright. Below = dim.")
+i_sDim   = input.bool(false, "Show Dim Signals",  group=GRP_SIG, tooltip="When off, only bright signals are shown.")
+i_sigCD  = input.int(5,     "Signal Cooldown (bars)", minval=1, maxval=50, group=GRP_SIG)
+
+// --- Visuals ---
+GRP_VIS  = "◈ Visuals"
+i_sFill  = input.bool(false, "Show Gradient Fill",  group=GRP_VIS, tooltip="Off by default. Enable for gradient between price and band.")
+i_sGlow  = input.bool(true,  "Band Glow Effect",    group=GRP_VIS, tooltip="Neon glow effect around the SuperTrend band. Looks great on dark theme.")
+i_sRegBg = input.bool(true,  "Regime Background",   group=GRP_VIS, tooltip="Subtle background tint when regime is VOLATILE (amber) or RANGING (gray).")
+i_sBar   = input.bool(true,  "Color Bars",          group=GRP_VIS)
+
+// --- Dashboard ---
+GRP_DSH  = "◈ Dashboard"
+i_sDash  = input.bool(true,  "Show Dashboard",     group=GRP_DSH)
+i_dLoc   = input.string("Top Right", "Location",   options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=GRP_DSH)
+
+// --- Colors ---
+GRP_COL  = "◈ Colors"
+i_cBull  = input.color(color.new(#089981, 0), "Bull",  inline="c1", group=GRP_COL)
+i_cBear  = input.color(color.new(#f23645, 0), "Bear",  inline="c1", group=GRP_COL)
+
+// ============================================================================
+// CORE CALCULATIONS
+// ============================================================================
+
+int n = bar_index
+
+// ATR
+float atr = ta.atr(i_atLen)
+float safeAtr = nz(atr, 0.001)
+
+// ── Regime Detection ──
+// ATR ratio: current vs historical average
+float atrMa    = ta.sma(atr, i_regLen)
+float atrRatio = atrMa > 0 ? atr / atrMa : 1.0
+
+// ADX calculation
+float upMove   = high - high[1]
+float dnMove   = low[1] - low
+float plusDM    = upMove > dnMove and upMove > 0 ? upMove : 0
+float minusDM  = dnMove > upMove and dnMove > 0 ? dnMove : 0
+float trueR    = ta.tr
+float smoothTR = ta.rma(trueR, i_adxLen)
+float smoothPD = ta.rma(plusDM, i_adxLen)
+float smoothND = ta.rma(minusDM, i_adxLen)
+float plusDI    = smoothTR > 0 ? 100 * smoothPD / smoothTR : 0
+float minusDI  = smoothTR > 0 ? 100 * smoothND / smoothTR : 0
+float diSum    = plusDI + minusDI
+float dx       = diSum > 0 ? 100 * math.abs(plusDI - minusDI) / diSum : 0
+float adx      = ta.rma(dx, i_adxLen)
+
+// Regime classification
+// 0 = RANGING, 1 = TRENDING, 2 = VOLATILE
+var int regime = 1
+if atrRatio > 1.4
+    regime := 2  // VOLATILE: ATR well above average
+else if adx < i_adxThr and atrRatio < 0.9
+    regime := 0  // RANGING: weak trend + compressed ATR
+else
+    regime := 1  // TRENDING: normal conditions
+
+// ── Adaptive Multiplier ──
+float adaptMult = i_bMult
+if i_adapt
+    if regime == 2      // VOLATILE: widen bands to avoid whipsaws
+        adaptMult := i_bMult * (1.0 + (atrRatio - 1.0) * 0.4)
+    else if regime == 0  // RANGING: tighten slightly for faster response
+        adaptMult := i_bMult * 0.85
+    // TRENDING: keep base multiplier
+
+// Cap adaptive multiplier to reasonable range
+adaptMult := math.max(math.min(adaptMult, i_bMult * 2.0), i_bMult * 0.5)
+
+// ── SuperTrend Calculation ──
+var float stBand  = na
+var int   stDir   = 1   // 1 = bull, -1 = bear
+var int   flipBar = 0
+
+float upperBase = i_src + adaptMult * atr
+float lowerBase = i_src - adaptMult * atr
+
+// Previous band
+float prevBand = nz(stBand[1], stDir == 1 ? lowerBase : upperBase)
+
+if stDir == 1
+    stBand := math.max(lowerBase, prevBand)
+    if close < stBand
+        stDir  := -1
+        stBand := upperBase
+        flipBar := n
+else
+    stBand := math.min(upperBase, prevBand)
+    if close > stBand
+        stDir  := 1
+        stBand := lowerBase
+        flipBar := n
+
+bool trendFlip = stDir != stDir[1]
+
+// ── Trend EMA ──
+float trendMa = ta.ema(close, i_trendLen)
+bool  trendUp = close > trendMa
+bool  trendDn = close < trendMa
+
+// ── Volume ──
+float volMa  = ta.sma(volume, i_volLen)
+
+// ============================================================================
+// AI SIGNAL SCORING
+// ============================================================================
+
+// Score each trend flip 0-100 based on 5 factors:
+//   1. Volume surge on flip bar (0-20)
+//   2. Displacement: how far price closed beyond the band (0-25)
+//   3. Momentum: EMA trend alignment (0-20)
+//   4. Regime quality: trending regime = higher (0-15)
+//   5. Band distance before flip: how far price traveled to reach the band (0-20)
+
+scoreSignal(bool isBull) =>
+    float score = 0
+
+    // Factor 1: Volume surge (0-20)
+    float vRat = volMa > 0 ? volume / volMa : 1.0
+    float vPts = 0.0
+    if vRat >= 2.5
+        vPts := 20
+    else if vRat >= 1.5
+        vPts := 14
+    else if vRat >= 1.0
+        vPts := 8
+    else
+        vPts := 3
+    score += vPts
+
+    // Factor 2: Displacement beyond band (0-25)
+    // How far price closed past the SuperTrend line on the flip bar
+    float disp = isBull ? (close - stBand) : (stBand - close)
+    float dispAtr = safeAtr > 0 ? disp / safeAtr : 0
+    float dPts = 0.0
+    if dispAtr >= 1.5
+        dPts := 25
+    else if dispAtr >= 0.8
+        dPts := 18
+    else if dispAtr >= 0.3
+        dPts := 12
+    else if dispAtr > 0
+        dPts := 5
+    score += dPts
+
+    // Factor 3: EMA trend alignment (0-20)
+    bool aligned = (isBull and trendUp) or (not isBull and trendDn)
+    float emaDist = math.abs(close - trendMa) / safeAtr
+    float mPts = 0.0
+    if aligned and emaDist > 0.5
+        mPts := 20
+    else if aligned
+        mPts := 14
+    else if emaDist < 0.3  // near the EMA, could go either way
+        mPts := 8
+    else
+        mPts := 2  // counter-trend
+    score += mPts
+
+    // Factor 4: Regime quality (0-15)
+    float rPts = 0.0
+    if regime == 1  // TRENDING: best for SuperTrend signals
+        rPts := 15
+    else if regime == 2  // VOLATILE: signals can work but risky
+        rPts := 8
+    else  // RANGING: worst for SuperTrend
+        rPts := 3
+    score += rPts
+
+    // Factor 5: Band distance before flip (0-20)
+    // Wider gap between price and previous band = more conviction on the flip
+    float prevDist = 0.0
+    if not na(stBand[1])
+        prevDist := math.abs(close[1] - stBand[1]) / safeAtr
+    float bPts = 0.0
+    if prevDist >= 2.0
+        bPts := 20
+    else if prevDist >= 1.0
+        bPts := 14
+    else if prevDist >= 0.5
+        bPts := 8
+    else
+        bPts := 3
+    score += bPts
+
+    int(math.min(math.round(score), 100))
+
+// ============================================================================
+// SIGNAL GENERATION
+// ============================================================================
+
+var int   lastSigBar    = 0
+var float lastSigScore  = 0.0
+var bool  lastSigBright = false
+var int   lastSigDir    = 0   // 1=bull, -1=bear
+
+bool bullSignal = false
+bool bearSignal = false
+float sigScore  = 0.0
+
+if trendFlip and (barstate.isconfirmed or barstate.ishistory)
+    if i_sSig and (n - lastSigBar) > i_sigCD
+        int sc = 0
+        if stDir == 1
+            sc := scoreSignal(true)
+            if sc >= i_minSc
+                bullSignal   := true
+                sigScore     := sc
+                lastSigBar   := n
+                lastSigScore := sc
+                lastSigBright := sc >= i_hiBrt
+                lastSigDir   := 1
+        else
+            sc := scoreSignal(false)
+            if sc >= i_minSc
+                bearSignal   := true
+                sigScore     := sc
+                lastSigBar   := n
+                lastSigScore := sc
+                lastSigBright := sc >= i_hiBrt
+                lastSigDir   := -1
+
+bool isBright       = sigScore >= i_hiBrt
+bool showThisSignal = isBright or i_sDim
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+// ── Band Color (regime-aware) ──
+// Trending = pure bull/bear color, Volatile = amber tint, Ranging = desaturated
+color bandCore = stDir == 1 ? i_cBull : i_cBear
+color bandColor = regime == 2 ? color.new(#ffab00, 0) : regime == 0 ? color.new(#78909c, 20) : bandCore
+
+// ── Neon Glow Effect (3-layer band) ──
+// Outer glow: wide, very transparent
+plot(i_sGlow ? stBand : na, "Glow Outer", color=color.new(bandColor, 85), linewidth=6, style=plot.style_linebr)
+// Mid glow: medium, semi-transparent
+plot(i_sGlow ? stBand : na, "Glow Mid",   color=color.new(bandColor, 70), linewidth=4, style=plot.style_linebr)
+
+// ── Main Band (always visible) ──
+// Solid when trending/volatile, dotted when ranging
+stPlot = plot(stBand, "ST Band Fill Anchor", color=na, display=display.none)
+plot(regime != 0 ? stBand : na, "Band (Solid)",   color=bandColor, linewidth=2, style=plot.style_linebr)
+plot(regime == 0 ? stBand : na, "Band (Ranging)",  color=bandColor, linewidth=2, style=plot.style_linebr, linestyle=plot.linestyle_dotted)
+
+// ── Flip Dot ──
+plot(trendFlip ? stBand : na, "Flip Dot", color=bandCore, style=plot.style_circles, linewidth=5, join=false)
+
+// ── Gradient Fill (off by default, optional) ──
+srcPlot = plot(i_src, "Source", color=na, display=display.none)
+float topVal = math.max(i_src, stBand)
+float btmVal = math.min(i_src, stBand)
+color topFill = stDir == 1 ? color.new(i_cBull, 75) : color.new(i_cBear, 97)
+color btmFill = stDir == 1 ? color.new(i_cBull, 97) : color.new(i_cBear, 75)
+
+fill(stPlot, srcPlot, topVal, btmVal, topFill, btmFill,
+     title="Trend Fill",
+     display=i_sFill ? display.all : display.none)
+
+// ── Regime Background Shading ──
+bgcolor(i_sRegBg and regime == 2 ? color.new(#ffab00, 95) : na, title="Volatile BG")
+bgcolor(i_sRegBg and regime == 0 ? color.new(#78909c, 96) : na, title="Ranging BG")
+
+// ── Trend EMA ──
+plot(trendMa, "Trend EMA", color=color.new(trendUp ? i_cBull : i_cBear, 65), linewidth=1)
+
+// ── Signal Labels ──
+if bullSignal and showThisSignal
+    int sc     = int(math.round(sigScore))
+    color css  = isBright ? color.new(#00e676, 0) : color.new(#546e7a, 0)
+    string sz  = isBright ? size.small : size.tiny
+    string ico = isBright ? "★" : "○"
+    string txt = ico + " " + str.tostring(sc)
+
+    label.new(n, stBand, txt,
+      color=color.new(css, isBright ? 0 : 50),
+      textcolor=#ffffff, size=sz,
+      style=label.style_label_up,
+      tooltip="BULL Signal | Score: " + str.tostring(sc) +
+              "\nVolume: " + str.tostring(math.round(volume / nz(volMa, 1), 1)) + "x avg" +
+              "\nRegime: " + (regime == 1 ? "TRENDING" : regime == 2 ? "VOLATILE" : "RANGING") +
+              "\nMultiplier: " + str.tostring(math.round(adaptMult, 2)) +
+              "\nEMA Trend: " + (trendUp ? "ALIGNED" : "COUNTER"))
+
+if bearSignal and showThisSignal
+    int sc     = int(math.round(sigScore))
+    color css  = isBright ? color.new(#ff5252, 0) : color.new(#546e7a, 0)
+    string sz  = isBright ? size.small : size.tiny
+    string ico = isBright ? "★" : "○"
+    string txt = ico + " " + str.tostring(sc)
+
+    label.new(n, stBand, txt,
+      color=color.new(css, isBright ? 0 : 50),
+      textcolor=#ffffff, size=sz,
+      style=label.style_label_down,
+      tooltip="BEAR Signal | Score: " + str.tostring(sc) +
+              "\nVolume: " + str.tostring(math.round(volume / nz(volMa, 1), 1)) + "x avg" +
+              "\nRegime: " + (regime == 1 ? "TRENDING" : regime == 2 ? "VOLATILE" : "RANGING") +
+              "\nMultiplier: " + str.tostring(math.round(adaptMult, 2)) +
+              "\nEMA Trend: " + (trendDn ? "ALIGNED" : "COUNTER"))
+
+// ── Bar Coloring ──
+bool inBullZone = stDir == 1 and close > stBand
+bool inBearZone = stDir == -1 and close < stBand
+barcolor(i_sBar ?
+         bullSignal and showThisSignal ? color.new(#00e676, 0) :
+         bearSignal and showThisSignal ? color.new(#ff5252, 0) :
+         inBullZone ? color.new(i_cBull, 70) :
+         inBearZone ? color.new(i_cBear, 70) : na : na)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+if i_sDash
+    var dashPos = switch i_dLoc
+        "Top Right"    => position.top_right
+        "Bottom Right" => position.bottom_right
+        "Top Left"     => position.top_left
+        => position.bottom_left
+
+    var table dash = table.new(dashPos, 3, 8,
+      bgcolor=color.new(#0c1018, 5),
+      border_width=1, border_color=color.new(#1a2030, 0),
+      frame_width=2,  frame_color=color.new(#1a2030, 0))
+
+    if barstate.islast
+        // ── Row 0: Header ──
+        dash.cell(0, 0, " ST", text_color=color.new(#4fc3f7, 0), text_size=size.normal, bgcolor=color.new(#0a0f1a, 0), text_halign=text.align_left)
+        dash.cell(1, 0, "AI ◈", text_color=color.new(#00e5ff, 0), text_size=size.normal, bgcolor=color.new(#0a0f1a, 0))
+        dash.cell(2, 0, "",     text_size=size.tiny, bgcolor=color.new(#0a0f1a, 0))
+
+        // ── Row 1: Trend ──
+        dash.cell(0, 1, "Trend", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        string trText = stDir == 1 ? "▲ BULLISH" : "▼ BEARISH"
+        color  trCol  = stDir == 1 ? i_cBull : i_cBear
+        dash.cell(1, 1, trText, text_color=trCol, text_size=size.normal)
+        dash.cell(2, 1, stDir == 1 ? "longs" : "shorts", text_color=color.new(#455a64, 0), text_size=size.small)
+
+        // ── Row 2: Regime ──
+        dash.cell(0, 2, "Regime", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        string regText = regime == 1 ? "TRENDING" : regime == 2 ? "VOLATILE" : "RANGING"
+        color  regCol  = regime == 1 ? color.new(#00e676, 0) : regime == 2 ? color.new(#ffab00, 0) : color.new(#78909c, 0)
+        dash.cell(1, 2, regText, text_color=regCol, text_size=size.normal)
+        dash.cell(2, 2, str.tostring(math.round(atrRatio, 2)) + "x", text_color=color.new(#455a64, 0), text_size=size.small)
+
+        // ── Row 3: EMA Alignment ──
+        dash.cell(0, 3, "EMA(" + str.tostring(i_trendLen) + ")", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        bool aligned = (stDir == 1 and trendUp) or (stDir == -1 and trendDn)
+        string alText = aligned ? "✓ ALIGNED" : "✗ COUNTER"
+        color  alCol  = aligned ? color.new(#00e676, 0) : color.new(#ffab00, 0)
+        dash.cell(1, 3, alText, text_color=alCol, text_size=size.normal)
+        dash.cell(2, 3, "", text_size=size.tiny)
+
+        // ── Row 4: Divider ──
+        dash.cell(0, 4, "", bgcolor=color.new(#1a2030, 0), text_size=size.tiny)
+        dash.cell(1, 4, "── AI Scores ──", text_color=color.new(#2a3a4a, 0), text_size=size.tiny, bgcolor=color.new(#1a2030, 0))
+        dash.cell(2, 4, "", bgcolor=color.new(#1a2030, 0), text_size=size.tiny)
+
+        // ── Row 5: Multiplier ──
+        dash.cell(0, 5, "Multiplier", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        color mCol = adaptMult > i_bMult * 1.1 ? color.new(#ffab00, 0) : adaptMult < i_bMult * 0.9 ? color.new(#4fc3f7, 0) : color.new(#00e676, 0)
+        dash.cell(1, 5, str.tostring(math.round(adaptMult, 2)), text_color=mCol, text_size=size.normal)
+        dash.cell(2, 5, "base " + str.tostring(math.round(i_bMult, 1)), text_color=color.new(#455a64, 0), text_size=size.small)
+
+        // ── Row 6: ADX ──
+        dash.cell(0, 6, "ADX", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        color adxCol = adx >= 30 ? color.new(#00e676, 0) : adx >= i_adxThr ? color.new(#69f0ae, 0) : color.new(#78909c, 0)
+        string adxBar = ""
+        int adxPct = int(math.min(adx, 50)) * 10 / 50
+        for b = 1 to 10
+            adxBar += b <= adxPct ? "■" : "□"
+        dash.cell(1, 6, str.tostring(math.round(adx, 1)), text_color=adxCol, text_size=size.normal)
+        dash.cell(2, 6, adxBar, text_color=adxCol, text_size=size.tiny)
+
+        // ── Row 7: Signal ──
+        dash.cell(0, 7, "Signal", text_color=color.new(#5c6b7a, 0), text_size=size.normal, text_halign=text.align_left)
+        bool recentSig  = lastSigBar > 0 and (n - lastSigBar) < 20
+        bool recentBull = recentSig and lastSigDir > 0
+        bool recentBear = recentSig and lastSigDir < 0
+        string sigText  = recentBull ? (lastSigBright ? "★ LONG" : "○ LONG") : recentBear ? (lastSigBright ? "★ SHORT" : "○ SHORT") : "— WAITING"
+        color  sigCol   = recentBull ? color.new(#00e676, 0) : recentBear ? color.new(#ff5252, 0) : color.new(#455a64, 0)
+        dash.cell(1, 7, sigText, text_color=sigCol, text_size=size.normal)
+        dash.cell(2, 7, recentSig ? str.tostring(int(lastSigScore)) + " pts" : "", text_color=color.new(#455a64, 0), text_size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(bullSignal,                         "Bull Signal",         "ST AI: LONG. Price crossed above SuperTrend.")
+alertcondition(bullSignal and isBright,            "AI-Confirmed Long",   "ST AI: ★ AI-CONFIRMED LONG. High-quality bullish flip.")
+alertcondition(bearSignal,                         "Bear Signal",         "ST AI: SHORT. Price crossed below SuperTrend.")
+alertcondition(bearSignal and isBright,            "AI-Confirmed Short",  "ST AI: ★ AI-CONFIRMED SHORT. High-quality bearish flip.")
+alertcondition(trendFlip,                          "Trend Flip",          "ST AI: SuperTrend direction changed.")
+alertcondition(regime == 2 and regime[1] != 2,     "Volatile Regime",     "ST AI: Market shifted to VOLATILE regime. Bands widened.")
+alertcondition(regime == 0 and regime[1] != 0,     "Ranging Regime",      "ST AI: Market shifted to RANGING regime. Caution advised.")
+
+// Hidden plots for external use
+plot(sigScore,      "Signal Score",      display=display.none)
+plot(adaptMult,     "Adaptive Mult",     display=display.none)
+plot(adx,           "ADX",               display=display.none)
+plot(float(regime), "Regime",            display=display.none)
+plot(float(stDir),  "Trend Direction",   display=display.none)

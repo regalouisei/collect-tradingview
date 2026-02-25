@@ -1,0 +1,293 @@
+//@version=6
+indicator("BTC vs GOLD Macro Rotation", overlay=false)
+
+// ============================================================================
+// USER INPUTS - SYMBOLS
+// ============================================================================
+i_btcSymbol     = input.string("COINBASE:BTCUSD", "BTC Symbol", group="Symbols")
+i_goldSymbol    = input.string("TVC:GOLD", "GOLD Symbol", group="Symbols")
+i_dxySymbol     = input.string("TVC:DXY", "DXY Symbol", group="Symbols")
+i_oilSymbol     = input.string("NYMEX:CL1!", "Oil (WTI) Symbol", group="Symbols")
+i_copperSymbol  = input.string("COMEX:HG1!", "Copper Symbol", group="Symbols")
+i_cpiSymbol     = input.string("ECONOMICS:USCPI", "US CPI Symbol", group="Symbols")
+i_rateSymbol    = input.string("ECONOMICS:USINTR", "Interest Rate Symbol", group="Symbols")
+i_gasSymbol     = input.string("NYMEX:NG1!", "Natural Gas Symbol", group="Symbols")
+i_ureaSymbol    = input.string("ECONOMICS:UREA", "Urea Symbol", group="Symbols")
+i_ammoniaSymbol = input.string("ECONOMICS:AMMONIA", "Ammonia Symbol", group="Symbols")
+
+// ============================================================================
+// USER INPUTS - WEIGHTS
+// ============================================================================
+i_fertWeight     = input.float(1.0, "Fertilizer Rule Weight", minval=0, maxval=5, step=0.1, group="Weights")
+i_dxyWeight      = input.float(1.0, "DXY Weight", minval=0, maxval=5, step=0.1, group="Weights")
+i_oilWeight      = input.float(1.0, "Oil Weight", minval=0, maxval=5, step=0.1, group="Weights")
+i_copperWeight   = input.float(1.0, "Copper Weight", minval=0, maxval=5, step=0.1, group="Weights")
+i_realRateWeight = input.float(1.0, "Real Rate Weight", minval=0, maxval=5, step=0.1, group="Weights")
+i_smoothLen      = input.int(3, "Smoothing EMA Length", minval=1, maxval=10, group="Settings")
+i_normLen        = input.int(20, "Normalization Length", minval=5, maxval=50, group="Settings")
+
+// ============================================================================
+// RPO - RELATIVE PERFORMANCE OVERRIDE
+// ============================================================================
+i_useRPO         = input.bool(true, "Enable Relative Performance Override (RPO)", group="RPO Settings")
+i_rpoLookback    = input.int(4, "RPO Lookback (weeks)", minval=1, maxval=12, group="RPO Settings")
+i_rpoThreshold   = input.float(1.0, "RPO Threshold (%)", minval=0.1, maxval=10, step=0.1, group="RPO Settings")
+i_rpoBoost       = input.float(20.0, "RPO Boost (strength points)", minval=5, maxval=40, step=1, group="RPO Settings")
+
+// ============================================================================
+// ADAPTIVE WEIGHTS
+// ============================================================================
+i_adaptiveWeights = input.bool(true, "Enable Adaptive Weights", group="Adaptive Settings")
+
+// ============================================================================
+// HELPER FUNCTIONS - ALL CALCULATIONS DESIGNED FOR WEEKLY CONTEXT
+// ============================================================================
+
+// Function to calculate normalized change
+calcNormChange(float src, int len) =>
+    float chg = ta.change(src, 1)
+    float absEma = ta.ema(math.abs(chg), len)
+    float denom = nz(absEma, 1.0)
+    float norm = na(chg) ? 0.0 : chg / denom
+    math.max(-2.0, math.min(2.0, norm))
+
+// ============================================================================
+// FETCH ALL DATA FROM WEEKLY TIMEFRAME
+// Using tuples to get multiple values from single security call where possible
+// ============================================================================
+
+// BTC data - close and lookback close for return calculation
+[btcClose, btcClosePrev] = request.security(i_btcSymbol, "W", [close, close[4]], ignore_invalid_symbol=true)
+
+// GOLD data - close and lookback close for return calculation  
+[goldClose, goldClosePrev] = request.security(i_goldSymbol, "W", [close, close[4]], ignore_invalid_symbol=true)
+
+// DXY data
+[dxyClose, dxyNorm] = request.security(i_dxySymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// Oil data
+[oilClose, oilNorm] = request.security(i_oilSymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// Copper data
+[copperClose, copperNorm] = request.security(i_copperSymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// Gas data
+[gasClose, gasNorm] = request.security(i_gasSymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// Urea data
+[ureaClose, ureaNorm] = request.security(i_ureaSymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// Ammonia data
+[ammoniaClose, ammoniaNorm] = request.security(i_ammoniaSymbol, "W", [close, calcNormChange(close, i_normLen)], ignore_invalid_symbol=true)
+
+// CPI and Rate data for Real Rate
+cpiClose  = request.security(i_cpiSymbol, "W", close, ignore_invalid_symbol=true)
+cpi12     = request.security(i_cpiSymbol, "W", close[12], ignore_invalid_symbol=true)
+rateClose = request.security(i_rateSymbol, "W", close, ignore_invalid_symbol=true)
+
+// ============================================================================
+// CALCULATE RETURNS IN SCRIPT (using weekly data already fetched)
+// ============================================================================
+btcReturn  = (not na(btcClose) and not na(btcClosePrev) and btcClosePrev != 0) ? (btcClose / btcClosePrev - 1) * 100 : 0.0
+goldReturn = (not na(goldClose) and not na(goldClosePrev) and goldClosePrev != 0) ? (goldClose / goldClosePrev - 1) * 100 : 0.0
+
+// ============================================================================
+// CALCULATE REAL RATE
+// ============================================================================
+inflYoY = (not na(cpiClose) and not na(cpi12) and cpi12 != 0) ? (cpiClose - cpi12) / cpi12 * 100.0 : na
+realRate = (not na(rateClose) and not na(inflYoY)) ? rateClose - inflYoY : na
+
+// Real rate change - need previous real rate
+cpiClosePrev  = request.security(i_cpiSymbol, "W", close[1], ignore_invalid_symbol=true)
+cpi13         = request.security(i_cpiSymbol, "W", close[13], ignore_invalid_symbol=true)
+rateClosePrev = request.security(i_rateSymbol, "W", close[1], ignore_invalid_symbol=true)
+
+inflYoYPrev = (not na(cpiClosePrev) and not na(cpi13) and cpi13 != 0) ? (cpiClosePrev - cpi13) / cpi13 * 100.0 : na
+realRatePrev = (not na(rateClosePrev) and not na(inflYoYPrev)) ? rateClosePrev - inflYoYPrev : na
+
+realRateChg = (not na(realRate) and not na(realRatePrev)) ? realRate - realRatePrev : 0.0
+realRateNorm = math.max(-2.0, math.min(2.0, realRateChg))
+
+// ============================================================================
+// CHECK IF BTC/GOLD ARE VALID
+// ============================================================================
+btcValid  = not na(btcClose)
+goldValid = not na(goldClose)
+bothValid = btcValid and goldValid
+
+// ============================================================================
+// RELATIVE PERFORMANCE OVERRIDE (RPO)
+// ============================================================================
+returnDiff = btcReturn - goldReturn
+rpoFavorsBTC  = i_useRPO and returnDiff > i_rpoThreshold
+rpoFavorsGOLD = i_useRPO and returnDiff < -i_rpoThreshold
+rpoNeutral    = not rpoFavorsBTC and not rpoFavorsGOLD
+
+// ============================================================================
+// DIRECTION HELPERS (using nz for safety)
+// ============================================================================
+ureaUp      = not na(ureaClose) and nz(ureaNorm, 0.0) > 0
+ureaDown    = not na(ureaClose) and nz(ureaNorm, 0.0) < 0
+ammoniaUp   = not na(ammoniaClose) and nz(ammoniaNorm, 0.0) > 0
+ammoniaDown = not na(ammoniaClose) and nz(ammoniaNorm, 0.0) < 0
+gasUp       = not na(gasClose) and nz(gasNorm, 0.0) > 0
+gasDown     = not na(gasClose) and nz(gasNorm, 0.0) < 0
+fertValid   = not na(ureaClose) and not na(ammoniaClose) and not na(gasClose)
+
+// ============================================================================
+// ADAPTIVE WEIGHTS - FERTILIZER DIVERGENCE
+// ============================================================================
+fertDivergence = (ureaUp and ammoniaDown) or (ureaDown and ammoniaUp)
+fertWeightAdj  = i_adaptiveWeights and fertDivergence ? 0.5 : 1.0
+
+// ============================================================================
+// COUNT VALID FACTORS FOR CONFIDENCE
+// ============================================================================
+validFactors = 0
+validFactors := validFactors + (na(dxyClose) ? 0 : 1)
+validFactors := validFactors + (na(oilClose) ? 0 : 1)
+validFactors := validFactors + (na(copperClose) ? 0 : 1)
+validFactors := validFactors + (na(realRate) ? 0 : 1)
+validFactors := validFactors + (fertValid ? 1 : 0)
+totalFactors = 5
+confidenceScale = validFactors / totalFactors
+
+// ============================================================================
+// SCORING SYSTEM
+// ============================================================================
+var float scoreBtc  = 0.0
+var float scoreGold = 0.0
+
+scoreBtc  := 0.0
+scoreGold := 0.0
+
+// FERTILIZER RULES (with adaptive weight)
+if fertValid
+    float fertW = i_fertWeight * fertWeightAdj
+    if ureaUp and ammoniaUp and gasDown
+        scoreGold := scoreGold + 2.0 * fertW
+    if ureaUp and ammoniaUp and gasUp
+        scoreGold := scoreGold + 3.0 * fertW
+        scoreBtc  := scoreBtc - 1.0 * fertW
+    if ureaDown and ammoniaDown and gasDown
+        scoreBtc  := scoreBtc + 3.0 * fertW
+        scoreGold := scoreGold - 1.0 * fertW
+    if ureaUp and ammoniaDown and gasDown
+        scoreBtc := scoreBtc + 1.5 * fertW
+    if ureaDown and ammoniaUp and gasUp
+        scoreGold := scoreGold + 2.0 * fertW
+        scoreBtc  := scoreBtc - 0.5 * fertW
+    if ureaDown and ammoniaUp and gasDown
+        scoreGold := scoreGold + 1.0 * fertW
+
+// DXY COMPONENT
+if not na(dxyClose)
+    if nz(dxyNorm, 0.0) > 0
+        scoreGold := scoreGold + 1.0 * i_dxyWeight
+        scoreBtc  := scoreBtc - 1.0 * i_dxyWeight
+    else if nz(dxyNorm, 0.0) < 0
+        scoreBtc := scoreBtc + 1.0 * i_dxyWeight
+
+// OIL COMPONENT
+if not na(oilClose)
+    if nz(oilNorm, 0.0) > 0
+        scoreGold := scoreGold + 1.0 * i_oilWeight
+    else if nz(oilNorm, 0.0) < 0
+        scoreBtc := scoreBtc + 0.5 * i_oilWeight
+
+// COPPER COMPONENT
+if not na(copperClose)
+    if nz(copperNorm, 0.0) > 0
+        scoreBtc := scoreBtc + 1.0 * i_copperWeight
+    else if nz(copperNorm, 0.0) < 0
+        scoreGold := scoreGold + 0.5 * i_copperWeight
+
+// REAL RATE COMPONENT
+if not na(realRate)
+    if realRateNorm < 0
+        scoreGold := scoreGold + 1.0 * i_realRateWeight
+    else if realRateNorm > 0
+        scoreBtc := scoreBtc + 1.0 * i_realRateWeight
+
+// ============================================================================
+// CONVERT TO PREFERENCES
+// ============================================================================
+eps = 0.0001
+posBtc  = math.max(scoreBtc, 0.0)
+posGold = math.max(scoreGold, 0.0)
+totalPos = posBtc + posGold + eps
+
+btcPref  = posBtc / totalPos
+goldPref = posGold / totalPos
+
+// Apply smoothing
+btcPrefSmooth  = ta.ema(btcPref, i_smoothLen)
+goldPrefSmooth = ta.ema(goldPref, i_smoothLen)
+
+// ============================================================================
+// CALCULATE STRENGTH (0-100)
+// ============================================================================
+rawDiff = btcPrefSmooth - goldPrefSmooth
+strengthBTC_base  = 50.0 + rawDiff * 50.0
+strengthGOLD_base = 100.0 - strengthBTC_base
+
+// ============================================================================
+// APPLY RPO OVERRIDE
+// ============================================================================
+strengthBTC  = strengthBTC_base
+strengthGOLD = strengthGOLD_base
+
+if rpoFavorsBTC
+    strengthBTC  := math.min(95.0, strengthBTC_base + i_rpoBoost)
+    strengthGOLD := math.max(5.0, 100.0 - strengthBTC)
+else if rpoFavorsGOLD
+    strengthGOLD := math.min(95.0, strengthGOLD_base + i_rpoBoost)
+    strengthBTC  := math.max(5.0, 100.0 - strengthGOLD)
+
+// Apply confidence scaling if adaptive weights enabled
+if i_adaptiveWeights
+    strengthBTC  := 50.0 + (strengthBTC - 50.0) * confidenceScale
+    strengthGOLD := 50.0 + (strengthGOLD - 50.0) * confidenceScale
+
+// Clamp final values
+strengthBTC  := math.max(5.0, math.min(95.0, strengthBTC))
+strengthGOLD := math.max(5.0, math.min(95.0, strengthGOLD))
+
+// Determine winner
+btcWins = strengthBTC >= strengthGOLD
+
+// ============================================================================
+// VISUAL OUTPUT
+// ============================================================================
+plot(strengthBTC, "BTC Strength", color=color.new(color.green, 0), style=plot.style_columns, linewidth=3)
+plot(-strengthGOLD, "GOLD Strength", color=color.new(color.yellow, 0), style=plot.style_columns, linewidth=3)
+
+hline(0, "Zero", color=color.white, linestyle=hline.style_solid, linewidth=2)
+hline(50, "BTC Strong", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+hline(-50, "GOLD Strong", color=color.new(color.yellow, 70), linestyle=hline.style_dotted)
+
+// ============================================================================
+// INFO TABLE
+// ============================================================================
+var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 30), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    winnerText = btcWins ? "BTC" : "GOLD"
+    winColor = btcWins ? color.green : color.yellow
+    rpoStatus = rpoFavorsBTC ? "BTC ↑" : rpoFavorsGOLD ? "GOLD ↑" : "Neutral"
+    rpoColor = rpoFavorsBTC ? color.green : rpoFavorsGOLD ? color.yellow : color.gray
+    
+    table.cell(infoTable, 0, 0, "ROTATE TO:", text_color=color.white, text_size=size.normal)
+    table.cell(infoTable, 1, 0, winnerText, text_color=winColor, text_size=size.large)
+    table.cell(infoTable, 0, 1, "BTC Strength", text_color=color.green, text_size=size.normal)
+    table.cell(infoTable, 1, 1, str.tostring(math.round(strengthBTC, 1)), text_color=color.green, text_size=size.normal)
+    table.cell(infoTable, 0, 2, "GOLD Strength", text_color=color.yellow, text_size=size.normal)
+    table.cell(infoTable, 1, 2, str.tostring(math.round(strengthGOLD, 1)), text_color=color.yellow, text_size=size.normal)
+    table.cell(infoTable, 0, 3, "RPO Status", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 3, rpoStatus, text_color=rpoColor, text_size=size.small)
+    table.cell(infoTable, 0, 4, "BTC 4W Ret", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, str.tostring(math.round(btcReturn, 2)) + "%", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 0, 5, "GOLD 4W Ret", text_color=color.gray, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, str.tostring(math.round(goldReturn, 2)) + "%", text_color=color.gray, text_size=size.tiny)
+
+bgcolor(btcWins ? color.new(color.green, 92) : color.new(color.yellow, 92))

@@ -1,0 +1,612 @@
+//@version=5
+indicator("Eduinfx OB Suite — LTF+HTF OB (CSAK+CSM, FVG-validated, BarIndex, Hardcoded Theme+BB)",
+     shorttitle="Eduinfx OB Suite",
+     overlay=true, max_boxes_count=500, max_lines_count=500, max_bars_back=2000, dynamic_requests=true)
+
+//=====================================================================
+// 1) SYSTEM CONFIG (hardcoded)
+//=====================================================================
+int scanRange         = 50
+int extendBarsForward = 9
+int MAX_BROKEN_HIST   = 20
+
+color c_broken = color.new(#B0BEC5, 80)
+color c_hide   = color.new(color.white, 100)
+
+//=====================================================================
+// 2) THEME — HARDCODED (no inputs)
+//   - CSAK palette: Supply=orange, Demand=teal
+//   - CSM  palette: Supply=amber,  Demand=emerald
+//   - Breaker uses destination color (orange/teal), NO FILL (border only) + DASHED
+//=====================================================================
+// CSAK base colors
+color COL_SUP_CSAK = color.rgb(255, 153, 51)   // orange
+color COL_DEM_CSAK = color.rgb(0, 200, 200)    // teal
+
+// CSM base colors (distinct)
+color COL_SUP_CSM  = color.rgb(241, 196, 15)   // amber
+color COL_DEM_CSM  = color.rgb(46, 204, 113)   // emerald
+
+// Breaker destination colors
+color COL_BRK_SUP_TO_DEM = COL_DEM_CSAK        // teal
+color COL_BRK_DEM_TO_SUP = COL_SUP_CSAK        // orange
+
+// LTF style
+int obFillAlpha      = 86
+int obBorderAlpha    = 10
+int obBorderW        = 1
+int breakerFillBoost = 10                      // retained (even though breaker has no fill)
+
+// HTF border-only style
+int htfBorderAlpha   = 15
+int htfBorderW       = 1                       // change here if you want thicker HTF border
+
+//=====================================================================
+// 3) INPUTS — LTF/HTF display + nested (keep as inputs)
+//=====================================================================
+groupLTF = "Orderblocks (LTF)"
+ltfMode = input.string("Supply Demand dan Breaker Block", "Display Mode (LTF)",
+     options=["Supply and Demand", "Breaker Block", "Supply Demand dan Breaker Block"], group=groupLTF)
+
+ltfMaxBox    = input.int(5,  "Max Active Setups (LTF)", minval=1, maxval=20, group=groupLTF)
+ltfKeepClean = input.bool(true, "Auto-Clean History (LTF)", group=groupLTF)
+
+groupHTF = "Orderblocks (HTF Overlay)"
+showHTF = input.bool(false, "Enable HTF Overlay?", group=groupHTF)
+htfTF   = input.timeframe("60", "HTF Timeframe", group=groupHTF)
+
+htfMode = input.string("Supply Demand dan Breaker Block", "Display Mode (HTF)",
+     options=["Supply and Demand", "Breaker Block", "Supply Demand dan Breaker Block"], group=groupHTF)
+
+htfMaxBox    = input.int(5,  "Max Active Setups (HTF)", minval=1, maxval=20, group=groupHTF)
+htfKeepClean = input.bool(true, "Auto-Clean History (HTF)", group=groupHTF)
+
+groupNested = "Nested Filter"
+useNestedSameDir = input.bool(false, "Enable Nested (Overlap + Same Direction vs HTF)", group=groupNested)
+
+//=====================================================================
+// 4) BOLLINGER — HARDCODED (CSM trigger)
+//=====================================================================
+int   BB_LEN  = 20
+float BB_MULT = 2.0
+
+//=====================================================================
+// 5) HELPERS (BarIndex-based)
+//=====================================================================
+f_right_index(_barsForward) =>
+    bar_index + _barsForward
+
+// trigger type: 1=CSAK, 2=CSM
+f_base_col(_isSup, _trigType) =>
+    int tt = na(_trigType) ? 1 : _trigType
+    if _isSup
+        tt == 2 ? COL_SUP_CSM : COL_SUP_CSAK
+    else
+        tt == 2 ? COL_DEM_CSM : COL_DEM_CSAK
+
+// Breaker colors: use destination
+f_breaker_col(_isSup) => _isSup ? COL_BRK_SUP_TO_DEM : COL_BRK_DEM_TO_SUP
+
+// Final color: breaker if flipped, else base palette depends on trigger
+f_final_col(_isSup, _isFlip, _trigType) =>
+    _isFlip ? f_breaker_col(_isSup) : f_base_col(_isSup, _trigType)
+
+// Alphas
+f_fill_alpha_ltf(_isFlip) =>
+    int a = obFillAlpha
+    if _isFlip
+        a := math.max(0, a - breakerFillBoost)
+    a
+
+f_fill_ltf(_isSup, _isFlip, _trigType) =>
+    color.new(f_final_col(_isSup, _isFlip, _trigType), f_fill_alpha_ltf(_isFlip))
+
+f_border_ltf(_isSup, _isFlip, _trigType) =>
+    color.new(f_final_col(_isSup, _isFlip, _trigType), obBorderAlpha)
+
+f_border_htf(_isSup, _isFlip, _trigType) =>
+    color.new(f_final_col(_isSup, _isFlip, _trigType), htfBorderAlpha)
+
+// Direction helper (searah)
+f_dir_bull(_isSup, _isFlip) =>
+    _isFlip ? _isSup : (not _isSup)
+
+// Mode filter
+f_is_shown_by_mode(_mode, _isFlip) =>
+    bool out = false
+    if _mode == "Supply and Demand"
+        out := not _isFlip
+    else if _mode == "Breaker Block"
+        out := _isFlip
+    else
+        out := true
+    out
+
+//=====================================================================
+// 6) CORE (BBMA midpoint + MAHI/MALO) + CSAK + CSM
+//=====================================================================
+bb_mid = ta.sma(close, 20)
+ma5_h  = ta.wma(high, 5)
+ma5_l  = ta.wma(low,  5)
+ma10_h = ta.wma(high, 10)
+ma10_l = ta.wma(low,  10)
+
+// CSAK trigger
+csakBuy  = open <= bb_mid and close > bb_mid and close > ma5_h and close > ma10_h
+csakSell = open >= bb_mid and close < bb_mid and close < ma5_l and close < ma10_l
+
+// Bollinger (hardcoded) for CSM
+bbBasis = ta.sma(close, BB_LEN)
+bbDev   = BB_MULT * ta.stdev(close, BB_LEN)
+topbb   = bbBasis + bbDev
+lowbb   = bbBasis - bbDev
+
+// CSM trigger (your definition)
+csmBuy  = close > topbb and ma5_h < topbb and ma10_h < topbb
+csmSell = close < lowbb and ma5_l > lowbb and ma10_l > lowbb
+
+//=====================================================================
+// 7) LTF FINDER: OB + trigger type (FVG-validated)
+//     Rule: Trigger at [2]; FVG scan from j=1 (1 candle after trigger) up to fractal.
+//=====================================================================
+f_find_ob_ltf() =>
+    float sup_top  = na
+    float sup_bot  = na
+    int   sup_left = na
+    int   sup_trig = na
+
+    float dem_top  = na
+    float dem_bot  = na
+    int   dem_left = na
+    int   dem_trig = na
+
+    bool sellCSM  = csmSell[2]
+    bool sellCSAK = csakSell[2]
+    bool buyCSM   = csmBuy[2]
+    bool buyCSAK  = csakBuy[2]
+
+    bool trigSell = sellCSAK or sellCSM
+    bool trigBuy  = buyCSAK  or buyCSM
+
+    int trigSellType = sellCSM ? 2 : 1
+    int trigBuyType  = buyCSM  ? 2 : 1
+
+    if trigSell
+        for i = 2 to scanRange
+            bool isFractalHigh = high[i] >= high[i + 1] and high[i] >= high[i - 1]
+            bool touchesMAHI = (high[i] >= ma5_h[i] or high[i] >= ma10_h[i]) or (high[i+1] >= ma5_h[i+1] or high[i+1] >= ma10_h[i+1]) or (high[i-1] >= ma5_h[i-1] or high[i-1] >= ma10_h[i-1])
+            if isFractalHigh and touchesMAHI
+                bool fvgFound = false
+                if i >= 3
+                    for j = 1 to (i - 2)
+                        bool bullF = low[j] > high[j + 2]
+                        bool bearF = high[j] < low[j + 2]
+                        if bullF or bearF
+                            fvgFound := true
+                            break
+
+                if fvgFound
+                    bool bull_L = close[i + 1] > open[i + 1]
+                    bool bull_M = close[i] > open[i]
+                    if not bull_M and not bull_L
+                        sup_top := high[i]
+                        sup_bot := low[i]
+                        sup_left := bar_index[i]
+                        sup_trig := trigSellType
+                        break
+                    else if bull_M
+                        sup_top := high[i]
+                        sup_bot := low[i]
+                        sup_left := bar_index[i]
+                        sup_trig := trigSellType
+                        break
+                    else if bull_L
+                        sup_top := high[i]
+                        sup_bot := low[i + 1]
+                        sup_left := bar_index[i + 1]
+                        sup_trig := trigSellType
+                        break
+
+    if trigBuy
+        for i = 2 to scanRange
+            bool isFractalLow = low[i] <= low[i + 1] and low[i] <= low[i - 1]
+            bool touchesMALO = (low[i] <= ma5_l[i] or low[i] <= ma10_l[i]) or (low[i+1] <= ma5_l[i+1] or low[i+1] <= ma10_l[i+1]) or (low[i-1] <= ma5_l[i-1] or low[i-1] <= ma10_l[i-1])
+            if isFractalLow and touchesMALO
+                bool fvgFound = false
+                if i >= 3
+                    for j = 1 to (i - 2)
+                        bool bullF = low[j] > high[j + 2]
+                        bool bearF = high[j] < low[j + 2]
+                        if bullF or bearF
+                            fvgFound := true
+                            break
+
+                if fvgFound
+                    bool bear_L = close[i + 1] < open[i + 1]
+                    bool bear_M = close[i] < open[i]
+                    if not bear_M and not bear_L
+                        dem_top := high[i]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i]
+                        dem_trig := trigBuyType
+                        break
+                    else if bear_M
+                        dem_top := high[i]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i]
+                        dem_trig := trigBuyType
+                        break
+                    else if bear_L
+                        dem_top := high[i + 1]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i + 1]
+                        dem_trig := trigBuyType
+                        break
+
+    [sup_top, sup_bot, sup_left, sup_trig, dem_top, dem_bot, dem_left, dem_trig]
+
+[ltf_st, ltf_sb, ltf_sleft, ltf_strig, ltf_dt, ltf_db, ltf_dleft, ltf_dtrig] = f_find_ob_ltf()
+
+bool newSupOB = not na(ltf_st) and (na(ltf_st[1]) or ltf_st != ltf_st[1])
+bool newDemOB = not na(ltf_dt) and (na(ltf_dt[1]) or ltf_dt != ltf_dt[1])
+
+//=====================================================================
+// 8) HTF bundle (OB + trigger type), computed inside security
+//     Same rule: Trigger at [2]; FVG scan j=1..(i-2).
+//     Returns LEFT BAR_INDEX IN HTF CONTEXT. We'll map it to LTF bar_index after.
+//=====================================================================
+f_htf_bundle() =>
+    float bb_midH = ta.sma(close, 20)
+    float ma5_hH  = ta.wma(high, 5)
+    float ma5_lH  = ta.wma(low,  5)
+    float ma10_hH = ta.wma(high, 10)
+    float ma10_lH = ta.wma(low,  10)
+
+    bool csBuyH  = open <= bb_midH and close > bb_midH and close > ma5_hH and close > ma10_hH
+    bool csSellH = open >= bb_midH and close < bb_midH and close < ma5_lH and close < ma10_lH
+
+    float bbBasisH = ta.sma(close, BB_LEN)
+    float bbDevH   = BB_MULT * ta.stdev(close, BB_LEN)
+    float topbbH   = bbBasisH + bbDevH
+    float lowbbH   = bbBasisH - bbDevH
+
+    bool csmBuyH  = close > topbbH and ma5_hH < topbbH and ma10_hH < topbbH
+    bool csmSellH = close < lowbbH and ma5_lH > lowbbH and ma10_lH > lowbbH
+
+    bool sellCSM  = csmSellH[2]
+    bool sellCSAK = csSellH[2]
+    bool buyCSM   = csmBuyH[2]
+    bool buyCSAK  = csBuyH[2]
+
+    bool trigSellH = sellCSAK or sellCSM
+    bool trigBuyH  = buyCSAK  or buyCSM
+
+    int trigSellTypeH = sellCSM ? 2 : 1
+    int trigBuyTypeH  = buyCSM  ? 2 : 1
+
+    float sup_top  = na
+    float sup_bot  = na
+    int   sup_left = na
+    int   sup_trig = na
+
+    float dem_top  = na
+    float dem_bot  = na
+    int   dem_left = na
+    int   dem_trig = na
+
+    if trigSellH
+        for i = 2 to scanRange
+            bool isFractalHigh = high[i] >= high[i + 1] and high[i] >= high[i - 1]
+            bool touchesMAHI = (high[i] >= ma5_hH[i] or high[i] >= ma10_hH[i]) or (high[i+1] >= ma5_hH[i+1] or high[i+1] >= ma10_hH[i+1]) or (high[i-1] >= ma5_hH[i-1] or high[i-1] >= ma10_hH[i-1])
+            if isFractalHigh and touchesMAHI
+                bool fvgFound = false
+                if i >= 3
+                    for j = 1 to (i - 2)
+                        bool bullF = low[j] > high[j + 2]
+                        bool bearF = high[j] < low[j + 2]
+                        if bullF or bearF
+                            fvgFound := true
+                            break
+
+                if fvgFound
+                    bool bull_L = close[i + 1] > open[i + 1]
+                    bool bull_M = close[i] > open[i]
+                    if not bull_M and not bull_L
+                        sup_top := high[i]
+                        sup_bot := low[i]
+                        sup_left := bar_index[i]
+                        sup_trig := trigSellTypeH
+                        break
+                    else if bull_M
+                        sup_top := high[i]
+                        sup_bot := low[i]
+                        sup_left := bar_index[i]
+                        sup_trig := trigSellTypeH
+                        break
+                    else if bull_L
+                        sup_top := high[i]
+                        sup_bot := low[i + 1]
+                        sup_left := bar_index[i + 1]
+                        sup_trig := trigSellTypeH
+                        break
+
+    if trigBuyH
+        for i = 2 to scanRange
+            bool isFractalLow = low[i] <= low[i + 1] and low[i] <= low[i - 1]
+            bool touchesMALO = (low[i] <= ma5_lH[i] or low[i] <= ma10_lH[i]) or (low[i+1] <= ma5_lH[i+1] or low[i+1] <= ma10_lH[i+1]) or (low[i-1] <= ma5_lH[i-1] or low[i-1] <= ma10_lH[i-1])
+            if isFractalLow and touchesMALO
+                bool fvgFound = false
+                if i >= 3
+                    for j = 1 to (i - 2)
+                        bool bullF = low[j] > high[j + 2]
+                        bool bearF = high[j] < low[j + 2]
+                        if bullF or bearF
+                            fvgFound := true
+                            break
+
+                if fvgFound
+                    bool bear_L = close[i + 1] < open[i + 1]
+                    bool bear_M = close[i] < open[i]
+                    if not bear_M and not bear_L
+                        dem_top := high[i]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i]
+                        dem_trig := trigBuyTypeH
+                        break
+                    else if bear_M
+                        dem_top := high[i]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i]
+                        dem_trig := trigBuyTypeH
+                        break
+                    else if bear_L
+                        dem_top := high[i + 1]
+                        dem_bot := low[i]
+                        dem_left := bar_index[i + 1]
+                        dem_trig := trigBuyTypeH
+                        break
+
+    [sup_top, sup_bot, sup_left, sup_trig, dem_top, dem_bot, dem_left, dem_trig]
+
+// Fetch HTF values into LTF context.
+// NOTE: the returned bar_index is HTF-context; we will approximate mapping by using the HTF signal's LTF bar_index at the time it prints.
+// Practically it draws correctly and stays pinned in bar_index space on LTF chart.
+[htf_st, htf_sb, htf_sleft_raw, htf_strig, htf_dt, htf_db, htf_dleft_raw, htf_dtrig] = request.security(syminfo.tickerid, htfTF, f_htf_bundle(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Map left to current LTF bar_index when HTF signal updates (stable, non-gap)
+int htf_sleft = na
+int htf_dleft = na
+if not na(htf_st) and (na(htf_st[1]) or htf_st != htf_st[1])
+    htf_sleft := bar_index
+else
+    htf_sleft := nz(htf_sleft[1])
+
+if not na(htf_dt) and (na(htf_dt[1]) or htf_dt != htf_dt[1])
+    htf_dleft := bar_index
+else
+    htf_dleft := nz(htf_dleft[1])
+
+//=====================================================================
+// 9) STORAGE — HTF
+//=====================================================================
+var box[]   htf_boxes      = array.new_box()
+var float[] htf_limits     = array.new_float()
+var bool[]  htf_is_supply  = array.new_bool()
+var bool[]  htf_is_flipped = array.new_bool()
+var int[]   htf_trig_type  = array.new_int()
+var box[]   htf_broken     = array.new_box()
+
+f_htf_draw(_leftIdx, _top, _bot, _isSup, _trigType) =>
+    box hb = box.new(left=_leftIdx, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index,
+         border_color=c_hide, border_width=1, border_style=line.style_solid, bgcolor=c_hide)
+
+    array.push(htf_boxes, hb)
+    array.push(htf_limits, _isSup ? _top : _bot)
+    array.push(htf_is_supply, _isSup)
+    array.push(htf_is_flipped, false)
+    array.push(htf_trig_type, _trigType)
+
+    if array.size(htf_boxes) > htfMaxBox
+        box.delete(array.shift(htf_boxes))
+        array.shift(htf_limits), array.shift(htf_is_supply), array.shift(htf_is_flipped), array.shift(htf_trig_type)
+
+if showHTF
+    if not na(htf_st) and (na(htf_st[1]) or htf_st != htf_st[1])
+        f_htf_draw(htf_sleft, htf_st, htf_sb, true,  htf_strig)
+    if not na(htf_dt) and (na(htf_dt[1]) or htf_dt != htf_dt[1])
+        f_htf_draw(htf_dleft, htf_dt, htf_db, false, htf_dtrig)
+
+//=====================================================================
+// 10) STORAGE — LTF
+//=====================================================================
+var box[]   ltf_boxes      = array.new_box()
+var float[] ltf_limits     = array.new_float()
+var bool[]  ltf_is_supply  = array.new_bool()
+var bool[]  ltf_is_flipped = array.new_bool()
+var int[]   ltf_trig_type  = array.new_int()
+var box[]   ltf_broken     = array.new_box()
+
+f_ltf_trim_oldest_active_ob() =>
+    box obOld = array.shift(ltf_boxes)
+    box.delete(obOld)
+    array.shift(ltf_limits), array.shift(ltf_is_supply), array.shift(ltf_is_flipped), array.shift(ltf_trig_type)
+
+f_ltf_draw_ob(_leftIdx, _top, _bot, _isSup, _trigType) =>
+    box b = box.new(left=_leftIdx, top=_top, right=bar_index, bottom=_bot, xloc=xloc.bar_index,
+         border_color=c_hide, border_width=1, border_style=line.style_solid, bgcolor=c_hide)
+
+    array.push(ltf_boxes, b)
+    array.push(ltf_limits, _isSup ? _top : _bot)
+    array.push(ltf_is_supply, _isSup)
+    array.push(ltf_is_flipped, false)
+    array.push(ltf_trig_type, _trigType)
+
+    if array.size(ltf_boxes) > ltfMaxBox
+        f_ltf_trim_oldest_active_ob()
+
+if newSupOB
+    f_ltf_draw_ob(ltf_sleft, ltf_st, ltf_sb, true,  ltf_strig)
+if newDemOB
+    f_ltf_draw_ob(ltf_dleft, ltf_dt, ltf_db, false, ltf_dtrig)
+
+//=====================================================================
+// 11) HTF update loop (border-only, dashed; extend by bar_index)
+//=====================================================================
+if array.size(htf_boxes) > 0
+    int kH = array.size(htf_boxes) - 1
+    while kH >= 0
+        box  hb    = array.get(htf_boxes, kH)
+        float lim  = array.get(htf_limits, kH)
+        bool isSup = array.get(htf_is_supply, kH)
+        bool isFlip= array.get(htf_is_flipped, kH)
+        int  tType = array.get(htf_trig_type, kH)
+
+        bool confirmed = barstate.isconfirmed
+        bool del = false
+
+        if isSup
+            if (not isFlip) and confirmed and close > lim
+                array.set(htf_is_flipped, kH, true)
+                array.set(htf_limits, kH, box.get_bottom(hb))
+            else if isFlip and confirmed and close < lim
+                del := true
+        else
+            if (not isFlip) and confirmed and close < lim
+                array.set(htf_is_flipped, kH, true)
+                array.set(htf_limits, kH, box.get_top(hb))
+            else if isFlip and confirmed and close > lim
+                del := true
+
+        isFlip := array.get(htf_is_flipped, kH)
+        bool showH = showHTF and f_is_shown_by_mode(htfMode, isFlip)
+
+        if showH
+            box.set_bgcolor(hb, c_hide)
+            box.set_border_style(hb, line.style_dashed)
+            box.set_border_width(hb, htfBorderW)
+            box.set_border_color(hb, f_border_htf(isSup, isFlip, tType))
+        else
+            box.set_bgcolor(hb, c_hide)
+            box.set_border_color(hb, c_hide)
+            box.set_border_width(hb, 1)
+            box.set_border_style(hb, line.style_solid)
+
+        if del
+            if htfKeepClean
+                box.delete(hb)
+            else
+                box.set_right(hb, bar_index)
+                box.set_bgcolor(hb, c_hide)
+                box.set_border_color(hb, c_broken)
+                box.set_border_width(hb, 1)
+                box.set_border_style(hb, line.style_dashed)
+
+                array.push(htf_broken, hb)
+                if array.size(htf_broken) > MAX_BROKEN_HIST
+                    box.delete(array.shift(htf_broken))
+
+            array.remove(htf_boxes, kH), array.remove(htf_limits, kH), array.remove(htf_is_supply, kH), array.remove(htf_is_flipped, kH), array.remove(htf_trig_type, kH)
+        else
+            box.set_right(hb, f_right_index(extendBarsForward))
+
+        kH -= 1
+
+//=====================================================================
+// 12) Nested overlap + same direction (HTF must be shown)
+//=====================================================================
+f_is_nested_overlap_same_dir(_ltfTop, _ltfBot, _ltfBullDir) =>
+    bool ok = false
+    if showHTF and array.size(htf_boxes) > 0
+        for ii = 0 to array.size(htf_boxes) - 1
+            box hb = array.get(htf_boxes, ii)
+
+            bool hSup  = array.get(htf_is_supply, ii)
+            bool hFlip = array.get(htf_is_flipped, ii)
+
+            bool hShown = f_is_shown_by_mode(htfMode, hFlip)
+            if hShown
+                bool hBullDir = f_dir_bull(hSup, hFlip)
+                if hBullDir == _ltfBullDir
+                    float hTop = box.get_top(hb)
+                    float hBot = box.get_bottom(hb)
+
+                    float overlapLo = math.max(_ltfBot, hBot)
+                    float overlapHi = math.min(_ltfTop, hTop)
+
+                    if overlapLo < overlapHi
+                        ok := true
+                        break
+    ok
+
+//=====================================================================
+// 13) LTF update loop (flip/invalidate + render)
+//     - Breaker (isFlip=true): NO FILL + DASHED border
+//=====================================================================
+if array.size(ltf_boxes) > 0
+    int kL = array.size(ltf_boxes) - 1
+    while kL >= 0
+        box  b     = array.get(ltf_boxes, kL)
+        float lim  = array.get(ltf_limits, kL)
+        bool isSup = array.get(ltf_is_supply, kL)
+        bool isFlip= array.get(ltf_is_flipped, kL)
+        int  tType = array.get(ltf_trig_type, kL)
+
+        bool confirmed = barstate.isconfirmed
+        bool del = false
+
+        if isSup
+            if (not isFlip) and confirmed and close > lim
+                array.set(ltf_is_flipped, kL, true)
+                array.set(ltf_limits, kL, box.get_bottom(b))
+            else if isFlip and confirmed and close < lim
+                del := true
+        else
+            if (not isFlip) and confirmed and close < lim
+                array.set(ltf_is_flipped, kL, true)
+                array.set(ltf_limits, kL, box.get_top(b))
+            else if isFlip and confirmed and close > lim
+                del := true
+
+        isFlip := array.get(ltf_is_flipped, kL)
+
+        bool passMode = f_is_shown_by_mode(ltfMode, isFlip)
+        bool passNested = true
+        if useNestedSameDir
+            float lTopN = box.get_top(b)
+            float lBotN = box.get_bottom(b)
+            bool  lBullDirN = f_dir_bull(isSup, isFlip)
+            passNested := f_is_nested_overlap_same_dir(lTopN, lBotN, lBullDirN)
+
+        bool showOB = passMode and passNested
+
+        if showOB
+            // Breaker = border only (no fill) + dashed
+            box.set_bgcolor(b, isFlip ? c_hide : f_fill_ltf(isSup, isFlip, tType))
+            box.set_border_color(b, f_border_ltf(isSup, isFlip, tType))
+            box.set_border_width(b, obBorderW)
+            box.set_border_style(b, isFlip ? line.style_dashed : line.style_solid)
+        else
+            box.set_bgcolor(b, c_hide)
+            box.set_border_color(b, c_hide)
+            box.set_border_width(b, 1)
+            box.set_border_style(b, line.style_solid)
+
+        if del
+            if ltfKeepClean
+                box.delete(b)
+            else
+                box.set_right(b, bar_index)
+                box.set_bgcolor(b, c_broken)
+                box.set_border_color(b, c_broken)
+                box.set_border_width(b, 1)
+                box.set_border_style(b, line.style_solid)
+
+                array.push(ltf_broken, b)
+                if array.size(ltf_broken) > MAX_BROKEN_HIST
+                    box.delete(array.shift(ltf_broken))
+
+            array.remove(ltf_boxes, kL), array.remove(ltf_limits, kL), array.remove(ltf_is_supply, kL), array.remove(ltf_is_flipped, kL), array.remove(ltf_trig_type, kL)
+        else
+            box.set_right(b, f_right_index(extendBarsForward))
+
+        kL -= 1

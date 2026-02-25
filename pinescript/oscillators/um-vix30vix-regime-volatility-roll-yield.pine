@@ -1,0 +1,311 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © UnderwearMillionaire
+
+// DESCRIPTION
+// This indicator compares spot VIX to a synthetic 30-day constant-maturity volatility estimate (“VIX30”)
+// built from VX1 and VX2 futures. The VIX30/VIX Ratio reveals short-term volatility pressure and regime
+// shifts that traditional VX1/VX2 roll-yield alone often misses.
+//
+// VIX30 is constructed using true calendar-day interpolation between VX1 and VX2, with VX1% and VX2%
+// showing the real-time weights behind the 30-day volatility anchor. The table displays the volatility
+// regime, the VX1/VX2 weights, spot-term roll yield (VIX30/VIX), and futures-term roll yield (VX2/VX1),
+// giving a complete, front-of-the-curve perspective on volatility dynamics.
+//
+// Use this to spot early vol expansions, collapsing contango, and regime transitions that influence
+// VXX, UVXY, SVIX, VX options, and VIX futures.
+
+
+// HOW IT WORKS
+// The script calculates the exact calendar days to expiration for the front two VIX futures.
+// It then applies linear interpolation to blend VX1 and VX2 into a 30-day constant-maturity
+// synthetic volatility measure (“VIX30”). Comparing VIX30 to spot VIX produces the VIX30/VIX
+// Ratio, which highlights short-term volatility pressure and regime direction. A full term
+// structure table summarizes regime, VX1%/VX2% weights, and both spot-term and futures-term
+// roll yields.
+
+
+// DEFAULT SETTINGS
+// VX1! and VX2! are used by default for front-month and second-month futures. These may be
+// manually overridden if TradingView rolls contracts early. The default timeframe is 30 minutes,
+// and the VIX30/VIX Ratio uses a 21-period EMA for regime smoothing. The historical threshold
+// is set to 1.08, reflecting the long-run average relationship between VIX30 and VIX.
+// All settings are user-configurable.
+
+
+// SUGGESTED USES
+// • Identify early volatility expansions before they appear in VX1/VX2 roll yield.
+// • Confirm contango/backwardation shifts with front-of-curve context.
+// • Time long/short volatility trades in VXX, UVXY, SVIX, and VX options.
+// • Monitor regime transitions (Low → Cautionary → High) to anticipate trend inflections.
+// • Combine with price action, NW trends, or MA color-flip systems for higher-confidence entries.
+// • MA red → green flips may signal opportunities to **short volatility** or increase equity exposure.
+// • MA green → red flips may signal opportunities to **go long volatility**, reduce equity exposure,
+//   or even take short-equity positions.
+
+
+// ALERTS
+// Alerts trigger when the ratio crosses above or below the historical threshold or when the
+// moving-average slope flips direction. A green flip signals rising volatility pressure;
+// a red flip signals fading or collapsing volatility. These can be used to automate long/short
+// volatility bias shifts or trade-entry notifications.
+
+
+// FURTHER HINTS
+// • Increasing orange/red in the table suggests an emerging higher-volatility environment.
+// • SVIX (inverse volatility ETF) can trend strongly when volatility decays; on a 6h chart,
+//   MA green flips often align with attractive short-volatility opportunities.
+// • For long-volatility trades, consider shrinking to a 30-minute chart and watching for
+//   MA green → red flips as early entry cues.
+// • Experiment with different timeframes and smoothing lengths to match your trading style.
+// • Higher VIX30/VIX and VX2/VX1 roll yields generally imply faster decay in VXX, UVXY, and UVIX —
+//   or stronger upside momentum in SVIX.
+
+//@version=6
+indicator("UM VIX30-rolling/VIX Ratio oscillator + Full Term Structure Table", shorttitle = "UM VIX30", overlay=false)
+
+// === INPUT SYMBOLS ===
+vx1Symbol = input.string("CBOE:VX1!", title="VX1! (Front Month Futures)", tooltip="Front-month VIX futures continuous contract. TradingView sometimes rolls VX1! to the next month before actual expiry. If that throws off the math, override this with a specific VX futures symbol such as VXZ2025 or VXF2026.")
+vx2Symbol = input.string("CBOE:VX2!", title="VX2! (Second Month Futures)", tooltip="Second-month VIX futures continuous contract. TradingView sometimes rolls VX2! early as VX1! rolls. If that throws off the indicator, override this with a specific VX futures symbol such as VXZ2025 or VXF2026.")
+vixSymbol = input.string("CBOE:VIX",  title="Spot VIX Symbol")
+
+// === TIMEFRAME SELECTION ===
+res = input.string("30", title="Data Resolution", options=["D", "60", "30", "5"], tooltip="Data sampling period for all symbols. Higher timeframes (D, 60) are smoother but slower to react; lower (30, 5) are more responsive but noisier.")
+
+// === MA DISPLAY TOGGLE ===
+showMA = input.bool(true, title="Show Moving Average")
+
+// === USER CONFIG: Historical Regime Threshold ===
+// This is the "historical average" level for VIX30/VIX ratio that separates stress vs complacency.
+// using 1.08 (~+8%). 
+histThresh = input.float(1.08, "Historical Avg VIX30/VIX Ratio Threshold", minval=0.5, maxval=2.0,  tooltip="My estimated long-run average for the VIX30/VIX ratio (~1.08). Above this line = Low volatility regime (steep contango). Between 1.0 and this line = Cautionary / medium regime. At or below 1.0 = High-volatility / stress regime.")
+
+// === FUNCTION: Get VIX Future Expiry (3rd Friday - 30d) ===
+getVixExpiry(year_, month_) =>
+    firstDay = timestamp(year_, month_, 1, 0, 0)
+    dowFirst = dayofweek(firstDay)
+    offsetToFriday = (dayofweek.friday - dowFirst + 7) % 7
+    thirdFriday = firstDay + (offsetToFriday + 14) * 86400000
+    thirdFridayWeds = thirdFriday - 2 * 86400000
+    thirdFridayWeds
+
+// === DETERMINE CORRECT FRONT / NEXT EXPIRATIONS ===
+tNow   = time
+yearNow  = year(tNow)
+monthNow = month(tNow)
+
+expFront = getVixExpiry(yearNow, monthNow)
+expNextY = monthNow == 12 ? yearNow + 1 : yearNow
+expNextM = monthNow == 12 ? 1 : monthNow + 1
+expNext  = getVixExpiry(expNextY, expNextM)
+
+// If the front-month expiry has already passed, roll forward one month
+if (tNow > expFront)
+    expFront := expNext
+    expNextY := expNextM == 12 ? yearNow + 1 : yearNow
+    expNextM := expNextM == 12 ? 1 : expNextM + 1
+    expNext  := getVixExpiry(expNextY, expNextM)
+
+// === DAYS TO EXPIRATION (front and next) ===
+d1 = (expFront - tNow) / 86400000.0
+d2 = (expNext  - tNow) / 86400000.0
+
+// === FETCH VIX FUTURES PRICES ===
+vx1 = request.security(vx1Symbol, res, close)
+vx2 = request.security(vx2Symbol, res, close)
+vix = request.security(vixSymbol,  res, close)
+
+// === Helper: Clamp a value between min and max ===
+clamp(val, min, max) =>
+    val < min ? min : val > max ? max : val
+
+// === CORRECT 30-DAY INTERPOLATION (SPVXSTR METHOD) ===
+target = 30.0
+denom  = (d2 - d1)
+wVX1_raw = denom != 0.0 ? (d2 - target) / denom : na
+wVX2_raw = denom != 0.0 ? 1.0 - wVX1_raw : na
+wVX1 = na(wVX1_raw) ? na : clamp(wVX1_raw, 0.0, 1.0)
+wVX2 = na(wVX2_raw) ? na : clamp(wVX2_raw, 0.0, 1.0)
+
+// === SYNTHETIC 30-DAY CONSTANT-MATURITY VIX ===
+vix30 = wVX1 * vx1 + wVX2 * vx2
+
+// === WEIGHTS AS PERCENTAGES ===
+vx1WeightPct = wVX1 * 100.0
+vx2WeightPct = wVX2 * 100.0
+
+// === VIX30 / VIX RATIO ===
+ratio = vix30 / vix
+
+// === VX2 / VX1 RATIO ===
+vxRatio = vx2 / vx1
+
+// === ROLL YIELDS ===
+vix30RollYield = (vix30 / vix - 1.0) * 100.0     // spot-term roll yield
+vxRollYield    = (vx2 / vx1 - 1.0) * 100.0       // futures-term roll yield
+
+// === MOVING AVERAGE INPUTS ===
+maType   = input.string("EMA", title="MA Type", options=["EMA", "SMA", "WMA"])
+maLength = input.int(21, minval=1, title="MA Length")
+
+getMA(source, length) =>
+    maType == "EMA" ? ta.ema(source, length) :    maType == "SMA" ? ta.sma(source, length) :                      ta.wma(source, length)
+
+ma       = getMA(ratio, maLength)
+maUp     = ma > ma[1]        // slope rising?
+maColor  = maUp ? color.green : color.red
+showDash = (bar_index % 2) == 0
+
+// === USER CONFIG FOR VISUAL REFERENCE LINE ===
+// keeps your existing behavior but now tied to histThresh
+refLine2 = histThresh
+
+// === CONDITIONAL COLORING FOR MAIN RATIO PLOT ===
+lineColor = ratio > refLine2 ? color.green : ratio < 1.0 ? color.red : color.orange
+
+// === PLOTS ===
+ratioPlot = plot(ratio, title="VIX30 / VIX Ratio", color=lineColor, linewidth=1)
+refPlot   = plot(1.0,      title="VIX30/VIX Ratio = 1 Reference", color=color.gray, linewidth=1)
+refPlot2  = plot(refLine2, title="Historic Threshold (VIX30/VIX)", color=color.new(color.orange, 10), linewidth=1)
+
+// optional MA on top of ratio
+plot((showMA and showDash) ? ma : na, title="MA (Dashed)", color=maColor, linewidth=2)
+
+// === FILLS ===
+isAboveOne       = ratio > 1.0
+isBelowOne       = ratio < 1.0
+isCautionaryBand = ratio >= 1.0 and ratio < refLine2
+fill(ratioPlot, refPlot,  color = isAboveOne and ratio >= refLine2 ? color.new(color.green, 80)  : na)
+fill(ratioPlot, refPlot,  color = isCautionaryBand               ? color.new(color.orange, 70) : na)
+fill(refPlot,  ratioPlot, color = isBelowOne                    ? color.new(color.red, 80)    : na)
+
+// === COLOR CONSTANTS ===
+var color GREEN_DARK   = color.new(color.green, 0)
+var color GREEN_LIGHT  = color.new(color.green, 70)
+var color ORANGE_DARK  = color.new(color.orange, 0)
+var color ORANGE_LIGHT = color.new(color.orange, 70)
+var color RED_DARK     = color.new(color.red, 0)
+var color RED_LIGHT    = color.new(color.red, 70)
+var color GRAY_LIGHT   = color.new(color.gray, 70)
+
+// === VOLATILITY REGIME TEXT FOR TABLE ===
+isLow        = ratio > refLine2
+isCautionary = ratio >= 1.01 and ratio <= 1.079
+isHigh       = ratio <= 1.0
+isCautionary := (not isLow and not isHigh) ? true : isCautionary
+regimeText = isLow ? "Low" : isCautionary ? "Cautionary" : "High"
+bgColor  = isLow ? GREEN_LIGHT  : isCautionary ? ORANGE_LIGHT : RED_LIGHT
+txtColor = isLow ? GREEN_DARK   : isCautionary ? ORANGE_DARK  : RED_DARK
+
+// === VX1 / VX2 COLOR LOGIC FOR TABLE ===
+getVxColor(val) =>
+    var array<color> colors = array.new<color>(2, color.black)
+    if not na(val)
+        if val >= 50
+            array.set(colors, 0, color.new(color.green, 70))
+            array.set(colors, 1, color.new(color.green, 0))
+        else if val >= 30
+            array.set(colors, 0, color.new(color.orange, 70))
+            array.set(colors, 1, color.new(color.orange, 0))
+        else
+            array.set(colors, 0, color.new(color.red, 70))
+            array.set(colors, 1, color.new(color.red, 0))
+    colors
+
+// === COLOR FUNCTIONS FOR ROLL YIELDS FOR TABLE ===
+getVix30RyColor(val) =>
+    var array<color> colors = array.new<color>(2, color.black)
+    if not na(val)
+        if val > 8
+            array.set(colors, 0, color.new(color.green, 70))
+            array.set(colors, 1, color.new(color.green, 0))
+        else if val >= 1
+            array.set(colors, 0, color.new(color.orange, 70))
+            array.set(colors, 1, color.new(color.orange, 0))
+        else
+            array.set(colors, 0, color.new(color.red, 70))
+            array.set(colors, 1, color.new(color.red, 0))
+    colors
+
+getVxRyColor(val) =>
+    var array<color> colors = array.new<color>(2, color.black)
+    if not na(val)
+        if val > 5
+            array.set(colors, 0, color.new(color.green, 70))
+            array.set(colors, 1, color.new(color.green, 0))
+        else if val >= 0.1
+            array.set(colors, 0, color.new(color.orange, 70))
+            array.set(colors, 1, color.new(color.orange, 0))
+        else
+            array.set(colors, 0, color.new(color.red, 70))
+            array.set(colors, 1, color.new(color.red, 0))
+    colors
+
+// === BUILD COLORS/STRINGS FOR TABLE ===
+vx1Arr = getVxColor(vx1WeightPct)
+vx2Arr = getVxColor(vx2WeightPct)
+vx1Bg  = array.get(vx1Arr, 0)
+vx1Txt = array.get(vx1Arr, 1)
+vx2Bg  = array.get(vx2Arr, 0)
+vx2Txt = array.get(vx2Arr, 1)
+vx1Str = str.tostring(vx1WeightPct, "#.0") + "%"
+vx2Str = str.tostring(vx2WeightPct, "#.0") + "%"
+
+vix30RyArr = getVix30RyColor(vix30RollYield)
+vix30RyBg  = array.get(vix30RyArr, 0)
+vix30RyTxt = array.get(vix30RyArr, 1)
+vix30RyStr = str.tostring(vix30RollYield, "#.1") + "%"
+
+vxRyArr = getVxRyColor(vxRollYield)
+vxRyBg  = array.get(vxRyArr, 0)
+vxRyTxt = array.get(vxRyArr, 1)
+vxRyStr = str.tostring(vxRollYield, "#.1") + "%"
+
+// === Contango / Backwardation label ===
+vxState = vxRollYield > 0 ? " (Contango)" : " (Backwardation)"
+vxRyFinalStr = vxRyStr + vxState
+
+// === BUILD TABLE ===
+// 5 columns now: 0-Regime, 1-VX1%, 2-VX2%, 3-VIX30 RY, 4-VX RY
+var tbl = table.new(position.bottom_right, 5, 2,
+     border_width=1,
+     frame_color=color.new(color.gray, 0),
+     border_color=color.new(color.gray, 0))
+
+// Header row
+table.cell(tbl, 0, 0, "Volatility Regime",  text_color=color.black, bgcolor=GRAY_LIGHT, text_size=size.small)
+table.cell(tbl, 1, 0, "VX1%",             text_color=color.black, bgcolor=GRAY_LIGHT, text_size=size.small)
+table.cell(tbl, 2, 0, "VX2%",             text_color=color.black, bgcolor=GRAY_LIGHT, text_size=size.small)
+table.cell(tbl, 3, 0, "VIX30/VIX RY",       text_color=color.black, bgcolor=GRAY_LIGHT, text_size=size.small)
+table.cell(tbl, 4, 0, "VX2/VX1 RY",         text_color=color.black, bgcolor=GRAY_LIGHT, text_size=size.small)
+
+// Data row
+table.cell(tbl, 0, 1, regimeText,  text_color=txtColor,    bgcolor=bgColor,    text_size=size.small)
+table.cell(tbl, 1, 1, vx1Str,      text_color=vx1Txt,      bgcolor=vx1Bg,      text_size=size.small)
+table.cell(tbl, 2, 1, vx2Str,      text_color=vx2Txt,      bgcolor=vx2Bg,      text_size=size.small)
+table.cell(tbl, 3, 1, vix30RyStr,  text_color=vix30RyTxt,  bgcolor=vix30RyBg,  text_size=size.small)
+table.cell(tbl, 4, 1, vxRyFinalStr, text_color=vxRyTxt, bgcolor=vxRyBg, text_size=size.small)
+
+// ==================================================================
+// ALERT LOGIC
+// ==================================================================
+
+// 1. MA turns green -> Long Volatility
+//    That happens when maUp just flipped from false to true.
+longVol_alert_fromMA = ta.crossover(ma, ma[1])  // ma > ma[1] now AND was <= before
+// but that's not exactly equivalent to slope flip. We'll do slope logic:
+longVol_alert_fromMA := (maUp and not (ma[1] > ma[2]))
+
+// 2. MA turns red -> Short Volatility
+shortVol_alert_fromMA = (not maUp and (ma[1] > ma[2]))
+
+// 3. Ratio falls below historical average -> Long Volatility
+longVol_alert_fromRatio = ta.crossunder(ratio, histThresh)
+
+// 4. Ratio rises above historical average -> Short Volatility
+shortVol_alert_fromRatio = ta.crossover(ratio, histThresh)
+
+// === Register alert conditions ===
+alertcondition(longVol_alert_fromMA,     title="Long Volatility (MA Slope Up)",     message="MA turned green / slope up: Long Volatility bias")
+alertcondition(shortVol_alert_fromMA,    title="Short Volatility (MA Slope Down)",  message="MA turned red / slope down: Short Volatility bias")
+alertcondition(longVol_alert_fromRatio,  title="Long Volatility (Below Threshold)", message="VIX30/VIX dropped below historical avg: Long Volatility bias")
+alertcondition(shortVol_alert_fromRatio, title="Short Volatility (Above Threshold)",message="VIX30/VIX broke above historical avg: Short Volatility bias")

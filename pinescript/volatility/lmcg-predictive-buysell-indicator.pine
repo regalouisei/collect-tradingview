@@ -1,0 +1,181 @@
+//@version=6
+indicator("Combined Predictive Buy/Sell Indicator", shorttitle="PredCombo", overlay=true, timeframe="", timeframe_gaps=true)
+
+// ───── Inputs from All Indicators ─────
+// EMA Inputs (from first and second)
+emaFastLen = input.int(9, title="Fast EMA Length", minval=1)  // Adjusted to match second's default
+emaMidLen = input.int(13, title="Mid EMA Length", minval=1)   // From first
+emaSlowLen = input.int(21, title="Slow EMA Length", minval=1)
+// HTF Timeframe (from first)
+htfTimeframe = input.timeframe("60", title="Higher Timeframe (e.g., 60 for 1H)")
+// Range Lookback (from first)
+rangeLen = input.int(3, title="Range Lookback for Breakout", minval=1)  // Shortened for more signals
+// Volume Filter (from first)
+useVolFilter = input.bool(false, title="Use Volume Filter")  // Default off for more signals
+volMaLen = input.int(14, title="Volume MA Length")
+volMultiplier = input.float(1.2, title="Volume Multiplier (e.g., 1.2x avg)", minval=1.0, step=0.1)  // Lowered for more signals
+// Momentum Inputs (from second)
+rsiLen = input.int(14, "RSI Length")
+rsiHigh = input.int(70, "RSI High")
+rsiLow = input.int(30, "RSI Low")
+macdFast = input.int(12, "MACD Fast")
+macdSlow = input.int(26, "MACD Slow")
+macdSigLen = input.int(9, "MACD Signal")
+atrLen = input.int(14, "ATR Volatility")
+// Intermarket (from second, optional for general use)
+useDxy = input.bool(false, "Use DXY Correlation")  // Made optional since not all assets relate to DXY
+dxyLen = input.int(20, "DXY Correlation Len")
+dxySym = input.string("TVC:DXY", "DXY Ticker")
+strongLvl = input.float(0.55, "Strong Signal >", step=0.05)
+mildLvl = input.float(0.15, "Mild Signal >", step=0.05)  // Kept for sig display
+// New for more signals: Min score thresholds
+minScoreLong = input.float(0.05, "Min Score for Long", step=0.05)
+minScoreShort = input.float(-0.05, "Max Score for Short", step=0.05)
+// Predictive VMACD (from third)
+vmacdSrc = input.source(close, title="VMACD Source")
+vmacdFastLen = input.int(12, "VMACD Fast Length", minval=1)
+vmacdSlowLen = input.int(26, "VMACD Slow Length", minval=1)
+vmacdSigLen = input.int(9, "VMACD Signal Length", minval=1)
+regLen = input.int(20, "Regression Lookback", minval=2)
+projBars = input.int(5, "Projection Ahead (bars)", minval=1)
+quadDamp = input.float(0.6, "Quadratic Damping (0.0 = no curve, 1.0 = full)", minval=0.0, maxval=1.0, step=0.1)
+// Display Options (from second)
+showIcons = input.bool(true, "Show Strong Signal Icons")
+showBars = input.bool(true, "Color Price Bars")
+showBg = input.bool(true, "Background Regime Fill")
+
+// ───── Calculations ─────
+// EMAs on Current Timeframe
+emaFast = ta.ema(close, emaFastLen)
+emaMid = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+// HTF EMAs
+htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaFastLen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+htfEmaMid = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaMidLen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaSlowLen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// HTF Trend
+htfBullish = htfEmaFast > htfEmaMid and htfEmaMid > htfEmaSlow
+htfBearish = htfEmaFast < htfEmaMid and htfEmaMid < htfEmaSlow
+htfNeutral = not htfBullish and not htfBearish
+
+// Plot EMAs
+plot(emaFast, color=color.blue, title="Fast EMA")
+plot(emaMid, color=color.orange, title="Mid EMA")
+plot(emaSlow, color=color.red, title="Slow EMA")
+
+// Momentum Components (from second)
+emaDir = emaFast > emaSlow ? 1 : emaFast < emaSlow ? -1 : 0  // Using fast/slow as in second
+rsi = ta.rsi(close, rsiLen)
+rsiDir = rsi < rsiLow ? 1 : rsi > rsiHigh ? -1 : 0
+[macdL, macdSig, macdHist] = ta.macd(close, macdFast, macdSlow, macdSigLen)
+macdDir = macdHist > 0 ? 1 : macdHist < 0 ? -1 : 0
+atr = ta.atr(atrLen)
+volScale = 1 / math.max(0.001, 1 + atr/close)  // Dampen in high vol
+
+// Intermarket (optional DXY)
+dxyDir = 0
+if useDxy
+    dxy = request.security(dxySym, timeframe.period, close, ignore_invalid_symbol=true)
+    corr = ta.correlation(close, dxy, dxyLen)
+    dxyDir := na(corr) ? 0 : corr > 0 ? -1 : 1
+
+// Composite Score
+tech = (emaDir + rsiDir + macdDir) / 3.0
+composite = (0.6 * tech + 0.2 * dxyDir) * volScale
+score = math.max(-1.0, math.min(1.0, composite))
+
+// Signal Text & Color (from second)
+string sig = switch
+    score > strongLvl => "Strong Buy"
+    score > mildLvl => "Buy"
+    score < -strongLvl => "Strong Sell"
+    score < -mildLvl => "Sell"
+    => "Neutral"
+color sigCol = switch sig
+    "Strong Buy" => color.new(color.lime, 0)
+    "Buy" => color.new(color.green, 20)
+    "Strong Sell" => color.new(color.maroon, 0)
+    "Sell" => color.new(color.red, 20)
+    => color.gray
+
+// Predictive VMACD (from third, but without scaling since overlay=true, we can plot separately if needed)
+fastVwma = ta.vwma(vmacdSrc, vmacdFastLen)
+slowVwma = ta.vwma(vmacdSrc, vmacdSlowLen)
+vmacdRaw = fastVwma - slowVwma
+signalRaw = ta.ema(vmacdRaw, vmacdSigLen)
+
+// For projection (keep raw for calculations)
+get_slope(series float src_series, int len) =>
+    float stdev_y = ta.stdev(src_series, len)
+    float stdev_x = ta.stdev(bar_index, len)
+    float corr = ta.correlation(bar_index, src_series, len)
+    stdev_x != 0 ? corr * (stdev_y / stdev_x) : 0.0
+slopeV = get_slope(vmacdRaw, regLen)
+slopeS = get_slope(signalRaw, regLen)
+
+// Curvature
+linregV = ta.linreg(vmacdRaw, regLen, 0)
+curvV = (vmacdRaw - linregV) * quadDamp * 2 / regLen
+linregS = ta.linreg(signalRaw, regLen, 0)
+curvS = (signalRaw - linregS) * quadDamp * 2 / regLen
+
+// Projected values
+futureV = vmacdRaw + slopeV * projBars + curvV * projBars * projBars
+futureS = signalRaw + slopeS * projBars + curvS * projBars * projBars
+
+// Predictive Direction: Relaxed for more signals
+predBullish = futureV > futureS  // Just projected VMACD above signal
+predBearish = futureV < futureS
+
+// Combined Entry Signals
+// Base from first: EMA stack + breakout + HTF
+rangeHigh = ta.highest(high, rangeLen)
+rangeLow = ta.lowest(low, rangeLen)
+baseLong = htfBullish and close > emaFast and emaFast > emaMid and emaMid > emaSlow and close > rangeHigh[1]
+baseShort = htfBearish and close < emaFast and emaFast < emaMid and emaMid < emaSlow and close < rangeLow[1]
+
+// Enhance with composite score and predictive (lower threshold for more signals)
+longCondition = baseLong and (score > minScoreLong) and predBullish
+shortCondition = baseShort and (score < minScoreShort) and predBearish
+
+// Weak Signals (relaxed conditions for more frequent potential entries)
+weakLong = htfBullish and close > emaFast and (score > 0.0) and predBullish
+weakShort = htfBearish and close < emaFast and (score < 0.0) and predBearish
+
+// Volume Filter
+avgVol = ta.sma(volume, volMaLen)
+highVol = volume > avgVol * volMultiplier
+if useVolFilter
+    longCondition := longCondition and highVol
+    shortCondition := shortCondition and highVol
+    weakLong := weakLong and highVol
+    weakShort := weakShort and highVol
+
+// Plot Main Signals
+plotshape(series=longCondition, title="Long Entry", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small, text="BUY")
+plotshape(series=shortCondition, title="Short Entry", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small, text="SELL")
+
+// Plot Weak Signals (only if not already a main signal)
+plotshape(weakLong and not longCondition, "Weak Buy", style=shape.circle, location=location.belowbar, color=color.new(color.green, 50), size=size.tiny, text="wBuy")
+plotshape(weakShort and not shortCondition, "Weak Sell", style=shape.circle, location=location.abovebar, color=color.new(color.red, 50), size=size.tiny, text="wSell")
+
+// Alerts
+alertcondition(longCondition, title="Combined Long Alert", message="Predictive Buy Signal - HTF Bullish, Score Positive, Projection Up")
+alertcondition(shortCondition, title="Combined Short Alert", message="Predictive Sell Signal - HTF Bearish, Score Negative, Projection Down")
+alertcondition(weakLong, title="Weak Long Alert", message="Potential Weak Buy - Check Conditions")
+alertcondition(weakShort, title="Weak Short Alert", message="Potential Weak Sell - Check Conditions")
+
+// Display from second
+bgcolor(showBg ? color.new(sigCol, 90) : na, title="Regime Fill")
+plotshape(showIcons and score > strongLvl and score[1] <= strongLvl, "Strong Buy", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(showIcons and score < -strongLvl and score[1] >= -strongLvl, "Strong Sell", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small)
+barcolor(showBars ? sigCol : na)
+
+// Background for HTF Trend (from first)
+bgcolor(htfBullish ? color.new(color.green, 90) : na, title="HTF Bullish")
+bgcolor(htfBearish ? color.new(color.red, 90) : na, title="HTF Bearish")
+bgcolor(htfNeutral ? color.new(color.gray, 90) : na, title="HTF Neutral")
+
+// Note: Projections are calculated but not plotted since overlay=true; if needed, could add a separate pane, but kept simple.

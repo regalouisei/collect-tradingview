@@ -1,0 +1,801 @@
+//@version=6
+strategy("MASU+ v8.2 (DC+NW+ELM+VIX) [1H]", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     pyramiding=0, calc_on_every_tick=true,
+     max_labels_count=500, max_lines_count=200, max_boxes_count=300,
+     commission_type=strategy.commission.cash_per_order, commission_value=7.0, slippage=2)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════
+// ASSET TYPE
+asset_type_input = input.string("Auto", "Asset Type", options=["Auto", "Metals", "Stocks", "Crypto", "Indices", "Commodities", "Forex", "Energy"], group="Asset Detection",
+     tooltip="Auto: detect from ticker. Affects SL/TP and adverse exit.")
+
+// TIME FILTER
+use_time_filter = input.bool(true, "Trade Only During Session", group="Time Filter")
+trading_session = input.session("0900-2200", "Trading Hours", group="Time Filter")
+
+// TREND
+trend_ema_fast = input.int(21, "Trend EMA Fast", minval=5, group="Trend")
+trend_ema_slow = input.int(50, "Trend EMA Slow", minval=10, group="Trend")
+trend_ema_filter = input.int(200, "Trend Filter EMA", minval=50, group="Trend")
+
+// DONCHIAN CHANNEL (enhanced v8.2)
+use_donchian = input.bool(true, "Enable Donchian Channel", group="Donchian Channel")
+dc_length = input.int(20, "Donchian Period", minval=5, maxval=100, group="Donchian Channel",
+     tooltip="Standard: 20. Crypto: 14-20. Stocks: 20-55.")
+dc_show = input.bool(true, "Show Donchian Lines", group="Donchian Channel")
+dc_use_breakout = input.bool(true, "Use DC Breakout Signals", group="Donchian Channel")
+dc_use_for_sl = input.bool(false, "Use DC for Stop Loss", group="Donchian Channel",
+     tooltip="SL = opposite channel band instead of ATR-based.")
+dc_squeeze_mult = input.float(0.6, "Squeeze Threshold (x avg)", minval=0.3, maxval=0.9, step=0.1, group="Donchian Channel",
+     tooltip="Channel width below this fraction of average = squeeze alert.")
+
+// VIX FEAR & GREED (NEW v8.2)
+use_vix_sentiment = input.bool(true, "Enable VIX Sentiment", group="VIX Fear & Greed",
+     tooltip="v8.2: Uses VIX to gauge market fear/greed. Adjusts entry bias and position sizing.")
+vix_symbol = input.symbol("CBOE:VIX", "VIX Symbol", group="VIX Fear & Greed")
+vix_extreme_fear = input.float(30.0, "Extreme Fear (VIX >)", minval=20, maxval=50, step=1, group="VIX Fear & Greed")
+vix_fear = input.float(22.0, "Fear (VIX >)", minval=15, maxval=40, step=1, group="VIX Fear & Greed")
+vix_greed = input.float(14.0, "Greed (VIX <)", minval=8, maxval=20, step=1, group="VIX Fear & Greed")
+vix_extreme_greed = input.float(12.0, "Extreme Greed (VIX <)", minval=5, maxval=15, step=1, group="VIX Fear & Greed")
+vix_roc_period = input.int(5, "VIX ROC Period", minval=1, maxval=20, group="VIX Fear & Greed",
+     tooltip="Rate of change period for VIX momentum. Rising VIX = increasing fear.")
+vix_use_as_filter = input.bool(false, "Block Entries on Extreme Fear", group="VIX Fear & Greed",
+     tooltip="When enabled, blocks new LONG entries when VIX > Extreme Fear threshold.")
+vix_size_adjust = input.bool(true, "Adjust Position Size by Sentiment", group="VIX Fear & Greed",
+     tooltip="Reduce position size in fear, increase in greed. Max 1.3x in extreme greed, min 0.5x in extreme fear.")
+show_vix_bg = input.bool(true, "Show VIX Background Tint", group="VIX Fear & Greed",
+     tooltip="Subtle background color: green = greed, red = fear.")
+
+// MARKET BREADTH (SPX proxy)
+use_market_breadth = input.bool(true, "Enable Market Breadth", group="Market Breadth",
+     tooltip="Uses SPX500 daily trend as risk-on/off proxy.")
+mb_symbol = input.symbol("OANDA:SPX500USD", "Breadth Proxy Symbol", group="Market Breadth")
+mb_ema_len = input.int(200, "Breadth EMA Length", minval=50, group="Market Breadth")
+
+// MTF FILTER
+use_mtf_filter = input.bool(true, "Use MTF Filter", group="MTF Filter")
+mtf_timeframe = input.timeframe("240", "Higher Timeframe", group="MTF Filter")
+mtf_ema_fast_len = input.int(21, "MTF EMA Fast", minval=5, group="MTF Filter")
+mtf_ema_slow_len = input.int(55, "MTF EMA Slow", minval=10, group="MTF Filter")
+
+// NW KERNEL RIBBON
+use_nw_ribbon = input.bool(true, "Use NW Kernel Ribbon", group="NW Ribbon")
+nw_src = input.source(close, "Source", group="NW Ribbon")
+nw_lookback = input.int(50, "Lookback Window", minval=10, maxval=200, group="NW Ribbon")
+nw_bw_scale = input.float(1.0, "Bandwidth Scale", minval=0.3, maxval=3.0, step=0.1, group="NW Ribbon")
+nw_bw_mode = input.string("Adaptive", "Bandwidth Mode", options=["Fixed", "Adaptive"], group="NW Ribbon")
+nw_ribbon_threshold = input.int(6, "Ribbon Threshold (of 7)", minval=4, maxval=7, group="NW Ribbon")
+show_nw_ribbon = input.bool(true, "Show NW Ribbon", group="NW Ribbon")
+
+// ELM NEURAL FILTER
+use_elm = input.bool(true, "Enable ELM Filter", group="ELM Neural")
+elm_lr = input.float(0.015, "Learning Rate", step=0.005, group="ELM Neural")
+elm_weight_decay = input.float(0.9995, "Weight Decay", minval=0.990, maxval=1.0, step=0.0005, group="ELM Neural")
+elm_target_bars = input.int(5, "Target Lookahead Bars", minval=1, maxval=20, group="ELM Neural")
+elm_conf_soft = input.float(0.55, "Soft Confidence", step=0.05, group="ELM Neural")
+elm_use_block = input.bool(false, "AI Can Block?", group="ELM Neural")
+elm_conf_hard = input.float(0.60, "Block Threshold", step=0.05, group="ELM Neural")
+elm_size_impact = input.bool(true, "Quality Affects Size", group="ELM Neural")
+elm_use_calibration = input.bool(true, "Use Calibration", group="ELM Neural")
+elm_calibration_window = input.int(100, "Calibration Window", minval=20, group="ELM Neural")
+
+// ORDER FLOW
+use_order_flow = input.bool(true, "Enable Order Flow", group="Order Flow")
+show_vwap = input.bool(true, "Show VWAP", group="Order Flow")
+cvd_length = input.int(20, "CVD Period", minval=1, group="Order Flow")
+cvd_threshold = input.float(0.6, "CVD Threshold", minval=0.1, maxval=1.0, step=0.1, group="Order Flow")
+
+// SMART MONEY
+use_smc = input.bool(true, "Enable Smart Money", group="Smart Money")
+show_order_blocks = input.bool(true, "Show Order Blocks", group="Smart Money")
+show_fvg = input.bool(true, "Show FVG", group="Smart Money")
+show_liquidity = input.bool(true, "Show Liquidity Sweeps", group="Smart Money")
+show_bos = input.bool(true, "Show BOS/CHoCH", group="Smart Money")
+ob_lookback = input.int(10, "OB Lookback", minval=5, group="Smart Money")
+fvg_min_size = input.float(0.5, "FVG Min Size (ATR)", minval=0.1, step=0.1, group="Smart Money")
+liquidity_lookback = input.int(20, "Liquidity Lookback", minval=10, group="Smart Money")
+bos_pivot_length = input.int(5, "BOS Pivot Length", minval=3, group="Smart Money")
+
+// RISK MANAGEMENT
+atr_length = input.int(14, "ATR Period", minval=1, group="Risk")
+base_sl_atr = input.float(1.5, "Base SL (ATR)", minval=0.5, step=0.1, group="Risk")
+partial_tp_atr = input.float(1.5, "Partial TP (ATR)", minval=0.5, step=0.1, group="Risk",
+     tooltip="Close partial_tp_pct% at this ATR level. Remainder runs with trail.")
+partial_tp_pct = input.float(50.0, "Partial TP %", minval=10, maxval=90, step=10, group="Risk")
+use_trailing = input.bool(true, "Use Trailing Stop", group="Risk")
+trail_activation_pct = input.float(0.25, "Trail Activation (% of TP)", minval=0.1, maxval=0.9, step=0.05, group="Risk")
+trail_offset_atr = input.float(0.2, "Trail Offset (ATR)", minval=0.05, step=0.05, group="Risk")
+adverse_stocks_atr = input.float(0.7, "Adverse Exit Stocks (ATR)", minval=0.3, step=0.1, group="Risk")
+adverse_other_atr = input.float(1.0, "Adverse Exit Others (ATR)", minval=0.5, step=0.1, group="Risk")
+hard_sl_atr = input.float(2.0, "Hard SL (ATR)", minval=1.0, step=0.1, group="Risk")
+
+// FILTERS
+adx_length = input.int(14, "ADX Period", minval=1, group="Filters")
+adx_threshold = input.int(30, "ADX Min Threshold", minval=15, maxval=50, group="Filters")
+volume_spike_mult = input.float(1.2, "Volume Spike Mult", minval=1.0, step=0.1, group="Filters")
+volume_floor_pct = input.float(0.5, "Volume Floor (% of avg)", minval=0.1, maxval=1.0, step=0.1, group="Filters")
+
+// CONFLUENCE WEIGHTS (v8.2: +VIX)
+w_mtf = input.float(2.0, "W: MTF", minval=0, maxval=5, step=0.5, group="Weights")
+w_ribbon = input.float(1.5, "W: NW Ribbon", minval=0, maxval=5, step=0.5, group="Weights")
+w_elm = input.float(1.0, "W: ELM AI", minval=0, maxval=5, step=0.5, group="Weights")
+w_of = input.float(1.0, "W: Order Flow", minval=0, maxval=5, step=0.5, group="Weights")
+w_smc = input.float(1.0, "W: Smart Money", minval=0, maxval=5, step=0.5, group="Weights")
+w_adx = input.float(0.5, "W: ADX Trend", minval=0, maxval=5, step=0.5, group="Weights")
+w_slope = input.float(0.5, "W: NW Slope", minval=0, maxval=5, step=0.5, group="Weights")
+w_donchian = input.float(1.0, "W: Donchian", minval=0, maxval=5, step=0.5, group="Weights")
+w_breadth = input.float(0.5, "W: Market Breadth", minval=0, maxval=5, step=0.5, group="Weights")
+w_vix = input.float(1.0, "W: VIX Sentiment", minval=0, maxval=5, step=0.5, group="Weights")
+min_confluence = input.float(3.0, "Min Confluence to Enter", minval=0.5, maxval=15, step=0.5, group="Weights")
+
+// ALERTS
+alert_confidence_pct = input.float(85.0, "Alert at Confidence %", minval=50, maxval=100, step=5, group="Alerts")
+
+// DISPLAY
+showDashboard = input.bool(true, "Show Dashboard", group="Display")
+show_sl_tp_lines = input.bool(true, "Show SL/TP Lines", group="Display")
+dash_style = input.string("Full", "Dashboard Style", options=["Full", "Compact"], group="Display")
+
+// VOLATILITY REGIME
+use_vol_regime = input.bool(true, "Enable Vol Regime", group="Volatility")
+atr_percentile_length = input.int(100, "ATR Percentile Period", minval=20, group="Volatility")
+
+// EQUITY GUARD
+use_equity_guard = input.bool(true, "Enable Equity Guard", group="Equity Guard")
+max_consec_losses = input.int(5, "Max Consec Losses", minval=2, group="Equity Guard")
+max_drawdown_pct = input.float(15.0, "Max DD % to Pause", minval=5, maxval=50, group="Equity Guard")
+guard_cooldown_length = input.int(50, "Guard Cooldown (bars)", minval=10, group="Equity Guard")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. ASSET TYPE DETECTION (expanded v8.2)
+// ═══════════════════════════════════════════════════════════════════════════
+f_has(string src, string sub) => str.contains(str.upper(src), str.upper(sub))
+
+f_detectAsset() =>
+    sym = str.upper(syminfo.ticker)
+    if asset_type_input != "Auto"
+        asset_type_input
+    else if f_has(sym,"XAU") or f_has(sym,"XAG") or f_has(sym,"XPT") or f_has(sym,"XPD") or f_has(sym,"GOLD") or f_has(sym,"SILVER") or f_has(sym,"GC1") or f_has(sym,"SI1")
+        "Metals"
+    else if f_has(sym,"BTC") or f_has(sym,"ETH") or f_has(sym,"SOL") or f_has(sym,"DOGE") or f_has(sym,"XRP") or f_has(sym,"AAVE") or f_has(sym,"ADA") or f_has(sym,"BNB") or f_has(sym,"AVAX") or f_has(sym,"DOT") or f_has(sym,"LINK") or f_has(sym,"SHIB") or f_has(sym,"LTC") or f_has(sym,"HBAR") or f_has(sym,"CELO") or f_has(sym,"KAS") or f_has(sym,"ETC") or f_has(sym,"NEAR") or f_has(sym,"ATOM") or syminfo.type == "crypto"
+        "Crypto"
+    else if f_has(sym,"NAS100") or f_has(sym,"US500") or f_has(sym,"US2000") or f_has(sym,"US30") or f_has(sym,"SPX") or f_has(sym,"NDX") or f_has(sym,"DAX") or f_has(sym,"DE40") or f_has(sym,"UK100") or f_has(sym,"FTSE") or f_has(sym,"EU50") or f_has(sym,"FR40") or f_has(sym,"JP225") or f_has(sym,"NIK") or syminfo.type == "index"
+        "Indices"
+    else if f_has(sym,"BCO") or f_has(sym,"WTICO") or f_has(sym,"NATGAS") or f_has(sym,"XCU") or f_has(sym,"CL1") or f_has(sym,"NG1") or f_has(sym,"USOIL") or f_has(sym,"UKOIL") or f_has(sym,"BRENT")
+        "Energy"
+    else if f_has(sym,"EUR") or f_has(sym,"GBP") or f_has(sym,"JPY") or f_has(sym,"CHF") or f_has(sym,"AUD") or f_has(sym,"NZD") or f_has(sym,"CAD") and syminfo.type == "forex"
+        "Forex"
+    else
+        "Stocks"
+
+current_asset_type = f_detectAsset()
+is_stocks = current_asset_type == "Stocks"
+adverse_atr = is_stocks ? adverse_stocks_atr : adverse_other_atr
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. CORE INDICATORS
+// ═══════════════════════════════════════════════════════════════════════════
+atr = ta.atr(atr_length)
+ema_fast = ta.ema(close, trend_ema_fast)
+ema_slow = ta.ema(close, trend_ema_slow)
+ema_filter = ta.ema(close, trend_ema_filter)
+[diPlus, diMinus, adx] = ta.dmi(adx_length, adx_length)
+rsi = ta.rsi(close, 14)
+volume_sma = ta.sma(volume, 20)
+volume_spike = volume > volume_sma * volume_spike_mult
+volume_floor_ok = volume_sma > 0 ? volume >= volume_sma * volume_floor_pct : true
+
+bb_basis = ta.sma(close, 20)
+bb_dev = 2.0 * ta.stdev(close, 20)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+highest_high = ta.highest(high, 20)
+lowest_low = ta.lowest(low, 20)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. DONCHIAN CHANNEL (enhanced v8.2)
+// ═══════════════════════════════════════════════════════════════════════════
+dc_upper = ta.highest(high, dc_length)
+dc_lower = ta.lowest(low, dc_length)
+dc_mid = (dc_upper + dc_lower) / 2.0
+dc_width = dc_upper - dc_lower
+dc_width_pct = dc_mid > 0 ? dc_width / dc_mid * 100 : 0
+dc_width_avg = ta.sma(dc_width_pct, 50)
+
+// Squeeze detection: channel narrower than threshold * average
+dc_squeeze = dc_width_avg > 0 ? dc_width_pct < dc_width_avg * dc_squeeze_mult : false
+dc_expanding = dc_width_pct > dc_width_pct[1] and dc_width_pct[1] > dc_width_pct[2]
+
+// Donchian signals
+dc_breakout_long = close > dc_upper[1] and close[1] <= dc_upper[2]
+dc_breakout_short = close < dc_lower[1] and close[1] >= dc_lower[2]
+dc_trend_long = close > dc_mid
+dc_trend_short = close < dc_mid
+dc_filter_long = not use_donchian or dc_trend_long
+dc_filter_short = not use_donchian or dc_trend_short
+
+// Position within channel (0 = bottom, 100 = top)
+dc_position_pct = dc_width > 0 ? (close - dc_lower) / dc_width * 100 : 50
+dc_zone = dc_position_pct >= 90 ? "TOP" : dc_position_pct >= 60 ? "UPPER" : dc_position_pct >= 40 ? "MID" : dc_position_pct >= 10 ? "LOWER" : "BOT"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. VIX FEAR & GREED SENTIMENT (NEW v8.2)
+// ═══════════════════════════════════════════════════════════════════════════
+vix_close = request.security(vix_symbol, "D", close, lookahead=barmerge.lookahead_off)
+vix_high = request.security(vix_symbol, "D", ta.highest(close, 5), lookahead=barmerge.lookahead_off)
+vix_low = request.security(vix_symbol, "D", ta.lowest(close, 5), lookahead=barmerge.lookahead_off)
+vix_sma20 = request.security(vix_symbol, "D", ta.sma(close, 20), lookahead=barmerge.lookahead_off)
+vix_roc = request.security(vix_symbol, "D", ta.roc(close, vix_roc_period), lookahead=barmerge.lookahead_off)
+
+// Classify sentiment
+vix_val = nz(vix_close, 18)
+vix_sentiment = vix_val >= vix_extreme_fear ? 1 : vix_val >= vix_fear ? 2 : vix_val > vix_greed ? 3 : vix_val > vix_extreme_greed ? 4 : 5
+// 1=Extreme Fear, 2=Fear, 3=Neutral, 4=Greed, 5=Extreme Greed
+
+vix_label = vix_sentiment == 1 ? "EXTREME FEAR" : vix_sentiment == 2 ? "FEAR" : vix_sentiment == 3 ? "NEUTRAL" : vix_sentiment == 4 ? "GREED" : "EXTREME GREED"
+
+// VIX momentum: rising VIX = panic building, falling VIX = calm returning
+vix_roc_val = nz(vix_roc, 0)
+vix_rising = vix_roc_val > 5    // VIX jumped 5%+ = panic spike
+vix_falling = vix_roc_val < -5  // VIX dropping 5%+ = relief
+vix_momentum = vix_rising ? "PANIC SPIKE" : vix_falling ? "RELIEF" : "STABLE"
+
+// VIX relative to its 20-day SMA (overbought/oversold)
+vix_above_sma = nz(vix_sma20, 18) > 0 ? vix_val / vix_sma20 : 1.0
+vix_elevated = vix_above_sma > 1.2  // VIX 20%+ above its average = unusually fearful
+
+// Market prediction score (-2 to +2)
+// Negative = bearish outlook (high fear, rising VIX)
+// Positive = bullish outlook (low fear, falling VIX)
+vix_prediction = 0.0
+vix_prediction += vix_sentiment == 5 ? 1.0 : vix_sentiment == 4 ? 0.5 : vix_sentiment == 3 ? 0.0 : vix_sentiment == 2 ? -0.5 : -1.0
+vix_prediction += vix_falling ? 0.5 : vix_rising ? -0.5 : 0.0
+vix_prediction += vix_elevated ? -0.5 : 0.0
+
+// Translate prediction to market outlook
+market_outlook = vix_prediction >= 1.0 ? "BULLISH" : vix_prediction >= 0.3 ? "LEAN BULL" : vix_prediction <= -1.0 ? "BEARISH" : vix_prediction <= -0.3 ? "LEAN BEAR" : "NEUTRAL"
+
+// VIX-based position size multiplier
+vix_size_mult = 1.0
+if vix_size_adjust and use_vix_sentiment
+    vix_size_mult := vix_sentiment == 5 ? 1.3 : vix_sentiment == 4 ? 1.15 : vix_sentiment == 3 ? 1.0 : vix_sentiment == 2 ? 0.75 : 0.5
+    // Override: if VIX is spiking, always reduce
+    if vix_rising
+        vix_size_mult := math.min(vix_size_mult, 0.7)
+
+// VIX filter for entries
+vix_block_long = use_vix_sentiment and vix_use_as_filter and vix_sentiment == 1
+// In extreme fear: block longs. Shorts are OK (contrarian requires caution).
+
+// VIX confluence: adds weight for longs in greed, shorts in fear
+vix_favors_long = use_vix_sentiment and (vix_sentiment >= 3 and not vix_rising)
+vix_favors_short = use_vix_sentiment and (vix_sentiment <= 2 or vix_rising)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. MARKET BREADTH (SPX proxy)
+// ═══════════════════════════════════════════════════════════════════════════
+mb_close = request.security(mb_symbol, "D", close, lookahead=barmerge.lookahead_off)
+mb_ema = request.security(mb_symbol, "D", ta.ema(close, mb_ema_len), lookahead=barmerge.lookahead_off)
+market_risk_on = mb_close > mb_ema
+mb_status = market_risk_on ? "RISK ON" : "RISK OFF"
+mb_filter_long = not use_market_breadth or market_risk_on
+mb_filter_short = not use_market_breadth or true
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. NW KERNEL RIBBON
+// ═══════════════════════════════════════════════════════════════════════════
+f_nw_endpoint(float src, float h, int lookback) =>
+    float sum_w = 0.0
+    float sum_wy = 0.0
+    for i = 0 to lookback - 1
+        float u = float(i) / h
+        float w = math.exp(-0.5 * u * u)
+        sum_w += w
+        sum_wy += w * nz(src[i])
+    sum_w > 0 ? sum_wy / sum_w : src
+
+atr_norm_pct = atr / close * 100
+atr_norm_sma = ta.sma(atr_norm_pct, 50)
+adaptive_scale = nw_bw_mode == "Adaptive" ? math.max(0.5, math.min(2.5, atr_norm_sma > 0 ? atr_norm_pct / atr_norm_sma : 1.0)) : 1.0
+bw_scale = nw_bw_scale * adaptive_scale
+
+nw1 = f_nw_endpoint(nw_src, 3.0 * bw_scale, nw_lookback)
+nw2 = f_nw_endpoint(nw_src, 5.0 * bw_scale, nw_lookback)
+nw3 = f_nw_endpoint(nw_src, 8.0 * bw_scale, nw_lookback)
+nw4 = f_nw_endpoint(nw_src, 13.0 * bw_scale, nw_lookback)
+nw5 = f_nw_endpoint(nw_src, 21.0 * bw_scale, nw_lookback)
+nw6 = f_nw_endpoint(nw_src, 34.0 * bw_scale, nw_lookback)
+nw7 = f_nw_endpoint(nw_src, 55.0 * bw_scale, nw_lookback)
+nw8 = f_nw_endpoint(nw_src, 89.0 * bw_scale, nw_lookback)
+
+nw_ordered_bull = (nw1>nw2?1:0) + (nw2>nw3?1:0) + (nw3>nw4?1:0) + (nw4>nw5?1:0) + (nw5>nw6?1:0) + (nw6>nw7?1:0) + (nw7>nw8?1:0)
+nw_ordered_bear = (nw1<nw2?1:0) + (nw2<nw3?1:0) + (nw3<nw4?1:0) + (nw4<nw5?1:0) + (nw5<nw6?1:0) + (nw6<nw7?1:0) + (nw7<nw8?1:0)
+nw_relaxed_bull = nw_ordered_bull >= nw_ribbon_threshold
+nw_relaxed_bear = nw_ordered_bear >= nw_ribbon_threshold
+ribbon_filter_long = not use_nw_ribbon or nw_relaxed_bull
+ribbon_filter_short = not use_nw_ribbon or nw_relaxed_bear
+nw1_slope = nw1 - nw1[1]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. ELM NEURAL FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+f_norm(val, lo, hi) => math.max(math.min((val - lo) / (hi - lo), 1.0), 0.0)
+
+ema200_elm = ta.ema(close, 200)
+dist_ema200 = (close - ema200_elm) / close * 100
+
+elm_f1 = nz(ta.rsi(close, 14) / 100.0, 0.5)
+elm_f2 = f_norm(ta.roc(close, 5), -10, 10)
+elm_f3 = f_norm(dist_ema200, -5, 5)
+elm_f4 = f_norm(adx, 0, 60)
+elm_f5 = f_norm(nw1 != 0 ? nw1_slope / nw1 * 1000 : 0, -5, 5)
+elm_f6 = f_norm(nw_ordered_bull - nw_ordered_bear, -7, 7)
+elm_f7 = volume_sma > 0 ? f_norm(volume / volume_sma, 0, 3) : 0.5
+
+var float ew1=0.1, var float ew2=0.1, var float ew3=0.1, var float ew4=0.05
+var float ew5=0.1, var float ew6=0.1, var float ew7=0.05, var float ew_bias=0.0
+
+elm_target = close > close[elm_target_bars] ? 1.0 : 0.0
+elm_prev_out = ew1*nz(elm_f1[elm_target_bars]) + ew2*nz(elm_f2[elm_target_bars]) + ew3*nz(elm_f3[elm_target_bars]) + ew4*nz(elm_f4[elm_target_bars]) + ew5*nz(elm_f5[elm_target_bars]) + ew6*nz(elm_f6[elm_target_bars]) + ew7*nz(elm_f7[elm_target_bars]) + ew_bias
+elm_prev_prob = 1.0 / (1.0 + math.exp(-math.max(math.min(elm_prev_out, 10), -10)))
+elm_error = elm_target - elm_prev_prob
+
+if barstate.isconfirmed
+    ew1 := ew1 * elm_weight_decay + elm_lr * elm_error * nz(elm_f1[elm_target_bars])
+    ew2 := ew2 * elm_weight_decay + elm_lr * elm_error * nz(elm_f2[elm_target_bars])
+    ew3 := ew3 * elm_weight_decay + elm_lr * elm_error * nz(elm_f3[elm_target_bars])
+    ew4 := ew4 * elm_weight_decay + elm_lr * elm_error * nz(elm_f4[elm_target_bars])
+    ew5 := ew5 * elm_weight_decay + elm_lr * elm_error * nz(elm_f5[elm_target_bars])
+    ew6 := ew6 * elm_weight_decay + elm_lr * elm_error * nz(elm_f6[elm_target_bars])
+    ew7 := ew7 * elm_weight_decay + elm_lr * elm_error * nz(elm_f7[elm_target_bars])
+    ew_bias := ew_bias * elm_weight_decay + elm_lr * elm_error
+
+elm_out = ew1*elm_f1 + ew2*elm_f2 + ew3*elm_f3 + ew4*elm_f4 + ew5*elm_f5 + ew6*elm_f6 + ew7*elm_f7 + ew_bias
+elm_prob = 1.0 / (1.0 + math.exp(-math.max(math.min(elm_out, 10), -10)))
+elm_clean = nz(elm_prob, 0.5)
+
+var int elm_correct = 0, var int elm_total = 0, var float elm_accuracy = 0.5, var float elm_conf_weight = 1.0
+if barstate.isconfirmed and bar_index > elm_target_bars + 10
+    float p = nz(elm_prob[elm_target_bars], 0.5)
+    bool ok = (p > 0.5) == (close > close[elm_target_bars])
+    elm_total += 1
+    if ok
+        elm_correct += 1
+    if elm_total > elm_calibration_window
+        elm_accuracy := elm_accuracy * 0.99 + (ok ? 0.01 : 0.0)
+    else
+        elm_accuracy := elm_total > 0 ? float(elm_correct) / float(elm_total) : 0.5
+    elm_conf_weight := elm_use_calibration ? math.max(0.0, math.min(1.5, (elm_accuracy - 0.48) / 0.08)) : 1.0
+
+elm_vote_long = use_elm and elm_clean > elm_conf_soft
+elm_vote_short = use_elm and elm_clean < (1.0 - elm_conf_soft)
+elm_block_long = use_elm and elm_use_block and elm_clean < (1.0 - elm_conf_hard)
+elm_block_short = use_elm and elm_use_block and elm_clean > elm_conf_hard
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. MTF FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+mtf_ema_f = request.security(syminfo.tickerid, mtf_timeframe, ta.ema(close, mtf_ema_fast_len), lookahead=barmerge.lookahead_off)
+mtf_ema_s = request.security(syminfo.tickerid, mtf_timeframe, ta.ema(close, mtf_ema_slow_len), lookahead=barmerge.lookahead_off)
+mtf_cl = request.security(syminfo.tickerid, mtf_timeframe, close, lookahead=barmerge.lookahead_off)
+mtf_bull = mtf_ema_f > mtf_ema_s and mtf_cl > mtf_ema_f
+mtf_bear = mtf_ema_f < mtf_ema_s and mtf_cl < mtf_ema_f
+mtf_filter_long = not use_mtf_filter or mtf_bull
+mtf_filter_short = not use_mtf_filter or mtf_bear
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. VWAP & ORDER FLOW
+// ═══════════════════════════════════════════════════════════════════════════
+var float vwap_sum = 0.0, var float vol_sum = 0.0, var float vwap = 0.0
+if barstate.isfirst or ta.change(time('D')) != 0
+    vwap_sum := 0.0
+    vol_sum := 0.0
+vwap_sum += volume * hlc3
+vol_sum += volume
+vwap := vol_sum > 0 ? vwap_sum / vol_sum : close
+
+buy_vol = close > open ? volume : 0.0
+sell_vol = close < open ? volume : 0.0
+delta = buy_vol - sell_vol
+cvd = ta.cum(delta)
+cvd_sma = ta.sma(cvd, cvd_length)
+vol_ratio = buy_vol / math.max(sell_vol, 1)
+
+of_bullish = use_order_flow and ((cvd > cvd_sma and cvd > cvd[1]) or vol_ratio > (1 + cvd_threshold)) and close > vwap
+of_bearish = use_order_flow and ((cvd < cvd_sma and cvd < cvd[1]) or vol_ratio < (1 - cvd_threshold)) and close < vwap
+of_filter_long = not use_order_flow or of_bullish or close > vwap
+of_filter_short = not use_order_flow or of_bearish or close < vwap
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11. SMART MONEY CONCEPTS
+// ═══════════════════════════════════════════════════════════════════════════
+bullish_ob = close > open and close[1] < open[1] and high - close < (high - low) * 0.3
+bearish_ob = close < open and close[1] > open[1] and close - low < (high - low) * 0.3
+bullish_fvg = low > high[2] and (low - high[2]) > atr * fvg_min_size
+bearish_fvg = high < low[2] and (low[2] - high) > atr * fvg_min_size
+recent_high = ta.highest(high, liquidity_lookback)
+recent_low = ta.lowest(low, liquidity_lookback)
+liq_grab_high = high > recent_high[1] and close < open and close < recent_high[1]
+liq_grab_low = low < recent_low[1] and close > open and close > recent_low[1]
+
+swing_high = ta.pivothigh(high, bos_pivot_length, bos_pivot_length)
+swing_low = ta.pivotlow(low, bos_pivot_length, bos_pivot_length)
+var float last_sh = na, var float last_sl = na
+if not na(swing_high)
+    last_sh := swing_high
+if not na(swing_low)
+    last_sl := swing_low
+bullish_bos = not na(last_sh) and close > last_sh and close[1] <= last_sh
+bearish_bos = not na(last_sl) and close < last_sl and close[1] >= last_sl
+
+smc_bullish = use_smc and (bullish_ob or bullish_fvg or liq_grab_low or bullish_bos)
+smc_bearish = use_smc and (bearish_ob or bearish_fvg or liq_grab_high or bearish_bos)
+smc_filter_long = not use_smc or smc_bullish or bullish_ob or bullish_fvg
+smc_filter_short = not use_smc or smc_bearish or bearish_ob or bearish_fvg
+
+// OB visualization
+var box[] bull_ob_boxes = array.new_box()
+var box[] bear_ob_boxes = array.new_box()
+if barstate.isconfirmed and use_smc and show_order_blocks
+    if bullish_ob
+        array.push(bull_ob_boxes, box.new(bar_index-1, high[1], bar_index+15, low[1], border_color=color.new(color.green,100), bgcolor=color.new(color.green,90)))
+        if array.size(bull_ob_boxes) > 6
+            box.delete(array.shift(bull_ob_boxes))
+    if bearish_ob
+        array.push(bear_ob_boxes, box.new(bar_index-1, high[1], bar_index+15, low[1], border_color=color.new(color.red,100), bgcolor=color.new(color.red,90)))
+        if array.size(bear_ob_boxes) > 6
+            box.delete(array.shift(bear_ob_boxes))
+
+var box[] fvg_bull = array.new_box()
+var box[] fvg_bear = array.new_box()
+if barstate.isconfirmed and use_smc and show_fvg
+    if bullish_fvg
+        array.push(fvg_bull, box.new(bar_index-2, low, bar_index+10, high[2], border_color=color.new(color.teal,100), bgcolor=color.new(color.teal,90)))
+        if array.size(fvg_bull) > 5
+            box.delete(array.shift(fvg_bull))
+    if bearish_fvg
+        array.push(fvg_bear, box.new(bar_index-2, low[2], bar_index+10, high, border_color=color.new(color.maroon,100), bgcolor=color.new(color.maroon,90)))
+        if array.size(fvg_bear) > 5
+            box.delete(array.shift(fvg_bear))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. VOLATILITY REGIME
+// ═══════════════════════════════════════════════════════════════════════════
+atr_pctrank = ta.percentrank(atr, atr_percentile_length)
+high_vol = atr_pctrank > 70
+low_vol = atr_pctrank < 30
+is_trending = adx > adx_threshold
+is_ranging = not is_trending
+bullish_trend = ema_fast > ema_slow and close > ema_filter
+bearish_trend = ema_fast < ema_slow and close < ema_filter
+
+regime_state = high_vol and is_trending ? 1 : high_vol ? 2 : low_vol and is_trending ? 3 : is_trending ? 1 : 4
+regime_sl = use_vol_regime ? (regime_state==1 ? 1.5 : regime_state==2 ? 1.2 : regime_state==3 ? 1.5 : 1.0) : base_sl_atr
+regime_tp = use_vol_regime ? (regime_state==1 ? 2.5 : regime_state==2 ? 1.8 : regime_state==3 ? 2.5 : 1.5) : partial_tp_atr * 2.0
+regime_label = regime_state==1 ? "HV-TR" : regime_state==2 ? "HV-RNG" : regime_state==3 ? "LV-TR" : "LV-RNG"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 13. EQUITY GUARD
+// ═══════════════════════════════════════════════════════════════════════════
+var int total_trades = 0, var int wins = 0
+var float total_profit = 0.0, var float total_loss_val = 0.0
+var int consec_losses = 0
+var float peak_eq = strategy.initial_capital
+var bool guard_active = false
+var int guard_cd = 0
+
+if strategy.closedtrades > total_trades
+    lp = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    total_trades := strategy.closedtrades
+    if lp > 0
+        wins += 1
+        total_profit += lp
+        consec_losses := 0
+    else
+        total_loss_val += math.abs(lp)
+        consec_losses += 1
+
+peak_eq := math.max(peak_eq, strategy.equity)
+dd_pct = peak_eq > 0 ? (peak_eq - strategy.equity) / peak_eq * 100 : 0
+
+if use_equity_guard
+    if consec_losses >= max_consec_losses or dd_pct >= max_drawdown_pct
+        if not guard_active
+            guard_cd := guard_cooldown_length
+        guard_active := true
+    if guard_active
+        guard_cd -= 1
+        if guard_cd <= 0
+            guard_active := false
+    if consec_losses < max_consec_losses and dd_pct < max_drawdown_pct
+        guard_active := false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 14. WEIGHTED CONFLUENCE (v8.2: +VIX weight)
+// ═══════════════════════════════════════════════════════════════════════════
+max_confl = w_mtf + w_ribbon + w_of + w_smc + w_adx + w_slope + w_elm + w_donchian + w_breadth + w_vix
+elm_w_eff = w_elm * elm_conf_weight
+
+ss_long = (mtf_filter_long ? w_mtf : 0) + (ribbon_filter_long ? w_ribbon : 0) + (of_filter_long ? w_of : 0) + (smc_filter_long ? w_smc : 0) + (is_trending ? w_adx : 0) + (elm_vote_long ? elm_w_eff : 0) + (nw1_slope > 0 ? w_slope : 0) + (dc_filter_long ? w_donchian : 0) + (mb_filter_long ? w_breadth : 0) + (vix_favors_long ? w_vix : 0)
+ss_short = (mtf_filter_short ? w_mtf : 0) + (ribbon_filter_short ? w_ribbon : 0) + (of_filter_short ? w_of : 0) + (smc_filter_short ? w_smc : 0) + (is_trending ? w_adx : 0) + (elm_vote_short ? elm_w_eff : 0) + (nw1_slope < 0 ? w_slope : 0) + (dc_filter_short ? w_donchian : 0) + (mb_filter_short ? w_breadth : 0) + (vix_favors_short ? w_vix : 0)
+
+conf_score = math.max(ss_long, ss_short)
+conf_pct = max_confl > 0 ? conf_score / max_confl * 100 : 0
+direction = ss_long > ss_short ? "LONG" : ss_short > ss_long ? "SHORT" : "WAIT"
+alert_worthy = conf_pct >= alert_confidence_pct
+
+// SL/TP
+sl_long = dc_use_for_sl and use_donchian ? dc_lower : close - atr * regime_sl
+tp_long = close + atr * regime_tp
+sl_short = dc_use_for_sl and use_donchian ? dc_upper : close + atr * regime_sl
+tp_short = close - atr * regime_tp
+
+f_qmult(float q, float mx) =>
+    p = mx > 0 ? q / mx : 0.5
+    p >= 0.75 ? 1.0 : p >= 0.5 ? 0.8 : 0.6
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 15. EXECUTION (v8.2: +VIX filter + VIX size adjust)
+// ═══════════════════════════════════════════════════════════════════════════
+in_session = not use_time_filter or not na(time(timeframe.period, trading_session))
+ema_cross_up = ta.crossover(ema_fast, ema_slow)
+ema_cross_down = ta.crossunder(ema_fast, ema_slow)
+rsi_cross_up = ta.crossover(rsi, 30)
+rsi_cross_down = ta.crossunder(rsi, 70)
+
+trend_long = is_trending and bullish_trend and ema_cross_up and volume_spike and volume_floor_ok
+trend_short = is_trending and bearish_trend and ema_cross_down and volume_spike and volume_floor_ok
+breakout_long = close > highest_high[1] and volume_spike and volume_floor_ok and close > ema_filter
+breakout_short = close < lowest_low[1] and volume_spike and volume_floor_ok and close < ema_filter
+mean_rev_long = is_ranging and close < bb_lower and rsi < 30 and rsi_cross_up and volume_floor_ok
+mean_rev_short = is_ranging and close > bb_upper and rsi > 70 and rsi_cross_down and volume_floor_ok
+dc_long = use_donchian and dc_use_breakout and dc_breakout_long and volume_spike and volume_floor_ok and close > ema_filter
+dc_short = use_donchian and dc_use_breakout and dc_breakout_short and volume_spike and volume_floor_ok and close < ema_filter
+
+long_cond = (trend_long or breakout_long or mean_rev_long or dc_long) and mtf_filter_long and ribbon_filter_long and of_filter_long and smc_filter_long and dc_filter_long and not elm_block_long and not vix_block_long and in_session and ss_long >= min_confluence and not guard_active
+short_cond = (trend_short or breakout_short or mean_rev_short or dc_short) and mtf_filter_short and ribbon_filter_short and of_filter_short and smc_filter_short and dc_filter_short and not elm_block_short and in_session and ss_short >= min_confluence and not guard_active
+
+// Entry type for alerts
+entry_type_long = trend_long ? "TREND" : breakout_long ? "BRKOUT" : mean_rev_long ? "MREV" : dc_long ? "DC" : "MIXED"
+entry_type_short = trend_short ? "TREND" : breakout_short ? "BRKOUT" : mean_rev_short ? "MREV" : dc_short ? "DC" : "MIXED"
+
+if long_cond and strategy.position_size == 0
+    qm = elm_size_impact ? f_qmult(ss_long, max_confl) : 1.0
+    final_size = strategy.equity * 0.10 * qm * vix_size_mult / close
+    strategy.entry("Long", strategy.long, qty=final_size)
+    strategy.exit("PartialL", "Long", qty_percent=partial_tp_pct, limit=close + atr * partial_tp_atr, stop=sl_long)
+    if use_trailing
+        tp_dist = atr * regime_tp
+        act_ticks = math.round(tp_dist * trail_activation_pct / syminfo.mintick)
+        off_ticks = math.round(atr * trail_offset_atr / syminfo.mintick)
+        strategy.exit("TrailL", "Long", stop=sl_long, trail_points=act_ticks, trail_offset=off_ticks)
+    else
+        strategy.exit("ExitL", "Long", stop=sl_long, limit=tp_long)
+    if alert_worthy
+        alert("BUY " + syminfo.ticker + " | " + entry_type_long + " | " + current_asset_type + " | Conf:" + str.tostring(conf_pct, "#") + "% | AI:" + str.tostring(elm_clean, "#.2") + " | VIX:" + vix_label + " | " + market_outlook + " | DC:" + dc_zone + " | " + regime_label, alert.freq_once_per_bar_close)
+
+if short_cond and strategy.position_size == 0
+    qm = elm_size_impact ? f_qmult(ss_short, max_confl) : 1.0
+    final_size = strategy.equity * 0.10 * qm * vix_size_mult / close
+    strategy.entry("Short", strategy.short, qty=final_size)
+    strategy.exit("PartialS", "Short", qty_percent=partial_tp_pct, limit=close - atr * partial_tp_atr, stop=sl_short)
+    if use_trailing
+        tp_dist = atr * regime_tp
+        act_ticks = math.round(tp_dist * trail_activation_pct / syminfo.mintick)
+        off_ticks = math.round(atr * trail_offset_atr / syminfo.mintick)
+        strategy.exit("TrailS", "Short", stop=sl_short, trail_points=act_ticks, trail_offset=off_ticks)
+    else
+        strategy.exit("ExitS", "Short", stop=sl_short, limit=tp_short)
+    if alert_worthy
+        alert("SELL " + syminfo.ticker + " | " + entry_type_short + " | " + current_asset_type + " | Conf:" + str.tostring(conf_pct, "#") + "% | AI:" + str.tostring(elm_clean, "#.2") + " | VIX:" + vix_label + " | " + market_outlook + " | DC:" + dc_zone + " | " + regime_label, alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16. VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAs
+plot(ema_fast, "EMA 21", color=#42A5F5, linewidth=1)
+plot(ema_slow, "EMA 50", color=#FFA726, linewidth=1)
+plot(ema_filter, "EMA 200", color=color.new(#EF5350, 50), linewidth=1)
+
+// Donchian Channel (enhanced with fill)
+p_dc_up = plot(dc_show and use_donchian ? dc_upper : na, "DC Upper", color=color.new(#26A69A, 40), linewidth=2)
+p_dc_lo = plot(dc_show and use_donchian ? dc_lower : na, "DC Lower", color=color.new(#EF5350, 40), linewidth=2)
+plot(dc_show and use_donchian ? dc_mid : na, "DC Mid", color=color.new(#FF9800, 50), linewidth=1, style=plot.style_cross)
+dc_fill_color = dc_squeeze ? color.new(#FF9800, 85) : dc_trend_long ? color.new(#26A69A, 92) : color.new(#EF5350, 92)
+fill(p_dc_up, p_dc_lo, color=dc_show and use_donchian ? dc_fill_color : na, title="DC Fill")
+
+// NW Ribbon
+nw_c = nw_relaxed_bull ? color.new(#00C853, 70) : nw_relaxed_bear ? color.new(#FF1744, 70) : color.new(color.gray, 85)
+p1 = plot(show_nw_ribbon ? nw1 : na, "NW1", color=color.new(#00E676, 40), linewidth=2)
+p8 = plot(show_nw_ribbon ? nw8 : na, "NW8", color=color.new(#E53935, 40), linewidth=2)
+fill(p1, p8, color=show_nw_ribbon ? nw_c : na)
+
+// VWAP
+plot(show_vwap ? vwap : na, "VWAP", color=#AB47BC, linewidth=2)
+
+// VIX background tint
+vix_bg = vix_sentiment == 1 ? color.new(#B71C1C, 95) : vix_sentiment == 2 ? color.new(#E53935, 96) : vix_sentiment == 4 ? color.new(#43A047, 96) : vix_sentiment == 5 ? color.new(#1B5E20, 95) : na
+bgcolor(show_vix_bg and use_vix_sentiment ? vix_bg : na, title="VIX Sentiment BG")
+
+// Squeeze highlight
+bgcolor(dc_squeeze and use_donchian ? color.new(#FF9800, 94) : na, title="DC Squeeze BG")
+
+// Entry signals
+plotshape(long_cond and barstate.isconfirmed, "BUY", shape.triangleup, location.belowbar, #00E676, size=size.small)
+plotshape(short_cond and barstate.isconfirmed, "SELL", shape.triangledown, location.abovebar, #FF1744, size=size.small)
+
+// Entry labels
+if long_cond and barstate.isconfirmed
+    label.new(bar_index, low - atr*0.5, "BUY " + str.tostring(conf_pct,"#") + "%\n" + entry_type_long + " " + current_asset_type + "\nVIX:" + vix_label, color=color.new(#00C853,50), textcolor=color.white, style=label.style_label_up, size=size.small)
+if short_cond and barstate.isconfirmed
+    label.new(bar_index, high + atr*0.5, "SELL " + str.tostring(conf_pct,"#") + "%\n" + entry_type_short + " " + current_asset_type + "\nVIX:" + vix_label, color=color.new(#FF1744,50), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// SMC labels
+if show_liquidity and use_smc and barstate.isconfirmed
+    if liq_grab_high
+        label.new(bar_index, high + atr*0.3, "LIQ", color=color.new(#FF9800,70), textcolor=#FF9800, style=label.style_label_down, size=size.tiny)
+    if liq_grab_low
+        label.new(bar_index, low - atr*0.3, "LIQ", color=color.new(#FF9800,70), textcolor=#FF9800, style=label.style_label_up, size=size.tiny)
+if show_bos and use_smc and barstate.isconfirmed
+    if bullish_bos
+        label.new(bar_index, low - atr*0.15, "BOS", color=color.new(#00C853,85), textcolor=#00C853, style=label.style_label_up, size=size.tiny)
+    if bearish_bos
+        label.new(bar_index, high + atr*0.15, "BOS", color=color.new(#FF1744,85), textcolor=#FF1744, style=label.style_label_down, size=size.tiny)
+
+// SL/TP lines
+var line sl_line = na, var line tp_line = na, var line partial_line = na
+var label sl_lbl = na, var label tp_lbl = na, var label partial_lbl = na
+
+if barstate.islast and strategy.position_size != 0 and show_sl_tp_lines
+    line.delete(sl_line)
+    line.delete(tp_line)
+    line.delete(partial_line)
+    label.delete(sl_lbl)
+    label.delete(tp_lbl)
+    label.delete(partial_lbl)
+    float d_sl = strategy.position_size > 0 ? sl_long : sl_short
+    float d_tp = strategy.position_size > 0 ? tp_long : tp_short
+    float d_partial = strategy.position_size > 0 ? close + atr * partial_tp_atr : close - atr * partial_tp_atr
+    sl_line := line.new(bar_index-20, d_sl, bar_index+10, d_sl, color=#EF5350, width=2, style=line.style_dashed)
+    tp_line := line.new(bar_index-20, d_tp, bar_index+10, d_tp, color=#00C853, width=2, style=line.style_dashed)
+    partial_line := line.new(bar_index-20, d_partial, bar_index+10, d_partial, color=color.new(#FF9800,30), width=1, style=line.style_dotted)
+    sl_lbl := label.new(bar_index+11, d_sl, "SL " + str.tostring(d_sl, format.mintick), color=color.new(#EF5350,80), textcolor=#EF5350, style=label.style_label_left, size=size.tiny)
+    tp_lbl := label.new(bar_index+11, d_tp, "TP " + str.tostring(d_tp, format.mintick), color=color.new(#00C853,80), textcolor=#00C853, style=label.style_label_left, size=size.tiny)
+    partial_lbl := label.new(bar_index+11, d_partial, str.tostring(partial_tp_pct,"#") + "% TP", color=color.new(#FF9800,80), textcolor=#FF9800, style=label.style_label_left, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 17. DASHBOARD (v8.2: redesigned, cleaner, with VIX + Donchian + prediction)
+// ═══════════════════════════════════════════════════════════════════════════
+mtf_15m_up = request.security(syminfo.tickerid, "15", ta.ema(close,21) > ta.ema(close,50), lookahead=barmerge.lookahead_off)
+mtf_1h_up = request.security(syminfo.tickerid, "60", ta.ema(close,21) > ta.ema(close,50), lookahead=barmerge.lookahead_off)
+mtf_4h_up = request.security(syminfo.tickerid, "240", ta.ema(close,21) > ta.ema(close,50), lookahead=barmerge.lookahead_off)
+trend_align = (mtf_15m_up ? 1 : 0) + (mtf_1h_up ? 1 : 0) + (mtf_4h_up ? 1 : 0)
+
+if showDashboard
+    int rows = dash_style == "Full" ? 20 : 12
+    var table db = table.new(position.bottom_right, 2, rows, border_width=1, border_color=color.new(#37474F, 60))
+    if barstate.islast
+        sz = size.small
+        bg_h = color.new(#0D1B2A, 10)
+        bg_r = color.new(#1B2838, 85)
+        int r = 0
+
+        // ── HEADER ──
+        table.cell(db, 0, r, "MASU+ v8.2", text_color=#E0E0E0, bgcolor=bg_h, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, current_asset_type + " " + syminfo.ticker, text_color=#90CAF9, bgcolor=bg_h, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── DIRECTION + CONFIDENCE ──
+        dir_bg = direction == "LONG" ? #00C853 : direction == "SHORT" ? #FF1744 : #546E7A
+        table.cell(db, 0, r, "Signal", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, direction + " " + str.tostring(conf_pct, "#") + "%", text_color=color.white, bgcolor=dir_bg, text_size=size.normal, text_halign=text.align_right)
+        r += 1
+
+        // ── VIX SENTIMENT (NEW) ──
+        vix_bg_d = vix_sentiment == 1 ? #B71C1C : vix_sentiment == 2 ? #D32F2F : vix_sentiment == 3 ? #546E7A : vix_sentiment == 4 ? #2E7D32 : #1B5E20
+        table.cell(db, 0, r, "VIX " + str.tostring(vix_val, "#.1"), text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, vix_label + (vix_rising ? " ^" : vix_falling ? " v" : ""), text_color=color.white, bgcolor=vix_bg_d, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── MARKET PREDICTION (NEW) ──
+        pred_bg = vix_prediction >= 1.0 ? #00C853 : vix_prediction >= 0.3 ? #66BB6A : vix_prediction <= -1.0 ? #FF1744 : vix_prediction <= -0.3 ? #EF5350 : #546E7A
+        table.cell(db, 0, r, "Outlook", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, market_outlook + " (" + str.tostring(vix_prediction, "#.1") + ")", text_color=color.white, bgcolor=pred_bg, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── DONCHIAN (enhanced) ──
+        dc_bg_d = dc_squeeze ? #FF9800 : dc_zone == "TOP" ? #00C853 : dc_zone == "BOT" ? #FF1744 : dc_zone == "UPPER" ? color.new(#00C853, 40) : dc_zone == "LOWER" ? color.new(#FF1744, 40) : #546E7A
+        dc_text = dc_zone + " " + str.tostring(dc_position_pct, "#") + "%" + (dc_squeeze ? " SQZ" : dc_expanding ? " EXP" : "")
+        table.cell(db, 0, r, "Donchian", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, dc_text, text_color=color.white, bgcolor=dc_bg_d, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── TRENDS ──
+        t_text = (mtf_15m_up ? "15m+" : "15m-") + " " + (mtf_1h_up ? "1H+" : "1H-") + " " + (mtf_4h_up ? "4H+" : "4H-")
+        t_bg = trend_align == 3 ? #00C853 : trend_align == 0 ? #FF1744 : #FF9800
+        table.cell(db, 0, r, "Trends", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, t_text + " (" + str.tostring(trend_align) + "/3)", text_color=color.white, bgcolor=t_bg, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── ADX ──
+        table.cell(db, 0, r, "ADX", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, str.tostring(adx, "#.0") + "/" + str.tostring(adx_threshold) + (is_trending ? " TREND" : " RANGE"), text_color=color.white, bgcolor=is_trending ? #00C853 : #78909C, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── ELM AI ──
+        table.cell(db, 0, r, "ELM AI", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        elm_dir = elm_vote_long ? "BULL" : elm_vote_short ? "BEAR" : "FLAT"
+        elm_bg = elm_vote_long ? #00C853 : elm_vote_short ? #FF1744 : #546E7A
+        table.cell(db, 1, r, elm_dir + " " + str.tostring(elm_clean*100, "#") + "% (acc:" + str.tostring(elm_accuracy*100, "#") + "%)", text_color=color.white, bgcolor=elm_bg, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── MARKET BREADTH ──
+        table.cell(db, 0, r, "SPX Breadth", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, mb_status, text_color=color.white, bgcolor=market_risk_on ? #00C853 : #FF1744, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── VOLUME ──
+        vol_pct_d = volume_sma > 0 ? volume / volume_sma * 100 : 100
+        vol_bg = volume_spike ? #00C853 : volume_floor_ok ? #78909C : #FF1744
+        table.cell(db, 0, r, "Volume", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, str.tostring(vol_pct_d, "#") + "% avg" + (volume_spike ? " SPIKE" : volume_floor_ok ? "" : " LOW"), text_color=color.white, bgcolor=vol_bg, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        // ── REGIME ──
+        reg_bg = regime_state==1 ? #00C853 : regime_state==2 ? #FF9800 : regime_state==3 ? #42A5F5 : #78909C
+        table.cell(db, 0, r, "Regime", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+        table.cell(db, 1, r, regime_label + "  SL:" + str.tostring(regime_sl,"#.1") + " TP:" + str.tostring(regime_tp,"#.1"), text_color=color.white, bgcolor=reg_bg, text_size=sz, text_halign=text.align_right)
+        r += 1
+
+        if dash_style == "Full"
+            // ── NW RIBBON ──
+            nw_text = nw_relaxed_bull ? "BULL " + str.tostring(nw_ordered_bull) + "/7" : nw_relaxed_bear ? "BEAR " + str.tostring(nw_ordered_bear) + "/7" : "FLAT"
+            nw_bg = nw_relaxed_bull ? #00C853 : nw_relaxed_bear ? #FF1744 : #546E7A
+            table.cell(db, 0, r, "NW Ribbon", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, nw_text, text_color=color.white, bgcolor=nw_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── ORDER FLOW ──
+            of_text = of_bullish ? "BUY FLOW" : of_bearish ? "SELL FLOW" : close > vwap ? "> VWAP" : "< VWAP"
+            of_bg = of_bullish ? #00C853 : of_bearish ? #FF1744 : close > vwap ? color.new(#00C853, 40) : color.new(#FF1744, 40)
+            table.cell(db, 0, r, "Order Flow", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, of_text, text_color=color.white, bgcolor=of_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── SMC ──
+            smc_text = smc_bullish ? "BULL" : smc_bearish ? "BEAR" : "WAIT"
+            smc_bg = smc_bullish ? #00C853 : smc_bearish ? #FF1744 : #546E7A
+            table.cell(db, 0, r, "Smart Money", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, smc_text + (bullish_bos ? " BOS+" : bearish_bos ? " BOS-" : ""), text_color=color.white, bgcolor=smc_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── VIX MOMENTUM ──
+            vm_bg = vix_rising ? #FF1744 : vix_falling ? #00C853 : #546E7A
+            table.cell(db, 0, r, "VIX ROC", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, vix_momentum + " " + str.tostring(vix_roc_val, "#.1") + "%", text_color=color.white, bgcolor=vm_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── VIX SIZE MULT ──
+            vs_bg = vix_size_mult >= 1.1 ? #00C853 : vix_size_mult <= 0.7 ? #FF1744 : #546E7A
+            table.cell(db, 0, r, "VIX Size", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, str.tostring(vix_size_mult, "#.2") + "x", text_color=color.white, bgcolor=vs_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── DC WIDTH ──
+            dcw_bg = dc_squeeze ? #FF9800 : #546E7A
+            table.cell(db, 0, r, "DC Width", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, str.tostring(dc_width_pct, "#.2") + "%" + (dc_squeeze ? " SQUEEZE" : dc_expanding ? " EXPANDING" : ""), text_color=color.white, bgcolor=dcw_bg, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── GUARD ──
+            table.cell(db, 0, r, "Guard", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, guard_active ? "PAUSED" : "OK  L:" + str.tostring(consec_losses) + " DD:" + str.tostring(dd_pct,"#.1") + "%", text_color=color.white, bgcolor=guard_active ? #FF1744 : #00C853, text_size=sz, text_halign=text.align_right)
+            r += 1
+
+            // ── STATS ──
+            wr = total_trades > 0 ? float(wins) / float(total_trades) * 100 : 0
+            table.cell(db, 0, r, "Stats", text_color=#B0BEC5, bgcolor=bg_r, text_size=sz, text_halign=text.align_left)
+            table.cell(db, 1, r, str.tostring(total_trades) + " trades  WR:" + str.tostring(wr, "#.0") + "%", text_color=color.white, bgcolor=wr >= 55 ? #00C853 : wr >= 45 ? #FF9800 : #FF1744, text_size=sz, text_halign=text.align_right)

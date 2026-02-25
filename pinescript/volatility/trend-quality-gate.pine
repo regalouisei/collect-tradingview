@@ -1,0 +1,162 @@
+//@version=6
+// © 2026 Ibotrade
+// Trend Quality Gate (TQG)
+// Market context / diagnostic indicator.
+// Educational use only. Not financial advice.
+
+indicator("Trend Quality Gate", shorttitle="TQG", overlay=false, max_labels_count=500)
+// --- INPUTS ---
+groupCore = "Core Engine"
+emaLenF   = input.int(21, "EMA Fast", group=groupCore)
+emaLenM   = input.int(34, "EMA Mid", group=groupCore)
+emaLenS   = input.int(55, "EMA Slow", group=groupCore)
+
+groupElite = "Enhancements"
+useBench   = input.bool(true, "Sync with Benchmark", group=groupElite)
+benchTkr   = input.symbol("SPY", "Benchmark Ticker", group=groupElite)
+showDiv    = input.bool(true, "Show Momentum Divergence", group=groupElite)
+lookback   = input.int(200, "Adaptive Volatility Lookback", group=groupElite)
+
+groupViz   = "Visuals"
+colorBars  = input.bool(true, "Color Candles Based on Posture", group=groupViz)
+showEMAs   = input.bool(true, "Show 21/34/55 EMAs on Price Chart", group=groupViz)
+
+// NEW: User-configurable EMA colors (kept in the same Visuals group)
+emaColF   = input.color(color.white, "EMA Fast Color", group=groupViz)
+emaColM   = input.color(color.red,   "EMA Mid Color",  group=groupViz)
+emaColS   = input.color(color.lime,  "EMA Slow Color", group=groupViz)
+
+// Optional: line widths (tiny, but useful and still simple)
+emaW      = input.int(2, "EMA Line Width", minval=1, maxval=5, group=groupViz)
+
+
+// --- CALCULATIONS ---
+emaF = ta.ema(close, emaLenF)
+emaM = ta.ema(close, emaLenM)
+emaS = ta.ema(close, emaLenS)
+
+direction = (emaF > emaM and emaM > emaS) ? 1.0 : (emaF < emaM and emaM < emaS) ? -1.0 : 0.0
+
+// Volume Efficiency (Effort vs Result)
+// (kept as-is, but you may consider guarding divisions in a later pass)
+effRaw = (high - low) / (volume / ta.sma(volume, 20))
+effQ   = math.min(effRaw / ta.sma(effRaw, 50), 2.0) / 2.0 
+
+// Quality Metrics
+slopeQ  = math.min(math.abs(emaM - emaM[5]) / (close * 0.002), 1.0)
+momQ    = math.abs(ta.rsi(close, 14) - 50.0) / 50.0
+quality = (slopeQ + momQ + effQ) / 3.0 * 5.0 
+
+// Final TQ Score & Adaptive Thresholds
+tqRaw     = direction * quality * 20.0
+tqFast    = ta.ema(tqRaw, 3)
+dynThresh = ta.stdev(tqRaw, lookback)
+upperBound = dynThresh
+
+// --- DIVERGENCE ENGINE (pivot-to-pivot, non-repainting) ---
+// Detect: price makes a higher pivot high while TQ makes a lower pivot high.
+int pivL = 5
+int pivR = 5
+
+float phPrice = ta.pivothigh(high, pivL, pivR)
+float phTQ    = ta.pivothigh(tqFast, pivL, pivR)
+
+var float prevPricePH = na
+var float prevTQPH    = na
+
+bool bearExhaustion = false
+
+// Update stored pivots only when BOTH series confirm a pivot high on the same bar.
+// This keeps the comparison apples-to-apples and avoids mixing pivot times.
+if not na(phPrice) and not na(phTQ)
+    bearExhaustion := (not na(prevPricePH) and not na(prevTQPH)) and (phPrice > prevPricePH) and (phTQ < prevTQPH)
+
+    prevPricePH := phPrice
+    prevTQPH    := phTQ
+else
+    bearExhaustion := false
+
+
+// --- BENCHMARK SYNC (anti-repaint explicit) ---
+benchClose = request.security(benchTkr, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+benchBull  = benchClose > ta.ema(benchClose, 200)
+
+// --- DYNAMIC OPACITY LOGIC ---
+// Maps quality (0-5) to transparency (80-0).
+float qOpacity = math.max(0.0, math.min(80.0, 100.0 - (quality / 5.0 * 100.0)))
+
+/// --- POSTURE LOGIC ---
+// (Keep posture/quality logic identical; split colors into SOLID (HUD) and SHADED (candles/plots))
+isBull = tqFast > upperBound
+isBear = tqFast < -upperBound
+
+string posture   = "STAND DOWN"
+color  pColSolid = color.gray
+
+if isBull
+    if quality >= 4.0 and (not useBench or benchBull)
+        posture   := bearExhaustion ? "FAVORABLE (DIVERGENCE)" : "FAVORABLE"
+        pColSolid := bearExhaustion ? #FFD700 : color.lime
+    else if quality >= 3.0
+        posture   := benchBull ? "PARTICIPATE" : "DEFENSIVE"
+        pColSolid := benchBull ? color.aqua : color.orange
+    else
+        posture   := "CAUTION"
+        pColSolid := color.yellow
+else if isBear
+    posture   := "DECAY"
+    pColSolid := color.red
+else
+    posture   := "STAND DOWN"
+    pColSolid := color.gray
+
+// SHADED color for candles/plots (reflects quality intensity via existing qOpacity)
+color pColShade = color.new(pColSolid, qOpacity)
+
+
+// ============================================================================
+// PRICE CHART OVERLAYS (EMAs + Candle Color)
+// ============================================================================
+
+// Candle color (optional) — use shaded color so intensity maps to quality
+barcolor(colorBars ? pColShade : na)
+
+// EMA plots on price chart (toggleable + color-configurable)
+plot(showEMAs ? emaF : na, "EMA Fast", color=emaColF, linewidth=emaW, force_overlay=true, display=showEMAs ? display.all : display.none)
+plot(showEMAs ? emaM : na, "EMA Mid",  color=emaColM, linewidth=emaW, force_overlay=true, display=showEMAs ? display.all : display.none)
+plot(showEMAs ? emaS : na, "EMA Slow", color=emaColS, linewidth=emaW, force_overlay=true, display=showEMAs ? display.all : display.none)
+
+
+// ============================================================================
+// INDICATOR PANE (TQ + bounds + heatmap + marker + HUD)
+// ============================================================================
+
+// --- PLOTS ---
+// Use shaded color on the plot for intensity; keep bounds/heatmap unchanged
+plot(tqFast, "TQ Score", color=pColShade, linewidth=2, style=plot.style_columns)
+plot(upperBound,  "Adaptive Limit", color=color.new(color.gray, 60))
+plot(-upperBound, "Adaptive Limit", color=color.new(color.gray, 60))
+
+plot(not na(tqFast) ? -115 : na, "Drift Heatmap",
+     color=color.from_gradient(tqFast, -100, 100, color.red, color.lime),
+     linewidth=4, style=plot.style_linebr)
+
+plotshape(showDiv and bearExhaustion ? tqFast : na, "Divergence Marker",
+          shape.triangledown, location.absolute, color.yellow, offset=-5, size=size.tiny)
+
+
+// --- HUD TABLE ---
+// Use SOLID posture color for readability (prevents dim/washed posture row)
+var table hud = table.new(position.top_right, 2, 3, border_width=1, border_color=color.new(color.gray, 50))
+
+if barstate.islast
+    table.cell(hud, 0, 0, "POSTURE", text_color=color.white, bgcolor=color.black)
+    table.cell(hud, 1, 0, posture,  text_color=color.black, bgcolor=pColSolid)
+
+    table.cell(hud, 0, 1, "BENCHMARK", text_color=color.white, bgcolor=color.black)
+    table.cell(hud, 1, 1, benchBull ? "BULLISH" : "BEARISH",
+         text_color=color.white, bgcolor=benchBull ? color.green : color.red)
+
+    table.cell(hud, 0, 2, "QUALITY", text_color=color.white, bgcolor=color.black)
+    table.cell(hud, 1, 2, str.tostring(quality, "#.##") + "/5",
+         text_color=color.white, bgcolor=pColSolid)

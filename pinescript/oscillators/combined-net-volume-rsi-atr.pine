@@ -1,0 +1,229 @@
+//@version=6
+indicator(title="Combined: Net Volume, RSI & ATR", shorttitle="Vol+RSI", format=format.price, precision=2, scale=scale.right)
+
+import TradingView/ta/8
+
+// ============================================================================
+// NET VOLUME SETTINGS & CALCULATION
+// ============================================================================
+GRP_VOL = "Net Volume"
+lowerTimeframeTooltip = "The indicator scans lower timeframe data to approximate Net volume. By default, the timeframe is chosen automatically. These inputs override this with a custom timeframe.\n\nHigher timeframes provide more historical data, but the data will be less precise."
+useCustomTimeframeInput = input.bool(false, "Use custom timeframe", tooltip = lowerTimeframeTooltip, group = GRP_VOL)
+lowerTimeframeInput = input.timeframe("1", "Timeframe", group = GRP_VOL)
+showNetVolume = input.bool(true, "Show Net Volume", group = GRP_VOL)
+
+lowerTimeframe = switch
+    useCustomTimeframeInput => lowerTimeframeInput
+    timeframe.isseconds     => "1S"
+    timeframe.isintraday    => "1"
+    timeframe.isdaily       => "5"
+    => "60"
+
+[upVolume, downVolume, delta] = ta.requestUpAndDownVolume(lowerTimeframe)
+
+var cumVol = 0.
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("The data vendor doesn't provide volume data for this symbol.")
+
+// Calculate volume range for scaling RSI
+volHigh = ta.highest(delta, 200)
+volLow = ta.lowest(delta, 200)
+volRange = volHigh - volLow
+
+// Net Volume Plot (unscaled - actual values)
+plot(showNetVolume ? delta : na, color=color.yellow, title="Net Volume", linewidth=2)
+
+// Zero line for Net Volume (semi-transparent yellow dashed line)
+hline(0, "Net Volume Zero", color=color.new(color.yellow, 60), linestyle=hline.style_dashed, linewidth=1)
+
+// ============================================================================
+// RSI SETTINGS & CALCULATION
+// ============================================================================
+GRP_RSI = "RSI Settings"
+rsiLengthInput = input.int(14, minval=1, title="RSI Length", group=GRP_RSI)
+rsiSourceInput = input.source(close, "Source", group=GRP_RSI)
+rsiUpperLevel = input.int(70, minval=50, maxval=100, title="Overbought Level", group=GRP_RSI)
+rsiMiddleLevel = input.int(50, minval=0, maxval=100, title="Middle Level", group=GRP_RSI)
+rsiLowerLevel = input.int(30, minval=0, maxval=50, title="Oversold Level", group=GRP_RSI)
+calculateDivergence = input.bool(false, title="Calculate Divergence", group=GRP_RSI, display = display.data_window, tooltip = "Calculating divergences is needed in order for divergence alerts to fire.")
+showRSI = input.bool(true, "Show RSI", group=GRP_RSI)
+
+change = ta.change(rsiSourceInput)
+up = ta.rma(math.max(change, 0), rsiLengthInput)
+down = ta.rma(-math.min(change, 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+
+// Scale RSI (0-100) to volume range
+// Map RSI from 0-100 to volume's actual range, centered at RSI middle level = volume 0
+// Calculate where 0 falls in the volume range
+zeroPosition = volRange > 0 ? (0 - volLow) / volRange : 0.5  // Position of 0 as fraction of range (0 to 1)
+
+// Scale RSI so that rsiMiddleLevel aligns with volume 0
+rsiScaled = volRange > 0 ? volLow + ((rsi - rsiMiddleLevel) / (100 - rsiMiddleLevel) * (volHigh - 0)) : delta
+
+// Alternative scaling: center RSI middle level at 0, spread rest proportionally
+rsiScaledCentered = volRange > 0 ? ((rsi - rsiMiddleLevel) / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : delta
+
+// Use centered scaling
+rsiScaled := rsiScaledCentered
+
+// RSI levels scaled to volume range (using custom levels)
+rsi70Scaled = volRange > 0 ? ((rsiUpperLevel - rsiMiddleLevel) / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : delta
+rsi50Scaled = 0.0  // Middle level always at 0
+rsi30Scaled = volRange > 0 ? ((rsiLowerLevel - rsiMiddleLevel) / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : delta
+
+// Plot RSI scaled to volume range
+rsiPlot = plot(showRSI ? rsiScaled : na, "RSI (Scaled)", color=color.blue, linewidth=2)
+
+// Plot RSI levels as lines (not hlines since we need dynamic values)
+plot(showRSI ? rsi70Scaled : na, title="RSI Upper Level", color=color.new(color.red, 50), linewidth=1, style=plot.style_line)
+plot(showRSI ? rsi50Scaled : na, title="RSI Middle Level", color=color.new(color.gray, 50), linewidth=1, style=plot.style_line)
+plot(showRSI ? rsi30Scaled : na, title="RSI Lower Level", color=color.new(color.green, 50), linewidth=1, style=plot.style_line)
+
+// Fill areas for overbought/oversold
+midLinePlot = plot(showRSI ? rsi50Scaled : na, color = na, editable = false, display = display.none)
+fill(rsiPlot, midLinePlot, rsi70Scaled, math.max(math.abs(volHigh), math.abs(volLow)), top_color = color.new(color.green, 80), bottom_color = color.new(color.green, 95), title = "Overbought Gradient Fill")
+fill(rsiPlot, midLinePlot, -math.max(math.abs(volHigh), math.abs(volLow)), rsi30Scaled, top_color = color.new(color.red, 95), bottom_color = color.new(color.red, 80), title = "Oversold Gradient Fill")
+
+// RSI Smoothing MA inputs
+GRP_RSI_SMOOTH = "RSI Smoothing"
+TT_BB = "Only applies when 'SMA + Bollinger Bands' is selected. Determines the distance between the SMA and the bands."
+maTypeInput = input.string("None", "Type", options = ["None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = GRP_RSI_SMOOTH, display = display.data_window)
+var isBB = maTypeInput == "SMA + Bollinger Bands"
+maLengthInput = input.int(14, "Length", group = GRP_RSI_SMOOTH, display = display.data_window, active = maTypeInput != "None")
+bbMultInput = input.float(2.0, "BB StdDev", minval = 0.001, maxval = 50, step = 0.5, tooltip = TT_BB, group = GRP_RSI_SMOOTH, display = display.data_window, active = isBB)
+var enableMA = maTypeInput != "None"
+
+// Smoothing MA Calculation
+ma(source, length, MAtype) =>
+    switch MAtype
+        "SMA"                   => ta.sma(source, length)
+        "SMA + Bollinger Bands" => ta.sma(source, length)
+        "EMA"                   => ta.ema(source, length)
+        "SMMA (RMA)"            => ta.rma(source, length)
+        "WMA"                   => ta.wma(source, length)
+        "VWMA"                  => ta.vwma(source, length)
+
+// Smoothing MA plots (scaled to volume range, centered at 0)
+smoothingMA = enableMA ? ma(rsi, maLengthInput, maTypeInput) : na
+smoothingStDev = isBB ? ta.stdev(rsi, maLengthInput) * bbMultInput : na
+
+// Scale smoothing MA to volume range, centered at RSI middle level = 0
+smoothingMAScaled = enableMA and volRange > 0 ? ((smoothingMA - rsiMiddleLevel) / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : na
+smoothingStDevScaled = isBB and volRange > 0 ? (smoothingStDev / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : na
+
+plot(smoothingMAScaled, "RSI-based MA", color=color.orange, display = enableMA ? display.all : display.none, editable = enableMA)
+bbUpperBand = plot(smoothingMAScaled + smoothingStDevScaled, title = "Upper Bollinger Band", color=color.purple, display = isBB ? display.all : display.none, editable = isBB)
+bbLowerBand = plot(smoothingMAScaled - smoothingStDevScaled, title = "Lower Bollinger Band", color=color.purple, display = isBB ? display.all : display.none, editable = isBB)
+fill(bbUpperBand, bbLowerBand, color= isBB ? color.new(color.purple, 90) : na, title="Bollinger Bands Background Fill", display = isBB ? display.all : display.none, editable = isBB)
+
+// RSI Divergence
+lookbackRight = 5
+lookbackLeft = 5
+rangeUpper = 60
+rangeLower = 5
+bearColor = color.red
+bullColor = color.green
+textColor = color.white
+noneColor = color.new(color.white, 100)
+
+var plFound = false
+var phFound = false
+var bullCond = false
+var bearCond = false
+
+// Variables to hold plot values - must be declared at script level
+bullishLine = 0.0
+bullishLabel = 0.0
+bearishLine = 0.0
+bearishLabel = 0.0
+
+// Extract pivot and barssince at script level for consistency
+plFoundCurrent = not na(ta.pivotlow(rsi, lookbackLeft, lookbackRight))
+phFoundCurrent = not na(ta.pivothigh(rsi, lookbackLeft, lookbackRight))
+barsSincePL = ta.barssince(plFoundCurrent)
+barsSincePH = ta.barssince(phFoundCurrent)
+
+if calculateDivergence
+    rsiLBR = rsi[lookbackRight]
+    rsiLBRScaled = volRange > 0 ? ((rsiLBR - rsiMiddleLevel) / 50) * math.max(math.abs(volHigh), math.abs(volLow)) : delta
+    
+    // Regular Bullish
+    plFound := plFoundCurrent
+    bullishLine := plFound ? rsiLBRScaled : na
+    bullishLabel := na
+    
+    if plFound
+        prevPivotBars = barsSincePL[1]
+        inRangeBull = rangeLower <= prevPivotBars and prevPivotBars <= rangeUpper
+        prevRSIValue = rsi[lookbackRight + prevPivotBars]
+        rsiHL = rsiLBR > prevRSIValue and inRangeBull
+        
+        lowLBR = low[lookbackRight]
+        prevLowValue = low[lookbackRight + prevPivotBars]
+        priceLL = lowLBR < prevLowValue
+        
+        bullCond := priceLL and rsiHL
+        bullishLabel := bullCond ? rsiLBRScaled : na
+    
+    // Regular Bearish
+    phFound := phFoundCurrent
+    bearishLine := phFound ? rsiLBRScaled : na
+    bearishLabel := na
+    
+    if phFound
+        prevPivotBars = barsSincePH[1]
+        inRangeBear = rangeLower <= prevPivotBars and prevPivotBars <= rangeUpper
+        prevRSIValue = rsi[lookbackRight + prevPivotBars]
+        rsiLH = rsiLBR < prevRSIValue and inRangeBear
+        
+        highLBR = high[lookbackRight]
+        prevHighValue = high[lookbackRight + prevPivotBars]
+        priceHH = highLBR > prevHighValue
+        
+        bearCond := priceHH and rsiLH
+        bearishLabel := bearCond ? rsiLBRScaled : na
+
+// Plot divergence lines and labels outside all conditional blocks
+plot(calculateDivergence ? bullishLine : na, offset = -lookbackRight, title = "Regular Bullish", linewidth = 2, color = (bullCond ? bullColor : noneColor))
+plotshape(calculateDivergence ? bullishLabel : na, offset = -lookbackRight, title = "Regular Bullish Label", text = " Bull ", style = shape.labelup, location = location.absolute, color = bullColor, textcolor = textColor)
+
+plot(calculateDivergence ? bearishLine : na, offset = -lookbackRight, title = "Regular Bearish", linewidth = 2, color = (bearCond ? bearColor : noneColor))
+plotshape(calculateDivergence ? bearishLabel : na, offset = -lookbackRight, title = "Regular Bearish Label", text = " Bear ", style = shape.labeldown, location = location.absolute, color = bearColor, textcolor = textColor)
+
+alertcondition(bullCond, title='Regular Bullish Divergence', message="Found a new Regular Bullish Divergence")
+alertcondition(bearCond, title='Regular Bearish Divergence', message='Found a new Regular Bearish Divergence')
+
+// ============================================================================
+// ATR SETTINGS & CALCULATION
+// ============================================================================
+GRP_ATR = "ATR Settings"
+atrLength = input.int(title="ATR Length", defval=200, minval=1, tooltip="Period for ATR calculation", group=GRP_ATR)
+atrSmoothing = input.string(title="ATR Smoothing", defval="RMA", options=["RMA", "SMA", "EMA", "WMA"], group=GRP_ATR)
+useCustomATRTimeframe = input.bool(false, "Use custom timeframe", group=GRP_ATR)
+atrTimeframeInput = input.timeframe("", "ATR Timeframe", tooltip="Leave empty for chart timeframe", group=GRP_ATR)
+showATR = input.bool(true, "Show ATR Value", group=GRP_ATR)
+
+atr_ma_function(source, length) =>
+    switch atrSmoothing
+        "RMA" => ta.rma(source, length)
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        => ta.wma(source, length)
+
+// Determine which timeframe to use for ATR
+atrTimeframe = useCustomATRTimeframe and atrTimeframeInput != "" ? atrTimeframeInput : timeframe.period
+
+// Calculate ATR on selected timeframe
+[atrValue, atrClose] = request.security(syminfo.tickerid, atrTimeframe, [atr_ma_function(ta.tr(true), atrLength), close])
+
+// Calculate ATR as percentage of current price
+atrPercent = (atrValue / atrClose) * 100
+
+// Display ATR value and percentage in top right corner
+var atrTable = table.new(position.top_right, 1, 1, border_width=1)
+if showATR and barstate.islast
+    timeframeDisplay = useCustomATRTimeframe and atrTimeframeInput != "" ? atrTimeframeInput : "Chart"
+    atrText = "ATR (" + str.tostring(atrLength) + " | " + timeframeDisplay + "): " + str.tostring(atrValue, format.mintick) + " | " + str.tostring(atrPercent, "#.##") + "%"
+    table.cell(atrTable, 0, 0, atrText, text_color=color.red, bgcolor=color.black, text_size=size.normal)

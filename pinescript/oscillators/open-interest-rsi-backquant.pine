@@ -1,0 +1,216 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+// Aggregated OI logic adapted from "Crypto OI Agregated" by NoveltyTrade, © NoveltyTrade
+// https://www.tradingview.com/script/1z6RXBA9-crypto-oi-agregated/
+
+//@version=6
+indicator("Open Interest RSI [BackQuant]","OI RSI [BackQuant]",overlay = false)
+
+// Groups
+const string grpRSI = "RSI"
+const string grpMA = "Moving Average"
+const string grpThr = "Thresholds"
+const string grpUI = "Extra Plotting and UI"
+const string grpOI = "Open Interest Source"
+const string tooltip_thres = "These will be used for 1/ Heatmap Gradient Calculation, 2/ Reference Lines, 3/ OB/OS Lower Levels, 4/ Extreme Highlighting. Please adjust to your usecase. Upper of 70, Lower of 30 is a good place to start."
+
+// Inputs
+
+// RSI
+string plotting = input.string("Line","Plotting Type",options = ["None","Line","Colored Line","Oscillator","Flag","Heatmap"],group = grpRSI,tooltip = "Select how to render the OI RSI on the panel.")
+int p = input.int(26,"Calculation Period",group = grpRSI,tooltip = "Base RSI length used for Open Interest RSI calculation.", inline="calc")
+int s_p = input.int(3,"Smoothing Period (SMA)",group = grpRSI,tooltip = "Simple moving average applied on top of the raw OI RSI.", inline="calc")
+
+// Moving Average
+bool show_ma = input.bool(true,"Show EMA",group = grpMA,tooltip = "Toggle the EMA overlay on the smoothed OI RSI.", inline="ema")
+int ma_p = input.int(21,"EMA Period",group = grpMA,tooltip = "EMA length applied to the smoothed OI RSI.", inline="ema")
+color ma_col = input.color(#ffff00,"EMA Color",group = grpMA, inline="ema")
+
+// Thresholds
+int mid = input.int(50,"Mid Point",group = grpThr,tooltip = "Central reference level for OI RSI.")
+int long_thres = input.int(80,"Extreme Upper Threshold",group = grpThr,tooltip = tooltip_thres, inline="thres")
+int short_thres = input.int(20,"Extreme Lower Threshold",group = grpThr,tooltip = tooltip_thres, inline="thres")
+string show_refs = input.string("Basic Reference Lines","Select Reference Lines",options = ["None","Basic Reference Lines","OB/ OS Levels"],group = grpThr,tooltip = "Control whether to show mid/threshold lines or OB/OS zones.")
+string show_extremes = input.string("Mean-Rev","Extreme Highlighting",options = ["None","Mean-Rev","Trend"],group = grpThr,tooltip = "Choose how to color the background when OI RSI is in extreme zones.")
+
+// Extra Plotting and UI
+color rsi_col = input.color(#ffffff,"RSI Line Color",group = grpUI)
+int lw = input.int(1,"RSI Line Width",minval = 1,maxval = 5,group = grpUI)
+color long_col = input.color(#00ff00,"Long/OB Color",group = grpUI)
+color short_col = input.color(#ff0000,"Short/OS Color",group = grpUI)
+bool showOiRsiMeter = input.bool(true,"Show OI RSI Meter",group = grpUI,tooltip = "Toggle the vertical strength meter table for OI RSI.")
+int oiRsiCells = input.int(30,"OI RSI Blocks",5,50,group = grpUI,tooltip = "Number of vertical blocks for the OI RSI meter. Higher = more granular.")
+string oiRsiPos = input.string("top_right","OI RSI Meter Position",options = ["top_left","top_center","top_right","bottom_left","bottom_center","bottom_right"],group = grpUI)
+
+// Open Interest Source
+string typ2 = input.string("COIN","OI Units",options = ["USD","COIN"],group = grpOI,tooltip = "Choose whether to aggregate OI in coin terms or converted to USD.")
+bool ex1 = input.bool(true,"Binance",group = grpOI, inline="cexs")
+bool ex2 = input.bool(true,"Bybit",group = grpOI, inline="cexs")
+bool ex3 = input.bool(true,"OKX",group = grpOI, inline="cexs")
+bool ex5 = input.bool(true,"Bitget",group = grpOI, inline="cexs")
+bool ex6 = input.bool(true,"Kraken",group = grpOI, inline="cexs")
+bool ex7 = input.bool(true,"HTX",group = grpOI, inline="cexs")
+bool ex8 = input.bool(true,"Deribit",group = grpOI, inline="cexs")
+
+
+type OI
+    float o
+    float h
+    float l
+    float c
+
+const string[] exchanges = array.from(
+ ex1 ? "Binance" : na,
+ ex2 ? "Bybit"   : na,
+ ex3 ? "OKX"     : na,
+ ex5 ? "Bitget"  : na,
+ ex6 ? "Kraken"  : na,
+ ex7 ? "HTX"     : na,
+ ex8 ? "Deribit" : na
+ )
+
+const string[] appendixes = array.from("USDT.P","USD.P","USDC.P","USD.PM")
+const int bars = 10000
+
+method sw(float _v,string _ex,string _app) =>
+    float _tmp = (
+     (_app == "USD.P" and (_ex == "Binance" or _ex == "Bybit" or _ex == "Kraken")) or
+     _ex == "OKX" or _ex == "Deribit"
+     ) ? _v * (_ex == "Binance" ? (syminfo.basecurrency == "BTC" ? 100 : 10) : 1) / close : _v
+    typ2 == "USD" ? _tmp * close : _tmp
+
+OI candle = OI.new(0.0,0.0,0.0,0.0)
+
+for [i, ex] in exchanges
+    if not na(ex)
+        for [j, app] in appendixes
+            OI oi_ex = request.security(ex + ":" + syminfo.basecurrency + app + "_OI",'',OI.new(open,high,low,close),ignore_invalid_symbol = true,calc_bars_count = bars)
+            if not na(oi_ex)
+                float o_conv = oi_ex.o.sw(ex,app)
+                float h_conv = oi_ex.h.sw(ex,app)
+                float l_conv = oi_ex.l.sw(ex,app)
+                float c_conv = oi_ex.c.sw(ex,app)
+                candle.o += o_conv
+                candle.h += h_conv
+                candle.l += l_conv
+                candle.c += c_conv
+
+float oiClose = candle.c
+
+if barstate.islastconfirmedhistory and na(oiClose)
+    runtime.error(str.format("No aggregated Open Interest data for `{0}`.",syminfo.prefix + ":" + syminfo.ticker))
+
+// RSI calculations
+float oi_rsi = ta.rsi(oiClose,p)
+float oi_rsi_s = ta.sma(oi_rsi,s_p)
+float ma = ta.ema(oi_rsi_s,ma_p)
+
+// Mode flags
+bool isLine = plotting == "Line"
+bool isColLine = plotting == "Colored Line"
+bool isOsc = plotting == "Oscillator"
+bool isFlag = plotting == "Flag"
+bool isHeatmap = plotting == "Heatmap"
+bool show_ma_ = show_ma==true and not isHeatmap
+plot(isHeatmap ? 1 : na,"OI RSI Heatmap",color.from_gradient(oi_rsi_s,short_thres,long_thres,short_col,long_col),style = plot.style_columns,histbase = 0)
+
+// Dynamic colors
+color rsi_dyn_col = oi_rsi_s > mid ? long_col : short_col
+
+// Line
+plot(isLine ? oi_rsi_s : na,"OI RSI Line",color = rsi_col,linewidth = lw)
+plot(show_ma_ ? ma : na ,"OI RSI EMA",color = ma_col,linewidth = 1)
+
+// Colored Line
+plot(isColLine ? oi_rsi_s : na,"OI RSI Colored",color = rsi_dyn_col,linewidth = lw)
+
+// Oscillator
+plot(isOsc ? oi_rsi_s : na,"OI RSI Osc",style = plot.style_columns,color = rsi_dyn_col, histbase = 50)
+
+// Flag style (filled between RSI and MA)
+plot_oi_flag = plot(isFlag ? oi_rsi_s : na,"OI RSI",color = long_col)
+plot_ma_flag = plot(isFlag ? ma : na,"OI RSI MA",color = short_col)
+fill(plot_oi_flag,plot_ma_flag,color = oi_rsi_s > ma ? long_col : short_col,title = "OI RSI Flag Fill")
+plot(isFlag ? oi_rsi_s : na,"OI RSI Outline",color = #000000,linewidth = 2)
+plot(isFlag ? ma : na,"OI MA Outline",color = #000000,linewidth = 2)
+
+// Reference lines
+plot(show_refs == "Basic Reference Lines" and not isHeatmap ? mid         : na,"Mid",color = color.gray)
+plot(show_refs == "Basic Reference Lines" and not isHeatmap ? long_thres  : na,"Upper Threshold",color = color.gray)
+plot(show_refs == "Basic Reference Lines" and not isHeatmap ? short_thres : na,"Lower Threshold",color = color.gray)
+
+// OB / OS zones
+plot_ob_top    = plot(show_refs == "OB/ OS Levels" and not isHeatmap ? 100 : na,"Upper OB Top",color = short_col)
+plot_ob_bottom = plot(show_refs == "OB/ OS Levels" and not isHeatmap ? long_thres : na,"Upper OB Bottom",color = color.new(short_col,90))
+fill(plot_ob_top,plot_ob_bottom,color = color.new(short_col,90),title = "Upper OB Fill")
+
+plot_os_top    = plot(show_refs == "OB/ OS Levels" and not isHeatmap ? short_thres : na,"Lower OS Top",color=long_col)
+plot_os_bottom = plot(show_refs == "OB/ OS Levels" and not isHeatmap ? 0 : na,"Lower OS Bottom",color = color.new(long_col,0))
+fill(plot_os_top,plot_os_bottom,color = color.new(long_col,90),title = "Lower OS Fill")
+
+// Extreme highlighting / background
+color bg_col = na
+
+if show_extremes == "Trend"
+    if oi_rsi_s >= long_thres
+        bg_col := color.new(long_col,80)
+    else if oi_rsi_s <= short_thres
+        bg_col := color.new(short_col,80)
+else if show_extremes == "Mean-Rev"
+    if oi_rsi_s >= long_thres
+        bg_col := color.new(short_col,80)
+    else if oi_rsi_s <= short_thres
+        bg_col := color.new(long_col,80)
+
+bgcolor(bg_col)
+
+
+// Helper functions for OI RSI vertical meter
+rescale(v,omin,omax,nmin,nmax) =>
+    nmin + (nmax - nmin) * (v - omin) / math.max(omax - omin,1e-9)
+
+clamp(x,lo,hi) =>
+    x < lo ? lo : x > hi ? hi : x
+
+// INVERTED gradient so RED is at the TOP and GREEN is at the BOTTOM
+gradColorInv(v) =>
+    _v = clamp(v,-50.0,50.0)
+    n  = (_v + 50.0) / 100.0
+    n < 0.5 ? color.from_gradient(n,0.0,0.5,long_col,color.white) : color.from_gradient(n,0.5,1.0,color.white,short_col)   // bottom becomes GREEN
+
+float oiRsiVal = clamp(oi_rsi_s,0.0,100.0)
+
+var table oiRsiMeter = na
+if showOiRsiMeter and na(oiRsiMeter)
+    oiRsiMeter := table.new(oiRsiPos,2,oiRsiCells+2,bgcolor=color.new(color.black,85))
+if showOiRsiMeter and barstate.islast
+    for r = 0 to oiRsiCells+1
+        oiRsiMeter.cell(0,r,"",bgcolor=color.new(color.black,85))
+        oiRsiMeter.cell(1,r,"",bgcolor=color.new(color.black,85))
+    // vertical gradient: row 0 = 100 (top, RED), row end = 0 (bottom, GREEN)
+    for row = 0 to oiRsiCells - 1
+        val    = rescale(row,0,oiRsiCells - 1,100,0)
+        colVal = rescale(val,0,100,-50,50)
+        col    = gradColorInv(colVal)
+        oiRsiMeter.cell(0,row,"",bgcolor=col)
+    // labels
+    oiRsiMeter.cell(0,0,"100",text_color=color.white)
+    oiRsiMeter.cell(0,oiRsiCells+1,"0",text_color=color.white)
+
+    // arrow
+    int arrowRow = math.round(rescale(oiRsiVal,0,100,oiRsiCells - 1,0))
+    oiRsiMeter.cell(1,arrowRow,"<",text_color=color.white)
+
+
+// Alerts
+// Upper Extremes (OB)
+alertcondition(ta.crossover(oi_rsi_s, long_thres), "OI RSI Enters Upper Extreme", "OI RSI entered upper extreme zone on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(oi_rsi_s, long_thres), "OI RSI Exits Upper Extreme", "OI RSI exited upper extreme zone on {{exchange}}:{{ticker}}")
+
+// Lower Extremes (OS)
+alertcondition(ta.crossunder(oi_rsi_s, short_thres), "OI RSI Enters Lower Extreme", "OI RSI entered lower extreme zone on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(oi_rsi_s, short_thres), "OI RSI Exits Lower Extreme", "OI RSI exited lower extreme zone on {{exchange}}:{{ticker}}")
+
+// Midline cross
+alertcondition(ta.crossover(oi_rsi_s, mid), "OI RSI Bullish Midline Cross", "OI RSI crossed above the midline on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(oi_rsi_s, mid), "OI RSI Bearish Midline Cross", "OI RSI crossed below the midline on {{exchange}}:{{ticker}}")

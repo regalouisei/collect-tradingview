@@ -1,0 +1,418 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator("Harmonic Frequency Visualizer [BackQuant]", overlay=false,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Constants
+const string cycles = "Cycle Analysis"
+const string inst   = "Instruments"
+const string plt    = "Plotting Settings"
+
+// Inputs
+int    lookback    = input.int(100, "Analysis Lookback", minval=50, maxval=200, group=cycles)
+float  sensitivity = input.float(1.0, "Sensitivity", minval=0.5, maxval=2.0, step=0.1, group=cycles)
+
+string inst1 = input.symbol("PYTH:GMCI30",       "", inline="1", group=inst)
+string inst2 = input.symbol("NASDAQ:TLT",         "", inline="2", group=inst)
+string inst3 = input.symbol("EASYMARKETS:OILUSD", "", inline="3", group=inst)
+string inst4 = input.symbol("TVC:GOLD",           "", inline="4", group=inst)
+string inst5 = input.symbol("PYTH:GMMEME",        "", inline="5", group=inst)
+
+color col1 = input.color(#00ff00, "", inline="1", group=inst)
+color col2 = input.color(#ff0000, "", inline="2", group=inst)
+color col3 = input.color(#0000ff, "", inline="3", group=inst)
+color col4 = input.color(#aee919, "", inline="4", group=inst)
+color col5 = input.color(#c002b4, "", inline="5", group=inst)
+
+string viewMode      = input.string("Spectrum", "View Mode", options=["Spectrum", "Spectrogram"], group=plt)
+string plotStyle     = input.string("Waveform", "Spectrum Style", options=["Waveform", "Bars", "Area"], group=plt)
+bool   showPhase     = input.bool(true, "Show Phase Direction", group=plt)
+bool   showResonance = input.bool(true, "Show Resonance Zones", group=plt)
+bool   showPeaks     = input.bool(true, "Highlight Dominant Cycles", group=plt)
+int    waveWidth     = input.int(2, "Line Width", minval=1, maxval=4, group=plt)
+string sym_size      = input.string("Small", "Label Size", ["Small", "Big"], group=plt)
+int    histBars      = input.int(50, "Spectrogram History", minval=20, maxval=80, group=plt,
+                         tooltip="Bars of history in spectrogram view")
+bool   showOsc       = input.bool(true, "Show Dominant Cycle Oscillator", group=plt)
+
+color m_col = chart.fg_color
+color s_col = color.new(m_col, 70)
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Helpers
+atan2(float y, float x) =>
+    float result = 0.0
+    if x > 0
+        result := math.atan(y / x)
+    else if x < 0 and y >= 0
+        result := math.atan(y / x) + math.pi
+    else if x < 0 and y < 0
+        result := math.atan(y / x) - math.pi
+    else if x == 0 and y > 0
+        result := math.pi / 2
+    else if x == 0 and y < 0
+        result := -math.pi / 2
+    else
+        result := 0.0
+    result
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Periods and layout — pushed AFTER current bar
+var int[] PERIODS = array.from(5, 8, 13, 21, 34, 55, 89, 120)
+int NUM_PERIODS = 8
+
+int   X_START  = 40
+int   X_END    = 200
+int   Y_BOTTOM = 0
+int   Y_TOP    = 100
+float X_SCALE  = (X_END - X_START) / (NUM_PERIODS - 1)
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Types
+type SpectrumResult
+    array<float> amps
+    array<float> phases
+    int   domIdx
+    float domAmp
+    float domPhase
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Core DFT — returns amplitude AND phase per period
+compute_dft(float src, int lb, float sens) =>
+    float[] _a = array.new_float(NUM_PERIODS, 0.0)
+    float[] _p = array.new_float(NUM_PERIODS, 0.0)
+    int   _di = 0
+    float _da = 0.0
+    float _dp = 0.0
+
+    if not na(src)
+        float mn = ta.sma(src, lb)
+        float sd = ta.stdev(src, lb)
+        float norm = sd != 0 ? (src - mn) / sd : 0.0
+
+        for i = 0 to NUM_PERIODS - 1
+            int   period = array.get(PERIODS, i)
+            float omega  = 2.0 * math.pi / period
+            float sCos   = 0.0
+            float sSin   = 0.0
+            int   window = math.min(lb - 1, 99)
+
+            for k = 0 to window
+                float val   = nz(norm[k])
+                float angle = omega * k
+                sCos += val * math.cos(angle)
+                sSin += val * math.sin(angle)
+
+            float amp   = math.min(math.sqrt(sCos * sCos + sSin * sSin) / lb * 100.0 * sens, 100.0)
+            float phase = atan2(sSin, sCos)
+
+            array.set(_a, i, amp)
+            array.set(_p, i, phase)
+
+            if amp > _da
+                _da := amp
+                _di := i
+                _dp := phase
+
+    SpectrumResult.new(_a, _p, _di, _da, _dp)
+
+// Heatmap color
+heat_color(float val) =>
+    val < 33.3 ? color.from_gradient(val, 0.0, 33.3, #0a0a2e, #1a3a6e) :
+     val < 66.6 ? color.from_gradient(val, 33.3, 66.6, #1a3a6e, #c85a2e) :
+                  color.from_gradient(val, 66.6, 100.0, #c85a2e, #ffcc00)
+
+// Request symbol data (no repaint)
+request_data(simple string symbol) =>
+    request.security(symbol, "", close[1], lookahead=barmerge.lookahead_on)
+
+// X position helper — offset from bar_index into future
+get_x(int idx) =>
+    int(bar_index + X_START + idx * X_SCALE)
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Persistent graphics arrays
+var line[]  gL  = array.new_line(0)
+var box[]   gB  = array.new_box(0)
+var label[] gLb = array.new_label(0)
+
+clear_gfx() =>
+    while array.size(gL) > 0
+        line.delete(array.pop(gL))
+    while array.size(gB) > 0
+        box.delete(array.pop(gB))
+    while array.size(gLb) > 0
+        label.delete(array.pop(gLb))
+    true
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Drawing: axes
+draw_axes(bool isSpectrogram) =>
+    // X axis
+    array.push(gL, line.new(bar_index + X_START - 5, Y_BOTTOM, bar_index + X_END + 10, Y_BOTTOM,
+         color=color.new(m_col, 50), width=1))
+    // Y axis
+    array.push(gL, line.new(bar_index + X_START - 5, Y_BOTTOM, bar_index + X_START - 5, Y_TOP + 10,
+         color=color.new(m_col, 50), width=1))
+
+    if isSpectrogram
+        float rowH = (Y_TOP - Y_BOTTOM) / NUM_PERIODS
+        for i = 0 to NUM_PERIODS - 1
+            float yMid = Y_BOTTOM + i * rowH + rowH / 2
+            int period = array.get(PERIODS, i)
+            array.push(gLb, label.new(bar_index + X_START - 8, yMid, str.tostring(period),
+                 color=#00000000, textcolor=color.new(m_col, 30), size=size.tiny,
+                 style=label.style_label_right))
+        array.push(gLb, label.new(bar_index + (X_START + X_END) / 2, Y_BOTTOM - 12,
+             "◄─── Time (bars ago) ───►",
+             color=#00000000, textcolor=color.new(m_col, 30), size=size.normal))
+        array.push(gLb, label.new(bar_index + X_START - 18, (Y_TOP + Y_BOTTOM) / 2,
+             "P\ne\nr\ni\no\nd",
+             color=#00000000, textcolor=color.new(m_col, 30), size=size.normal,
+             style=label.style_label_center))
+    else
+        for i = 0 to NUM_PERIODS - 1
+            int xPos = get_x(i)
+            int period = array.get(PERIODS, i)
+            array.push(gL, line.new(xPos, Y_BOTTOM, xPos, Y_TOP,
+                 color=s_col, style=line.style_dotted))
+            array.push(gLb, label.new(xPos, Y_BOTTOM - 5, str.tostring(period),
+                 color=#00000000, textcolor=color.new(m_col, 30), size=size.small,
+                 style=label.style_label_up))
+        for lvl = 0 to 4
+            float yVal = lvl * 25.0
+            array.push(gL, line.new(bar_index + X_START - 5, yVal, bar_index + X_END + 10, yVal,
+                 color=s_col, style=line.style_dotted))
+            array.push(gLb, label.new(bar_index + X_START - 8, yVal, str.tostring(int(yVal)),
+                 color=#00000000, textcolor=color.new(m_col, 50), size=size.tiny,
+                 style=label.style_label_right))
+        array.push(gLb, label.new(bar_index + (X_START + X_END) / 2, Y_BOTTOM - 15,
+             "◄─── Cycle Period (bars) ───►",
+             color=#00000000, textcolor=color.new(m_col, 30), size=size.large))
+        array.push(gLb, label.new(bar_index + X_START - 18, (Y_TOP + Y_BOTTOM) / 2,
+             "A\nm\np\nl\ni\nt\nu\nd\ne",
+             color=#00000000, textcolor=color.new(m_col, 30), size=size.large,
+             style=label.style_label_center))
+    true
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Drawing: spectrum waveform with phase arrows
+draw_spectrum(SpectrumResult spec, color col, string symName) =>
+    float maxAmp = 0.0
+    int   maxIdx = 0
+
+    for i = 0 to NUM_PERIODS - 2
+        int   x1 = get_x(i)
+        int   x2 = get_x(i + 1)
+        float y1 = array.get(spec.amps, i)
+        float y2 = array.get(spec.amps, i + 1)
+
+        if y1 > maxAmp
+            maxAmp := y1
+            maxIdx := i
+
+        if plotStyle == "Waveform"
+            array.push(gL, line.new(x1, y1, x2, y2, color=col, width=waveWidth))
+        else if plotStyle == "Bars"
+            array.push(gL, line.new(x1, Y_BOTTOM, x1, y1, color=color.new(col, 40), width=8))
+        else if plotStyle == "Area"
+            array.push(gL, line.new(x1, y1, x2, y2, color=col, width=waveWidth))
+            l1 = line.new(x1, y1, x2, y2, color=col, width=1)
+            l2 = line.new(x1, Y_BOTTOM, x2, Y_BOTTOM, color=col, width=1)
+            linefill.new(l1, l2, color.new(col, 80))
+            array.push(gL, l1)
+            array.push(gL, l2)
+
+    float lastAmp = array.get(spec.amps, NUM_PERIODS - 1)
+    if lastAmp > maxAmp
+        maxAmp := lastAmp
+        maxIdx := NUM_PERIODS - 1
+
+    if showPeaks and maxAmp > 20
+        int    peakX  = get_x(maxIdx)
+        float  phase  = array.get(spec.phases, maxIdx)
+        bool   rising = math.sin(phase) < 0
+        string arrow  = rising ? " ▲" : " ▼"
+        color  phCol  = showPhase ? (rising ? #00ff88 : #ff4466) : col
+        array.push(gLb, label.new(peakX, maxAmp + 5,
+             symName + (showPhase ? arrow : ""),
+             color=#00000000, textcolor=phCol,
+             size=sym_size == "Big" ? size.normal : size.small,
+             style=label.style_label_down))
+
+    if showPhase
+        for i = 0 to NUM_PERIODS - 1
+            float amp_i = array.get(spec.amps, i)
+            if amp_i > 15 and i != maxIdx
+                float phase_i = array.get(spec.phases, i)
+                bool  up_i    = math.sin(phase_i) < 0
+                int   xi      = get_x(i)
+                array.push(gLb, label.new(xi, amp_i + 3,
+                     up_i ? "▲" : "▼",
+                     color=#00000000,
+                     textcolor=color.new(up_i ? #00ff88 : #ff4466, 40),
+                     size=size.tiny, style=label.style_label_center))
+    true
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Drawing: resonance zones
+draw_resonance(SpectrumResult s1, SpectrumResult s2, SpectrumResult s3, SpectrumResult s4, SpectrumResult s5) =>
+    if showResonance
+        for i = 0 to NUM_PERIODS - 1
+            float sum = 0.0
+            int   cnt = 0
+            float thr = 30.0
+            if array.get(s1.amps, i) > thr
+                sum += array.get(s1.amps, i)
+                cnt += 1
+            if array.get(s2.amps, i) > thr
+                sum += array.get(s2.amps, i)
+                cnt += 1
+            if array.get(s3.amps, i) > thr
+                sum += array.get(s3.amps, i)
+                cnt += 1
+            if array.get(s4.amps, i) > thr
+                sum += array.get(s4.amps, i)
+                cnt += 1
+            if array.get(s5.amps, i) > thr
+                sum += array.get(s5.amps, i)
+                cnt += 1
+
+            if cnt >= 3
+                int   xPos   = get_x(i)
+                float avgAmp = sum / cnt
+                array.push(gB, box.new(xPos - 5, math.min(avgAmp + 10, Y_TOP), xPos + 5, Y_BOTTOM,
+                     bgcolor=color.new(#ffcc00, 85), border_color=color.new(#ffcc00, 60), border_width=1))
+                array.push(gLb, label.new(xPos, Y_TOP + 5, "⚡",
+                     color=#00000000, textcolor=#ffcc00, size=size.normal))
+    true
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Drawing: spectrogram heatmap
+draw_spectrogram(matrix<float> mat) =>
+    int   cols = matrix.columns(mat)
+    float rowH = (Y_TOP - Y_BOTTOM) / NUM_PERIODS
+    float colW = (X_END - X_START) / cols
+
+    for row = 0 to NUM_PERIODS - 1
+        for col = 0 to cols - 1
+            float amp = matrix.get(mat, row, col)
+            int   x1  = int(bar_index + X_START + col * colW)
+            int   x2  = int(bar_index + X_START + (col + 1) * colW)
+            float y1  = Y_BOTTOM + row * rowH
+            float y2  = Y_BOTTOM + (row + 1) * rowH
+            array.push(gB, box.new(x1, y2, x2, y1,
+                 bgcolor=heat_color(amp), border_color=color.new(#000000, 100), border_width=0))
+
+    array.push(gL, line.new(int(bar_index + X_END), Y_BOTTOM, int(bar_index + X_END), Y_TOP,
+         color=color.new(m_col, 40), width=1, style=line.style_dashed))
+    array.push(gLb, label.new(int(bar_index + X_END), Y_TOP + 3, "now",
+         color=#00000000, textcolor=color.new(m_col, 30), size=size.tiny))
+    true
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Main logic
+
+// Request multi-symbol data
+float src1 = request_data(inst1)
+float src2 = request_data(inst2)
+float src3 = request_data(inst3)
+float src4 = request_data(inst4)
+float src5 = request_data(inst5)
+
+// Chart source spectrum (drives spectrogram + oscillator)
+SpectrumResult chartSpec = compute_dft(close, lookback, sensitivity)
+
+// Multi-symbol spectra
+SpectrumResult spec1 = compute_dft(src1, lookback, sensitivity)
+SpectrumResult spec2 = compute_dft(src2, lookback, sensitivity)
+SpectrumResult spec3 = compute_dft(src3, lookback, sensitivity)
+SpectrumResult spec4 = compute_dft(src4, lookback, sensitivity)
+SpectrumResult spec5 = compute_dft(src5, lookback, sensitivity)
+
+// Spectrogram matrix
+var matrix<float> sgMat = matrix.new<float>(NUM_PERIODS, histBars, 0.0)
+
+matrix.remove_col(sgMat, 0)
+float[] newCol = array.copy(chartSpec.amps)
+matrix.add_col(sgMat, matrix.columns(sgMat), newCol)
+
+// Parse symbol names
+array<string> sym_1 = str.split(inst1, ":")
+array<string> sym_2 = str.split(inst2, ":")
+array<string> sym_3 = str.split(inst3, ":")
+array<string> sym_4 = str.split(inst4, ":")
+array<string> sym_5 = str.split(inst5, ":")
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Draw everything on last bar — positioned AFTER current bar
+if barstate.islast
+    clear_gfx()
+
+    bool isSgram = viewMode == "Spectrogram"
+    draw_axes(isSgram)
+
+    string title = isSgram ? "HARMONIC SPECTROGRAM" : "HARMONIC FREQUENCY VISUALIZER"
+    array.push(gLb, label.new(bar_index + (X_START + X_END) / 2, Y_TOP + 15, title,
+         color=#00000000, textcolor=m_col, size=size.large))
+
+    if isSgram
+        draw_spectrogram(sgMat)
+    else
+        draw_resonance(spec1, spec2, spec3, spec4, spec5)
+        draw_spectrum(spec1, col1, sym_1.last())
+        draw_spectrum(spec2, col2, sym_2.last())
+        draw_spectrum(spec3, col3, sym_3.last())
+        draw_spectrum(spec4, col4, sym_4.last())
+        draw_spectrum(spec5, col5, sym_5.last())
+
+        // Legend
+        int lx = bar_index + X_END + 15
+        int ly = Y_TOP
+        int ls = 10
+        array.push(gLb, label.new(lx, ly,       "● " + sym_1.last(), color=#00000000, textcolor=col1, size=size.small, style=label.style_label_left))
+        array.push(gLb, label.new(lx, ly - ls,   "● " + sym_2.last(), color=#00000000, textcolor=col2, size=size.small, style=label.style_label_left))
+        array.push(gLb, label.new(lx, ly - 2*ls, "● " + sym_3.last(), color=#00000000, textcolor=col3, size=size.small, style=label.style_label_left))
+        array.push(gLb, label.new(lx, ly - 3*ls, "● " + sym_4.last(), color=#00000000, textcolor=col4, size=size.small, style=label.style_label_left))
+        array.push(gLb, label.new(lx, ly - 4*ls, "● " + sym_5.last(), color=#00000000, textcolor=col5, size=size.small, style=label.style_label_left))
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Dominant cycle oscillator — proper series plot
+float oscRaw    = math.cos(chartSpec.domPhase)
+float oscValue  = 50.0 + 50.0 * oscRaw
+bool  oscRising = math.sin(chartSpec.domPhase) < 0
+color oscCol    = oscRising ? #00ff88 : #ff4466
+
+pOsc = plot(showOsc ? oscValue : na, "Cycle Oscillator", color=oscCol, linewidth=2)
+pMid = plot(showOsc ? 50.0 : na, "Midline", color=color.new(m_col, 80), linewidth=1, style=plot.style_cross)
+
+fill(pOsc, pMid,
+     oscValue > 50 ? oscValue : 50,
+     oscValue > 50 ? 50 : oscValue,
+     oscValue > 50 ? color.new(#ff4466, 50) : na,
+     oscValue > 50 ? color.new(#ff4466, 90) : na,
+     title="Osc Peak Zone")
+
+fill(pOsc, pMid,
+     oscValue < 50 ? 50 : oscValue,
+     oscValue < 50 ? oscValue : 50,
+     oscValue < 50 ? color.new(#00ff88, 90) : na,
+     oscValue < 50 ? color.new(#00ff88, 50) : na,
+     title="Osc Trough Zone")
+
+// Data window
+int domPeriod = array.get(PERIODS, chartSpec.domIdx)
+plot(domPeriod, "Dominant Period", display=display.data_window)
+plot(oscValue, "Oscillator Value", display=display.data_window)
+
+// Spacer
+plot(50, color=color.new(color.white, 100), display=display.pane)
+
+/////////////////////////////////////////////////////////////// © BackQuant ///////////////////////////////////////////////////////////////
+// Alerts
+alertcondition(ta.crossover(oscValue, 80), "Cycle Peak Zone", "Dominant cycle entering peak zone {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(oscValue, 20), "Cycle Trough Zone", "Dominant cycle entering trough zone {{exchange}}:{{ticker}}")
+alertcondition(ta.cross(oscValue, 50), "Cycle Midline Cross", "Dominant cycle crossed midline {{exchange}}:{{ticker}}")

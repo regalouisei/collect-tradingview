@@ -1,0 +1,135 @@
+//@version=6
+//@description This indicator calculates the current RSI based on the closing price and projects estimated prices for user-defined RSI target levels. Results are displayed in a table at the bottom-right corner of the chart. In the seconds version you will be able to show line where the price should be touch to RSI be that projected value.
+//@returns A table showing the current RSI and estimated prices for each RSI target level.
+
+indicator("RSI to Price Projection → Lines + Labels + Alerts", shorttitle = 'RSI->Value' ,overlay=true, max_lines_count=14, max_labels_count=14)
+
+// ==================== SETTINGS ====================
+len = input.int(14, "RSI Period", minval=2)
+rsi_targets_input = input.string(
+     "87.4,83.75,76.7,73.4,70.0,60.0,50.0,43.83,40.54,23.67,30,20.5,14,12",
+     "RSI Levels (comma separated)")
+
+show_table  = input.bool(true,  "Show table?")
+show_labels = input.bool(true,  "Show right-side labels?")
+show_lines  = input.bool(true,  "Plot horizontal lines?")
+alert_touch = input.bool(true,  "Alert when touching level?")
+
+// ==================== PARSE RSI LEVELS ====================
+var float[] rsi_targets = array.new_float()
+if barstate.isfirst
+    string[] parts = str.split(rsi_targets_input, ",")
+    for s in parts
+        val_str = str.replace(str.replace(s, " ", ""), "\t", "")
+        val = str.tonumber(val_str)
+        if not na(val) and val > 0 and val < 100
+            array.push(rsi_targets, val)
+
+// ==================== RSI CALCULATION ====================
+src = close
+up = ta.rma(math.max(ta.change(src), 0), len)
+down = ta.rma(math.max(-ta.change(src), 0), len)
+rsi_current = ta.rsi(src, len)
+
+// RSI for the current candle's LOW (minimum possible RSI)
+get_rsi_for_low() =>
+    change_ = low - close[1]
+    curr_up = math.max(change_, 0)
+    curr_down = math.max(-change_, 0)
+    prev_up = (up * len - math.max(close - close[1], 0)) / (len - 1)
+    prev_down = (down * len - math.max(-(close - close[1]), 0)) / (len - 1)
+    new_up = (prev_up * (len - 1) + curr_up) / len
+    new_down = (prev_down * (len - 1) + curr_down) / len
+    new_down > 0 ? 100 - (100 / (1 + new_up / new_down)) : na
+
+rsi_min = get_rsi_for_low()
+
+// RSI for the current candle's HIGH (maximum possible RSI)
+get_rsi_for_high() =>
+    change_ = high - close[1]
+    curr_up = math.max(change_, 0)
+    curr_down = math.max(-change_, 0)
+    prev_up = (up * len - math.max(close - close[1], 0)) / (len - 1)
+    prev_down = (down * len - math.max(-(close - close[1]), 0)) / (len - 1)
+    new_up = (prev_up * (len - 1) + curr_up) / len
+    new_down = (prev_down * (len - 1) + curr_down) / len
+    new_down > 0 ? 100 - (100 / (1 + new_up / new_down)) : na
+
+rsi_max = get_rsi_for_high()
+
+// ==================== PRICE FOR EACH RSI LEVEL ====================
+get_price_for_rsi(target_rsi) =>
+    result = 0.0
+    if target_rsi > 0 and target_rsi < 100
+        target_rs = target_rsi / (100 - target_rsi)
+        change_ = close - close[1]
+        curr_up = math.max(change_, 0)
+        curr_down = math.max(-change_, 0)
+        prev_up = (up * len - curr_up) / (len - 1)
+        prev_down = (down * len - curr_down) / (len - 1)
+        
+        delta = (target_rs * prev_down - prev_up) * (len - 1)
+        if delta >= 0
+            result := close[1] + delta
+        else
+            loss = (prev_up / target_rs - prev_down) * (len - 1)
+            if loss >= 0
+                result := close[1] - loss
+    result
+
+// ==================== TABLE ====================
+var table panel = table.new(position.bottom_right, 2, array.size(rsi_targets) + 4, 
+     bgcolor=color.new(#1e1e1e, 85), border_width=1, frame_color=#444444)
+
+if show_table and barstate.islast
+    table.clear(panel, 0, 0)
+    table.cell(panel, 0, 0, "RSI Max", text_color=#00FF00, bgcolor=#363636)
+    table.cell(panel, 1, 0, str.tostring(rsi_max, "0.00"), text_color=#00FF00)
+    table.cell(panel, 0, 1, "RSI Current", text_color=#FFFF00, bgcolor=#363636)
+    table.cell(panel, 1, 1, str.tostring(rsi_current, "0.00"), text_color=#FFFF00)
+    table.cell(panel, 0, 2, "RSI Min", text_color=#FF6F61, bgcolor=#363636)
+    table.cell(panel, 1, 2, str.tostring(rsi_min, "0.00"), text_color=#FF6F61)
+    table.cell(panel, 0, 3, "RSI Target", text_color=#00FFFF, bgcolor=#363636)
+    table.cell(panel, 1, 3, "Projected Price", text_color=#00FF00, bgcolor=#363636)
+
+    for i = 0 to array.size(rsi_targets) - 1
+        rsi = array.get(rsi_targets, i)
+        price = get_price_for_rsi(rsi)
+        table.cell(panel, 0, i + 4, str.tostring(rsi, "0.00"), text_color=#FF1744)
+        table.cell(panel, 1, i + 4, na(price) ? "N/A" : str.tostring(price, format.mintick), text_color=#00FF00)
+
+// ==================== LINES + LABELS + ALERTS ====================
+var line[] lines = array.new_line()
+var label[] labels = array.new_label()
+
+if barstate.islast
+    // Clear previous lines and labels
+    for l in lines
+        line.delete(l)
+    for lb in labels
+        label.delete(lb)
+    array.clear(lines)
+    array.clear(labels)
+
+    for i = 0 to array.size(rsi_targets) - 1
+        target_rsi = array.get(rsi_targets, i)
+        price = get_price_for_rsi(target_rsi)
+
+        if not na(price) and show_lines
+            style_ = line.style_solid
+            thickness = 1
+
+            new_line = line.new(x1 = bar_index - 100,y1 = price,x2 = bar_index + 50,y2 = price,color = color.new(color.green, 0),width = thickness,style = style_,extend = extend.right)
+            array.push(lines, new_line)
+
+            // Label on right side
+            if show_labels
+                lbl = label.new(x = bar_index + 10,y = price,text = "RSI " + str.tostring(target_rsi, "0.00") + " → " + str.tostring(price, format.mintick),style = label.style_label_left,color = color.new(color.green, 0),textcolor = color.white,size = size.normal,xloc = xloc.bar_index)
+                array.push(labels, lbl)
+
+            // Automatic Alert
+            if alert_touch and math.abs(close - price) <= syminfo.mintick * 2
+                alert("Touched RSI " + str.tostring(target_rsi, "0.00") + " → $" + str.tostring(price, format.mintick), alert.freq_once_per_bar_close)
+
+// ==================== ALERT CONDITION ====================
+alertcondition(alert_touch, title="Touch at RSI Level", message="Price touched a projected RSI level!")

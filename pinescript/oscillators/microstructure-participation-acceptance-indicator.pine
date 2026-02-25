@@ -1,0 +1,194 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © daniel_lee7395
+
+//@version=6
+indicator("Microstructure Participation & Acceptance Indicator", shorttitle="MPA Indicator", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// VWAP Settings
+vwapSrc = input.source(hlc3, "VWAP Source", group="VWAP Distance")
+vwapAnchor = input.string("Session", "VWAP Anchor", options=["Session", "Week", "Month"], group="VWAP Distance")
+
+// ATR Normalization
+atrLen = input.int(14, "ATR Length", minval=1, group="VWAP Distance")
+extremeThreshold = input.float(1.5, "Extreme Distance (ATR Multiple)", minval=0.5, step=0.1, group="VWAP Distance")
+
+// Volume Delta Proxy
+deltaEmaLen = input.int(9, "Delta EMA Length", minval=1, group="Volume Delta")
+deltaExpansionThresh = input.float(1.3, "Delta Expansion Threshold", minval=1.0, step=0.1, group="Volume Delta")
+
+// Acceptance State
+acceptanceLen = input.int(5, "Acceptance Lookback", minval=2, group="Acceptance Logic")
+chopThreshold = input.float(0.3, "Chop Threshold (VWAP/ATR)", minval=0.1, step=0.1, group="Acceptance Logic")
+
+// Visual Settings
+showBackground = input.bool(true, "Show State Background", group="Display")
+showLabels = input.bool(true, "Show State Labels", group="Display")
+showVwapLine = input.bool(true, "Show VWAP Line", group="Display")
+showBB = input.bool(true, "Show Bollinger Bands", group="Display")
+
+// Bollinger Bands Settings
+bbLength = input.int(20, "BB Length", minval=1, group="Bollinger Bands")
+bbMult = input.float(2.0, "BB Std Dev", minval=0.1, step=0.1, group="Bollinger Bands")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- VWAP Calculation with Anchor ---
+var float vwapSum = 0.0
+var float volumeSum = 0.0
+
+sessionChange = ta.change(time("D")) != 0
+weekChange = ta.change(time("W")) != 0
+monthChange = ta.change(time("M")) != 0
+
+newPeriod = vwapAnchor == "Session" ? sessionChange : vwapAnchor == "Week" ? weekChange : monthChange
+
+if newPeriod == true
+    vwapSum := 0.0
+    volumeSum := 0.0
+
+vwapSum += vwapSrc * volume
+volumeSum += volume
+vwap = volumeSum > 0 ? vwapSum / volumeSum : close
+
+// --- VWAP Distance Normalized by ATR ---
+atr = ta.atr(atrLen)
+vwapDist = close - vwap
+vwapDistNorm = atr > 0 ? vwapDist / atr : 0
+
+// --- Volume Delta Proxy (Bull vs Bear Volume) ---
+bullVol = close > open ? volume : 0
+bearVol = close < open ? volume : 0
+
+bullVolEma = ta.ema(bullVol, deltaEmaLen)
+bearVolEma = ta.ema(bearVol, deltaEmaLen)
+
+// Delta Imbalance Ratio
+deltaRatio = bearVolEma > 0 ? bullVolEma / bearVolEma : bullVolEma > 0 ? 2.0 : 1.0
+
+// --- Delta State (Expansion vs Compression) ---
+deltaExpanding = deltaRatio > deltaExpansionThresh or deltaRatio < (1.0 / deltaExpansionThresh)
+deltaDirection = deltaRatio > 1.0 ? 1 : -1
+
+// --- VWAP Distance Trend ---
+vwapDistIncreasing = ta.rising(math.abs(vwapDistNorm), acceptanceLen)
+
+// --- Bollinger Band Compression Detection ---
+bbBasis = ta.sma(close, bbLength)
+bbDev = ta.stdev(close, bbLength)
+bbUpper = bbBasis + (bbMult * bbDev)
+bbLower = bbBasis - (bbMult * bbDev)
+bbWidth = (bbDev / bbBasis) * 100
+bbCompressed = bbWidth < ta.sma(bbWidth, 50) * 0.7
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// State Definitions
+isChop = math.abs(vwapDistNorm) < chopThreshold and bbCompressed
+isExtreme = math.abs(vwapDistNorm) > extremeThreshold
+
+// Accepted Long: Price above VWAP, distance growing, delta bullish expanding
+acceptedLong = vwapDistNorm > 0 and vwapDistIncreasing and deltaDirection > 0 and deltaExpanding and not isChop
+
+// Accepted Short: Mirror logic
+acceptedShort = vwapDistNorm < 0 and vwapDistIncreasing and deltaDirection < 0 and deltaExpanding and not isChop
+
+// Rejection/Fade: Extended from VWAP without delta support
+rejectionLong = vwapDistNorm > extremeThreshold and (not deltaExpanding or deltaDirection < 0)
+
+rejectionShort = vwapDistNorm < -extremeThreshold and (not deltaExpanding or deltaDirection > 0)
+
+// Final State Assignment
+var string state = "Chop"
+
+if isChop
+    state := "Chop"
+else if acceptedLong
+    state := "Accepted Long"
+else if acceptedShort
+    state := "Accepted Short"
+else if rejectionLong
+    state := "Fade Long"
+else if rejectionShort
+    state := "Fade Short"
+else
+    state := "Neutral"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Background Colors (more transparent)
+bgColor = state == "Accepted Long" ? color.new(color.green, 90) : state == "Accepted Short" ? color.new(color.red, 90) : state == "Fade Long" ? color.new(color.orange, 90) : state == "Fade Short" ? color.new(color.orange, 90) : state == "Chop" ? color.new(color.gray, 93) : color.new(color.blue, 93)
+
+bgcolor(showBackground ? bgColor : na, title="State Background")
+
+// VWAP Line
+plot(showVwapLine ? vwap : na, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
+
+// Bollinger Bands (styled like TradingView default)
+bbUpperPlot = plot(showBB ? bbUpper : na, "BB Upper", color=color.new(#2962FF, 0), linewidth=1)
+bbBasisPlot = plot(showBB ? bbBasis : na, "BB Basis", color=color.new(#FF6D00, 0), linewidth=1)
+bbLowerPlot = plot(showBB ? bbLower : na, "BB Lower", color=color.new(#2962FF, 0), linewidth=1)
+fill(bbUpperPlot, bbLowerPlot, color=color.new(#2962FF, 95), title="BB Fill")
+
+// State Labels (only on state change)
+var string prevState = ""
+stateChanged = state != prevState
+prevState := state
+
+if showLabels and stateChanged and bar_index > 50
+    labelColor = state == "Accepted Long" ? color.green : state == "Accepted Short" ? color.red : state == "Fade Long" or state == "Fade Short" ? color.orange : state == "Chop" ? color.gray : color.blue
+    
+    label.new(bar_index, high, state, color=labelColor, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD (Optional Info Panel)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 5, border_width=1, border_color=color.new(color.white, 50), frame_width=1, frame_color=color.new(color.white, 50), bgcolor=color.new(color.black, 10))
+
+if barstate.islast
+    // Headers
+    table.cell(infoTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.normal)
+    table.cell(infoTable, 1, 0, "Value", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.normal)
+    
+    // State
+    table.cell(infoTable, 0, 1, "State", text_size=size.normal, text_color=color.white, bgcolor=color.new(color.black, 20))
+    stateColor = state == "Accepted Long" ? color.green : state == "Accepted Short" ? color.red : state == "Fade Long" or state == "Fade Short" ? color.orange : color.gray
+    table.cell(infoTable, 1, 1, state, bgcolor=color.new(stateColor, 50), text_size=size.normal, text_color=color.white)
+    
+    // VWAP Distance
+    table.cell(infoTable, 0, 2, "VWAP Dist", text_size=size.normal, text_color=color.white, bgcolor=color.new(color.black, 20))
+    distColor = vwapDistNorm > 0 ? color.green : color.red
+    table.cell(infoTable, 1, 2, str.tostring(vwapDistNorm, "#.##") + " ATR", bgcolor=color.new(distColor, 60), text_size=size.normal, text_color=color.white)
+    
+    // Delta Ratio
+    table.cell(infoTable, 0, 3, "Delta Ratio", text_size=size.normal, text_color=color.white, bgcolor=color.new(color.black, 20))
+    deltaColor = deltaRatio > 1.2 ? color.green : deltaRatio < 0.8 ? color.red : color.gray
+    table.cell(infoTable, 1, 3, str.tostring(deltaRatio, "#.##"), bgcolor=color.new(deltaColor, 60), text_size=size.normal, text_color=color.white)
+    
+    // Delta State
+    table.cell(infoTable, 0, 4, "Delta State", text_size=size.normal, text_color=color.white, bgcolor=color.new(color.black, 20))
+    deltaStateText = deltaExpanding ? "Expanding" : "Compressing"
+    deltaStateColor = deltaExpanding ? color.green : color.orange
+    table.cell(infoTable, 1, 4, deltaStateText, bgcolor=color.new(deltaStateColor, 60), text_size=size.normal, text_color=color.white)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+alertcondition(ta.crossover(state == "Accepted Long" ? 1 : 0, 0.5), "Accepted Long", "MNQ: Accepted Long Move Detected")
+
+alertcondition(ta.crossover(state == "Accepted Short" ? 1 : 0, 0.5), "Accepted Short", "MNQ: Accepted Short Move Detected")
+
+alertcondition(rejectionLong or rejectionShort, "Fade Setup", "MNQ: Potential Fade Setup")
+
+alertcondition(state == "Chop", "Chop Zone", "MNQ: Entered Chop/No-Trade Zone")

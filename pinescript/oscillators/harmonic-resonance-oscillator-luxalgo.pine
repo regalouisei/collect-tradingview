@@ -1,0 +1,103 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Harmonic Resonance Oscillator [LuxAlgo]", "LuxAlgo - Harmonic Resonance Oscillator", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Functions
+//---------------------------------------------------------------------------------------------------------------------{
+// Bandpass Filter based on John Ehlers' Cycle decomposition
+// Used to isolate specific harmonic frequencies from price action
+bandpass(float src, float period, float bandwidth) =>
+    float alpha = math.cos(2 * math.pi / period)
+    float beta  = 1 / math.cos(4 * math.pi * bandwidth / period)
+    float gamma = beta - math.sqrt(math.pow(beta, 2) - 1)
+    float alpha2 = 1 - gamma
+    
+    float filt = 0.0
+    filt := 0.5 * alpha2 * (src - src[2]) + gamma * (1 + alpha) * nz(filt[1]) - gamma * nz(filt[2])
+    filt
+
+// Function to normalize cycles into a resonance score (0 to 100)
+normalize(float src, int length) =>
+    float max = ta.highest(src, length)
+    float min = ta.lowest(src, length)
+    100 * (src - min) / math.max(max - min, 1e-10)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int refPeriodInput    = input.int(30, "Reference Period", minval = 2, group = "Harmonic Settings")
+float shortMultInput  = input.float(0.5, "Short Multiplier", minval = 0.1, step = 0.1, group = "Harmonic Settings")
+float medMultInput    = input.float(1.0, "Medium Multiplier", minval = 0.1, step = 0.1, group = "Harmonic Settings")
+float longMultInput   = input.float(2.0, "Long Multiplier", minval = 0.1, step = 0.1, group = "Harmonic Settings")
+float bandwidthInput  = input.float(0.1, "Bandwidth", minval = 0.01, maxval = 1, step = 0.05, group = "Harmonic Settings", tooltip = "Narrower bandwidth isolates the cycle more precisely.")
+
+int normLengthInput   = input.int(50, "Normalization Lookback", minval = 10, group = "Normalization Settings")
+
+float obLevelInput    = input.float(80, "Overbought Threshold", minval = 50, maxval = 100, group = "Overbought / Oversold Control")
+float osLevelInput    = input.float(20, "Oversold Threshold", minval = 0, maxval = 50, group = "Overbought / Oversold Control")
+
+color bullColorInput  = input.color(#089981, "Bullish Color", group = "Style")
+color bearColorInput  = input.color(#f23645, "Bearish Color", group = "Style")
+color obColorInput    = input.color(#f23645, "Overbought Color", group = "Style")
+color osColorInput    = input.color(#089981, "Oversold Color", group = "Style")
+bool  showBgInput     = input.bool(true, "Show Background Highlighting", group = "Style")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+// Decompose Price into 3 Harmonic Cycles
+float periodShort = math.max(refPeriodInput * shortMultInput, 2)
+float periodMed   = math.max(refPeriodInput * medMultInput, 2)
+float periodLong  = math.max(refPeriodInput * longMultInput, 2)
+
+float cycleShort = bandpass(close, periodShort, bandwidthInput)
+float cycleMed   = bandpass(close, periodMed, bandwidthInput)
+float cycleLong  = bandpass(close, periodLong, bandwidthInput)
+
+// Normalize each cycle to find local peaks/troughs
+float normShort = normalize(cycleShort, normLengthInput)
+float normMed   = normalize(cycleMed, normLengthInput)
+float normLong  = normalize(cycleLong, normLengthInput)
+
+// Harmonic Resonance is the confluence (average) of these cycles
+float harmonicRes = (normShort + normMed + normLong) / 3
+
+// Dynamic Volatility-Adjusted Zones
+// OB/OS levels adjust based on the current aggregate cycle amplitude
+float signalSdev = ta.stdev(harmonicRes, normLengthInput)
+float dynamicOB  = 50 + (obLevelInput - 50) * (signalSdev / 25) 
+float dynamicOS  = 50 - (50 - osLevelInput) * (signalSdev / 25)
+
+// Signal Logic
+bool isOverbought = harmonicRes > dynamicOB
+bool isOversold   = harmonicRes < dynamicOS
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+// Center Line
+plot(50, "Baseline", color.new(chart.fg_color, 80), 1, plot.style_line)
+
+// Dynamic Zones
+obPlot = plot(dynamicOB, "Dynamic Overbought", color.new(obColorInput, 50), 1, plot.style_line, linestyle = plot.linestyle_dotted)
+osPlot = plot(dynamicOS, "Dynamic Oversold", color.new(osColorInput, 50), 1, plot.style_line, linestyle = plot.linestyle_dotted)
+
+// Oscillator Plot
+oscColor = harmonicRes > 50 ? bullColorInput : bearColorInput
+oscPlot  = plot(harmonicRes, "Harmonic Resonance", oscColor, 2)
+
+// Gradient Fill from Center
+fill(oscPlot, plot(50, display = display.none), 
+     harmonicRes > 50 ? harmonicRes : 50, 
+     harmonicRes > 50 ? 50 : harmonicRes, 
+     harmonicRes > 50 ? color.new(bullColorInput, 50) : color.new(bearColorInput, 100), 
+     harmonicRes > 50 ? color.new(bullColorInput, 100) : color.new(bearColorInput, 50))
+
+// Background Highlighting for Confluence
+bgcolor(showBgInput and isOverbought ? color.new(bearColorInput, 90) : na)
+bgcolor(showBgInput and isOversold   ? color.new(bullColorInput, 90) : na)
+
+//---------------------------------------------------------------------------------------------------------------------}

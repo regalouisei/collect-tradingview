@@ -1,0 +1,900 @@
+//@version=5
+indicator("Quantum Rotational Field Mapping", shorttitle="⚛️ QRFM", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+//==============================================================================
+// 📊 INPUT CONFIGURATION — Detailed, user‑friendly tooltips (names unchanged)
+//==============================================================================
+var g1 = "⚛️ Quantum Core"
+enable_system = input.bool(true, "Enable QRFM System", group=g1, tooltip="🧠 MASTER SWITCH:\n\nTurns ALL QRFM calculations and visuals ON/OFF.\n\nUse cases:\n• OFF when you need a clean chart temporarily\n• OFF to benchmark chart performance\n• ON for normal operation")
+ci_lookback = input.int(8, "CI Smoothing Window", 1, 50, group=g1, tooltip="📈 COHERENCE INDEX SMOOTHING (SMA):\n\nControls how smooth vs. reactive CI is.\n\n• Lower (1–5): Very reactive, early ignition/exit; noisier\n• Medium (6–10): Balanced reactivity and stability\n• Higher (12–20+): Smooth CI, fewer but stronger signals\n\n💡 Tip: Start at 7–10 for intraday, 12–16 for swing")
+phase_sample_rate = input.int(6, "Phase Sample Rate (every N bars)", 1, 10, group=g1, tooltip="⏱️ PHASE COMPUTATION STEP:\n\nCalculates phase/amplitude every N bars to save CPU.\n\n• 1: Highest accuracy, heaviest load\n• 2–4: Good balance for live trading\n• 5–10: Lightest load, acceptable for higher TFs\n\n⚠️ Lower values are recommended for fast charts")
+max_history = input.int(100, "Max History Depth", 100, 1000, group=g1, tooltip="🧮 HISTORY BUFFERS FOR VISUALS:\n\nHow many bars of phase/amplitude history to keep.\n\n• 100–200: Light, good for minimal visuals\n• 300–600: Richer heat map patterns\n• 700–1000: Extended history (heavier)\n\n⚠️ Higher values = more memory/CPU")
+var g2 = "🔬 Oscillator Ensemble"
+use_rsi = input.bool(true, "RSI", group=g2, inline="rsi", tooltip="Momentum phase oscillator (0–100 scaled to −1…+1). Great baseline signal.")
+rsi_len = input.int(14, "Len", 2, 50, group=g2, inline="rsi", tooltip="RSI length.\n• Short (7–10): Fast, more noise\n• Standard (14): Balanced\n• Long (20–30): Smooth, fewer flips")
+use_macd = input.bool(true, "MACD", group=g2, inline="macd", tooltip="Trend‑phase via MACD histogram (smoothed momentum/trend).")
+macd_fast = input.int(12, "Fast", 2, 50, group=g2, inline="macd", tooltip="Fast EMA length.\nLower = more reactive trend read")
+macd_slow = input.int(26, "Slow", 2, 100, group=g2, inline="macd", tooltip="Slow EMA length.\nHigher = smoother baseline")
+macd_sig = input.int(9, "Sig", 2, 50, group=g2, inline="macd", tooltip="Signal EMA length for histogram.\nControls smoothing of MACD phase")
+use_stoch = input.bool(true, "Stoch", group=g2, inline="stoch", tooltip="Cycle/position within range. Pairs well with RSI.")
+stoch_len = input.int(14, "Len", 2, 50, group=g2, inline="stoch", tooltip="Lookback length.\nShorter = faster cycle detection")
+stoch_smooth = input.int(3, "Smth", 1, 20, group=g2, inline="stoch", tooltip="Smoothing for %K.\nHigher = smoother, slower")
+use_cci = input.bool(true, "CCI", group=g2, inline="cci", tooltip="Deviation from typical price (mean reversion energy).")
+cci_len = input.int(20, "Len", 2, 100, group=g2, inline="cci", tooltip="CCI length.\nLower = reactive deviation; Higher = stable")
+use_wpr = input.bool(true, "W%R", group=g2, inline="wpr", tooltip="Williams %R — inverse angle on range (bearish perspective).")
+wpr_len = input.int(14, "Len", 2, 50, group=g2, inline="wpr", tooltip="W%R length.\nShorter = faster overbought/oversold flips")
+use_mfi = input.bool(true, "MFI", group=g2, inline="mfi", tooltip="Money Flow Index — volume‑weighted RSI phase (if volume reliable).")
+mfi_len = input.int(14, "Len", 2, 50, group=g2, inline="mfi", tooltip="MFI length.\nUse longer values on illiquid symbols")
+use_roc = input.bool(true, "ROC", group=g2, inline="roc", tooltip="Rate of Change — velocity/acceleration cue.")
+roc_len = input.int(10, "Len", 2, 50, group=g2, inline="roc", tooltip="ROC length.\nShorter = faster but spikier velocity")
+use_tsi = input.bool(true, "TSI", group=g2, inline="tsi", tooltip="True Strength Index — double‑smoothed momentum phase.")
+tsi_long = input.int(25, "Long", 5, 100, group=g2, inline="tsi", tooltip="TSI long length (outer smoothing). Higher = smoother.")
+tsi_short = input.int(13, "Short", 2, 50, group=g2, inline="tsi", tooltip="TSI short length (inner smoothing). Lower = faster.")
+var g3 = "🎯 Signal Detection"
+ignition_threshold = input.float(0.80, "Ignition Threshold (CI)", 0.5, 0.95, 0.05, group=g3, tooltip="🚀 CI THRESHOLD FOR IGNITION:\n\nMinimum coherence to qualify as a trend ignition.\n\n• 0.50–0.65: Early/loose alignment; more trades\n• 0.70–0.85: Strong alignment; fewer but higher quality\n• 0.90–0.95: Only extreme coherence\n\n💡 Suggestion: 0.70–0.85 for most symbols")
+collapse_threshold = input.float(0.55, "Collapse Threshold (CI drop)", 0.2, 0.6, 0.05, group=g3, tooltip="💥 COHERENCE COLLAPSE MAGNITUDE:\n\nRequired CI drop (over window) to flag exits/reversals.\n\n• 0.20–0.35: Sensitive early warnings\n• 0.40–0.55: Balanced exit logic\n• 0.60: Only dramatic collapses\n\n💡 Pair with CI smoothing to tune responsiveness")
+phase_lock_tolerance = input.float(35.0, "Phase Lock Tolerance (°)", 10.0, 90.0, 5.0, group=g3, tooltip="🔒 MAXIMUM PHASE SPREAD:\n\nLargest allowed angle between any two oscillators while still considered 'locked'.\n\n• Tight (10–25°): Stronger confirmation, fewer signals\n• Medium (30–45°): Balanced\n• Loose (50–90°): Many signals, weaker alignment")
+min_entangled = input.int(4, "Min Entangled Pairs", 1, 15, group=g3, tooltip="🕸️ PAIRWISE CONFIRMATION:\n\nMinimum number of oscillator pairs that must exceed the entanglement threshold to validate a signal.\n\nHigher = more conservative.")
+enable_signals = input.bool(true, "Enable Signal Markers", group=g3, tooltip="📍 PRICE MARKERS & ALERTS:\n\nDraw long/short ignition and collapse markers on chart and enable corresponding alertconditions.")
+var g4 = "🌀 Circular Orbit Plot"
+show_orbit = input.bool(true, "Show Orbit Plot", group=g4, inline="orbit", tooltip="Polar dashboard of all oscillators in the complex plane:\n• Angle = phase (−180°…+180°)\n• Radius = amplitude\n\nWatch for vector convergence = coherence.")
+orbit_pos = input.string("Middle Left", "Position", ["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"], group=g4, inline="orbit")
+orbit_size = input.int(12, "Grid", 8, 20, group=g4, inline="orbit", tooltip="Grid resolution (cells per side). Larger = more detail, bigger panel.")
+orbit_vector_width = input.int(2, "Vector W", 1, 4, group=g4, inline="orbit", tooltip="Endpoint mark/line thickness. Cosmetic preference.")
+var g5 = "🔥 Phase‑Time Heat Map"
+show_heat = input.bool(true, "Show Heat Map", group=g5, inline="heat", tooltip="2D matrix of oscillator states across recent time bins.\nRows = oscillators, Columns = time.")
+heat_pos = input.string("Bottom Right", "Position", ["Top Left","Top Right","Bottom Left","Bottom Right"], group=g5, inline="heat")
+heat_time_bins = input.int(10, "Time Bins", 5, 20, group=g5, inline="heat", tooltip="Columns displayed (older → newer).\nMore bins = wider panel.")
+heat_color_mode = input.string("Phase Angle", "Color Mode", ["Phase Angle","Amplitude","Coherence Contribution"], group=g5, tooltip="Color mapping:\n• Phase Angle: Hue shows phase\n• Amplitude: Brightness shows strength\n• Coherence Contribution: Effect on CI (directional)")
+var g6 = "🕸️ Entanglement Web (Matrix)"
+show_web = input.bool(true, "Show Entanglement Web", group=g6, tooltip="Yellow N×N matrix of pairwise coherence.\nCell(i,j) = |cos(φi − φj)|.\nBrighter = stronger entanglement.\n\nSnapshot of NOW (no time axis).")
+web_threshold = input.float(0.25, "Entanglement Threshold", 0.2, 0.95, 0.05, group=g6, tooltip="Minimum pairwise coherence for a cell to highlight.\n\n• Lower (0.20–0.55): See more structure; busier matrix\n• Medium (0.60–0.75): Balanced view\n• Higher (0.80–0.95): Only strongest links\n\nUsed by both the visual and the entangled_pairs confirmation.")
+var g7 = "🌫️ Quantum Field Visuals"
+show_field = input.bool(true, "Show Field Cloud", group=g7, inline="field", tooltip="Background haze expressing coherence & dominant phase:\n• Green = bullish dominance\n• Red = bearish dominance\n• Opacity scales with CI")
+field_opacity_min = input.int(95, "Min Opacity", 0, 100, group=g7, inline="field", tooltip="Transparency when CI is LOW (weaker field). Higher = more visible cloud at low CI.")
+field_opacity_max = input.int(95, "Max Opacity", 0, 100, group=g7, inline="field", tooltip="Transparency when CI is HIGH (strong field). Higher = more visible cloud at high CI.")
+show_spiral = input.bool(true, "Show Phase Spiral", group=g7, inline="spiral", tooltip="Simplified historical phase evolution as an overlay curve.")
+spiral_depth = input.int(10, "Depth (bars)", 10, 200, group=g7, inline="spiral", tooltip="How far back to consider for the spiral shape.\nHigher = longer history, heavier draw.")
+show_collapse = input.bool(true, "Show Collapse Bursts", group=g7, tooltip="Draws visual bursts when CI drops sharply (collapse events).\nUse as exit/transition warnings.")
+var g8 = "🏆 Dashboard"
+show_dashboard = input.bool(true, "Show Dashboard", group=g8, inline="dash", tooltip="Compact stats panel:\n• CI, Dominant Phase, Field Strength\n• Entangled Pairs, Phase‑Lock\n• Quantum State, Collapse Risk\n• Last signal state")
+dash_pos = input.string("Top Right", "Position", ["Top Left","Top Right","Bottom Left","Bottom Right"], group=g8, inline="dash")
+dash_size = input.string("Large", "Size", ["Small","Normal","Large"], group=g8, inline="dash", tooltip="Text/cell size of the dashboard.")
+theme = input.string("Quantum", "Color Theme", ["Quantum","Neon","Matrix","Aurora"], group=g8, tooltip="Preset color palettes for all visuals.\nChange for different vibes/contrast.")
+//==============================================================================
+// 🎨 COLOR SYSTEM
+//==============================================================================
+q_bull    = theme == "Quantum" ? color.rgb(0, 255, 127)    : theme == "Neon"   ? color.rgb(57, 255, 20)  : theme == "Matrix" ? color.lime    : color.rgb(0, 255, 200)
+q_bear    = theme == "Quantum" ? color.rgb(255, 20, 147)   : theme == "Neon"   ? color.rgb(255, 0, 255)  : theme == "Matrix" ? color.red     : color.rgb(255, 100, 200)
+q_neutral = theme == "Quantum" ? color.rgb(100, 200, 255)  : theme == "Neon"   ? color.rgb(0, 255, 255)  : theme == "Matrix" ? color.aqua    : color.rgb(150, 150, 255)
+q_energy  = theme == "Quantum" ? color.rgb(255, 215, 0)    : theme == "Neon"   ? color.rgb(255, 255, 0)  : theme == "Matrix" ? color.yellow  : color.rgb(255, 200, 50)
+q_void    = theme == "Quantum" ? color.rgb(75, 0, 130)     : theme == "Neon"   ? color.rgb(138, 43, 226) : theme == "Matrix" ? color.purple  : color.rgb(100, 50, 150)
+//==============================================================================
+// 🔧 UTILITY FUNCTIONS
+//==============================================================================
+pi = math.pi
+
+norm(x, min, max) => (x - min) / math.max(max - min, 1e-10)
+clamp(x, lo, hi) => x < lo ? lo : x > hi ? hi : x
+// Custom atan2
+custom_atan2(y, x) =>
+    atan_val = math.atan(y / x)
+    if x > 0
+        atan_val
+    else if x < 0 and y >= 0
+        atan_val + pi
+    else if x < 0 and y < 0
+        atan_val - pi
+    else if x == 0 and y > 0
+        pi / 2
+    else if x == 0 and y < 0
+        -pi / 2
+    else
+        na 
+safe_atan2(y, x) => custom_atan2(y, x) 
+
+degrees(rad) => rad * 180.0 / pi
+radians(deg) => deg * pi / 180.0
+
+// Map value to color gradient
+phaseColor(phase_deg) =>
+    norm_phase = (phase_deg + 180.0) / 360.0  // 0 to 1
+    r = int(clamp(255 * math.sin(norm_phase * pi), 0, 255))
+    g = int(clamp(255 * math.sin((norm_phase + 0.33) * pi), 0, 255))
+    b = int(clamp(255 * math.sin((norm_phase + 0.66) * pi), 0, 255))
+    color.rgb(r, g, b)
+
+amplitudeColor(amp) =>
+
+    val = int(clamp(amp * 255, 0, 255))
+    color.rgb(val, val, val)
+
+coherenceColor(contrib) =>
+
+    contrib >= 0 ? color.new(q_bull, int((1.0 - contrib) * 80)) : color.new(q_bear, int((1.0 + contrib) * 80))
+//==============================================================================
+// 📊 OSCILLATOR CALCULATIONS
+//==============================================================================
+// Normalize oscillator
+normalize(val, overbought, oversold) =>
+    2.0 * (val - oversold) / math.max(overbought - oversold, 1e-10) - 1.0
+// RSI
+rsi_raw = use_rsi ? ta.rsi(close, rsi_len) : 50.0
+rsi_norm = normalize(rsi_raw, 70, 30)
+// MACD
+[macd_line, macd_signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macd_norm = use_macd ? clamp(macd_hist / ta.stdev(macd_hist, 50), -1, 1) : 0.0
+// Stochastic
+stoch_k = use_stoch ? ta.sma(ta.stoch(close, high, low, stoch_len), stoch_smooth) : 50.0
+stoch_norm = normalize(stoch_k, 80, 20)
+// CCI
+cci_raw = use_cci ? ta.cci(close, cci_len) : 0.0
+cci_norm = clamp(cci_raw / 200.0, -1, 1)
+// Williams %R
+wpr_raw = use_wpr ? ta.wpr(wpr_len) : -50.0
+wpr_norm = normalize(wpr_raw, -20, -80)
+// MFI
+mfi_raw = use_mfi ? ta.mfi(hlc3, mfi_len) : 50.0
+mfi_norm = normalize(mfi_raw, 80, 20)
+// ROC
+roc_raw = use_roc ? ta.roc(close, roc_len) : 0.0
+roc_norm = clamp(roc_raw / 10.0, -1, 1)
+// TSI
+tsi_raw = use_tsi ? ta.tsi(close, tsi_short, tsi_long) : 0.0
+tsi_norm = clamp(tsi_raw / 50.0, -1, 1)
+// Precalculate active oscillator indices
+osc_names = array.from("RSI", "MACD", "Stoch", "CCI", "WPR", "MFI", "ROC", "TSI")
+osc_enabled = array.from(use_rsi, use_macd, use_stoch, use_cci, use_wpr, use_mfi, use_roc, use_tsi)
+active_indices = array.new_int()
+for i = 0 to array.size(osc_enabled) - 1
+    if array.get(osc_enabled, i)
+        array.push(active_indices, i)
+// Build active oscillator values
+osc_values = array.new_float(array.size(active_indices), 0.0)
+active_count = array.size(active_indices)
+if active_count > 0
+    for idx = 0 to active_count - 1
+        i = array.get(active_indices, idx)
+        val = switch i
+            0 => rsi_norm
+            1 => macd_norm
+            2 => stoch_norm
+            3 => cci_norm
+            4 => wpr_norm
+            5 => mfi_norm
+            6 => roc_norm
+            7 => tsi_norm
+            => 0.0  
+        if val != 0.0 and not na(val) 
+            array.set(osc_values, idx, val)
+//==============================================================================
+// 🌊 PHASE & AMPLITUDE EXTRACTION (Hilbert-style)
+//==============================================================================
+osc_phases = array.new_float(active_count, 0.0)
+osc_amps = array.new_float(active_count, 0.0)
+
+for idx = 0 to active_count - 1
+    val = array.get(osc_values, idx)
+    val_prev = nz(array.get(osc_values, idx)[1], val)
+    // In-phase (I) = value, Quadrature (Q) = derivative
+    I = val
+    Q = val - val_prev 
+    // Phase (radians, then degrees)
+    phase_rad = safe_atan2(Q, I)
+    phase_deg = degrees(phase_rad)
+    // Amplitude (magnitude)
+    amp = math.sqrt(I*I + Q*Q)
+    
+    array.set(osc_phases, idx, phase_deg)
+    array.set(osc_amps, idx, amp)
+//==============================================================================
+// 🧮 COHERENCE INDEX CALCULATION
+//==============================================================================
+// Sum complex exponentials: Σ e^(iφ) = Σ cos(φ) + i·Σ sin(φ)
+sum_cos = 0.0
+sum_sin = 0.0
+N = active_count
+
+for idx = 0 to active_count - 1
+    phase_deg = array.get(osc_phases, idx)
+    phase_rad = radians(phase_deg)
+    sum_cos += math.cos(phase_rad)
+    sum_sin += math.sin(phase_rad)
+// Magnitude of resultant vector
+resultant_mag = math.sqrt(sum_cos*sum_cos + sum_sin*sum_sin)
+// Coherence Index
+CI_raw = N > 0 ? resultant_mag / N : 0.0
+CI = ta.sma(CI_raw, ci_lookback) 
+// Dominant phase 
+dominant_phase_rad = safe_atan2(sum_sin, sum_cos)
+dominant_phase_deg = degrees(dominant_phase_rad)
+// Field strength
+avg_amp = 0.0
+for idx = 0 to active_count - 1
+    avg_amp += array.get(osc_amps, idx)
+avg_amp := N > 0 ? avg_amp / N : 0.0
+field_strength = CI * avg_amp
+//==============================================================================
+// 🕸️ ENTANGLEMENT MATRIX 
+//==============================================================================
+// Symmetric matrix: E[i][j] = |cos(φᵢ - φⱼ)
+entangle_matrix = array.new_float(active_count * active_count, 0.0) 
+
+idx2d(r, c, size) => r * size + c
+
+entangled_pairs = 0
+for idx_i = 0 to active_count - 1
+    if idx_i < active_count - 1
+        for idx_j = idx_i + 1 to active_count - 1
+            phi_i = radians(array.get(osc_phases, idx_i))
+            phi_j = radians(array.get(osc_phases, idx_j))
+            phase_diff = phi_i - phi_j
+            entanglement = math.abs(math.cos(phase_diff))
+            
+            k_ij = idx2d(idx_i, idx_j, active_count)
+            k_ji = idx2d(idx_j, idx_i, active_count)
+            array.set(entangle_matrix, k_ij, entanglement)
+            array.set(entangle_matrix, k_ji, entanglement)
+            
+            if entanglement >= web_threshold and entanglement > 0.0  // Filter zero values
+                entangled_pairs += 1
+//==============================================================================
+// 🚨 SIGNAL DETECTION (Ignition & Collapse)
+//==============================================================================
+// Ignition: CI crosses above threshold
+ignition_long  = ta.crossover(CI, ignition_threshold) and dominant_phase_deg > -90 and dominant_phase_deg < 90
+ignition_short = ta.crossover(CI, ignition_threshold) and (dominant_phase_deg < -90 or dominant_phase_deg > 90)
+// Collapse: CI drops significantly
+CI_prev = nz(CI[5], CI)
+collapse_event = (CI_prev - CI) > collapse_threshold and CI_prev > 0.6
+// Phase lock check
+phase_locked = false
+if N > 1
+    phase_spread = 0.0
+    for idx_i = 0 to active_count - 1
+        if idx_i < active_count - 1 
+            for idx_j = idx_i + 1 to active_count - 1
+                diff = math.abs(array.get(osc_phases, idx_i) - array.get(osc_phases, idx_j))
+                if diff > 180
+                    diff := 360 - diff
+                phase_spread := math.max(phase_spread, diff)
+    phase_locked := phase_spread < phase_lock_tolerance
+// Final signals
+long_signal  = enable_signals and ignition_long  and phase_locked and entangled_pairs >= min_entangled
+short_signal = enable_signals and ignition_short and phase_locked and entangled_pairs >= min_entangled
+exit_signal  = enable_signals and collapse_event
+//==============================================================================
+// 🎨 CIRCULAR ORBIT PLOT
+//==============================================================================
+var table orbit = na
+if show_orbit and barstate.islast
+
+    orbit_position = 
+      orbit_pos == "Top Left"       ? position.top_left :
+      orbit_pos == "Top Center"     ? position.top_center :
+      orbit_pos == "Top Right"      ? position.top_right :
+      orbit_pos == "Middle Left"    ? position.middle_left :
+      orbit_pos == "Middle Center"  ? position.middle_center :
+      orbit_pos == "Middle Right"   ? position.middle_right :
+      orbit_pos == "Bottom Left"    ? position.bottom_left :
+      orbit_pos == "Bottom Center"  ? position.bottom_center :
+      position.bottom_right
+    
+    if not na(orbit)
+        table.delete(orbit)
+    
+    orbit := table.new(orbit_position, orbit_size, orbit_size, 
+      bgcolor=color.new(color.black, 50), 
+      border_color=color.new(q_neutral, 70), 
+      border_width=1)
+    // Draw grid background
+    center = int(orbit_size / 2)
+    for r = 0 to orbit_size - 1
+        for c = 0 to orbit_size - 1
+            dx = c - center
+            dy = r - center
+            dist = math.sqrt(dx*dx + dy*dy)
+            max_dist = center
+            cell_color = color.new(color.gray, 97)
+            if dist < max_dist * 0.25
+                cell_color := color.new(q_void, 95)
+            else if dist < max_dist * 0.5
+                cell_color := color.new(q_void, 96)
+            else if dist < max_dist * 0.75
+                cell_color := color.new(q_void, 97)
+            
+            table.cell(orbit, c, r, "", bgcolor=cell_color, width=0.5, height=0.5)
+    // Draw oscillator vectors
+    for idx = 0 to active_count - 1
+        phase_deg = array.get(osc_phases, idx)
+        amp = array.get(osc_amps, idx)      
+        // Normalize amplitude to grid radius
+        radius = amp * center * 0.8       
+        // Convert polar to Cartesian
+        phase_rad = radians(phase_deg)
+        x = radius * math.cos(phase_rad)
+        y = radius * math.sin(phase_rad)       
+        // Map to grid coordinates
+        col = int(center + x)
+        row = int(center - y)       
+        // Clamp to grid bounds
+        col := clamp(col, 0, orbit_size - 1)
+        row := clamp(row, 0, orbit_size - 1)        
+        // Determine color by quadrant
+        vec_color = 
+          phase_deg >= -45 and phase_deg < 45   ? q_bull :   
+          phase_deg >= 45 and phase_deg < 135   ? q_neutral : 
+          phase_deg >= -135 and phase_deg < -45 ? q_neutral : 
+          q_bear                   
+        // Draw vector endpoint
+        osc_label = array.get(osc_names, array.get(active_indices, idx))
+        table.cell(orbit, col, row, str.substring(osc_label, 0, 1), 
+          text_color=vec_color, 
+          bgcolor=color.new(vec_color, 70),
+          text_size=size.tiny)    
+    // Center marker
+    table.cell(orbit, center, center, "⊗", 
+      text_color=color.new(q_energy, 0), 
+      bgcolor=color.new(color.black, 30),
+      text_size=size.small)
+//==============================================================================
+// 🔥 PHASE-TIME HEAT MAP
+//==============================================================================
+var table heat = na
+if show_heat and barstate.islast
+    hpos = heat_pos == "Top Left" ? position.top_left : heat_pos == "Top Right" ? position.top_right : heat_pos == "Bottom Left" ? position.bottom_left : position.bottom_right
+    
+    rows = active_count + 1 
+    cols = heat_time_bins + 1 
+    
+    if not na(heat)
+        table.delete(heat)
+    
+    heat := table.new(hpos, cols, rows, 
+      bgcolor=color.new(color.black, 80), 
+      border_color=color.new(q_neutral, 60), 
+      border_width=1)
+    // Header
+    table.cell(heat, 0, 0, "🔥", text_color=color.white, text_size=size.small)
+    for c = 1 to heat_time_bins
+        bars_ago = (heat_time_bins - c) * 5 
+        table.cell(heat, c, 0, str.tostring(bars_ago), text_color=color.white, text_size=size.tiny, text_halign=text.align_center)
+    // Oscillator rows 
+    for idx = 0 to active_count - 1
+        i = array.get(active_indices, idx)
+        // Row label
+        osc_name = array.get(osc_names, i)
+        table.cell(heat, 0, idx+1, osc_name, text_color=color.white, text_size=size.tiny)
+        for c = 1 to heat_time_bins
+            bars_ago = (heat_time_bins - c) * 5
+            
+            phase_hist = nz(array.get(osc_phases, idx)[bars_ago], 0.0)
+            amp_hist = nz(array.get(osc_amps, idx)[bars_ago], 0.0)
+            // Color by mode 
+            if phase_hist == 0.0 and amp_hist == 0.0 
+                table.cell(heat, c, idx+1, "", bgcolor=color.new(color.gray, 90))
+            else
+                cell_color = 
+                  heat_color_mode == "Phase Angle" ? phaseColor(phase_hist) :
+                  heat_color_mode == "Amplitude" ? amplitudeColor(amp_hist) :
+                  coherenceColor(math.cos(radians(phase_hist)))  // Contribution to CI
+                
+                table.cell(heat, c, idx+1, "", bgcolor=color.new(cell_color, 40))
+//==============================================================================
+// 🕸️ ENTANGLEMENT WEB 
+//==============================================================================
+var table web_matrix = na
+if show_web and barstate.islast
+    // Position opposite of heat map
+    wpos = heat_pos == "Bottom Right" ? position.bottom_left : position.bottom_right
+    
+    if not na(web_matrix)
+        table.delete(web_matrix)
+    
+    web_matrix := table.new(wpos, active_count + 1, active_count + 1, 
+      bgcolor=color.new(color.black, 80), 
+      border_color=color.new(q_neutral, 60), 
+      border_width=1)
+    // Header
+    table.cell(web_matrix, 0, 0, "🕸️", text_color=color.white, text_size=size.small)
+    for idx = 0 to active_count - 1
+        i = array.get(active_indices, idx)
+        osc_short = str.substring(array.get(osc_names, i), 0, 1)
+        table.cell(web_matrix, idx+1, 0, osc_short, text_color=color.white, text_size=size.tiny)
+        table.cell(web_matrix, 0, idx+1, osc_short, text_color=color.white, text_size=size.tiny)
+    // Matrix cells 
+    for idx_i = 0 to active_count - 1
+        for idx_j = 0 to active_count - 1
+            if idx_i == idx_j
+                table.cell(web_matrix, idx_j+1, idx_i+1, "—", text_color=color.gray, text_size=size.tiny)
+            else
+                k = idx2d(idx_i, idx_j, active_count)
+                ent = array.get(entangle_matrix, k)
+                
+                if ent == 0.0  
+                    table.cell(web_matrix, idx_j+1, idx_i+1, "", bgcolor=color.new(color.gray, 92))
+                else
+                    cell_bg = ent >= web_threshold ? 
+                      color.new(q_energy, int((1.0 - ent) * 70)) : 
+                      color.new(color.gray, 92)
+                    
+                    table.cell(web_matrix, idx_j+1, idx_i+1, "", bgcolor=cell_bg)
+//==============================================================================
+// 🌫️ QUANTUM FIELD VISUALS
+//==============================================================================
+field_opacity = field_opacity_min + (field_opacity_max - field_opacity_min) * CI
+field_color_base = dominant_phase_deg > -90 and dominant_phase_deg < 90 ? q_bull : q_bear
+field_color = show_field ? color.new(field_color_base, int(field_opacity)) : na
+
+bgcolor(field_color, title="Quantum Field Cloud")
+//==============================================================================
+// 🌀 PHASE SPIRAL
+//==============================================================================
+spiral_phase = show_spiral ? ta.sma(dominant_phase_deg, spiral_depth) : na
+plot(show_spiral ? close * (1.0 + spiral_phase / 1000.0) : na, 
+  "Phase Spiral", 
+  color=color.new(q_neutral, 60), 
+  linewidth=1, 
+  style=plot.style_circles)
+//==============================================================================
+// 📊 COHERENCE INDEX PLOT 
+//==============================================================================
+plot(CI * 100, "Coherence Index (%)", color=color.new(q_energy, 0), linewidth=2, display=display.none)
+//==============================================================================
+// 🏆 DASHBOARD
+//==============================================================================
+var table dash = na
+if show_dashboard and barstate.islast
+    dpos = dash_pos == "Top Left" ? position.top_left : dash_pos == "Top Right" ? position.top_right : dash_pos == "Bottom Left" ? position.bottom_left : position.bottom_right
+    cols = dash_size == "Large" ? 4 : 3
+    rows = dash_size == "Large" ? 12 : dash_size == "Normal" ? 10 : 7
+    
+    if not na(dash)
+        table.delete(dash)
+    
+    dash := table.new(dpos, cols, rows, 
+      bgcolor=color.new(color.black, 80), 
+      border_color=color.new(q_neutral, 60), 
+      border_width=1)
+    
+    tWhite = color.white
+    tGray = #B2B5BE
+    row = 0
+    // Header
+    table.merge_cells(dash, 0, row, cols-1, row)
+    table.cell(dash, 0, row, "⚛️ QRFM | " + syminfo.ticker, text_color=tWhite, text_halign=text.align_center, text_size=size.normal)
+    row += 1
+    // Coherence Index
+    table.cell(dash, 0, row, "CI", text_color=tGray, text_size=size.small)
+    ci_color = CI > 0.7 ? q_energy : CI > 0.5 ? q_neutral : tGray
+    table.cell(dash, 1, row, str.tostring(CI, "#.###"), text_color=ci_color, text_halign=text.align_right, text_size=size.small)
+    if cols > 3
+        table.cell(dash, 2, row, "Active Osc", text_color=tGray, text_size=size.small)
+        table.cell(dash, 3, row, str.tostring(active_count), text_color=tWhite, text_halign=text.align_right, text_size=size.small)
+    row += 1
+    // Dominant Phase
+    table.cell(dash, 0, row, "Dom Phase", text_color=tGray, text_size=size.small)
+    phase_color = dominant_phase_deg > -90 and dominant_phase_deg < 90 ? q_bull : q_bear
+    table.cell(dash, 1, row, str.tostring(dominant_phase_deg, "#.#") + "°", text_color=phase_color, text_halign=text.align_right, text_size=size.small)
+    if cols > 3
+        table.cell(dash, 2, row, "Field Str", text_color=tGray, text_size=size.small)
+        table.cell(dash, 3, row, str.tostring(field_strength, "#.##"), text_color=q_energy, text_halign=text.align_right, text_size=size.small)
+    row += 1
+    // Entangled Pairs
+    table.cell(dash, 0, row, "Entangled", text_color=tGray, text_size=size.small)
+    ent_color = entangled_pairs >= min_entangled ? q_bull : q_bear
+    table.cell(dash, 1, row, str.tostring(entangled_pairs), text_color=ent_color, text_halign=text.align_right, text_size=size.small)
+    if cols > 3
+        table.cell(dash, 2, row, "Phase Lock", text_color=tGray, text_size=size.small)
+        lock_text = phase_locked ? "🔒 YES" : "🔓 NO"
+        table.cell(dash, 3, row, lock_text, text_color=phase_locked ? q_bull : tGray, text_halign=text.align_right, text_size=size.small)
+    row += 1
+    // Quantum State
+    table.cell(dash, 0, row, "State", text_color=tGray, text_size=size.small)
+    q_state = 
+      CI > ignition_threshold and phase_locked ? "🚀 IGNITION" :
+      CI > 0.6 ? "⚡ COHERENT" :
+      collapse_event ? "💥 COLLAPSE" :
+      "🌀 CHAOS"
+    q_state_color = 
+      str.contains(q_state, "IGNITION") ? q_energy :
+      str.contains(q_state, "COHERENT") ? q_bull :
+      str.contains(q_state, "COLLAPSE") ? q_bear :
+      tGray
+    table.merge_cells(dash, 1, row, cols-1, row)
+    table.cell(dash, 1, row, q_state, text_color=q_state_color, text_halign=text.align_center, text_size=size.small)
+    row += 1
+    // Collapse Risk
+    collapse_risk = (CI_prev - CI) / math.max(CI_prev, 0.1)
+    table.cell(dash, 0, row, "Collapse Risk", text_color=tGray, text_size=size.small)
+    risk_pct = clamp(collapse_risk * 100, 0, 100)
+    risk_color = risk_pct > 50 ? q_bear : risk_pct > 25 ? color.orange : q_bull
+    table.merge_cells(dash, 1, row, cols-1, row)
+    table.cell(dash, 1, row, str.tostring(risk_pct, "#.#") + "%", text_color=risk_color, text_halign=text.align_center, text_size=size.small)
+    row += 1
+    // Signal
+    table.merge_cells(dash, 0, row, cols-1, row)
+    sig_text = long_signal ? "🟢 LONG IGNITION" : short_signal ? "🔴 SHORT IGNITION" : exit_signal ? "⚠️ EXIT (COLLAPSE)" : "⚪ NEUTRAL"
+    sig_color = long_signal ? q_bull : short_signal ? q_bear : exit_signal ? color.orange : tGray
+    table.cell(dash, 0, row, sig_text, text_color=sig_color, text_halign=text.align_center, text_size=size.normal)
+//==============================================================================
+// 📡 SIGNAL MARKERS
+//==============================================================================
+plotshape(long_signal, 
+  title="Long Ignition", 
+  style=shape.triangleup, 
+  location=location.belowbar, 
+  color=color.new(color.green, 0),
+  size=size.tiny, 
+  text="") 
+
+plotshape(short_signal, 
+  title="Short Ignition", 
+  style=shape.triangledown, 
+  location=location.abovebar, 
+  color=color.new(color.red, 0), 
+  size=size.tiny, 
+  text="") 
+
+is_long_exit = dominant_phase_deg > -90 and dominant_phase_deg < 90
+
+plotshape(exit_signal, 
+  title="Long Exit Circle (Above)", 
+  style=shape.circle, 
+  location=location.abovebar, 
+  color=color.new(color.red, 90), 
+  size=size.tiny, 
+  offset=0, 
+  text="") 
+
+plotshape(exit_signal, 
+  title="Long Exit Circle (Below)", 
+  style=shape.circle, 
+  location=location.belowbar, 
+  color=color.new(color.red, 90), 
+  size=size.tiny, 
+  offset=0, 
+  text="") 
+//==============================================================================
+// 📢 ALERTS
+//==============================================================================
+alertcondition(long_signal, 
+  title="QRFM Long Ignition", 
+  message="⚛️ QRFM: LONG — Phase Coherence Ignition | CI={{plot_0}} | {{ticker}} @ {{close}}")
+alertcondition(short_signal, 
+  title="QRFM Short Ignition", 
+  message="⚛️ QRFM: SHORT — Phase Coherence Ignition | CI={{plot_0}} | {{ticker}} @ {{close}}")
+alertcondition(exit_signal, 
+  title="QRFM Collapse", 
+  message="⚛️ QRFM: COLLAPSE — Quantum Field Breakdown | {{ticker}} @ {{close}}")
+alertcondition(phase_locked, 
+  title="QRFM Phase Lock", 
+  message="⚛️ QRFM: Phase Lock Achieved | All oscillators aligned | {{ticker}}")
+//==============================================================================
+// ✍️ SIGNATURE
+//==============================================================================
+var table sig = na
+if na(sig)
+    sig := table.new(position.bottom_center, 1, 1, 
+      bgcolor=color.new(color.black, 85), 
+      border_color=color.new(q_neutral, 65), 
+      border_width=1)
+
+table.clear(sig, 0, 0)
+table.cell(sig, 0, 0, 
+  "⚡ Dskyz (DAFE) Trading Systems - Quantum Rotational Field Mapping (⚛️  QRFM)", 
+  text_color=q_neutral, 
+  text_size=size.small)
+//==============================================================================
+// ⚛️ QUANTUM ROTATIONAL FIELD MAPPING (QRFM)
+// Phase Coherence & Oscillator Entanglement in the Complex Plane
+//==============================================================================
+//
+// 🌌 THEORETICAL FOUNDATION: QUANTUM MECHANICS MEETS MARKET DYNAMICS
+//
+// In quantum mechanics, particles exist in superposition—simultaneously 
+// occupying multiple states—until observation collapses the wavefunction. 
+// Markets exhibit eerily similar behavior: oscillators (RSI, MACD, Stochastic) 
+// independently cycle through phases, seemingly random and uncorrelated—until 
+// they suddenly ALIGN, creating explosive directional moves.
+//
+// QRFM treats each oscillator as a quantum particle with:
+// • AMPLITUDE (A): Signal strength/conviction
+// • PHASE (φ): Directional state in the cycle (0° to 360°)
+//
+// In the complex plane, each oscillator becomes a rotating vector:
+//
+//     Ψₙ = Aₙ · e^(iφₙ) = Aₙ · (cos φₙ + i·sin φₙ)
+//
+// where:
+// • n = oscillator index (RSI, MACD, etc.)
+// • Aₙ = normalized amplitude (0 to 1)
+// • φₙ = phase angle extracted via Hilbert-style transform
+// • i = imaginary unit (√-1)
+//
+// 🔬 THE COHERENCE INDEX: MEASURING QUANTUM ALIGNMENT
+//
+// When oscillators are phase-incoherent (random), their vectors point in 
+// different directions, canceling each other out. When they phase-lock 
+// (coherent), vectors align, producing a strong resultant.
+//
+// The Coherence Index quantifies this alignment:
+//
+//     CI = (1/N) · |Σ e^(iφₙ)| = (1/N) · |Σ cos φₙ + i·Σ sin φₙ|
+//
+// Geometrically: CI is the magnitude of the vector sum, normalized to [0,1].
+//
+// • CI = 1: Perfect phase coherence (all oscillators aligned)
+// • CI = 0: Total phase chaos (oscillators cancel out)
+// • 0 < CI < 1: Partial alignment
+//
+// 🌀 PHASE EXTRACTION VIA ANALYTIC SIGNAL
+//
+// To obtain phase φ from a real-valued oscillator, we construct the analytic 
+// signal using a Hilbert-transform approximation:
+//
+//     φ = arctan2(Quadrature, In-Phase)
+//
+// We use a derivative-based quadrature for computational efficiency:
+//
+//     Q = rate of change (derivative proxy)
+//     I = oscillator value (in-phase)
+//     φ = atan2(Q, I)
+//
+// This maps each oscillator to a rotating phasor in the complex plane.
+//
+// ⚡ QUANTUM COLLAPSE EVENTS: THE TRADING EDGE
+//
+// In quantum mechanics, wavefunction collapse is the transition from 
+// superposition to a definite state. In markets, coherence collapse signals 
+// regime change:
+//
+// 1. IGNITION: CI rises from <0.3 to >0.75 → oscillators phase-lock → 
+//    strong trend initiates
+//
+// 2. COLLAPSE: CI drops from >0.7 to <0.3 within N bars → phase coherence 
+//    breaks → trend exhaustion/reversal
+//
+// 3. RESONANCE: CI oscillates in stable band (0.4-0.6) → ranging/choppy 
+//    market (no quantum state)
+//
+// 🕸️ ENTANGLEMENT MATRIX: PAIRWISE COHERENCE
+//
+// Beyond global CI, we compute pairwise phase coherence between oscillator 
+// pairs i and j:
+//
+//     E(i,j) = |cos(φᵢ - φⱼ)| = alignment score [0,1]
+//
+// High E(i,j) → oscillators i and j are "entangled" (moving in sync)
+// Low E(i,j) → decorrelated (independent motion)
+//
+// The entanglement web visualizes these connections, revealing hidden 
+// correlations invisible to traditional analysis.
+//
+// 🎨 VISUAL INNOVATIONS: NEVER-BEFORE-SEEN IN TRADING
+//
+// 1. CIRCULAR ORBIT PLOT: Polar display showing oscillator vectors rotating 
+//    in real-time. Each vector's angle = phase, length = amplitude. Visual 
+//    convergence instantly reveals coherence.
+//
+// 2. PHASE-TIME HEAT MAP: 2D grid (oscillators × time) colored by phase 
+//    angle. Horizontal bands = phase-lock. Chaos = rainbow noise.
+//
+// 3. ENTANGLEMENT WEB: Lines connect oscillators when pairwise coherence 
+//    exceeds threshold. Thickness = entanglement strength. Looks like a 
+//    neural network firing.
+//
+// 4. QUANTUM FIELD CLOUD: Overlay on chart showing coherence intensity as 
+//    atmospheric "pressure." Dense field = high CI. Dissipating cloud = collapse.
+//
+// 5. PHASE SPIRAL: Historical phase evolution drawn as a 3D-style spiral 
+//    (flattened to 2D). Tight spiral = coherent rotation. Scattered = chaos.
+//
+// 6. COLLAPSE BURST MARKERS: Visual "explosions" when CI collapses, styled 
+//    with radiating shapes.
+//
+// 🧮 MULTI-DIMENSIONAL ARRAY ARCHITECTURE
+//
+// QRFM maintains several matrix structures for efficient computation:
+//
+// • phase_history[osc][time]: 2D ring buffer of phase angles
+// • amp_history[osc][time]: 2D ring buffer of amplitudes
+// • entangle_matrix[osc][osc]: Symmetric pairwise coherence matrix
+// • phase_bins[time][phase_sector]: Discretized phase-space for heat map
+// • coherence_buffer[time]: 1D ring buffer for CI time series
+//
+// Indexing is carefully managed to prevent lookback violations and optimize 
+// loop performance.
+//
+// 📊 OSCILLATOR ENSEMBLE (8 Quantum Particles)
+//
+// 1. RSI: Momentum phase (overbought/oversold cycle)
+// 2. MACD: Trend phase (bull/bear cycle via histogram)
+// 3. Stochastic: Price location phase within range
+// 4. CCI: Deviation phase from statistical mean
+// 5. Williams %R: Inverse Stochastic (bear perspective)
+// 6. MFI: Money flow phase (volume-weighted RSI)
+// 7. ROC: Rate-of-change phase (velocity)
+// 8. TSI: True Strength Index (double-smoothed momentum)
+//
+// Each oscillator is normalized to [-1, 1] before phase extraction.
+//
+// 🎯 TRADING WITH QRFM
+//
+// ENTRY SIGNALS:
+// • Long: CI ignition (0.3 → 0.75+) + dominant phase > 0° (bullish quadrant)
+// • Short: CI ignition + dominant phase < 0° (bearish quadrant)
+//
+// EXIT SIGNALS:
+// • Coherence collapse (CI >0.7 → <0.3)
+// • Phase reversal (dominant phase flips quadrant)
+//
+// FILTERS:
+// • Avoid trades when CI < 0.4 (no quantum state)
+// • Increase position size when entanglement pairs > 50% (strong sync)
+//
+// MULTI-TIMEFRAME:
+// • Higher TF: Use CI for bias (>0.6 = trending, <0.4 = ranging)
+// • Lower TF: Execute on collapse/ignition events
+//
+// 💡 PHILOSOPHICAL NOTE
+//
+// If markets are emergent systems of collective behavior, oscillators are 
+// individual agents. QRFM reveals when these agents synchronize into a 
+// coherent whole—a phase transition from disorder to order. By visualizing 
+// this in the complex plane, we see the market's "wavefunction" before it 
+// collapses into price movement.
+//
+// This isn't prediction—it's observation of the quantum field itself.
+//
+//==============================================================================
+// 📘 USER GUIDE: MASTERING THE QUANTUM FIELD
+//==============================================================================
+//
+// 🔮 GETTING STARTED
+//
+// 1. Load QRFM on any chart (works on all assets/timeframes)
+// 2. Enable all visual modules initially to see the full system
+// 3. Watch the Circular Orbit Plot—this is your primary visual
+// 4. Observe coherence index (CI line at bottom)
+// 5. Wait for CI ignition event (watch vectors converge on orbit plot)
+//
+// 🎛️ CORE SETTINGS
+//
+// Oscillator Lengths: Adjust to match your instrument's dominant cycle. 
+// Shorter (7-10) for crypto/forex, longer (14-21) for stocks/indices.
+//
+// CI Lookback: Smoothing window for coherence calculation. Lower (3-5) for 
+// raw/reactive CI, higher (8-14) for stable/filtered CI.
+//
+// Enable/Disable Oscillators: Turn off oscillators that don't suit your 
+// strategy. Minimum 3 required for meaningful coherence.
+//
+// 📡 INTERPRETING THE CIRCULAR ORBIT PLOT
+//
+// This is QRFM's signature visual—a real-time polar display of oscillator 
+// phases.
+//
+// • CENTER: Zero point (neutral)
+// • VECTORS: Lines from center to perimeter, one per oscillator
+// • ANGLE: Oscillator phase (0° = right, 90° = top, etc.)
+// • LENGTH: Oscillator amplitude (short = weak, long = strong)
+// • COLOR: Phase quadrant (green = bullish, red = bearish, etc.)
+//
+// WHAT TO LOOK FOR:
+// • CONVERGENCE: All vectors point same direction → high CI → trade setup
+// • SCATTER: Vectors point everywhere → low CI → avoid
+// • ROTATION: Vectors rotating together → trending market
+// • CHAOTIC WOBBLE: Vectors flip randomly → ranging market
+//
+// 🔥 PHASE-TIME HEAT MAP
+//
+// 2D grid showing oscillator phases over time. Read like this:
+//
+// • ROWS: Individual oscillators (RSI, MACD, etc.)
+// • COLUMNS: Time bins (left = recent, right = older)
+// • COLOR: Phase angle (gradient from red/bearish to green/bullish)
+//
+// PATTERNS:
+// • HORIZONTAL BANDS: Oscillators maintaining phase → stable trend
+// • VERTICAL BANDS: All oscillators same phase at a moment → ignition point
+// • RAINBOW CHAOS: Random colors → low coherence
+// • COLOR SHIFTS: Phase transitions visible as band color changes
+//
+// 🕸️ ENTANGLEMENT WEB
+//
+// Lines connecting oscillators when pairwise coherence exceeds threshold.
+//
+// • THICK LINES: Strong entanglement (oscillators moving in lockstep)
+// • THIN LINES: Weak entanglement (loose correlation)
+// • NO LINE: Decorrelated (independent)
+//
+// INSIGHTS:
+// • Many lines (dense web) → high coherence → strong trend
+// • Few lines (sparse web) → low coherence → range/chop
+// • Sudden web formation → ignition event
+// • Web collapse → trend exhaustion
+//
+// 🌫️ QUANTUM FIELD CLOUD
+//
+// Atmospheric overlay on chart showing coherence "pressure."
+//
+// • DENSE/OPAQUE: High CI (strong quantum field)
+// • LIGHT/TRANSPARENT: Low CI (weak field)
+// • COLOR: Bullish (green) or bearish (red) based on dominant phase
+//
+// Use this as a background bias indicator. Dense clouds = tradeable conditions.
+//
+// 💥 COLLAPSE BURST MARKERS
+//
+// Visual "explosions" when coherence collapses. These are your high-probability 
+// reversal/exit signals.
+//
+// • Appear when CI drops >0.4 in short period
+// • Sized by collapse magnitude
+// • Color-coded by direction (red = bearish collapse, green = bullish)
+//
+// ⚙️ SIGNAL SETTINGS
+//
+// Ignition Threshold: CI level to trigger long/short signal (0.65-0.85). 
+// Lower = more signals, higher = only strong ignition.
+//
+// Collapse Threshold: CI drop magnitude to trigger exit (0.3-0.5).
+//
+// Phase Lock Tolerance: Max phase spread for "locked" state (15-45°). 
+// Tighter = stricter alignment required.
+//
+// Min Entangled Pairs: How many oscillator pairs must be entangled for 
+// signal confirmation (1-10). Higher = more conservative.
+//
+// 🎨 VISUAL CUSTOMIZATION
+//
+// All visual modules can be toggled independently. Recommended combos:
+//
+// • CLEAN: Orbit Plot + Dashboard only
+// • FULL: All modules (overwhelming but complete picture)
+// • HEAT: Heat Map + Field Cloud (pattern recognition)
+// • WEB: Orbit + Entanglement Web (correlation focus)
+//
+// Adjust transparencies to prevent clutter. Orbit plot is essential—keep it on.
+//
+// 📊 DASHBOARD METRICS
+//
+// • CI (Coherence Index): Current alignment score (0-1)
+// • Dominant Phase: Average phase angle of ensemble
+// • Field Strength: Weighted CI by amplitude
+// • Entangled Pairs: Count of oscillator pairs above threshold
+// • Collapse Risk: Probability of imminent coherence breakdown
+// • Quantum State: Categorization (Ignition/Coherent/Collapsing/Chaos)
+//
+// 💼 PROFESSIONAL TRADING WORKFLOW
+//
+// 1. SCAN: Check CI level. <0.4 = skip, >0.6 = watch closely
+// 2. ORBIT: Observe vector convergence on circular plot
+// 3. HEAT MAP: Verify phase-lock (horizontal color bands)
+// 4. WEB: Confirm entanglement (dense connections)
+// 5. SIGNAL: Wait for ignition or collapse event
+// 6. ENTRY: Execute when CI crosses ignition threshold + phase alignment
+// 7. MANAGEMENT: Monitor field cloud density + collapse risk
+// 8. EXIT: On collapse burst or phase flip
+//
+// ⚠️ IMPORTANT NOTES
+//
+// • QRFM is a REGIME indicator, not a precise timer. Use with price action.
+// • Best on 15m-4h timeframes (too noisy on <5m, too slow on Daily+)
+// • Works across all assets but excels on mean-reverting instruments
+// • Coherence ignition ≠ guaranteed profit. It's a probability edge.
+// • Let the system "warm up" (50+ bars) before trusting signals
+//
+// 🚀 ADVANCED TIPS
+//
+// • Divergence: Price makes new high but CI drops → bearish (and vice versa)
+// • Resonance Cycles: CI tends to oscillate in ~20-40 bar cycles (fractal)
+// • Multi-TF Confirmation: Align CI ignition on 1h and 15m for max conviction
+// • Oscillator Weighting: Disable weaker oscillators (e.g., turn off MFI if 
+//   volume is unreliable on your instrument)
+// • Phase Spiral: Watch spiral tightness. Tight = strong rotation, loose = drift
+//
+// Remember: You're observing the market's quantum wavefunction. Trade the 
+// collapses, not the noise.
+//
+//==============================================================================

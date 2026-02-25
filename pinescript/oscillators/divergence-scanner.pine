@@ -1,0 +1,233 @@
+//@version=5
+indicator("Precise Divergence Strategy", overlay=true, max_lines_count=50, max_labels_count=20)
+
+// ============================================
+// إعدادات المؤشرات - كما في الفيديو
+// ============================================
+
+// MACD
+macd_fast = input.int(12, "MACD Fast Length", group="MACD Settings")
+macd_slow = input.int(26, "MACD Slow Length", group="MACD Settings")
+macd_signal = input.int(9, "MACD Signal Length", group="MACD Settings")
+
+// Stochastic RSI
+rsi_length = input.int(8, "RSI Length", group="Stochastic RSI Settings")
+stoch_length = input.int(5, "Stochastic Length", group="Stochastic RSI Settings")
+stoch_k = input.int(5, "K Smoothing", group="Stochastic RSI Settings")
+stoch_d = input.int(5, "D Smoothing", group="Stochastic RSI Settings")
+
+// إعدادات الكشف الدقيق
+pivot_strength = input.int(5, "Pivot Strength (Left & Right)", minval=3, maxval=10, group="Divergence Detection")
+max_lookback = input.int(50, "Maximum Lookback Range", minval=20, maxval=100, group="Divergence Detection")
+min_pivot_distance = input.int(10, "Minimum Distance Between Pivots", minval=5, maxval=30, group="Divergence Detection")
+
+// فلاتر الجودة
+min_stoch_divergence = input.float(5.0, "Min Stochastic Divergence %", minval=3.0, maxval=20.0, group="Quality Filters")
+require_strong_uptrend = input.bool(true, "Require Strong Uptrend (Daily + Current)", group="Quality Filters")
+min_bars_since_signal = input.int(20, "Min Bars Since Last Signal", minval=10, maxval=50, group="Quality Filters")
+
+// ============================================
+// حساب المؤشرات
+// ============================================
+
+// MACD
+[macdLine, macdSignal, macdHist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// Stochastic RSI
+rsi = ta.rsi(close, rsi_length)
+stochRSI = ta.stoch(rsi, rsi, rsi, stoch_length)
+stochK = ta.sma(stochRSI, stoch_k)
+stochD = ta.sma(stochK, stoch_d)
+
+// الاتجاه - الفريم الحالي
+ema50_current = ta.ema(close, 50)
+ema200_current = ta.ema(close, 200)
+uptrend_current = ema50_current > ema200_current
+
+// الاتجاه - اليومي
+ema50_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+ema200_daily = request.security(syminfo.tickerid, "D", ta.ema(close, 200), lookahead=barmerge.lookahead_off)
+uptrend_daily = ema50_daily > ema200_daily
+
+// الفلتر النهائي للاتجاه
+strong_uptrend = require_strong_uptrend ? (uptrend_current and uptrend_daily) : uptrend_current
+
+// ============================================
+// كشف القيعان المؤكدة بدقة عالية
+// ============================================
+
+// استخدام ta.pivotlow للحصول على قيعان مؤكدة فقط
+pricePivotLow = ta.pivotlow(low, pivot_strength, pivot_strength)
+macdPivotLow = ta.pivotlow(macdLine, pivot_strength, pivot_strength)
+stochPivotLow = ta.pivotlow(stochK, pivot_strength, pivot_strength)
+
+// ============================================
+// تخزين القيعان المؤكدة الثلاثة معاً فقط
+// ============================================
+
+var array<float> confirmed_price_lows = array.new<float>()
+var array<int> confirmed_bars = array.new<int>()
+var array<float> confirmed_macd_lows = array.new<float>()
+var array<float> confirmed_stoch_lows = array.new<float>()
+
+// عندما يتم تأكيد قاع على السعر، نتحقق من وجود قيعان مؤكدة على المؤشرات في نفس المنطقة
+if not na(pricePivotLow)
+    
+    pivot_bar = bar_index - pivot_strength
+    pivot_price = low[pivot_strength]
+    
+    // البحث عن قاع MACD في نفس المنطقة (±3 شموع)
+    var float matched_macd = na
+    var float matched_stoch = na
+    
+    for i = 0 to 6
+        offset = i - 3
+        check_bar = pivot_bar + offset
+        
+        if check_bar >= 0 and check_bar < bar_index
+            bar_diff = bar_index - check_bar
+            
+            // تحقق من وجود قاع MACD
+            if not na(ta.pivotlow(macdLine, pivot_strength, pivot_strength)[bar_diff])
+                matched_macd := macdLine[bar_diff]
+            
+            // تحقق من وجود قاع Stochastic
+            if not na(ta.pivotlow(stochK, pivot_strength, pivot_strength)[bar_diff])
+                matched_stoch := stochK[bar_diff]
+    
+    // فقط إذا وجدنا القيعان الثلاثة متطابقة
+    if not na(matched_macd) and not na(matched_stoch)
+        array.push(confirmed_price_lows, pivot_price)
+        array.push(confirmed_bars, pivot_bar)
+        array.push(confirmed_macd_lows, matched_macd)
+        array.push(confirmed_stoch_lows, matched_stoch)
+        
+        // الاحتفاظ بآخر 15 قاع فقط
+        if array.size(confirmed_price_lows) > 15
+            array.shift(confirmed_price_lows)
+            array.shift(confirmed_bars)
+            array.shift(confirmed_macd_lows)
+            array.shift(confirmed_stoch_lows)
+
+// ============================================
+// فحص الديفرجنس بشروط صارمة جداً
+// ============================================
+
+var int last_divergence_bar = 0
+divergence_detected = false
+
+if array.size(confirmed_price_lows) >= 2 and strong_uptrend
+    
+    array_size = array.size(confirmed_price_lows)
+    
+    // القاع الأحدث
+    current_price = array.get(confirmed_price_lows, array_size - 1)
+    current_bar = array.get(confirmed_bars, array_size - 1)
+    current_macd = array.get(confirmed_macd_lows, array_size - 1)
+    current_stoch = array.get(confirmed_stoch_lows, array_size - 1)
+    
+    // فحص مقابل القيعان السابقة
+    for i = array_size - 2 to math.max(0, array_size - 8)
+        
+        previous_price = array.get(confirmed_price_lows, i)
+        previous_bar = array.get(confirmed_bars, i)
+        previous_macd = array.get(confirmed_macd_lows, i)
+        previous_stoch = array.get(confirmed_stoch_lows, i)
+        
+        bars_between = current_bar - previous_bar
+        bars_since_last = bar_index - last_divergence_bar
+        
+        // التحقق من المسافة الزمنية
+        if bars_between >= min_pivot_distance and bars_between <= max_lookback and bars_since_last >= min_bars_since_signal
+            
+            // ============================================
+            // الشروط الدقيقة للديفرجنس (من الفيديو):
+            // 
+            // 1. السعر: القاع الحالي أدنى من القاع السابق (نزول)
+            // 2. MACD: القاع الحالي أدنى من القاع السابق (نزول - متطابق مع السعر)
+            // 3. Stochastic: القاع الحالي أعلى من القاع السابق (صعود - ديفرجنس!)
+            // 4. يجب أن يكون فرق Stochastic واضح وقوي
+            // ============================================
+            
+            condition_price_lower = current_price < previous_price
+            condition_macd_lower = current_macd < previous_macd
+            condition_stoch_higher = current_stoch > previous_stoch
+            
+            // حساب قوة الديفرجنس
+            stoch_divergence_strength = ((current_stoch - previous_stoch) / previous_stoch) * 100
+            
+            // فلتر إضافي: يجب أن يكون السعر قد انخفض بشكل واضح
+            price_drop_percent = ((current_price - previous_price) / previous_price) * 100
+            
+            // جميع الشروط يجب أن تتحقق
+            if condition_price_lower and condition_macd_lower and condition_stoch_higher
+                
+                // الديفرجنس يجب أن يكون قوي بما يكفي
+                if stoch_divergence_strength >= min_stoch_divergence and price_drop_percent < -1.0
+                    
+                    divergence_detected := true
+                    last_divergence_bar := bar_index
+                    
+                    // رسم خط السعر
+                    line.new(previous_bar, previous_price, current_bar, current_price, 
+                             color=color.new(color.red, 0), 
+                             width=4, 
+                             style=line.style_solid)
+                    
+                    // تسمية مفصلة
+                    label_text = "🔥 BUY SIGNAL\n" + 
+                                 "══════════════\n" +
+                                 "DIVERGENCE CONFIRMED\n\n" +
+                                 "📉 Price: " + str.tostring(price_drop_percent, "#.##") + "%\n" +
+                                 str.tostring(previous_price, format.mintick) + " → " + str.tostring(current_price, format.mintick) + "\n\n" +
+                                 "📉 MACD: Lower Low ⬇\n" +
+                                 str.tostring(previous_macd, "#.####") + " → " + str.tostring(current_macd, "#.####") + "\n\n" +
+                                 "📈 Stoch RSI: +" + str.tostring(stoch_divergence_strength, "#.##") + "% ⬆\n" +
+                                 str.tostring(previous_stoch, "#.##") + " → " + str.tostring(current_stoch, "#.##") + "\n\n" +
+                                 "✅ Uptrend: Active\n" +
+                                 "Bars between: " + str.tostring(bars_between)
+                    
+                    label.new(current_bar, current_price, 
+                             text=label_text,
+                             style=label.style_label_up, 
+                             color=color.new(color.green, 0), 
+                             textcolor=color.white, 
+                             size=size.large,
+                             textalign=text.align_left)
+                    
+                    // إشارة صوتية
+                    break
+
+// ============================================
+// الرسومات
+// ============================================
+
+// إشارة الشراء
+plotshape(divergence_detected, "Buy Signal", 
+          shape.triangleup, 
+          location.belowbar, 
+          color=color.new(color.lime, 0), 
+          size=size.large,
+          offset=-pivot_strength)
+
+// خطوط EMA
+plot(ema50_current, "EMA 50", color=color.new(color.blue, 30), linewidth=2)
+plot(ema200_current, "EMA 200", color=color.new(color.orange, 30), linewidth=2)
+
+// خلفية الاتجاه
+bgcolor(strong_uptrend ? color.new(color.green, 97) : color.new(color.red, 97), title="Trend")
+
+// علامة على القيعان المؤكدة
+plotshape(not na(pricePivotLow) and not na(macdPivotLow) and not na(stochPivotLow), 
+          "Confirmed Pivot", 
+          shape.circle, 
+          location.belowbar, 
+          color=color.new(color.yellow, 40), 
+          size=size.tiny,
+          offset=-pivot_strength)
+
+// ============================================
+// تنبيهات
+// ============================================
+
+alertcondition(divergence_detected, "High Quality Divergence", "🔥 HIGH QUALITY DIVERGENCE SIGNAL!")

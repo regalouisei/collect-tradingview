@@ -1,0 +1,325 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © PhenLabs
+
+//    __  ___      __             _            ____  ___      __       _      ___                __                     
+//   / / / (_)____/ /_____  _____(_)________ _/ /  |/  /___ _/ /______(_)  __/   |  ____  ____ _/ /_  ______  ___  _____
+//  / /_/ / / ___/ __/ __ \/ ___/ / ___/ __ `/ / /|_/ / __ `/ __/ ___/ / |/_/ /| | / __ \/ __ `/ / / / /_  / / _ \/ ___/
+// / __  / (__  ) /_/ /_/ / /  / / /__/ /_/ / / /  / / /_/ / /_/ /  / />  </ ___ |/ / / / /_/ / / /_/ / / /_/  __/ /    
+///_/ /_/_/____/\__/\____/_/  /_/\___/\__,_/_/_/  /_/\__,_/\__/_/  /_/_/|_/_/  |_/_/ /_/\__,_/_/\__, / /___/\___/_/     
+//                                                                                             /____/                   
+//                                                      @PhenLabs - VERSION ONE
+
+//@version=6
+indicator('Historical Matrix Analyzer [PhenLabs]', shorttitle ='HMA - PhenLabs', overlay = false, max_bars_back = 100)
+
+// ============================================================================
+// USER INPUTS
+// ============================================================================
+rsiPeriod = input.int(14, 'RSI Period', minval = 1)
+macdFast = input.int(12, 'MACD Fast Length', minval = 1)
+macdSlow = input.int(26, 'MACD Slow Length', minval = 1)
+macdSignal = input.int(9, 'MACD Signal Length', minval = 1)
+volumeMAPeriod = input.int(20, 'Volume MA Period', minval = 1)
+lookbackPeriod = input.int(200, 'Statistics Lookback Period', minval = 50, maxval = 500)
+forwardBars = input.int(5, 'Forward Performance Bars', minval = 1, maxval = 20)
+colorSensitivity = input.float(2.0, 'Color Intensity Sensitivity', minval = 0.5, maxval = 5.0, step = 0.5)
+minOccurrences = input.int(3, 'Minimum Occurrences for Coloring', minval = 1, maxval = 10)
+tablePosition = input.string('top_right', 'Table Position', options = ['top_left', 'top_right', 'bottom_left', 'bottom_right'])
+showCurrentState = input.bool(true, 'Show Current State Panel', group = 'Display')
+infoPanelPosition = input.string('bottom_left', 'Info Panel Position', options = ['top_left', 'top_right', 'bottom_left', 'bottom_right'], group = 'Display')
+bayesianPriorWeight = input.int(5, 'Win Rate Smoothing Strength', minval = 1, maxval = 20, tooltip = 'Higher values = more conservative estimates with small samples', group = 'Advanced')
+
+// ============================================================================
+// TECHNICAL INDICATORS
+// ============================================================================
+rsi = ta.rsi(close, rsiPeriod)
+[macdLine, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+volumeMA = ta.sma(volume, volumeMAPeriod)
+
+// ============================================================================
+// STATE CLASSIFICATION FUNCTIONS
+// ============================================================================
+
+// RSI State (0-6): 7 states
+getRSIState() =>
+    if rsi < 20
+        0 // Extreme Oversold
+    else if rsi < 30
+        1 // Oversold
+    else if rsi < 40
+        2 // Weak
+    else if rsi < 60
+        3 // Neutral
+    else if rsi < 70
+        4 // Strong
+    else if rsi < 80
+        5 // Overbought
+    else
+        6 // Extreme Overbought
+
+getRSILabel(int state) =>
+    switch state
+        0 => 'Extreme Oversold (<20)'
+        1 => 'Oversold (20-30)'
+        2 => 'Weak (30-40)'
+        3 => 'Neutral (40-60)'
+        4 => 'Strong (60-70)'
+        5 => 'Overbought (70-80)'
+        6 => 'Extreme Overbought (>80)'
+        => 'Unknown'
+
+// Combined Indicator State (0-7): 8 states
+getIndicatorState() =>
+    macdBullish = macdLine > signalLine ? 1 : 0
+    volumeHigh = volume > volumeMA ? 1 : 0
+    priceRising = close > close[1] ? 1 : 0
+
+    macdBullish * 4 + volumeHigh * 2 + priceRising * 1
+
+getIndicatorLabel(int state) =>
+    macdStatus = state >= 4 ? 'MACD Bullish' : 'MACD Bearish'
+    volStatus = state % 4 >= 2 ? 'Volume High' : 'Volume Low'
+    priceStatus = state % 2 == 1 ? 'Price Rising' : 'Price Falling'
+    macdStatus + ' | ' + volStatus + ' | ' + priceStatus
+
+// ============================================================================
+// STATISTICS STORAGE (56 cells = 7 RSI states × 8 indicator states)
+// ============================================================================
+var array<float> cellReturns = array.new_float(56, 0.0)
+var array<int> cellCounts = array.new_int(56, 0)
+var array<float> cellWins = array.new_float(56, 0.0)
+
+// ============================================================================
+// BAYESIAN WIN RATE CALCULATION
+// ============================================================================
+// Uses Bayesian smoothing to reduce erratic behavior with small samples
+// Assumes neutral 50% prior and adjusts based on actual observations
+calculateEstimatedWinRate(float wins, int total) =>
+    if total == 0
+        50.0 // No data, assume neutral
+    // Bayesian smoothing: add virtual observations
+    else // Prior: assume 50% win rate with virtual samples
+        priorWins = bayesianPriorWeight * 0.5
+        priorTotal = float(bayesianPriorWeight)
+
+        adjustedWins = wins + priorWins
+        adjustedTotal = float(total) + priorTotal
+
+        adjustedWins / adjustedTotal * 100
+
+// ============================================================================
+// HISTORICAL DATA TRACKING
+// ============================================================================
+var array<int> histRSIStates = array.new_int(0)
+var array<int> histIndStates = array.new_int(0)
+var array<float> histPrices = array.new_float(0)
+var array<int> histBarIndex = array.new_int(0)
+
+// Store current bar data
+if not na(rsi) and not na(macdLine)
+    currentRSIState = getRSIState()
+    currentIndState = getIndicatorState()
+
+    array.push(histRSIStates, currentRSIState)
+    array.push(histIndStates, currentIndState)
+    array.push(histPrices, close)
+    array.push(histBarIndex, bar_index)
+
+    // Maintain lookback window
+    if array.size(histRSIStates) > lookbackPeriod
+        array.shift(histRSIStates)
+        array.shift(histIndStates)
+        array.shift(histPrices)
+        array.shift(histBarIndex)
+
+// ============================================================================
+// CALCULATE FORWARD RETURNS AND UPDATE STATISTICS
+// ============================================================================
+if bar_index >= forwardBars
+    histSize = array.size(histRSIStates)
+
+    // Reset statistics
+    if barstate.islast
+        for i = 0 to 55 by 1
+            array.set(cellReturns, i, 0.0)
+            array.set(cellCounts, i, 0)
+            array.set(cellWins, i, 0.0)
+
+    // Calculate returns for historical states
+    for i = 0 to math.min(histSize - 1, lookbackPeriod - forwardBars - 1) by 1
+        if barstate.islast
+            pastBarIndex = array.get(histBarIndex, i)
+            forwardBarIndex = pastBarIndex + forwardBars
+
+            // Check if forward bar exists in our history
+            if forwardBarIndex <= bar_index
+                pastPrice = array.get(histPrices, i)
+
+                // Find forward price
+                forwardPrice = 0.0
+                foundForward = false
+                for j = i + 1 to histSize - 1 by 1
+                    if array.get(histBarIndex, j) == forwardBarIndex
+                        forwardPrice := array.get(histPrices, j)
+                        foundForward := true
+                        break
+
+                if foundForward and pastPrice > 0
+                    rsiState = array.get(histRSIStates, i)
+                    indState = array.get(histIndStates, i)
+
+                    cellIndex = rsiState * 8 + indState
+
+                    if cellIndex >= 0 and cellIndex < 56
+                        returnPct = (forwardPrice - pastPrice) / pastPrice * 100
+
+                        currentReturn = array.get(cellReturns, cellIndex)
+                        currentCount = array.get(cellCounts, cellIndex)
+                        currentWins = array.get(cellWins, cellIndex)
+
+                        array.set(cellReturns, cellIndex, currentReturn + returnPct)
+                        array.set(cellCounts, cellIndex, currentCount + 1)
+
+                        if returnPct > 0
+                            array.set(cellWins, cellIndex, currentWins + 1)
+
+// ============================================================================
+// COLOR CALCULATION FUNCTION
+// ============================================================================
+getCellColor(float avgReturn, int count, bool isActive = false) =>
+    if count < minOccurrences
+        color.new(color.gray, isActive ? 40 : 70)
+    else
+        normalizedReturn = avgReturn * colorSensitivity
+        intensity = math.min(math.abs(normalizedReturn) * 10, 100)
+        transparency = isActive ? 20 : 100 - int(intensity)
+
+        if avgReturn > 0.1
+            color.new(color.green, transparency)
+        else if avgReturn < -0.1
+            color.new(color.red, transparency)
+        else
+            color.new(color.gray, isActive ? 40 : 80)
+
+// Get signal strength text
+getSignalStrength(float avgReturn, int count) =>
+    if count < minOccurrences
+        '⚠️ INSUFFICIENT DATA'
+    else if math.abs(avgReturn) > 3.0
+        avgReturn > 0 ? '🔥 STRONG BULLISH' : '❄️ STRONG BEARISH'
+    else if math.abs(avgReturn) > 1.5
+        avgReturn > 0 ? '✅ BULLISH' : '⛔ BEARISH'
+    else if math.abs(avgReturn) > 0.5
+        avgReturn > 0 ? '↗️ WEAK BULLISH' : '↘️ WEAK BEARISH'
+    else
+        '➖ NEUTRAL'
+
+// ============================================================================
+// TABLE CONSTRUCTION (9 columns × 8 rows)
+// ============================================================================
+var table statsTable = table.new(tablePosition == 'top_left' ? position.top_left : tablePosition == 'top_right' ? position.top_right : tablePosition == 'bottom_left' ? position.bottom_left : position.bottom_right, 9, 8, bgcolor = color.new(color.black, 10), border_width = 1, border_color = color.gray)
+
+// Get current state for highlighting
+currentRSI = getRSIState()
+currentInd = getIndicatorState()
+currentCellIndex = currentRSI * 8 + currentInd
+
+if barstate.islast
+    // Header Row - RSI States
+    table.cell(statsTable, 0, 0, 'RSI \\ Indicators', bgcolor = color.new(color.blue, 70), text_color = color.white, text_size = size.small)
+
+    rsiLabels = array.from('< 20\nXOverS', '20-30\nOverS', '30-40\nWeak', '40-60\nNeut', '60-70\nStrong', '70-80\nOverB', '> 80\nXOverB')
+
+    for i = 0 to 6 by 1
+        table.cell(statsTable, 0, i + 1, array.get(rsiLabels, i), bgcolor = color.new(color.blue, 70), text_color = color.white, text_size = size.tiny)
+
+    // Header Column - Indicator Combinations (8 states)
+    indLabels = array.from('MACD↓\nVol↓\nP↓', 'MACD↓\nVol↓\nP↑', 'MACD↓\nVol↑\nP↓', 'MACD↓\nVol↑\nP↑', 'MACD↑\nVol↓\nP↓', 'MACD↑\nVol↓\nP↑', 'MACD↑\nVol↑\nP↓', 'MACD↑\nVol↑\nP↑')
+
+    for i = 0 to 7 by 1
+        table.cell(statsTable, i + 1, 0, array.get(indLabels, i), bgcolor = color.new(color.purple, 70), text_color = color.white, text_size = size.tiny)
+
+    // Data Cells (7 RSI × 8 Indicator = 56 cells)
+    for rsiState = 0 to 6 by 1
+        for indState = 0 to 7 by 1
+            cellIndex = rsiState * 8 + indState
+            count = array.get(cellCounts, cellIndex)
+            totalReturn = array.get(cellReturns, cellIndex)
+            wins = array.get(cellWins, cellIndex)
+
+            avgReturn = count > 0 ? totalReturn / count : 0.0
+            estimatedWinRate = calculateEstimatedWinRate(wins, count)
+
+            // Check if this is the current active cell
+            isActiveCell = rsiState == currentRSI and indState == currentInd
+
+            cellText = count > 0 ? str.format('{0,number,#.##}%\nEWR:{1,number,#}%\nn={2}', avgReturn, estimatedWinRate, count) : 'N/A'
+
+            // Add indicator for active cell
+            if isActiveCell
+                cellText := '⦿ NOW ⦿\n' + cellText
+                cellText
+
+            cellColor = getCellColor(avgReturn, count, isActiveCell)
+
+            table.cell(statsTable, indState + 1, rsiState + 1, cellText, bgcolor = cellColor, text_color = isActiveCell ? color.yellow : color.white, text_size = size.tiny, tooltip = str.format('RSI: {0} | Indicators: {1}\nAvg Return: {2,number,#.##}%\nEst. Win Rate: {3,number,#.##}%\nOccurrences: {4}', array.get(rsiLabels, rsiState), array.get(indLabels, indState), avgReturn, estimatedWinRate, count))
+
+// ============================================================================
+// CURRENT STATE INFO PANEL - PROPERLY FORMATTED
+// ============================================================================
+if showCurrentState
+    var table infoPanel = table.new(infoPanelPosition == 'top_left' ? position.top_left : infoPanelPosition == 'top_right' ? position.top_right : infoPanelPosition == 'bottom_left' ? position.bottom_left : position.bottom_right, 1, 8, bgcolor = color.new(color.black, 5), border_width = 2, frame_width = 2)
+
+    if barstate.islast
+        currentCount = array.get(cellCounts, currentCellIndex)
+        currentAvgReturn = currentCount > 0 ? array.get(cellReturns, currentCellIndex) / currentCount : 0.0
+        currentWins = array.get(cellWins, currentCellIndex)
+        currentEstimatedWinRate = calculateEstimatedWinRate(currentWins, currentCount)
+
+        // Determine panel color
+        panelColor = currentAvgReturn > 1 ? color.new(color.green, 60) : currentAvgReturn < -1 ? color.new(color.red, 60) : color.new(color.orange, 70)
+
+        // Row 0: Title
+        table.cell(infoPanel, 0, 0, '📊 CURRENT STATE', bgcolor = color.new(color.blue, 40), text_color = color.white, text_size = size.normal)
+
+        // Row 1: Signal Strength
+        signalStrength = getSignalStrength(currentAvgReturn, currentCount)
+        strengthColor = currentAvgReturn > 1 ? color.new(color.green, 50) : currentAvgReturn < -1 ? color.new(color.red, 50) : color.new(color.gray, 60)
+
+        table.cell(infoPanel, 0, 1, signalStrength, bgcolor = strengthColor, text_color = color.white, text_size = size.normal)
+
+        // Row 2: RSI Value
+        table.cell(infoPanel, 0, 2, 'RSI: ' + str.format('{0,number,#.#}', rsi), bgcolor = panelColor, text_color = color.yellow, text_size = size.normal)
+
+        // Row 3: RSI Label
+        table.cell(infoPanel, 0, 3, getRSILabel(currentRSI), bgcolor = panelColor, text_color = color.white, text_size = size.small)
+
+        // Row 4: Indicator Status
+        table.cell(infoPanel, 0, 4, getIndicatorLabel(currentInd), bgcolor = panelColor, text_color = color.white, text_size = size.small)
+
+        // Row 5: Average Return
+        table.cell(infoPanel, 0, 5, 'Avg Return: ' + str.format('{0,number,#.##}%', currentAvgReturn), bgcolor = currentAvgReturn > 0 ? color.new(color.green, 60) : color.new(color.red, 60), text_color = color.white, text_size = size.normal)
+
+        // Row 6: Estimated Win Rate
+        table.cell(infoPanel, 0, 6, 'Est. Win Rate: ' + str.format('{0,number,#.#}%', currentEstimatedWinRate), bgcolor = currentEstimatedWinRate > 50 ? color.new(color.green, 60) : color.new(color.red, 60), text_color = color.white, text_size = size.normal)
+
+        // Row 7: Confidence
+        confidenceLevel = currentCount >= minOccurrences * 3 ? 'High Confidence' : currentCount >= minOccurrences ? 'Medium Confidence' : 'Low Confidence'
+        confidenceColor = currentCount >= minOccurrences * 3 ? color.new(color.green, 60) : currentCount >= minOccurrences ? color.new(color.orange, 60) : color.new(color.red, 60)
+
+        table.cell(infoPanel, 0, 7, confidenceLevel + ' (n=' + str.tostring(currentCount) + ')', bgcolor = confidenceColor, text_color = color.white, text_size = size.small)
+
+// ============================================================================
+// VISUAL PERFORMANCE BARS
+// ============================================================================
+currentCount_plot = array.get(cellCounts, currentCellIndex)
+currentAvgReturn_plot = currentCount_plot > 0 ? array.get(cellReturns, currentCellIndex) / currentCount_plot : 0.0
+currentWins_plot = array.get(cellWins, currentCellIndex)
+currentEstWinRate_plot = calculateEstimatedWinRate(currentWins_plot, currentCount_plot)
+
+// Plot bars for visual representation
+plot(currentAvgReturn_plot, 'Avg Return %', color = currentAvgReturn_plot > 0 ? color.new(color.green, 30) : color.new(color.red, 30), linewidth = 3, style = plot.style_histogram)
+
+hline(0, 'Zero Line', color = color.new(color.gray, 50), linestyle = hline.style_solid, linewidth = 1)
+
+plot(currentEstWinRate_plot - 50, 'Est. Win Rate (±50%)', color = currentEstWinRate_plot > 50 ? color.new(color.lime, 60) : color.new(color.maroon, 60), linewidth = 2, style = plot.style_area, display = display.none)

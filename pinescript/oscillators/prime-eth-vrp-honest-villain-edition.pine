@@ -1,0 +1,149 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Credit: Based on the original VRP indicator developed by EdgeTools
+// © Engineered by the proprietary trading division at CMZN LTD. ŞTİ.
+// © Lead Quant: A. Arda UZAN / "The Honest Villain"
+// © Web3 Research Arm: Arol DAO (aroldao.eth)
+//
+// "The Honest Villain's ETH VRP - V3 Hybrid"
+// Measures localized variance risk premium using Deribit's ETH DVOL vs custom Realized Volatility.
+// Dynamically scales to lower timeframes using vectorized math and proper annualization.
+
+//@version=6
+indicator("Prime ETH VRP [Honest Villain Edition]", shorttitle="ETH VRP", overlay=false, max_bars_back=5000)
+
+// --- Inputs ---
+string dvol_ticker = input.symbol("DERIBIT:ETHDVOL", "Volatility Index Ticker", group="Data Sources")
+
+// Core Settings
+int rv_length = input.int(30, "Realized Vol Period (Bars)", minval=2, maxval=500, group="Core Settings")
+string rv_method = input.string("Garman-Klass", "RV Calculation Method", options=["Close-to-Close", "Parkinson", "Garman-Klass"], group="Core Settings")
+int vrp_smoothing = input.int(5, "VRP Smoothing (EMA)", minval=1, maxval=21, group="Core Settings")
+int stat_lookback = input.int(365, "Statistical Lookback (Bars)", minval=60, group="Core Settings")
+
+// Regime Thresholds
+float threshold_high = input.float(5.0, "High VRP (%)", step=0.5, group="Thresholds")
+float threshold_extreme = input.float(10.0, "Extreme VRP (%)", step=0.5, group="Thresholds")
+float threshold_low = input.float(-2.0, "Low VRP (%)", step=0.5, group="Thresholds")
+
+// Display
+bool show_histogram = input.bool(true, "Histogram", group="Display")
+bool show_table = input.bool(true, "Statistics Panel", group="Display")
+
+// --- Color Definitions ---
+color primary_color = #3b82f6
+color bullish_color = #22c55e
+color bearish_color = #ef4444
+color neutral_color = #737373
+color text_color = #fafafa
+color table_bg = #171717
+
+// --- Data Sources ---
+float dvol = request.security(dvol_ticker, timeframe.period, close, lookahead=barmerge.lookahead_off)
+
+float c_close = close
+float c_high = high
+float c_low = low
+float c_open = open
+
+// --- Dynamic Timeframe Annualization ---
+float bars_per_year = 31536000 / timeframe.in_seconds(timeframe.period)
+
+// --- Vectorized Realized Volatility Functions ---
+float log_ret = math.log(c_close / nz(c_close[1], c_close))
+
+calc_rv_ctc(int len) =>
+    ta.stdev(log_ret, len) * math.sqrt(bars_per_year) * 100
+
+calc_rv_parkinson(int len) =>
+    float hl = math.log(c_high / c_low)
+    float hl_sq = hl * hl
+    float safe_hl_sq = (not na(c_high) and not na(c_low) and c_low > 0) ? hl_sq : 0.0
+    float sum_sq = math.sum(safe_hl_sq, len)
+    math.sqrt(sum_sq / (4.0 * math.log(2.0) * len) * bars_per_year) * 100
+
+calc_rv_gk(int len) =>
+    float hl = math.log(c_high / c_low)
+    float co = math.log(c_close / c_open)
+    float gk_comp = 0.5 * hl * hl - (2 * math.log(2) - 1) * co * co
+    float safe_gk = (not na(c_high) and not na(c_low) and not na(c_open) and not na(c_close) and c_low > 0 and c_open > 0) ? gk_comp : 0.0
+    float sum_gk = math.sum(safe_gk, len)
+    math.sqrt(math.max(sum_gk / len, 0) * bars_per_year) * 100
+
+get_rv(int len) =>
+    switch rv_method
+        "Close-to-Close" => calc_rv_ctc(len)
+        "Parkinson" => calc_rv_parkinson(len)
+        "Garman-Klass" => calc_rv_gk(len)
+        => calc_rv_ctc(len)
+
+// --- Core Calculations ---
+float rv_val = get_rv(rv_length)
+float vrp_raw = dvol - rv_val
+float c_vrp = ta.ema(vrp_raw, vrp_smoothing)
+
+// --- Statistical Context (Z-Score & Percentile) ---
+float vrp_mean = ta.sma(c_vrp, stat_lookback)
+float vrp_stdev = ta.stdev(c_vrp, stat_lookback)
+float vrp_zscore = (c_vrp - vrp_mean) / math.max(vrp_stdev, 0.001)
+float vrp_percentile = ta.percentrank(c_vrp, stat_lookback)
+
+// Regime Classification
+get_regime() =>
+    if c_vrp >= threshold_extreme
+        "EXTREME"
+    else if c_vrp >= threshold_high
+        "HIGH"
+    else if c_vrp >= 0
+        "NORMAL"
+    else if c_vrp >= threshold_low
+        "LOW"
+    else
+        "NEGATIVE"
+
+string regime = get_regime()
+
+// --- Dynamic Colors ---
+get_vrp_color() =>
+    if c_vrp >= threshold_extreme
+        color.from_gradient(c_vrp, threshold_extreme, threshold_extreme + 5, bullish_color, primary_color)
+    else if c_vrp >= threshold_high
+        bullish_color
+    else if c_vrp >= 0
+        color.from_gradient(c_vrp, 0, threshold_high, neutral_color, bullish_color)
+    else if c_vrp >= threshold_low
+        color.from_gradient(c_vrp, threshold_low, 0, bearish_color, neutral_color)
+    else
+        bearish_color
+
+color vrp_color = get_vrp_color()
+
+// --- Plotting ---
+plot(show_histogram ? c_vrp : na, "ETH VRP", vrp_color, style=plot.style_histogram, linewidth=3)
+hline(0, "Zero Line", color.new(neutral_color, 50))
+
+// --- Statistics Panel ---
+if show_table and barstate.islast
+    var table tbl = table.new(position.top_right, 2, 7, border_width=1, bgcolor=color.new(table_bg, 80))
+    table.clear(tbl, 0, 0, 1, 6)
+    
+    table.cell(tbl, 0, 0, "Prime ETH VRP", text_color=text_color, bgcolor=color.new(#262626, 20), text_size=size.small)
+    
+    table.cell(tbl, 0, 1, "Net VRP", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(c_vrp, "#.##") + "%", text_color=vrp_color, text_size=size.small)
+    
+    table.cell(tbl, 0, 2, "Deribit DVOL", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(dvol, "#.##") + "%", text_color=color.new(primary_color, 40), text_size=size.small)
+    
+    table.cell(tbl, 0, 3, "Realized Vol", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(rv_val, "#.##") + "%", text_color=color.new(bearish_color, 40), text_size=size.small)
+    
+    table.cell(tbl, 0, 4, "Regime", text_color=text_color, text_size=size.small)
+    table.cell(tbl, 1, 4, regime, text_color=vrp_color, text_size=size.small)
+    
+    table.cell(tbl, 0, 5, "Z-Score", text_color=text_color, text_size=size.small)
+    color z_col = vrp_zscore > 1.5 ? bullish_color : vrp_zscore < -1.5 ? bearish_color : neutral_color
+    table.cell(tbl, 1, 5, str.tostring(vrp_zscore, "#.##"), text_color=z_col, text_size=size.small)
+    
+    table.cell(tbl, 0, 6, "Percentile", text_color=text_color, text_size=size.small)
+    color p_col = vrp_percentile > 80 ? bullish_color : vrp_percentile < 20 ? bearish_color : neutral_color
+    table.cell(tbl, 1, 6, str.tostring(vrp_percentile, "#.##") + "%", text_color=p_col, text_size=size.small)

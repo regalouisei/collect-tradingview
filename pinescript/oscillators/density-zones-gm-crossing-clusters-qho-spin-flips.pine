@@ -1,0 +1,239 @@
+//@version=6
+indicator("Density Zones (GM Crossing Clusters) + QHO Spin Flips", overlay=true, max_bars_back=5000, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────
+grpGM   = "Density Zone (Geometric Mean) Settings"
+L1      = input.int(20,  "MA1 Length", minval=1, group=grpGM)
+L2      = input.int(50,  "MA2 Length", minval=1, group=grpGM)
+W       = input.int(50,  "Crossing Window W (bars)", minval=2, group=grpGM)
+theta   = input.int(12,  "Density Threshold θ (crossings)", minval=1, group=grpGM)
+
+showGM       = input.bool(true,  "Show MA1 / MA2 / GM", group=grpGM)
+shadeDZbg    = input.bool(true,  "Shade Density Zones (Background)", group=grpGM)
+showDZBounds = input.bool(true,  "Show Density Zone Bounds (High/Low)", group=grpGM)
+
+showCrossMarks = input.bool(true, "Show GM Cross Markers (Up/Down)", group=grpGM)
+
+grpQHO  = "Spin Flip (QHO) Settings"
+L       = input.int(100, "Regression Length L", minval=2, group=grpQHO)
+kappa   = input.float(3.0, "Spin Flip Threshold κ (σ)", minval=0.5, step=0.5, group=grpQHO)
+showQHO = input.bool(true, "Show QHO Bands (1σ/2σ/3σ)", group=grpQHO)
+
+grpViz  = "Visual Settings"
+dzBgTransp = input.int(85, "Density Zone BG Transparency (0-100)", minval=0, maxval=100, group=grpViz)
+dzBgColor   = input.color(color.aqua, "Density Zone BG Color", group=grpViz)
+
+dzHiColor   = input.color(color.new(color.aqua, 0), "DZ Upper Bound Color", group=grpViz)
+dzLoColor   = input.color(color.new(color.aqua, 0), "DZ Lower Bound Color", group=grpViz)
+dzOutlineWidth = input.int(2, "DZ Outline Width", minval=1, maxval=5, group=grpViz)
+
+grpDZFill = "Density Zone Fill (Inside Bounds)"
+fillDZ       = input.bool(true, "Fill Inside DZ Bounds", group=grpDZFill)
+dzFillColor  = input.color(color.new(color.aqua, 0), "DZ Fill Color", group=grpDZFill)
+dzFillTransp = input.int(90, "DZ Fill Transparency (0-100)", minval=0, maxval=100, group=grpDZFill)
+
+grpDZOutline = "Density Zone Outline Style"
+dzOutlineStyle = input.string("Line", "Outline Style",
+     options=["Line","Circles","Crosses","Asterisks"], group=grpDZOutline)
+
+// Spin flip marker (labels to avoid plot-limit)
+grpSpin = "Spin Flip Marker Settings"
+showSpinMarks = input.bool(true, "Show Spin Flip Markers", group=grpSpin)
+spinColor    = input.color(color.fuchsia, "Spin Flip Marker Color", group=grpSpin)
+spinSizeOpt  = input.string("small", "Spin Flip Marker Size",
+     options=["tiny","small","normal","large","huge"], group=grpSpin)
+
+// GM cross marker settings (labels to avoid plot-limit)
+grpCross = "GM Cross Marker Settings"
+crossUpColor   = input.color(color.green, "Cross Above GM Color", group=grpCross)
+crossDownColor = input.color(color.red,   "Cross Below GM Color", group=grpCross)
+
+crossSizeOpt = input.string("small", "GM Cross Marker Size",
+     options=["tiny","small","normal","large","huge"], group=grpCross)
+
+crossStyleOpt = input.string("Label (GM↑/GM↓)", "GM Cross Marker Style",
+     options=["Label (GM↑/GM↓)","Triangle","Arrow","Circle","X"], group=grpCross)
+
+crossUpText   = input.string("GM↑", "Cross Up Text", group=grpCross)
+crossDownText = input.string("GM↓", "Cross Down Text", group=grpCross)
+
+// Label management (avoid runaway label counts)
+grpPerf = "Performance / Limits"
+maxCrossLabels = input.int(300, "Max Cross Labels On Chart", minval=0, maxval=2000, group=grpPerf)
+maxSpinLabels  = input.int(300, "Max Spin Labels On Chart",  minval=0, maxval=2000, group=grpPerf)
+
+// ─────────────────────────────────────────────────────────────
+// Helpers (use switch to avoid multiline ternary parser issues)
+// ─────────────────────────────────────────────────────────────
+labelSizeFromOpt(string opt) =>
+    switch opt
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        =>          size.huge
+
+crossSymbolFromStyle(string style, bool isUp) =>
+    switch style
+        "Triangle" => isUp ? "▲" : "▼"
+        "Arrow"    => isUp ? "↑" : "↓"
+        "Circle"   => "●"
+        "X"        => "×"
+        =>           ""   // "Label (GM↑/GM↓)" uses user text
+
+var label[] crossLabels = array.new_label()
+var label[] spinLabels  = array.new_label()
+
+pushLabelAndPrune(label[] arr, label lb, int maxKeep) =>
+    if maxKeep <= 0
+        label.delete(lb)
+    else
+        array.push(arr, lb)
+        if array.size(arr) > maxKeep
+            label old = array.shift(arr)
+            label.delete(old)
+
+// ─────────────────────────────────────────────────────────────
+// Geometric Mean Equilibrium (Density Anchor)
+// ─────────────────────────────────────────────────────────────
+ma1 = ta.sma(close, L1)
+ma2 = ta.sma(close, L2)
+gm  = math.sqrt(ma1 * ma2)
+
+crossUp   = ta.crossover(close, gm)
+crossDown = ta.crossunder(close, gm)
+
+// Sign relative to GM (use prior sign on equality to reduce spurious flips)
+var int sPrev = 0
+sNow = close > gm ? 1 : close < gm ? -1 : sPrev
+
+crossEvent = (bar_index > 0) and (sNow != sPrev)
+sPrev := sNow
+
+// ─────────────────────────────────────────────────────────────
+// Crossing density over window W (rolling sum without ta.sum)
+// D_t = Σ_{i=0..W-1} 1{crossEvent_{t-i}}
+// Implemented as: cumsum(x) - cumsum(x)[W]
+// ─────────────────────────────────────────────────────────────
+x = crossEvent ? 1.0 : 0.0
+cumX = ta.cum(x)
+D = bar_index >= W ? (cumX - cumX[W]) : cumX
+
+isDZ    = D >= theta
+dzStart = isDZ and not isDZ[1]
+dzEnd   = not isDZ and isDZ[1]
+
+// ─────────────────────────────────────────────────────────────
+// Density Zone Bounds (High/Low while in-zone)
+// ─────────────────────────────────────────────────────────────
+var float dzHi = na
+var float dzLo = na
+
+if dzStart
+    dzHi := high
+    dzLo := low
+else if isDZ
+    dzHi := math.max(dzHi, high)
+    dzLo := math.min(dzLo, low)
+else
+    dzHi := na
+    dzLo := na
+
+dzHi_in = (isDZ and showDZBounds) ? dzHi : na
+dzLo_in = (isDZ and showDZBounds) ? dzLo : na
+
+// ─────────────────────────────────────────────────────────────
+// QHO Spin Flip (Regression residual / rolling stdev)
+// ─────────────────────────────────────────────────────────────
+lsr        = ta.linreg(close, L, 0)
+residual   = close - lsr
+residStdev = ta.stdev(residual, L)
+
+Y        = residStdev == 0.0 ? 0.0 : (close - lsr) / residStdev
+spinFlip = math.abs(Y) > kappa
+spinUp   = Y >  kappa
+spinDn   = Y < -kappa
+
+z1Top = lsr + 1.0 * residStdev
+z1Bot = lsr - 1.0 * residStdev
+z2Top = lsr + 2.0 * residStdev
+z2Bot = lsr - 2.0 * residStdev
+z3Top = lsr + 3.0 * residStdev
+z3Bot = lsr - 3.0 * residStdev
+
+// ─────────────────────────────────────────────────────────────
+// Plots (kept under the 64-plot limit)
+// ─────────────────────────────────────────────────────────────
+plot(showGM ? ma1 : na, color=color.new(color.blue, 0),  title="MA1")
+plot(showGM ? ma2 : na, color=color.new(color.red,  0),  title="MA2")
+plot(showGM ? gm  : na, color=color.new(color.green,0),  title="Geometric Mean (GM)")
+
+bgcolor(shadeDZbg and isDZ ? color.new(dzBgColor, dzBgTransp) : na, title="Density Zone BG Shading")
+
+pDzHi_fill = plot(fillDZ ? dzHi_in : na, title="DZ High (fill anchor)", color=color.new(dzHiColor, 0), linewidth=1, display=display.none)
+pDzLo_fill = plot(fillDZ ? dzLo_in : na, title="DZ Low  (fill anchor)", color=color.new(dzLoColor, 0), linewidth=1, display=display.none)
+fill(pDzHi_fill, pDzLo_fill, color=(fillDZ ? color.new(dzFillColor, dzFillTransp) : na), title="DZ Fill (Inside Bounds)")
+
+dzStyleLine    = (dzOutlineStyle == "Line")
+dzStyleCircles = (dzOutlineStyle == "Circles")
+dzStyleCrosses = (dzOutlineStyle == "Crosses")
+dzStyleStars   = (dzOutlineStyle == "Asterisks")
+
+plot(showDZBounds and dzStyleLine    ? dzHi : na, title="Density Zone High (Line)",    color=dzHiColor, linewidth=dzOutlineWidth, style=plot.style_line)
+plot(showDZBounds and dzStyleLine    ? dzLo : na, title="Density Zone Low (Line)",     color=dzLoColor, linewidth=dzOutlineWidth, style=plot.style_line)
+
+plot(showDZBounds and dzStyleCircles ? dzHi : na, title="Density Zone High (Circles)", color=dzHiColor, linewidth=dzOutlineWidth, style=plot.style_circles)
+plot(showDZBounds and dzStyleCircles ? dzLo : na, title="Density Zone Low (Circles)",  color=dzLoColor, linewidth=dzOutlineWidth, style=plot.style_circles)
+
+plot(showDZBounds and dzStyleCrosses ? dzHi : na, title="Density Zone High (Crosses)", color=dzHiColor, linewidth=dzOutlineWidth, style=plot.style_cross)
+plot(showDZBounds and dzStyleCrosses ? dzLo : na, title="Density Zone Low (Crosses)",  color=dzLoColor, linewidth=dzOutlineWidth, style=plot.style_cross)
+
+plotchar(showDZBounds and dzStyleStars ? dzHi : na, title="Density Zone High (Asterisks)", char="*", location=location.absolute, color=dzHiColor, size=size.tiny)
+plotchar(showDZBounds and dzStyleStars ? dzLo : na, title="Density Zone Low (Asterisks)",  char="*", location=location.absolute, color=dzLoColor, size=size.tiny)
+
+p1t = plot(showQHO ? z1Top : na, color=color.new(color.green,  85), title="1σ Top")
+p1b = plot(showQHO ? z1Bot : na, color=color.new(color.green,  85), title="1σ Bot")
+p2t = plot(showQHO ? z2Top : na, color=color.new(color.orange, 85), title="2σ Top")
+p2b = plot(showQHO ? z2Bot : na, color=color.new(color.orange, 85), title="2σ Bot")
+p3t = plot(showQHO ? z3Top : na, color=color.new(color.red,    85), title="3σ Top")
+p3b = plot(showQHO ? z3Bot : na, color=color.new(color.red,    85), title="3σ Bot")
+
+fill(p1t, p1b, color=color.new(color.green,  90))
+fill(p2t, p2b, color=color.new(color.orange, 90))
+fill(p3t, p3b, color=color.new(color.red,    90))
+
+plot(lsr, title="Regression Equilibrium (LSR)", color=color.white, linewidth=2)
+
+// ─────────────────────────────────────────────────────────────
+// Markers via LABELS (prevents “too many plots” runtime error)
+// ─────────────────────────────────────────────────────────────
+crossLblSize = labelSizeFromOpt(crossSizeOpt)
+spinLblSize  = labelSizeFromOpt(spinSizeOpt)
+
+if showCrossMarks and crossUp
+    txt = (crossStyleOpt == "Label (GM↑/GM↓)") ? crossUpText : crossSymbolFromStyle(crossStyleOpt, true)
+    lb = label.new(bar_index, low, txt, style=label.style_label_up, textcolor=color.white, color=crossUpColor, size=crossLblSize)
+    pushLabelAndPrune(crossLabels, lb, maxCrossLabels)
+
+if showCrossMarks and crossDown
+    txt = (crossStyleOpt == "Label (GM↑/GM↓)") ? crossDownText : crossSymbolFromStyle(crossStyleOpt, false)
+    lb = label.new(bar_index, high, txt, style=label.style_label_down, textcolor=color.white, color=crossDownColor, size=crossLblSize)
+    pushLabelAndPrune(crossLabels, lb, maxCrossLabels)
+
+if showSpinMarks and spinFlip
+    lb = label.new(bar_index, close, "", style=label.style_circle, textcolor=color.white, color=spinColor, size=spinLblSize)
+    pushLabelAndPrune(spinLabels, lb, maxSpinLabels)
+
+// ─────────────────────────────────────────────────────────────
+// Alerts
+// ─────────────────────────────────────────────────────────────
+alertcondition(dzStart, title="Density Zone START", message="Density Zone START: GM crossing density exceeded threshold.")
+alertcondition(dzEnd,   title="Density Zone END",   message="Density Zone END: GM crossing density fell below threshold.")
+
+alertcondition(spinUp,  title="Spin Flip UP (Y > +κ)", message="Spin Flip UP: price exceeded +κ sigma from regression equilibrium.")
+alertcondition(spinDn,  title="Spin Flip DOWN (Y < -κ)", message="Spin Flip DOWN: price exceeded -κ sigma from regression equilibrium.")
+
+alertcondition(crossUp,   title="Cross Above GM", message="Cross Above GM: close crossed above geometric mean.")
+alertcondition(crossDown, title="Cross Below GM", message="Cross Below GM: close crossed below geometric mean.")

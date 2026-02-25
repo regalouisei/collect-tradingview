@@ -1,0 +1,295 @@
+//@version=6
+indicator("Smart Krypto Swing Trade Suite (Pro+ Edition)", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// -----------------------------------------------------------------------------
+// 1. EINSTELLUNGEN
+// -----------------------------------------------------------------------------
+grp_struc = "Major Support & Resistance (4H)"
+htf       = input.timeframe("240", "HTF Zonen", group=grp_struc)
+length    = input.int(50, "Zonen Lookback (Kerzen)", minval=10, group=grp_struc)
+showBoxes = input.bool(true, "Zeige Major Supply/Demand Boxen", group=grp_struc)
+
+grp_ob    = "Lokale Order Blocks (Minor Zonen)"
+showOB    = input.bool(true, "Zeige Order Blocks", group=grp_ob)
+mitigOB   = input.bool(true, "Gefüllte Order Blocks ausblenden?", group=grp_ob)
+reqObDelta= input.bool(true, "OBs mit Volumen-Delta bestätigen?", group=grp_ob)
+obDeltaPct= input.int(60, "Min. Delta Dominanz in % (z.B. 60)", minval=51, maxval=90, group=grp_ob)
+
+grp_fvg   = "Fair Value Gaps (Entry Trigger)"
+showFVG   = input.bool(true, "Zeige FVGs (NUR in 4H Zonen)", group=grp_fvg)
+
+grp_vol   = "Volumen & Orderflow"
+showVol   = input.bool(true, "Zeige Volumen-Kerzen (Wale = Weiß)", group=grp_vol)
+volMult   = input.float(2.0, "Volumen-Schwelle (2.0 = 200% vom Schnitt)", step=0.5, group=grp_vol)
+showCvd   = input.bool(true, "Zeige CVD Divergenzen (Pfeile)", group=grp_vol)
+
+grp_mag   = "Daily & Weekly Magnete"
+showWeekly= input.bool(true, "Zeige Weekly (PWH/PWL & W.Open)", group=grp_mag)
+showDaily = input.bool(true, "Zeige Daily (PDH/PDL)", group=grp_mag)
+
+grp_trend = "Swing Trend Indikatoren"
+showEMAs  = input.bool(true, "Zeige EMA 50 (Trend)", group=grp_trend)
+showWMA   = input.bool(true, "Zeige WMA 200 (Support)", group=grp_trend)
+showVwap  = input.bool(true, "Zeige Monthly VWAP", group=grp_trend)
+
+grp_dash  = "Dashboard (4h Swing Trend)"
+showDash  = input.bool(true, "Zeige Markt-Dashboard", group=grp_dash)
+posDash   = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left"], group=grp_dash)
+
+// -----------------------------------------------------------------------------
+// 2. FARBEN & STIL
+// -----------------------------------------------------------------------------
+c_neon_green = #00FF00
+c_neon_red   = #FF0055
+c_real_blue  = #2962FF 
+c_ema_50     = #00FF00
+c_vwap       = color.new(#40E0D0, 0) // Türkis
+c_fvg        = color.new(#00E5FF, 70) 
+c_gold       = color.new(#FFD700, 0)
+
+colorBuy     = color.new(c_neon_green, 85)
+colorSell    = color.new(c_neon_red, 85)
+colorObBull  = color.new(color.teal, 70)
+colorObBear  = color.new(color.maroon, 70)
+c_weekly     = color.new(#EE82EE, 0)     
+c_daily      = color.new(color.orange, 0) 
+
+// -----------------------------------------------------------------------------
+// 3. VOLUMEN & CVD 
+// -----------------------------------------------------------------------------
+avgVol = ta.sma(volume, 20)
+isWhale = volume > (avgVol * volMult)
+barcolor(showVol and isWhale ? color.white : na, title="Whale Volume")
+
+tw = high - low
+buyVol = tw == 0 ? 0 : volume * ((close - low) / tw)
+sellVol = tw == 0 ? 0 : volume * ((high - close) / tw)
+delta = buyVol - sellVol
+cvd = ta.cum(delta)
+
+int divLb = 5
+pl = ta.pivotlow(low, divLb, divLb)
+ph = ta.pivothigh(high, divLb, divLb)
+
+var float prev_pl_p = na
+var float prev_pl_c = na
+var float prev_ph_p = na
+var float prev_ph_c = na
+bool bDiv = false
+bool sDiv = false
+
+if not na(pl)
+    if pl < prev_pl_p and cvd[divLb] > prev_pl_c
+        bDiv := true
+    prev_pl_p := pl
+    prev_pl_c := cvd[divLb]
+    
+if not na(ph)
+    if ph > prev_ph_p and cvd[divLb] < prev_ph_c
+        sDiv := true
+    prev_ph_p := ph
+    prev_ph_c := cvd[divLb]
+
+plotshape(showCvd and bDiv, location=location.belowbar, color=c_neon_green, style=shape.labelup, size=size.tiny, offset=-divLb, text="CVD", textcolor=color.black)
+plotshape(showCvd and sDiv, location=location.abovebar, color=c_neon_red, style=shape.labeldown, size=size.tiny, offset=-divLb, text="CVD", textcolor=color.white)
+
+// -----------------------------------------------------------------------------
+// 4. MAJOR ZONEN (4H) & ENTRY FVGs (BLAU) MIT ZIEL-LABELS
+// -----------------------------------------------------------------------------
+calc_major(len) =>
+    h = ta.highest(high, len)
+    l = ta.lowest(low, len)
+    t_h = ta.valuewhen(high == h, time, 0)
+    t_l = ta.valuewhen(low == l, time, 0)
+    [h, l, t_h, t_l]
+
+[htf_hi, htf_lo, t_hi, t_lo] = request.security(syminfo.tickerid, htf, calc_major(length))
+
+rangeP = htf_hi - htf_lo
+a_sup = htf_hi - (rangeP * 0.05)
+a_dem = htf_lo + (rangeP * 0.05)
+
+var box buyBox = box.new(na, na, na, na, border_color=c_neon_green, bgcolor=colorBuy, extend=extend.right, xloc=xloc.bar_time)
+var box sellBox = box.new(na, na, na, na, border_color=c_neon_red, bgcolor=colorSell, extend=extend.right, xloc=xloc.bar_time)
+
+// Labels für Demand und Supply wieder hinzugefügt!
+var label labBuy = label.new(na, na, "MAJOR DEMAND (4H)", style=label.style_none, textcolor=c_neon_green, size=size.normal, xloc=xloc.bar_time)
+var label labSell = label.new(na, na, "MAJOR SUPPLY (4H)", style=label.style_none, textcolor=c_neon_red, size=size.normal, xloc=xloc.bar_time)
+
+if barstate.islast 
+    if showBoxes
+        future_time = time + (time - time[1]) * 10 
+        box.set_lefttop(sellBox, t_hi, htf_hi)
+        box.set_rightbottom(sellBox, future_time, a_sup)
+        box.set_lefttop(buyBox, t_lo, a_dem)
+        box.set_rightbottom(buyBox, future_time, htf_lo)
+        
+        // Text exakt positionieren
+        label.set_xy(labSell, future_time, htf_hi)
+        label.set_xy(labBuy, future_time, a_dem)
+    else
+        // Verstecken, wenn Checkbox aus ist
+        label.set_xy(labSell, na, na)
+        label.set_xy(labBuy, na, na)
+
+inD = low[1] <= a_dem
+inS = high[1] >= a_sup
+
+var box[] bullFVGs = array.new_box()
+var box[] bearFVGs = array.new_box()
+var label[] fvgLabBull = array.new_label()
+var label[] fvgLabBear = array.new_label()
+
+if showFVG
+    if low > high[2] and inD
+        array.push(bullFVGs, box.new(bar_index - 2, low, bar_index, high[2], bgcolor=c_fvg, border_color=na))
+        array.push(fvgLabBull, label.new(bar_index, low, "🎯 " + str.tostring(math.round(a_sup)), style=label.style_label_up, color=color.new(color.black, 100), textcolor=c_neon_green, size=size.tiny))
+    
+    if high < low[2] and inS
+        array.push(bearFVGs, box.new(bar_index - 2, high, bar_index, low[2], bgcolor=c_fvg, border_color=na))
+        array.push(fvgLabBear, label.new(bar_index, high, "🎯 " + str.tostring(math.round(a_dem)), style=label.style_label_down, color=color.new(color.black, 100), textcolor=c_neon_red, size=size.tiny))
+
+    if array.size(bullFVGs) > 0
+        for i = array.size(bullFVGs) - 1 to 0
+            b = array.get(bullFVGs, i)
+            l = array.get(fvgLabBull, i)
+            box.set_right(b, bar_index + 2)
+            label.set_x(l, bar_index + 2) 
+            if low <= box.get_bottom(b) 
+                box.delete(array.remove(bullFVGs, i))
+                label.delete(array.remove(fvgLabBull, i))
+
+    if array.size(bearFVGs) > 0
+        for i = array.size(bearFVGs) - 1 to 0
+            b = array.get(bearFVGs, i)
+            l = array.get(fvgLabBear, i)
+            box.set_right(b, bar_index + 2)
+            label.set_x(l, bar_index + 2) 
+            if high >= box.get_top(b) 
+                box.delete(array.remove(bearFVGs, i))
+                label.delete(array.remove(fvgLabBear, i))
+
+// -----------------------------------------------------------------------------
+// 5. LOKALE ORDER BLOCKS (MINOR) - DELTA CONFIRMED
+// -----------------------------------------------------------------------------
+var box[] bullOBs = array.new_box()
+var box[] bearOBs = array.new_box()
+
+if showOB
+    paBullE = close[1] < open[1] and close > open and close > high[1] and (close - open) > (open[1] - close[1]) * 1.2
+    paBearE = close[1] > open[1] and close < open and close < low[1] and (open - close) > (close[1] - open[1]) * 1.2
+
+    ob_vol_valid = volume > avgVol
+    bullDeltaValid = buyVol > (volume * (obDeltaPct / 100))
+    bearDeltaValid = sellVol > (volume * (obDeltaPct / 100))
+
+    isBullE = reqObDelta ? (paBullE and ob_vol_valid and bullDeltaValid) : paBullE
+    isBearE = reqObDelta ? (paBearE and ob_vol_valid and bearDeltaValid) : paBearE
+
+    if isBullE
+        array.push(bullOBs, box.new(bar_index - 1, high[1], bar_index + 5, low[1], border_color=color.teal, bgcolor=colorObBull))
+    if isBearE
+        array.push(bearOBs, box.new(bar_index - 1, high[1], bar_index + 5, low[1], border_color=color.maroon, bgcolor=colorObBear))
+
+    if array.size(bullOBs) > 0
+        for i = array.size(bullOBs) - 1 to 0
+            b = array.get(bullOBs, i)
+            box.set_right(b, bar_index + 2)
+            if mitigOB and close < box.get_bottom(b)
+                box.delete(array.remove(bullOBs, i))
+    
+    if array.size(bearOBs) > 0
+        for i = array.size(bearOBs) - 1 to 0
+            b = array.get(bearOBs, i)
+            box.set_right(b, bar_index + 2)
+            if mitigOB and close > box.get_top(b)
+                box.delete(array.remove(bearOBs, i))
+
+// -----------------------------------------------------------------------------
+// 6. TRENDS, MAGNETE, VWAP & LABELS
+// -----------------------------------------------------------------------------
+ema50 = ta.ema(close, 50)
+wma200 = ta.wma(close, 200)
+avwap = ta.vwap(hlc3, timeframe.change("M")) // Fest auf Monthly eingestellt
+
+plot(showEMAs ? ema50 : na, "EMA 50", color=c_ema_50, linewidth=2)
+plot(showWMA ? wma200 : na, "WMA 200", color=c_real_blue, linewidth=2)
+plot(showVwap ? avwap : na, "Monthly VWAP", color=c_vwap, linewidth=3) // Dicker und Türkis
+
+[w_h, w_l] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+w_o        = request.security(syminfo.tickerid, "W", open) 
+[d_h, d_l] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+var line l_pwh = line.new(na, na, na, na, color=c_weekly, width=2)
+var line l_pwl = line.new(na, na, na, na, color=c_weekly, width=2)
+var line l_wo  = line.new(na, na, na, na, color=c_gold, width=2, style=line.style_dotted) 
+
+var line l_pdh = line.new(na, na, na, na, color=c_daily, width=2)
+var line l_pdl = line.new(na, na, na, na, color=c_daily, width=2)
+
+var label lab_pwh  = label.new(na, na, "PWH", style=label.style_none, textcolor=c_weekly, size=size.small)
+var label lab_pwl  = label.new(na, na, "PWL", style=label.style_none, textcolor=c_weekly, size=size.small)
+var label lab_wo   = label.new(na, na, "W.Open", style=label.style_none, textcolor=c_gold, size=size.small)
+
+var label lab_pdh  = label.new(na, na, "PDH", style=label.style_none, textcolor=c_daily, size=size.small)
+var label lab_pdl  = label.new(na, na, "PDL", style=label.style_none, textcolor=c_daily, size=size.small)
+var label lab_ema  = label.new(na, na, "EMA 50", style=label.style_none, textcolor=c_ema_50, size=size.small)
+var label lab_wma  = label.new(na, na, "WMA 200", style=label.style_none, textcolor=c_real_blue, size=size.small)
+var label lab_vwap = label.new(na, na, "M.VWAP", style=label.style_none, textcolor=c_vwap, size=size.small) 
+
+if barstate.islast
+    start = bar_index
+    end = bar_index + 12
+    if showWeekly
+        line.set_xy1(l_pwh, start, w_h), line.set_xy2(l_pwh, end, w_h), label.set_xy(lab_pwh, end + 1, w_h)
+        line.set_xy1(l_pwl, start, w_l), line.set_xy2(l_pwl, end, w_l), label.set_xy(lab_pwl, end + 1, w_l)
+        line.set_xy1(l_wo, start, w_o), line.set_xy2(l_wo, end, w_o), label.set_xy(lab_wo, end + 1, w_o)
+    if showDaily
+        line.set_xy1(l_pdh, start, d_h), line.set_xy2(l_pdh, end, d_h), label.set_xy(lab_pdh, end + 1, d_h)
+        line.set_xy1(l_pdl, start, d_l), line.set_xy2(l_pdl, end, d_l), label.set_xy(lab_pdl, end + 1, d_l)
+    if showEMAs
+        label.set_xy(lab_ema, end + 1, ema50)
+    if showWMA
+        label.set_xy(lab_wma, end + 1, wma200)
+    if showVwap
+        label.set_xy(lab_vwap, end + 1, avwap)
+
+// -----------------------------------------------------------------------------
+// 7. DASHBOARD (FULL VERSION)
+// -----------------------------------------------------------------------------
+dash_calc() => 
+    [m, s, h] = ta.macd(close, 12, 26, 9)
+    [close, ta.ema(close, 50), ta.rsi(close, 14), m, s]
+
+[btc_c, btc_e, btc_r, btc_m, btc_s] = request.security("BINANCE:BTCUSDT", "240", dash_calc())
+[btcd_c, btcd_e, btcd_r, btcd_m, btcd_s] = request.security("CRYPTOCAP:BTC.D", "240", dash_calc())
+[usdtd_c, usdtd_e, usdtd_r, usdtd_m, usdtd_s] = request.security("CRYPTOCAP:USDT.D", "240", dash_calc())
+[curr_c, curr_e, curr_r, curr_m, curr_s] = request.security(syminfo.tickerid, "240", dash_calc())
+
+if showDash and barstate.islast
+    var table tbl = table.new(posDash == "Top Right" ? position.top_right : posDash == "Bottom Right" ? position.bottom_right : position.top_left, 4, 5, bgcolor=color.new(color.black, 40), border_width=1)
+    table.cell(tbl, 0, 0, "ASSET", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tbl, 1, 0, "4H TREND", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tbl, 2, 0, "4H RSI", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(tbl, 3, 0, "4H MACD", text_color=color.white, bgcolor=color.new(color.gray, 50))
+
+    string[] assets = array.from("BTC", "BTC.D", "USDT.D", syminfo.ticker)
+    float[] prices  = array.from(btc_c, btcd_c, usdtd_c, curr_c)
+    float[] emas    = array.from(btc_e, btcd_e, usdtd_e, curr_e)
+    float[] rsis    = array.from(btc_r, btcd_r, usdtd_r, curr_r)
+    float[] macds   = array.from(btc_m, btcd_m, usdtd_m, curr_m)
+    float[] sigs    = array.from(btc_s, btcd_s, usdtd_s, curr_s)
+
+    for i = 0 to 3
+        c = array.get(prices, i), e = array.get(emas, i), r = array.get(rsis, i), m = array.get(macds, i), s = array.get(sigs, i)
+        bg_color = i == 3 ? color.new(color.blue, 80) : na
+        table.cell(tbl, 0, i+1, array.get(assets, i), text_color=color.white, bgcolor=bg_color)
+        table.cell(tbl, 1, i+1, c > e ? "BULL" : "BEAR", text_color=c > e ? c_neon_green : c_neon_red, bgcolor=bg_color)
+        table.cell(tbl, 2, i+1, str.tostring(math.round(r)), text_color=r >= 70 ? c_neon_red : r <= 30 ? c_neon_green : color.white, bgcolor=bg_color)
+        table.cell(tbl, 3, i+1, m > s ? "BULL" : "BEAR", text_color=m > s ? c_neon_green : c_neon_red, bgcolor=bg_color)
+
+// -----------------------------------------------------------------------------
+// 8. ALARME
+// -----------------------------------------------------------------------------
+alertcondition(low > high[2] and inD, "🚀 SWING LONG", "Bull FVG in HTF Zone!")
+alertcondition(high < low[2] and inS, "📉 SWING SHORT", "Bear FVG in HTF Zone!")

@@ -1,0 +1,133 @@
+//@version=6
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © UAlgo
+
+indicator("Liquidity Raids [UAlgo]", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ————— Constants
+color C_RESISTANCE = color.rgb(255, 82, 82)
+color C_SUPPORT    = color.rgb(76, 175, 79)
+color C_SWEEP_BUY  = color.rgb(255, 235, 59)
+color C_SWEEP_SELL = color.rgb(33, 150, 243)
+string G_GEN       = "General Settings"
+string G_VIS       = "Visual Styling"
+string G_VOL       = "Volume Confirmation"
+string TT_VOL      = "Relative Volume (RVOL): Ratio of the sweep bar's volume to the average volume of the last 20 bars. 100% means the volume is equal to the average, while 200% means it's twice the average."
+
+// ————— Inputs
+int pivotPeriodInput      = input.int(20, "Pivot Length", 3, 100, 1, group = G_GEN)
+int maxLinesInput         = input.int(5, "Maximum Active Levels", 1, 50, 1, group = G_GEN)
+bool showLabelsInput      = input.bool(true, "Show Sweep Labels", group = G_VIS)
+color resistanceColorInput = input.color(color.new(C_RESISTANCE, 60), "Resistance Color", group = G_VIS)
+color supportColorInput    = input.color(color.new(C_SUPPORT, 60), "Support Color", group = G_VIS)
+string lineStyleInput     = input.string("Dotted", "Line Style", options = ["Solid", "Dotted", "Dashed"], group = G_VIS)
+
+// Volume Confirmation Settings
+bool useVolFilterInput    = input.bool(false, "Enable Volume Filter", group = G_VOL, tooltip = TT_VOL)
+float volMultiplierInput  = input.float(1.0, "Volume Multiplier", 0.1, 5.0, 0.1, group = G_VOL, tooltip = "Minimum volume multiplier required for a signal. For example, if set to 1.5, volume must be at least 150% of the average.")
+
+// ————— Types & Methods
+type LiquidityLevel
+    float price
+    int   startBar
+    line  lineObj
+
+method delete(LiquidityLevel this) =>
+    line.delete(this.lineObj)
+
+method update(LiquidityLevel this) =>
+    line.set_x2(this.lineObj, bar_index)
+
+// ————— Calculations
+var resistanceLevels = array.new<LiquidityLevel>()
+var supportLevels    = array.new<LiquidityLevel>()
+
+float ph = ta.pivothigh(high, pivotPeriodInput, pivotPeriodInput)
+float pl = ta.pivotlow(low, pivotPeriodInput, pivotPeriodInput)
+
+// Volume Analysis
+float volAvg = ta.sma(volume, 20)
+float volRelative = (volume / volAvg) * 100
+bool isVolStrong = not useVolFilterInput or (volume > volAvg * volMultiplierInput)
+
+getLineStyle(simple string s) =>
+    switch s
+        "Solid"  => line.style_solid
+        "Dotted" => line.style_dotted
+        "Dashed" => line.style_dashed
+        => line.style_dotted
+
+// Handle New Resistance (Buy Liquidity)
+if not na(ph)
+    line newL = line.new(bar_index[pivotPeriodInput], ph, bar_index, ph, color = resistanceColorInput, width = 1, style = getLineStyle(lineStyleInput))
+    resistanceLevels.push(LiquidityLevel.new(ph, bar_index[pivotPeriodInput], newL))
+    
+    if resistanceLevels.size() > maxLinesInput
+        (resistanceLevels.shift()).delete()
+
+// Handle New Support (Sell Liquidity)
+if not na(pl)
+    line newL = line.new(bar_index[pivotPeriodInput], pl, bar_index, pl, color = supportColorInput, width = 1, style = getLineStyle(lineStyleInput))
+    supportLevels.push(LiquidityLevel.new(pl, bar_index[pivotPeriodInput], newL))
+    
+    if supportLevels.size() > maxLinesInput
+        (supportLevels.shift()).delete()
+
+// Process Active Levels
+bool buySweepOccurred  = false
+bool sellSweepOccurred = false
+
+// Check Resistance Levels (Buy Liquidity Sweeps)
+if resistanceLevels.size() > 0
+    for i = resistanceLevels.size() - 1 to 0
+        LiquidityLevel lvl = resistanceLevels.get(i)
+        lvl.update()
+        
+        bool priceSwept = high > lvl.price and close <= lvl.price
+        bool broken     = close > lvl.price
+        
+        if priceSwept and isVolStrong
+            buySweepOccurred := true
+            if showLabelsInput
+                label.new(bar_index, high, "▼ BSL", style = label.style_label_down, color = #00000000, textcolor = C_SWEEP_BUY, size = size.small)
+            
+            // Highlight level line and add Volume Info ABOVE the line midpoint (BSL - Yellow)
+            line.new(lvl.startBar, lvl.price, bar_index, lvl.price, color = C_SWEEP_BUY, width = 1)
+            int midX = math.round((lvl.startBar + bar_index) / 2)
+            label.new(midX, lvl.price, str.tostring(volRelative, "#") + "% VOL", color = #00000000, textcolor = color.new(C_SWEEP_BUY, 20), style = label.style_label_down, size = size.tiny)
+            
+            resistanceLevels.remove(i).delete()
+        else if broken
+            resistanceLevels.remove(i).delete()
+
+// Check Support Levels (Sell Liquidity Sweeps)
+if supportLevels.size() > 0
+    for i = supportLevels.size() - 1 to 0
+        LiquidityLevel lvl = supportLevels.get(i)
+        lvl.update()
+        
+        bool priceSwept = low < lvl.price and close >= lvl.price
+        bool broken     = close < lvl.price
+        
+        if priceSwept and isVolStrong
+            sellSweepOccurred := true
+            if showLabelsInput
+                label.new(bar_index, low, "▲ SSL", style = label.style_label_up, color = #00000000, textcolor = C_SWEEP_SELL, size = size.small)
+            
+            // Highlight level line and add Volume Info BELOW the line midpoint (SSL - Blue)
+            line.new(lvl.startBar, lvl.price, bar_index, lvl.price, color = C_SWEEP_SELL, width = 1)
+            int midX = math.round((lvl.startBar + bar_index) / 2)
+            label.new(midX, lvl.price, str.tostring(volRelative, "#") + "% VOL", color = #00000000, textcolor = color.new(C_SWEEP_SELL, 20), style = label.style_label_up, size = size.tiny)
+            
+            supportLevels.remove(i).delete()
+        else if broken
+            supportLevels.remove(i).delete()
+
+// ————— Alerts
+alertcondition(buySweepOccurred, "Buy Liquidity Sweep", "BSL Swept!")
+alertcondition(sellSweepOccurred, "Sell Liquidity Sweep", "SSL Swept!")
+
+if buySweepOccurred
+    alert("UAlgo BSL Sweep: " + str.tostring(close), alert.freq_once_per_bar_close)
+if sellSweepOccurred
+    alert("UAlgo SSL Sweep: " + str.tostring(close), alert.freq_once_per_bar_close)

@@ -1,0 +1,256 @@
+//@version=5
+indicator("Market Profile Dominance Analyzer", "Dominance Analyzer", overlay=false, max_bars_back=5000)
+
+// Входные параметры
+timeframe_input = input.string(defval='Auto', title='Higher Time Frame', 
+     options=['Auto', '1', '5', '10', '15', '30', '60', '120', '180', '240', '360', '480', '720', 'D', 'W', '2W', 'M', '3M', '6M', '12M'])
+percent_va = input.float(70.0, title="Value Area %", minval=1, maxval=100) / 100
+show_signals = input.bool(true, title="Show Buy/Sell Signals")
+show_histogram = input.bool(true, title="Show Dominance Histogram")
+sensitivity = input.int(5, title="Signal Sensitivity", minval=1, maxval=20)
+num_channels = input.int(20, title="Number of Channels", minval=10, maxval=50)
+
+// Цвета
+buyer_color = input.color(color.new(color.green, 0), title="Buyer Color")
+seller_color = input.color(color.new(color.red, 0), title="Seller Color")
+neutral_color = input.color(color.new(color.gray, 50), title="Neutral Color")
+
+// Определение таймфрейма
+get_timeframe() =>
+    if timeframe_input == 'Auto'
+        switch timeframe.period
+            '1' => '120'
+            '2' => '180'
+            '3' => '240'
+            '5' => 'D'
+            '10' => 'W'
+            '15' => 'W'
+            '30' => 'W'
+            '45' => 'W'
+            '60' => 'W'
+            '120' => 'M'
+            '180' => 'M'
+            '240' => 'M'
+            'D' => '12M'
+            'W' => '12M'
+            => 'D'
+    else
+        timeframe_input
+
+selected_tf = get_timeframe()
+
+// Получение данных с высшего таймфрейма
+[htf_high, htf_low, htf_volume, htf_time] = request.security(syminfo.tickerid, selected_tf, 
+     [high, low, volume, time], lookahead=barmerge.lookahead_off)
+
+// Определение новой сессии HTF
+var float last_htf_time = na
+bool new_htf_session = na(last_htf_time) or htf_time != last_htf_time
+
+if new_htf_session
+    last_htf_time := htf_time
+
+// Переменные для накопления данных текущей HTF сессии
+var array<float> session_highs = array.new<float>()
+var array<float> session_lows = array.new<float>()
+var array<float> session_volumes = array.new<float>()
+var float session_high = na
+var float session_low = na
+
+// Сброс данных на новой сессии
+if new_htf_session
+    array.clear(session_highs)
+    array.clear(session_lows)
+    array.clear(session_volumes)
+    session_high := high
+    session_low := low
+
+// Накопление данных текущей сессии
+array.push(session_highs, high)
+array.push(session_lows, low)
+array.push(session_volumes, volume)
+
+// Обновление диапазона сессии
+session_high := array.max(session_highs)
+session_low := array.min(session_lows)
+
+// Расчет каналов Market Profile
+channel_size = (session_high - session_low) / num_channels
+
+// Функция для проверки пересечения диапазонов
+range_overlap(range_low, range_high, bar_low, bar_high) =>
+    math.max(range_low, bar_low) <= math.min(range_high, bar_high)
+
+// Расчет объема в каждом канале
+var array<float> channel_volumes = array.new<float>(num_channels, 0.0)
+
+// Пересчёт объёмов каналов
+array.clear(channel_volumes)
+for i = 0 to num_channels - 1
+    array.push(channel_volumes, 0.0)
+
+// Заполнение объёмов по барам текущей сессии
+int bars_in_session = array.size(session_highs)
+for bar_idx = 0 to bars_in_session - 1
+    float bar_high = array.get(session_highs, bar_idx)
+    float bar_low = array.get(session_lows, bar_idx)
+    float bar_volume = array.get(session_volumes, bar_idx)
+    
+    // Для каждого бара определяем, какие каналы он затрагивает
+    for channel_idx = 0 to num_channels - 1
+        float channel_low = session_low + channel_idx * channel_size
+        float channel_high = session_low + (channel_idx + 1) * channel_size
+        
+        if range_overlap(channel_low, channel_high, bar_low, bar_high)
+            float current_vol = array.get(channel_volumes, channel_idx)
+            array.set(channel_volumes, channel_idx, current_vol + bar_volume)
+
+// Поиск POC (Point of Control) - канал с максимальным объёмом
+float total_volume = array.sum(channel_volumes)
+int poc_index = 0
+float poc_volume = 0.0
+
+for i = 0 to num_channels - 1
+    float vol = array.get(channel_volumes, i)
+    if vol > poc_volume
+        poc_volume := vol
+        poc_index := i
+
+// Расчет Value Area (начинаем с POC и расширяем в обе стороны)
+float va_volume = poc_volume
+int va_high_index = poc_index
+int va_low_index = poc_index
+float target_va_volume = total_volume * percent_va
+
+// Расширяем VA пока не достигнем целевого процента объёма
+while va_volume < target_va_volume and (va_high_index < num_channels - 1 or va_low_index > 0)
+    float high_vol = va_high_index < num_channels - 1 ? array.get(channel_volumes, va_high_index + 1) : 0.0
+    float low_vol = va_low_index > 0 ? array.get(channel_volumes, va_low_index - 1) : 0.0
+    
+    if high_vol >= low_vol and va_high_index < num_channels - 1
+        va_high_index += 1
+        va_volume += high_vol
+    else if low_vol > 0 and va_low_index > 0
+        va_low_index -= 1
+        va_volume += low_vol
+    else if high_vol > 0 and va_high_index < num_channels - 1
+        va_high_index += 1
+        va_volume += high_vol
+    else
+        break
+
+// Расчет уровней цен
+get_channel_price(index, position) =>
+    session_low + (index + position) * channel_size
+
+float poc_price = get_channel_price(poc_index, 0.5)
+float va_high_price = get_channel_price(va_high_index, 1.0)
+float va_low_price = get_channel_price(va_low_index, 0.0)
+
+// Определение позиции цены относительно структуры
+int price_vs_poc = close > poc_price ? 1 : close < poc_price ? -1 : 0
+int price_vs_va = close > va_high_price ? 2 : close < va_low_price ? -2 : 0
+
+// Анализ дисбаланса объёма в Value Area
+float upper_va_volume = 0.0
+float lower_va_volume = 0.0
+
+for i = poc_index to va_high_index
+    upper_va_volume += array.get(channel_volumes, i)
+
+for i = va_low_index to poc_index
+    lower_va_volume += array.get(channel_volumes, i)
+
+float volume_imbalance = upper_va_volume + lower_va_volume > 0 ? 
+     (upper_va_volume - lower_va_volume) / (upper_va_volume + lower_va_volume) * 100 : 0
+
+// Дополнительные факторы
+float price_momentum = ta.sma(ta.change(close), 5)
+int volume_trend = ta.sma(volume, 5) > ta.sma(volume, 20) ? 1 : -1
+
+// Расчет позиции в VA (нормализованная от -1 до 1)
+float va_position = 0.0
+if close > va_high_price
+    va_position := 1.0
+else if close < va_low_price
+    va_position := -1.0
+else
+    float va_range = va_high_price - va_low_price
+    va_position := va_range > 0 ? (close - va_low_price) / va_range * 2 - 1 : 0
+
+// Итоговый индекс доминирования
+// Итоговый индекс доминирования
+float dominance_score = price_vs_poc * 10 + price_vs_va * 5 + volume_imbalance * 0.5 + price_momentum * 100 + volume_trend * 5 + va_position * 15
+
+// Сглаживание сигнала
+float smooth_dominance = ta.ema(dominance_score, sensitivity)
+
+// Определение состояния рынка
+int market_state = smooth_dominance > 10 ? 1 : smooth_dominance < -10 ? -1 : 0
+
+// Визуализация фона
+color bgcolor_color = market_state == 1 ? color.new(buyer_color, 90) : 
+                      market_state == -1 ? color.new(seller_color, 90) : 
+                      color.new(neutral_color, 95)
+bgcolor(bgcolor_color)
+
+// Гистограмма доминирования
+color hist_color = smooth_dominance > 0 ? buyer_color : seller_color
+plot(show_histogram ? smooth_dominance : na, "Dominance", color=hist_color, style=plot.style_histogram, linewidth=2)
+
+// Опорные линии
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dashed, linewidth=2)
+hline(50, "Overbought", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+hline(-50, "Oversold", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+
+// Сигналы покупки/продажи
+bool buy_signal = ta.crossover(smooth_dominance, -10) and market_state[1] != 1
+bool sell_signal = ta.crossunder(smooth_dominance, 10) and market_state[1] != -1
+
+plotshape(show_signals and buy_signal, "Buy Signal", shape.triangleup, 
+     location.bottom, buyer_color, size=size.small)
+plotshape(show_signals and sell_signal, "Sell Signal", shape.triangledown, 
+     location.top, seller_color, size=size.small)
+
+// Информационная таблица
+if barstate.islast and bars_in_session > 0
+    var table info_table = table.new(position.top_right, 2, 7, 
+         bgcolor=color.new(color.white, 20), border_width=1, border_color=color.gray)
+    
+    string state_text = market_state == 1 ? "BUYERS" : market_state == -1 ? "SELLERS" : "NEUTRAL"
+    color state_color = market_state == 1 ? buyer_color : market_state == -1 ? seller_color : neutral_color
+    
+    table.cell(info_table, 0, 0, "Market State:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    table.cell(info_table, 1, 0, state_text, text_color=state_color, text_size=size.normal, bgcolor=color.new(state_color, 90))
+    
+    table.cell(info_table, 0, 1, "Dominance:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    table.cell(info_table, 1, 1, str.tostring(math.round(smooth_dominance, 1)), text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    
+    table.cell(info_table, 0, 2, "Price vs POC:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    string poc_text = close > poc_price ? "Above ↑" : close < poc_price ? "Below ↓" : "At →"
+    color poc_color = close > poc_price ? buyer_color : close < poc_price ? seller_color : neutral_color
+    table.cell(info_table, 1, 2, poc_text, text_color=poc_color, text_size=size.small, bgcolor=color.new(color.white, 20))
+    
+    table.cell(info_table, 0, 3, "Volume Imbal.:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    color imbal_color = volume_imbalance > 5 ? buyer_color : volume_imbalance < -5 ? seller_color : neutral_color
+    table.cell(info_table, 1, 3, str.tostring(math.round(volume_imbalance, 1)) + "%", text_color=imbal_color, text_size=size.small, bgcolor=color.new(color.white, 20))
+    
+    table.cell(info_table, 0, 4, "Timeframe:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    table.cell(info_table, 1, 4, selected_tf, text_color=color.blue, text_size=size.small, bgcolor=color.new(color.white, 20))
+    
+    table.cell(info_table, 0, 5, "Bars in Session:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    table.cell(info_table, 1, 5, str.tostring(bars_in_session), text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    
+    table.cell(info_table, 0, 6, "Total Volume:", text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+    table.cell(info_table, 1, 6, str.tostring(math.round(total_volume, 0)), text_color=color.black, text_size=size.small, bgcolor=color.new(color.white, 20))
+
+// Алерты
+alertcondition(buy_signal, title="Buyers Dominate", message="🟢 Buyers are taking control - potential buy opportunity")
+alertcondition(sell_signal, title="Sellers Dominate", message="🔴 Sellers are taking control - potential sell opportunity")
+alertcondition(ta.cross(smooth_dominance, 0), title="Dominance Shift", message="⚪ Market dominance has shifted")
+
+// Отладочные данные (только в Data Window)
+plot(poc_price, "POC Price", color=color.yellow, linewidth=1, display=display.data_window)
+plot(va_high_price, "VA High", color=color.blue, linewidth=1, display=display.data_window)
+plot(va_low_price, "VA Low", color=color.blue, linewidth=1, display=display.data_window)
+plot(bars_in_session, "Bars in HTF Session", color=color.purple, linewidth=1, display=display.data_window)

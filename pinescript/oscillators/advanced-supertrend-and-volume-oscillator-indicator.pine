@@ -1,0 +1,182 @@
+//@version=6
+indicator("Advanced Engine: ST + VWAP + VolOsc + StochRSI + PnL", overlay=true)
+
+// =========================================================================
+// 1. Indicator Calculations
+// =========================================================================
+atrPeriod = input.int(10, "ATR Length", group="SuperTrend")
+factor = input.float(3.0, "Multiplier", step=0.1, group="SuperTrend")
+[supertrend, direction] = ta.supertrend(factor, atrPeriod)
+
+vwapValue = ta.vwap(hlc3)
+
+// Volume Oscillator: Raw Calculation
+shortVolLen = input.int(5, "Short Volume EMA", group="Volume Oscillator")
+longVolLen = input.int(10, "Long Volume EMA", group="Volume Oscillator")
+shortVol = ta.ema(volume, shortVolLen)
+longVol = ta.ema(volume, longVolLen)
+volOsc = 100 * (shortVol - longVol) / longVol
+
+// Stochastic RSI: Raw Calculation
+rsiLen = input.int(14, "RSI Length", group="Stochastic RSI")
+stochLen = input.int(14, "Stochastic Length", group="Stochastic RSI")
+kSmooth = input.int(3, "K Smooth", group="Stochastic RSI")
+dSmooth = input.int(3, "D Smooth", group="Stochastic RSI")
+rsiVal = ta.rsi(close, rsiLen)
+kVal = ta.sma(ta.stoch(rsiVal, rsiVal, rsiVal, stochLen), kSmooth)
+dVal = ta.sma(kVal, dSmooth)
+avgStoch = (kVal + dVal) / 2
+
+// =========================================================================
+// 2. Trajectory & Price Action Definitions
+// =========================================================================
+// Reverted: 2-Bar Confirmation on raw data to filter out 1-bar head fakes
+volRising    = ta.rising(volOsc, 2)
+volFalling   = ta.falling(volOsc, 2)
+stochRising  = ta.rising(avgStoch, 2)
+stochFalling = ta.falling(avgStoch, 2)
+
+stGreen = direction < 0
+stRed   = direction > 0
+priceAbove = close > vwapValue
+priceBelow = close < vwapValue
+
+stochOS       = avgStoch < 20
+stochOB       = avgStoch > 80
+stochStuckBot = avgStoch <= 1   
+stochStuckTop = avgStoch >= 99  
+
+// Candle Color Validation
+candleGreen = close > open
+candleRed   = close < open
+
+// =========================================================================
+// 3. Logic Engine (Raw Signals)
+// =========================================================================
+buyStandard = stGreen and priceAbove and volRising and stochRising and candleGreen
+buyStuck    = stochStuckBot and stGreen and priceAbove and volRising and candleGreen
+buyOverride = stochOS and volRising and stochRising and priceAbove and stRed and candleGreen
+rawLongSignal = buyStandard or buyStuck or buyOverride
+
+sellStandard = stRed and priceBelow and volRising and stochFalling and candleRed
+sellStuck    = stochStuckTop and stRed and priceBelow and volFalling and candleRed
+sellOverride = stochOB and volRising and stochFalling and priceBelow and stGreen and candleRed
+rawShortSignal = sellStandard or sellStuck or sellOverride
+
+// =========================================================================
+// 4. Intraday PnL Tracker, Exits & Time Management
+// =========================================================================
+var int tradeState = 0 
+var float entryPrice = na
+var float dailyRealizedPnL = 0.0
+
+// Custom EOD Time Check (Default 15:10)
+eodHour = input.int(15, "EOD Square-Off Hour", group="Intraday Settings")
+eodMinute = input.int(10, "EOD Square-Off Minute", group="Intraday Settings")
+
+// Use time_close to ensure it fires exactly at the end of the candle closing at 15:10
+int closeHour = hour(time_close, syminfo.timezone)
+int closeMinute = minute(time_close, syminfo.timezone)
+
+bool isPastEOD = (closeHour > eodHour) or (closeHour == eodHour and closeMinute >= eodMinute)
+bool isEOD = (isPastEOD and not isPastEOD[1]) or session.islastbar // Fires exactly once at target time
+bool isFirstBar = session.isfirstbar
+bool isNewDay = ta.change(time("D")) != 0
+
+string currentDateString = str.tostring(dayofmonth(time), "00") + "-" + str.tostring(month(time), "00") + "-" + str.tostring(year(time))
+
+// --- BULLETPROOF LOGGING & DAILY RESET ---
+if isNewDay
+    string prevDateString = str.tostring(dayofmonth(time[1]), "00") + "-" + str.tostring(month(time[1]), "00") + "-" + str.tostring(year(time[1]))
+    // Ensure any open positions missed by EOD are calculated into yesterday's PnL
+    if tradeState == 1
+        dailyRealizedPnL += (close[1] - entryPrice)
+    else if tradeState == -1
+        dailyRealizedPnL += (entryPrice - close[1])
+        
+    log.info("Date: {0}, Ticker: {1}, Pnl Points: {2}", prevDateString, syminfo.ticker, str.tostring(dailyRealizedPnL, "#.##"))
+    
+    dailyRealizedPnL := 0.0
+    tradeState := 0
+    entryPrice := na
+
+// Prevent new trades from opening after EOD time or on the first bar
+validBuy = rawLongSignal and tradeState != 1 and not isFirstBar and not isPastEOD
+validSell = rawShortSignal and tradeState != -1 and not isFirstBar and not isPastEOD
+
+// --- VWAP Early Exit Logic ---
+bool exitLong = tradeState == 1 and math.max(open, close) < vwapValue and not isPastEOD and not rawShortSignal
+bool exitShort = tradeState == -1 and math.min(open, close) > vwapValue and not isPastEOD and not rawLongSignal
+
+if exitLong
+    dailyRealizedPnL += (close - entryPrice)
+    tradeState := 0
+    entryPrice := na
+    label.new(bar_index, high, text="EXIT", color=color.new(color.gray, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+if exitShort
+    dailyRealizedPnL += (entryPrice - close)
+    tradeState := 0
+    entryPrice := na
+    label.new(bar_index, low, text="EXIT", color=color.new(color.gray, 0), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// JSON Payload Formatter for Alerts
+string buyPayload = '{"action": "BUY", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "exchange": "' + syminfo.prefix + '"}'
+string sellPayload = '{"action": "SELL", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "exchange": "' + syminfo.prefix + '"}'
+string exitPayload = '{"action": "EXIT", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "exchange": "' + syminfo.prefix + '"}'
+string eodPayload = '{"action": "SQUARE_OFF", "ticker": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "exchange": "' + syminfo.prefix + '"}'
+
+// --- Process Entries ---
+if exitLong or exitShort
+    alert(exitPayload, alert.freq_once_per_bar_close)
+
+if validBuy
+    if tradeState == -1 
+        dailyRealizedPnL += (entryPrice - close)
+    tradeState := 1
+    entryPrice := close
+    label.new(bar_index, low, text="BUY", color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    alert(buyPayload, alert.freq_once_per_bar_close)
+
+if validSell
+    if tradeState == 1 
+        dailyRealizedPnL += (close - entryPrice)
+    tradeState := -1
+    entryPrice := close
+    label.new(bar_index, high, text="SELL", color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    alert(sellPayload, alert.freq_once_per_bar_close)
+
+// --- Explicit Time-Based EOD Square Off ---
+if isEOD and tradeState != 0
+    if tradeState == 1
+        dailyRealizedPnL += (close - entryPrice)
+    else if tradeState == -1
+        dailyRealizedPnL += (entryPrice - close)
+    tradeState := 0
+    entryPrice := na
+    label.new(bar_index, hl2, text="EOD CLOSE", color=color.new(color.gray, 0), textcolor=color.white, style=label.style_label_center, size=size.tiny)
+    alert(eodPayload, alert.freq_once_per_bar_close)
+
+// =========================================================================
+// 5. On-Chart Summary Table & Plotting
+// =========================================================================
+plot(stGreen ? supertrend : na, "ST Up", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(stRed ? supertrend : na, "ST Down", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(vwapValue, "VWAP", color=color.new(color.blue, 0), linewidth=2)
+
+float openPnL = tradeState == 1 ? close - entryPrice : tradeState == -1 ? entryPrice - close : 0.0
+string posString = tradeState == 1 ? "LONG" : tradeState == -1 ? "SHORT" : "FLAT"
+color posColor = tradeState == 1 ? color.green : tradeState == -1 ? color.red : color.gray
+
+var table pnlTable = table.new(position.top_right, 2, 5, border_width = 1, border_color = color.gray, frame_color = color.gray, frame_width = 1)
+if barstate.islast
+    table.cell(pnlTable, 0, 0, "Position Info", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(pnlTable, 1, 0, "Points", text_color=color.white, bgcolor=color.new(color.black, 40))
+    table.cell(pnlTable, 0, 1, "Date:", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 1, 1, currentDateString, text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 0, 2, "State:", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 1, 2, posString, text_color=posColor, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 0, 3, "Open PnL:", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 1, 3, str.tostring(openPnL, "#.##"), text_color=openPnL >= 0 ? color.green : color.red, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 0, 4, "Realized (Day):", text_color=color.white, bgcolor=color.new(color.black, 80))
+    table.cell(pnlTable, 1, 4, str.tostring(dailyRealizedPnL, "#.##"), text_color=dailyRealizedPnL >= 0 ? color.green : color.red, bgcolor=color.new(color.black, 80))

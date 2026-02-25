@@ -1,0 +1,368 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MrMilesIL
+//@version=5
+strategy(
+     title="Regime Pullback Breakout (JM)",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=100000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.0,
+     slippage=0,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     process_orders_on_close=false)       // <-- Key change: fill entries next bar open
+
+
+//==============================
+// Inputs
+//==============================
+fastSmaLen     = input.int(20,  "FastSMA Length", minval=1)
+medSmaLen      = input.int(50,  "MedSMA Length",  minval=1)
+slowSmaLen     = input.int(200, "SlowSMA Length", minval=1)
+
+stochLen       = input.int(22,  "Stoch %K Length", minval=1)
+
+slopeLen       = input.int(22,  "MeasureSlope Lookback", minval=1)
+slopeMethod    = input.string("LinReg", "Slope Method", options=["Delta", "LinReg"])
+    // Delta: SMA_now - SMA_[slopeLen]
+    // LinReg: regression-based slope sign over slopeLen
+
+atrLen         = input.int(22,  "ATR Length", minval=1)
+stopAtrMult    = input.float(4, "Trailing Stop ATR Mult", step=1)
+tpAtrMult      = input.float(10.0, "Take Profit ATR Mult", step=1)
+UseTpPrice     =    input.bool(false, "Use Target Price exits")
+
+stochThresh    = input.float(30, "Stoch %K Threshold", step=1)
+stochLookback   = input.int(3, "Lookup back days used in pullback testing", step=1)
+posDollar      = input.float(25000, "Stock/ETF Position $", step=1000)
+futContracts   = input.int(1, "Futures Contracts", minval=1)
+
+tradeOnClose   = input.bool(true, "Trade on Bar Close Only (Recommended)")
+showRegimeBg   = input.bool(false, "Color Background by Regime")
+showPnLTable   = input.bool(true, "Show Regime P&L Table")
+
+//useEntryATRForTrail = input.bool(false, "Use Entry ATR for Trailing Stop? (else uses current ATR)")
+
+// New: prevent same-bar exits (recommended ON)
+preventSameBarExit = input.bool(true, "Prevent exits on entry bar")
+
+//to help with early exits...
+minHoldBars      = input.int(1, "Minimum hold bars AFTER entry", minval=0)
+trailActivateATR = input.float(0, "Activate trailing AFTER profit >= X ATR (0 = immediate)", step=1)
+atrRefMode       = input.string("Entry", "ATR reference for trailing stop",
+                 options=["Entry", "Max(Entry,Current)", "Current"])
+
+
+//==============================
+// Regime trade toggles (NEW)
+//==============================
+tradeRegime1 = input.bool(true,  "Allow trading in Regime 1 (Uptrend)")
+tradeRegime2 = input.bool(true,  "Allow trading in Regime 2 (Bullish Reversal)")
+tradeRegime3 = input.bool(false, "Allow trading in Regime 3 (Downtrend)")
+tradeRegime4 = input.bool(false, "Allow trading in Regime 4 (Bearish Reversal)")
+tradeRegime0 = input.bool(false, "Allow trading when Regime = 0 (No classification)")
+
+//==============================
+// Trading permission by regime (NEW)
+//==============================
+
+
+//==============================
+// Helpers
+//==============================
+f_slope_up(src, len, method) =>
+    method == "Delta" ? (src - src[len] > 0) : (ta.sma(ta.change(ta.linreg(src, len, 0)), 1) > 0)
+
+f_slope_dn(src, len, method) =>
+    method == "Delta" ? (src - src[len] < 0) : (ta.sma(ta.change(ta.linreg(src, len, 0)), 1) < 0)
+
+// Safer bar gating (use confirmed close for signal generation)
+barOk = tradeOnClose ? barstate.isconfirmed : true
+
+//==============================
+// Indicators
+//==============================
+fastSMA = ta.sma(close, fastSmaLen)
+medSMA  = ta.sma(close, medSmaLen)
+slowSMA = ta.sma(close, slowSmaLen)
+
+stochK  = ta.stoch(close,high, low, stochLen)
+atr     = ta.atr(atrLen)
+
+//==============================
+// Regimes
+//==============================
+fastUp   = f_slope_up(fastSMA, slopeLen, slopeMethod)
+fastDown = f_slope_dn(fastSMA, slopeLen, slopeMethod)  // optional
+medUp    = f_slope_up(medSMA,  slopeLen, slopeMethod)
+medDown  = f_slope_dn(medSMA,  slopeLen, slopeMethod)
+slowUp   = f_slope_up(slowSMA, slopeLen, slopeMethod)
+slowDown = f_slope_dn(slowSMA, slopeLen, slopeMethod)
+
+// 1. Med > Slow and slope of both up = uptrend
+regime1 = (medSMA > slowSMA) and medUp and slowUp and fastUp
+
+// 2. Med > Slow and slope of Slow down = bullish reversal
+regime2a = (medSMA > slowSMA) and slowDown and medUp
+regime2b = fastUp and medUp and slowUp
+regime2c = (medSMA > slowSMA) and medUp and slowUp and fastDown
+regime2 = regime2a or regime2b or regime2c
+
+// 3. Med < Slow and slope of both down = downtrend
+regime3 = (medSMA < slowSMA) and medDown and slowDown
+
+// 4. Med < Slow and slope of Slow up = bearish reversal
+regime4 = (medSMA < slowSMA) and (slowUp or medUp)
+regimeId = regime1 ? 1 : regime2 ? 2 : regime3 ? 3 : regime4 ? 4 : 0
+
+tradeAllowed =
+     (regimeId == 1 and tradeRegime1) or
+     (regimeId == 2 and tradeRegime2) or
+     (regimeId == 3 and tradeRegime3) or
+     (regimeId == 4 and tradeRegime4) or
+     (regimeId == 0 and tradeRegime0)
+
+//==============================
+// Background coloring (already correct: global scope call)
+//==============================
+regimeBgColor =
+     not showRegimeBg ? na :
+     regime1 ? color.new(color.green, 75) :
+     regime2 ? color.new(color.green, 85) :
+     regime3 ? color.new(color.red,   75) :
+     regime4 ? color.new(color.red,   85) : na
+
+bgcolor(regimeBgColor)
+
+//==============================
+// Pullback definition
+//==============================
+stochWasBelow = ta.lowest(stochK, stochLookback) < stochThresh
+closeWasBelowFastSMA = ta.lowest(close - fastSMA, stochLookback) < 0
+
+pullback =  stochWasBelow or  closeWasBelowFastSMA //(close < fastSMA) //(stochK < stochThresh)
+newPullback = pullback and not pullback[1]  // pullback just started
+
+// --- One-shot arming so we only signal once per pullback episode ---
+var bool pullbackArmed = false
+if newPullback
+    pullbackArmed := true
+    
+//==============================
+// Entry logic
+// Trigger evaluated on bar close; entry fills NEXT bar open
+//==============================
+bullishRegime = tradeAllowed //regime1 or regime2
+
+// finds high of the lowest low in the last lookbackdays
+llOffset = math.abs(ta.lowestbars(low[1], stochLookback))      // 0 = current bar is lowest low, 1 = 1 bar ago, etc.
+float refHigh = na
+if not na(llOffset)
+    refHigh := high[llOffset+1]
+
+entrySignalRaw =
+     bullishRegime and pullback and
+     (close > open) and
+     (close > refHigh)
+entrySignal = entrySignalRaw and pullbackArmed
+
+plotshape(
+     entrySignal and barOk,
+     title="Entry Arrow",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.new(color.lime, 0),
+     size=size.tiny,
+     text="▲")
+
+//rearms entrysignal
+if entrySignal and barOk
+    pullbackArmed := false
+
+//==============================
+// Position sizing
+// NOTE: uses trigger bar close for share calc.
+// If you want $25k sized off NEXT open, tell me and I'll adjust.
+//==============================
+isFutures = (syminfo.type == "futures")
+qty = isFutures ? futContracts : math.max(1, math.floor(posDollar / close))
+
+//==============================
+// Trade management variables
+//==============================
+var float entryPrice  = na
+var float entryATR    = na
+var int   entryRegime = 0
+var int   entryBarIdx = na     // <-- New: bar index where entry fill occurred
+
+//to help with early exits
+var float hhSinceEntry  = na
+var float trailStop     = na
+var bool  trailArmed    = false
+
+justEntered = (strategy.position_size > 0) and (strategy.position_size[1] <= 0)
+
+// On entry fill bar (which is next day open), record entry details
+if justEntered
+    entryPrice  := strategy.position_avg_price
+    entryATR    := atr
+    entryRegime := regimeId
+    entryBarIdx := bar_index
+    hhSinceEntry    := high
+    trailStop   := entryPrice - stopAtrMult * entryATR //initial protective stop
+    trailArmed   := (trailActivateATR <= 0)
+
+// Reset when flat
+if (strategy.position_size == 0) and (strategy.position_size[1] == 0)
+    entryPrice   := na
+    entryATR     := na
+    entryRegime  := 0
+    entryBarIdx  := na
+    hhSinceEntry := na
+    trailStop    := na
+    trailArmed   := false
+
+
+//handle early exits,,
+
+if strategy.position_size > 0
+    // update highest high since entry
+    hhSinceEntry := na(hhSinceEntry) ? high : math.max(hhSinceEntry, high)
+
+// arm trailing only after price moves in favor by X ATR (if configured)
+if not trailArmed and not na(entryPrice) and not na(entryATR)
+    trailArmed := hhSinceEntry >= entryPrice + trailActivateATR * entryATR
+
+
+//==============================
+// Submit orders
+// Places order on trigger bar close; fills next bar open
+//==============================
+if entrySignal and barOk and strategy.position_size == 0
+    strategy.entry("L", strategy.long, qty=qty)
+
+// Sets which ATR to use for the trailing stop. 
+atrRef =
+     atrRefMode == "Entry" ? entryATR :
+     atrRefMode == "Max(Entry,Current)" ? math.max(entryATR, atr) :
+     atr
+
+
+// Take profit based on ENTRY ATR (your spec: X ATR from entry)
+tpPrice = (UseTpPrice and not na(entryPrice) and not na(entryATR)) ? (entryPrice + entryATR * tpAtrMult) : na
+
+//if UseTpPrice
+//    tpPrice = (not na(entryPrice) and not na(entryATR)) ? (entryPrice + entryATR * tpAtrMult) : na
+//else
+//    tpPrice = 0
+
+candidateStop = (strategy.position_size > 0 and trailArmed and not na(hhSinceEntry) and not na(atrRef)) ? (hhSinceEntry - stopAtrMult * atrRef) : na
+
+// Trail stop should NEVER move down
+if strategy.position_size > 0 and not na(candidateStop)
+    trailStop := na(trailStop) ? candidateStop : math.max(trailStop, candidateStop)
+
+// Gate exits: no same-bar exit + optional minimum hold bars
+barsSinceEntry = not na(entryBarIdx) ? (bar_index - entryBarIdx) : na
+exitAllowed = strategy.position_size > 0 and
+     (not preventSameBarExit or (barsSinceEntry >= 1)) and
+     (na(barsSinceEntry) ? false : (barsSinceEntry >= minHoldBars))
+
+
+if exitAllowed
+    strategy.exit(
+         id="L-exit",
+         from_entry="L",
+         stop=trailStop,
+         limit=tpPrice)
+else
+    strategy.cancel("L-exit")
+
+
+plot(strategy.position_size > 0 ? tpPrice : na, "Long Target", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? trailStop : na, "Stop Limit", color=color.blue, style=plot.style_circles, linewidth=1)
+
+
+
+//==============================
+// Regime-based P&L tracking
+//==============================
+var int   lastClosedCount = 0
+var float pnlR1 = 0.0
+var float pnlR2 = 0.0
+var float pnlR3 = 0.0
+var float pnlR4 = 0.0
+var int   tradesR1 = 0
+var int   tradesR2 = 0
+var int   tradesR3 = 0
+var int   tradesR4 = 0
+
+if strategy.closedtrades > lastClosedCount
+    idx = strategy.closedtrades - 1
+    tradeProfit = strategy.closedtrades.profit(idx)
+
+    if entryRegime == 1
+        pnlR1 += tradeProfit
+        tradesR1 += 1
+    else if entryRegime == 2
+        pnlR2 += tradeProfit
+        tradesR2 += 1
+    else if entryRegime == 3
+        pnlR3 += tradeProfit
+        tradesR3 += 1
+    else if entryRegime == 4
+        pnlR4 += tradeProfit
+        tradesR4 += 1
+
+    lastClosedCount := strategy.closedtrades
+ttlpnl = pnlR1+pnlR2+pnlR3+pnlR4
+ttltrades = tradesR1+tradesR2+tradesR3+tradesR4
+
+//==============================
+// Plots for verification
+//==============================
+plot(fastSMA, "FastSMA", color=color.new(color.teal, 0), linewidth=2)
+plot(medSMA,  "MedSMA",  color=color.new(color.orange, 0), linewidth=2)
+plot(slowSMA, "SlowSMA", color=color.new(color.blue, 0), linewidth=2)
+
+//==============================
+// Table output
+//==============================
+var table t = table.new(position.top_right, 4, 7, border_width=1)
+f_fmt(x) => str.tostring(x, "#,000")
+
+if showPnLTable and barstate.islast
+    table.cell(t, 0, 0, "Regime", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 0, "Trades", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 2, 0, "P&L",    text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 3, 0, "Notes",  text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 1, "1 Uptrend", text_color=color.white)
+    table.cell(t, 1, 1, str.tostring(tradesR1), text_color=color.white)
+    table.cell(t, 2, 1, f_fmt(pnlR1), text_color=(pnlR1>=0?color.lime:color.red))
+//    table.cell(t, 3, 1, "Med>Slow, both slopes up")
+
+    table.cell(t, 0, 2, "2 Bull Rev", text_color=color.white)
+    table.cell(t, 1, 2, str.tostring(tradesR2), text_color=color.white)
+    table.cell(t, 2, 2, f_fmt(pnlR2), text_color=(pnlR2>=0?color.lime:color.red))
+//    table.cell(t, 3, 2, "Med>Slow, Slow slope down")
+
+    table.cell(t, 0, 3, "3 Downtrend", text_color=color.white)
+    table.cell(t, 1, 3, str.tostring(tradesR3), text_color=color.white)
+    table.cell(t, 2, 3, f_fmt(pnlR3), text_color=(pnlR3>=0?color.lime:color.red))
+//    table.cell(t, 3, 3, "Med<Slow, both slopes down")
+
+    table.cell(t, 0, 4, "4 Bear Rev", text_color=color.white)
+    table.cell(t, 1, 4, str.tostring(tradesR4), text_color=color.white)
+    table.cell(t, 2, 4, f_fmt(pnlR4), text_color=(pnlR4>=0?color.lime:color.red))
+//    table.cell(t, 3, 4, "Med<Slow, Slow slope up")
+
+    table.cell(t, 0, 5, "Active Regime", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 5, str.tostring(regimeId), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 2, 5, "StochK", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 3, 5, str.tostring(stochK, format.mintick), text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    table.cell(t, 0, 6, "Total P&L", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 6, str.tostring(ttltrades), text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 2, 6, f_fmt(ttlpnl), text_color=color.white, bgcolor=color.new(color.black, 0))

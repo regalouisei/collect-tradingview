@@ -1,0 +1,140 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pechka_Rider
+
+//@version=6
+indicator("RSI Cascade Divergences", "RSI:CD", max_lines_count = 500, max_labels_count = 500)
+
+// { Inputs
+rsiSource       = input.source(close, "RSI Source", group = "RSI Settings")
+rsiLength       = input.int(14, "RSI Length", 1, group = "RSI Settings")
+rsiOB           = input.float(70, "RSI Overbought", 50, 100, group = "RSI Settings")
+rsiOS           = input.float(30, "RSI Oversold", 0, 50, group = "RSI Settings")
+
+pivotLeft       = input.int(4, "Pivot Length", 1, 50, group = "Divergence Settings", tooltip = "Number of bars to the left used to confirm an RSI swing high/low.")
+pivotRight      = input.int(1, "Pivot Confirm", 1, 50, group = "Divergence Settings", tooltip = "Number of bars to the right required to confirm an RSI swing high/low. Higher values reduce noise but delay detection of divergences.")
+minTreshold     = input.float(0, "Min. RSI Distance", 0, 100, 0.1, group = "Divergence Settings", tooltip = "Minimum RSI difference between two pivot points required to qualify as a divergence. This filters out extremely small RSI deviations.")
+bullMinStren    = input.int(3, "Min. Strength: Bull", 1, 10, group = "Divergence Settings", tooltip = "Minimum required cascade strength for a bullish divergence to be highlighted. Strength increases when multiple RSI swing lows form valid consecutive divergence structures. If the divergence crosses the Oversold level, it gains 1 additional strength point.")
+bearMinStren    = input.int(3, "Min. Strength: Bear", 1, 10, group = "Divergence Settings", tooltip = "Minimum required cascade strength for a bearish divergence to be highlighted. Strength increases when multiple RSI swing highs form valid consecutive divergence structures. If the divergence crosses the Overbought level, it gains 1 additional strength point.")
+
+useBullFilter   = input.bool(false, "Bull Filter", inline = "bullF", group = "External Filters")
+bullFilterSrc   = input.source(close, "", inline = "bullF", group = "External Filters", display = display.data_window)
+useBearFilter   = input.bool(false, "Bear Filter", inline = "bearF", group = "External Filters")
+bearFilterSrc   = input.source(close, "", inline = "bearF", group = "External Filters", display = display.data_window)
+
+lineWidth       = input.int(2, "Lines Width", 1, 5, group = "Visual", display = display.none, tooltip = "Thickness of divergence lines drawn between pivot points.")
+labelSize       = input.int(15, "Labels Size", 1, 30, group = "Visual", display = display.none, tooltip = "Size of the numeric strength labels displayed above or below bars. Small triangles have a fixed size. Their style and color can be customized in the style tab.")
+bullCol         = input.color(color.new(color.green, 25), "Bull Color", group = "Visual")
+bearCol         = input.color(color.new(color.red, 25), "Bear Color", group = "Visual")
+// }
+
+// { Type Declaration
+type pivot
+    bool isHigh
+    chart.point point
+    float src
+    int strength = 0
+//}
+
+// { Var variables
+var pivot[] highPivots = array.new<pivot>()
+var pivot[] lowPivots = array.new<pivot>()
+var int atrLength = rsiLength + pivotLeft + pivotRight
+// }
+
+// { Functions and Methods
+method updatePivots(pivot[] this, pivot new) =>
+    int i = 0
+    while i < this.size()
+        pivot old = this.get(i)
+        if (old.isHigh ? old.point.price < new.point.price : old.point.price > new.point.price)
+            this.remove(i)
+        else
+            i += 1
+    this.push(new)
+
+method calcStrength(pivot[] this) =>
+    int strength = 0
+    if this.size() > 1
+        pivot last = this.last()
+        pivot prev = this.get(-2)
+        bool diverCond = last.isHigh ? (last.point.price < prev.point.price and last.src > prev.src) : (last.point.price > prev.point.price and last.src < prev.src)
+        bool tresholdCheck = math.abs(last.point.price - prev.point.price) >= minTreshold
+        bool leftValueCheck = prev.strength > 0 or (last.isHigh ? prev.point.price > rsiOB : prev.point.price < rsiOS)
+        if diverCond and tresholdCheck and leftValueCheck
+            int currentStrength = last.isHigh ? (prev.point.price > rsiOB and last.point.price < rsiOB ? 2 : 1) : (prev.point.price < rsiOS and last.point.price > rsiOS ? 2 : 1)
+            last.strength := prev.strength + currentStrength
+        strength := last.strength
+    strength
+
+findDivergence(bool isHigh, float value, pivot[] pivotsArr, float border) =>
+    int diverStrength = 0
+    if not na(value) and (pivotsArr.size() > 0 or (isHigh ? value > border : value < border))
+        chart.point point = chart.point.new(time[pivotRight], bar_index[pivotRight], value)
+        pivotsArr.updatePivots(pivot.new(isHigh, point, rsiSource[pivotRight]))
+        diverStrength := pivotsArr.calcStrength()
+    diverStrength
+
+drawLine(pivot left, pivot right) =>
+    bool dotted = right.isHigh ? right.strength < bearMinStren : right.strength < bullMinStren
+    line.new(left.point, right.point, xloc.bar_index, extend.none, right.isHigh ? bearCol : bullCol, dotted ? line.style_dotted : line.style_solid, lineWidth)
+// }
+
+// { Calculations
+float rsi = ta.rsi(rsiSource, rsiLength)
+float ph = ta.pivothigh(rsi, pivotLeft, pivotRight)
+float pl = ta.pivotlow(rsi, pivotLeft, pivotRight)
+float labelOffset = ta.atr(atrLength) / 3
+int bullDiverStren = 0 
+int bearDiverStren = 0 
+bool bullDiver = false
+bool bearDiver = false
+bool bullFilter = useBullFilter ? bool(bullFilterSrc) : true
+bool bearFilter = useBearFilter ? bool(bearFilterSrc) : true
+
+if barstate.isconfirmed
+    bullDiverStren := findDivergence(false, pl, lowPivots, rsiOS)
+    bearDiverStren := findDivergence(true, ph, highPivots, rsiOB)
+    bullDiver := bullDiverStren >= bullMinStren and bullFilter
+    bearDiver := bearDiverStren >= bearMinStren and bearFilter
+
+    if bullDiverStren > 0
+        drawLine(lowPivots.get(-2), lowPivots.last())
+
+    if bearDiverStren > 0
+        drawLine(highPivots.get(-2), highPivots.last())
+
+    if bullDiver
+        label.new(bar_index, low - labelOffset, str.tostring(bullDiverStren), xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, bullCol, labelSize, force_overlay = true)
+
+    if bearDiver
+        label.new(bar_index, high + labelOffset, str.tostring(bearDiverStren), xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_down, bearCol, labelSize, force_overlay = true)
+
+    if rsi > rsiOB
+        lowPivots.clear()
+
+    if rsi < rsiOS
+        highPivots.clear()
+// }
+
+// { Plotting
+plotshape(bullDiver, "Bull Divergence", shape.triangleup, location.belowbar, bullCol, size = size.tiny, display = display.pane, force_overlay = true)
+plotshape(bearDiver, "Bear Divergence", shape.triangledown, location.abovebar, bearCol, size = size.tiny, display = display.pane, force_overlay = true)
+
+rsiPlot = plot(rsi, "RSI", #7E57C2)
+rsiUpperBand = hline(rsiOB, "RSI Overbought", #787B86)
+rsiLowerBand = hline(rsiOS, "RSI Oversold", #787B86)
+fill(rsiUpperBand, rsiLowerBand, color.rgb(126, 87, 194, 90), "RSI Background Fill")
+midLinePlot = plot(50, "Level 50 (Internal)", na, editable = false, display = display.none)
+fill(rsiPlot, midLinePlot, 100, rsiOB, color.new(color.green, 0), color.new(color.green, 100), "Overbought Gradient Fill")
+fill(rsiPlot, midLinePlot, rsiOS,  0, color.new(color.red, 100), color.new(color.red, 0), "Oversold Gradient Fill")
+// }
+
+// { Alerts
+alertcondition(bullDiver, "Bullish Divergence Alert", "Bullish Divergence Detected")
+alertcondition(bearDiver, "Bearish Divergence Alert", "Bearish Divergence Detected")
+
+if bullDiver
+    alert(syminfo.tickerid + " \'" + timeframe.period + "\'\n" + str.format("Bullish Divergence: {0}", bullDiverStren))
+if bearDiver
+    alert(syminfo.tickerid + " \'" + timeframe.period + "\'\n" + str.format("Bearish Divergence: {0}", bearDiverStren))
+// }

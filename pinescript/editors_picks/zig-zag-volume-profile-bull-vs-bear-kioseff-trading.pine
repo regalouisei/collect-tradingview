@@ -1,0 +1,624 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © KioseffTrading
+
+//@version=5
+indicator("Zig-Zag Volume Profile [Kioseff Trading]", max_lines_count = 500, max_labels_count = 500, overlay= true, max_polylines_count = 100, max_boxes_count = 500)
+
+import TradingView/ZigZag/6 as ZigZagLib
+import RicardoSantos/MathOperator/2
+
+
+ROWS          = input.int   (defval = 2000, maxval = 9998, minval = 10, step = 10, title = "Profile Rows", group = "Profile Settings")
+factor        = input.float (defval = 2.5, minval = 1.1, step = 0.1, title = "Scaling Factor", group = "Profile Settings")
+offset        = input.int   (defval = 1, title = "Offset Placement", minval = 1, group = "Profile Settings")
+curve         = input.bool  (defval = false, title = "Curved Profiles", group = "Profile Settings")
+same          = input.string(defval = "Middle", title = "VP Plot Type", options = ["Middle", "Same Side", "Opposing Side"], group = "Profile Settings")
+upCol         = input.color (defval = #14D990, title = "Bull Color", group = "Profile Settings")
+dnCol         = input.color (defval = #F24968, title = "Bear Color", group = "Profile Settings")
+transp        = input.int   (defval = 90, minval = 0, maxval = 100,    group = "Profile Settings", title = "Pofile Fill Transparency")
+transp2       = input.int   (defval = 0 , minval = 0, maxval = 100,    group = "Profile Settings", title = "Pofile Line Transparency")
+
+delta         = input.bool  (defval = false, title = "Show Delta", group = "Delta Settings")
+deltaRows     = input.int   (defval = 20, minval = 5, title = "Delta Rows", group = "Delta Settings")
+deltaSz       = input.string(defval = "Tiny", title = "Delta Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = "Delta Settings")
+
+poc           = input.bool  (defval = false, title = "Show POC", group = "POC Settings")
+delet         = input.bool  (defval = false, title = "Delete Violated POCs",  group = "POC Settings")
+poctype       = input.string(defval = "Bull & Bear POC", title = "POC Type", options = ["Bull & Bear POC", "Regular POC"], group = "POC Settings")
+show          = input.int   (defval = 20, title = "Historical POCs To Show", maxval = 250, minval = 1, group = "POC Settings") 
+livepoc       = input.bool  (defval = false, title = "Live POC Only", group = "POC Settings")
+transp3       = input.int   (defval = 15, minval = 0, maxval = 100, group = "POC Settings", title = "POC Line Transparency")
+generalPOCcol = input.color (defval = color.yellow, title = "Regular POC Col", group = "POC Settings")
+
+showVA        = input.bool  (defval = false, title = "Show Value Area Lines", group = "Value Area Settings")
+vaCumu        = input.float (defval = 70, title = "Value Area %", group = "Value Area Settings", minval = 5, maxval = 95) / 100
+transp4       = input.int   (defval = 66, title = "VA Lines Transparency", group = "Value Area Settings", minval = 0, maxval = 100)
+vatype        = input.string(defval = "Bull & Bear VA", title = "Value Area Type", group = "Value Area Settings", options = ["Bull & Bear VA", "Regular VA"])
+showVAS       = input.int   (defval = 20, title = "Historical Value Areas To Show", maxval = 250, minval = 1, group = "Value Area Settings") 
+liveVAS       = input.bool  (defval = false, title = "Live Value Areas Only", group = "Value Area Settings")
+deletv        = input.bool  (defval = false, title = "Delete Violated VAs",  group = "Value Area Settings")
+generalVAcol  = input.color (defval = color.white, title = "Regular VA Col", group = "Value Area Settings")
+
+
+N             = bar_index
+
+show := switch poctype 
+    
+    "Regular POC" => show + 1 
+    =>               show * 2
+
+showVAS := switch vatype 
+    
+    "Regular VA"  => showVAS * 2 + 1
+    =>               showVAS * 4 + 1
+
+if curve 
+    ROWS := 60 
+if same == "Middle" 
+    offset := 0
+
+// Create Zig Zag instance from user settings.
+var zigZag = ZigZagLib.newInstance(
+  ZigZagLib.Settings.new(
+      input.float(0.00001, "Price deviation for reversals (%)", 0.00001, 100.0, 0.5, "0.00001 - 100", group = "Zig Zag Settings"),
+      input.int(100, "Pivot legs", 2, group = "Zig Zag Settings"),
+      input(color.new(color.white,50), "Line color", group = "Zig Zag Settings"),
+      false, // input(false, "Extend to last bar"),
+      input(false, "Display reversal price", group = "Zig Zag Settings"),
+      input(false, "Display cumulative volume", group = "Zig Zag Settings"),
+      input(false, "Display reversal price change", inline = "priceRev", group = "Zig Zag Settings"),
+      input.string("Absolute", "", ["Absolute", "Percent"], inline = "priceRev", group = "Zig Zag Settings"),
+      true)
+ ),   atr = ta.atr(14)
+
+
+zigZag.update()
+
+
+type dataStore
+
+    matrix <float>        timeVolMat 
+    matrix <float>        HLmat
+    array  <int>          retArr 
+    array  <box>          pocs 
+    matrix <float>        tickLevels
+    array  <label>        deltaLabels
+    map    <float, float> mappedLevel
+    array  <box>          vas
+
+var data = dataStore.new(matrix.new<float>(2, 0), matrix.new<float>(2, 0), array.new_int(), array.new_box(), vas = array.new_box()),                                                                                                                                                                       //kioseff
+tLevels  = dataStore.new(tickLevels = matrix.new<float>(3, ROWS, 0.0)) 
+
+determine( a, b, c) => 
+
+    result = switch same 
+
+        "Opposing Side" => a
+        "Same Side"     => b
+        "Middle"        => c
+
+method double_binary_search_leftmost(array <float> id, i) =>
+
+    n  = id .binary_search_leftmost  (data.HLmat.get(0, i))
+    n1 = id .binary_search_leftmost  (data.HLmat.get(1, i))
+
+    [n, n1]
+
+method double_binary_search_leftmost_delta(array <float> id, top, btm) =>
+
+    n   = id .binary_search_leftmost  (top)
+    n1  = id .binary_search_leftmost  (btm)
+
+    [n, n1]
+
+method effSwitch(matrix<float> id, i, x, div, subtract) =>
+
+    switch data.retArr.get(i)
+
+        1  => id.set(1, x, id.get(1, x) + data.timeVolMat.get(1, i - subtract) / div)
+        -1 => id.set(2, x, id.get(2, x) + data.timeVolMat.get(1, i - subtract) / div)
+
+
+method keyLevelsCheck(array<box> id, array<float> timeRow, getx2, usePOC) =>
+
+
+    for i = 0 to timeRow.indexof(getx2) - 1
+
+        if data.HLmat.get(0, i) >= id.last().get_top() and data.HLmat.get(1, i) <= id.last().get_top()
+            id.last().set_right(N - i)
+
+        if usePOC 
+            if poctype == "Bull & Bear POC"
+            
+                if data.HLmat.get(0, i) >= id.get(id.size() - 2).get_top() and data.HLmat.get(1, i) <= id.get(id.size() - 2).get_top()
+                    id.get(id.size() - 2).set_right(N - i)
+        else 
+            if vatype == "Bull & Bear VA"
+
+                for x = 2 to 4
+
+                    if data.HLmat.get(0, i) >= id.get(id.size() - x).get_top() and data.HLmat.get(1, i) <= id.get(id.size() - x).get_top()
+                        id.get(id.size() - x).set_right(N - i)
+            else 
+            
+                if data.HLmat.get(0, i) >= id.get(id.size() - 2).get_top() and data.HLmat.get(1, i) <= id.get(id.size() - 2).get_top()
+                    id.get(id.size() - 2).set_right(N - i)
+
+method drawPOC(array<box> id, difference, idrow, check, newRowUp, newRowDn, remove, array<float> timeRow = na, int getx2 = na, int getx = na, cond1 = false) => 
+    
+    if remove 
+        if id.size() > 0 
+            for i = 0 to id.size() - 1
+                id.shift().delete()
+
+    if poc 
+
+        start = switch
+
+            same == "Middle" => cond1 ?  math.round(math.avg(last_bar_index, last_bar_index - timeRow.indexof(line.all.last().get_x2()))) : 
+                                         N - math.round(math.avg(timeRow.indexof(getx), timeRow.indexof(getx2))) + 1
+            =>                  difference  + offset - 1
+
+        if poctype == "Bull & Bear POC"
+
+            id.push(box.new(start, idrow.get(newRowUp.indexof(newRowUp.max())), N, idrow.get(newRowUp.indexof(newRowUp.max())) ,
+                     bgcolor = #00000000, border_color = color.new(upCol, transp3)))
+
+            id.push(box.new(start, idrow.get(newRowDn.indexof(newRowDn.max())), N, idrow.get(newRowDn.indexof(newRowDn.max())),
+                     bgcolor = #00000000, border_color = color.new(dnCol, transp3)))
+
+        else 
+
+            for i = 0 to newRowUp.size() - 1
+                newRowUp.set(i, newRowUp.get(i) + newRowDn.get(i))
+
+            id.push(box.new(start, idrow.get(newRowUp.indexof(newRowUp.max())), N, idrow.get(newRowUp.indexof(newRowUp.max())) ,
+                     bgcolor = #00000000, border_color = color.new(generalPOCcol, transp3)))
+
+        if check
+
+            id.keyLevelsCheck(timeRow, getx2, true)
+
+method setLevels(matrix<float> id, float gety, float gety2, cond) =>
+
+    rows = math.abs(gety2 - gety) / (ROWS - 1)
+
+    start = switch cond 
+
+        false => math.min(gety, gety2)
+        =>       gety
+
+    for i = 0 to ROWS - 1
+        id.set(0, i, start + rows * i)
+
+method createPoly(matrix<chart.point> id, array<float> timeRow, int add, int getx2, int getx, bool cond, int difference, 
+                                     array<float> idrow, array<float> lows, array<float> highs) => 
+
+    avg = switch cond 
+
+        false => math.round(math.avg(timeRow.indexof(getx2), timeRow.indexof(getx)))
+        =>       math.round(math.avg(last_bar_index, last_bar_index - timeRow.indexof(line.all.last().get_x2())))
+
+    add2 = determine(N - timeRow.indexof(getx2), N - avg, add)    
+
+    oper = switch cond
+
+        false => determine(add2 - offset + 1, add  + offset - 1, N - avg + 1)
+        =>       determine(N  - offset + 1, difference + offset - 1, avg)
+
+
+    [finx, finDn, finUp] = if same != "Middle"    
+
+        switch cond 
+
+            false => [add + offset - 1, idrow.min(), idrow.max()]
+            =>       [difference + offset - 1, lows.min(), highs.max()]
+
+    else 
+
+        switch cond 
+
+            false => [N - avg + 1, idrow.min(), idrow.max()]
+            =>       [avg, lows.min(), highs.max()]
+
+    id.add_col(0, 
+             array.from(chart.point.from_index(finx, finDn) ,chart.point.from_index(oper, finDn)))
+
+    id.add_col(id.columns(), 
+             array.from(chart.point.from_index(finx, finUp),chart.point.from_index(oper, finUp))) 
+
+    polyline.new(id.row(0), fill_color = color.new(upCol, transp), line_color  = color.new(upCol, transp2), curved = curve)
+    polyline.new(id.row(1), fill_color = color.new(dnCol, transp), line_color  = color.new(dnCol, transp2), curved = curve)
+
+
+norm(newRowUp, newRowDn, oldMin, oldMax, newRange, i) => 
+
+    calcUp = 1 + ((newRowUp.get(i) - oldMin) / (oldMax - oldMin)) * (newRange - 1)
+    calcDn = 1 + ((newRowDn.get(i) - oldMin) / (oldMax - oldMin)) * (newRange - 1)
+
+    [calcUp, calcDn]
+
+
+method calcDelta(array<float> id, array<float> newRowUp, array<float> newRowDn, float getY, float getY2, int middle) => 
+ 
+    if delta 
+
+        var dsz = switch deltaSz
+
+            "Tiny"   => size.tiny 
+            "Small"  => size.small 
+            "Normal" => size.normal 
+            "Large"  => size.large
+            "Huge"   => size.huge
+
+        db           = dataStore.new(mappedLevel = map.new<float, float>(), deltaLabels = array.new_label())
+        var lastdb   = dataStore.new(deltaLabels = array.new_label())     
+        var liveBox  = array.new_box()
+
+        if lastdb.deltaLabels.size() > 0 
+            for i = lastdb.deltaLabels.size() - 1 to 0 
+                lastdb.deltaLabels.remove(i).delete()
+
+        if liveBox.size() > 0 
+            liveBox.remove(0).delete() 
+
+        newSlice = (math.max(getY, getY2) - math.min(getY, getY2)) / deltaRows
+
+        idx = switch bar_index == last_bar_index
+
+            true => lastdb.deltaLabels
+            =>      db.deltaLabels
+
+        for i = 0 to deltaRows - 1
+                
+            db.mappedLevel.put(i, 0.0)
+
+            btm = math.min(getY, getY2) + (newSlice * i)
+            top = math.min(getY, getY2) + (newSlice * (i + 1))
+
+            idx.push(label.new(chart.point.from_index(middle, math.avg(top, btm)),
+                             textcolor = color.white, style = label.style_none, color = #00000000, size = dsz))
+
+            [topCol, btmCol] = id.double_binary_search_leftmost_delta(top, btm)
+
+            for x = btmCol to topCol
+
+                db.mappedLevel.put(i, db.mappedLevel.get(i) + (newRowUp.get(x) - newRowDn.get(x)))
+
+        valArr = db.mappedLevel.values(), valArr.sort(order.ascending), array <float> pos = na, array <float> neg = na
+
+        if valArr.last ().over (0)
+            pos := valArr.slice(   valArr.binary_search_rightmost(0), valArr.size())
+        if valArr.first().under(0)
+            neg := valArr.slice(0, valArr.binary_search_leftmost (0))
+
+        for i = 0 to deltaRows - 1
+
+            col = switch math.sign(db.mappedLevel.get(i))
+
+                1  => color.from_gradient(db.mappedLevel.get(i), pos.min(), pos.max(), color.new(upCol, 50), color.new(upCol, 10))
+                -1 => color.from_gradient(db.mappedLevel.get(i), neg.max(), neg.min(), color.new(dnCol, 10), color.new(dnCol, 50))
+                =>    color.new(color.white, 75)
+
+            idx.get(i).set_textcolor        (col),
+            idx.get(i).set_text(str.tostring(db.mappedLevel.get(i), format.volume))
+
+        sumCol = switch math.sign(newRowUp.sum() - newRowDn.sum())
+
+            1  => upCol
+            -1 => dnCol 
+            =>  color.white
+
+
+        if bar_index < last_bar_index
+
+            box.new(chart.point.from_index(middle - 5, math.max(getY, getY2) + atr * 2), chart.point.from_index(middle + 5, math.max(getY, getY2) + atr), 
+                                                  bgcolor      = color.new(sumCol, 80), 
+                                                  text_color   = color.white, 
+                                                  border_color = sumCol, 
+                                                  text         = str.tostring(newRowUp.sum() - newRowDn.sum(), format.volume))
+        if bar_index == last_bar_index 
+
+            liveBox.push(box.new(chart.point.from_index(middle - 5, math.max(getY, getY2) + atr * 2), chart.point.from_index(middle + 5, math.max(getY, getY2) + atr), 
+                                                  bgcolor      = color.new(sumCol, 80), 
+                                                  text_color   = color.white, 
+                                                  border_color = sumCol, 
+                                                  text         = str.tostring(newRowUp.sum() - newRowDn.sum(), format.volume)))
+
+
+
+method calcVA(array<box> id, id2, newRowUp, newRowDn, getx, getx2, timeRow, check, remove, cond = false) => 
+
+    if showVA
+
+        if remove 
+            if id.size() > 0 
+                for i = 0 to id.size() - 1
+                    id.shift().delete()
+
+        maxU = newRowUp.indexof(newRowUp.max()), bottom  = 0, top  = 0
+        maxD = newRowDn.indexof(newRowDn.max()), bottomD = 0, topD = 0
+
+        if vatype == "Bull & Bear VA"
+
+            for i = 0 to newRowUp.size() - 1
+
+                slice = newRowUp.slice(math.max(maxU - i, 0), math.min(maxU + i + 1, newRowUp.size()))
+
+                if slice.sum() / newRowUp.sum() >= vaCumu
+
+                    bottom := math.max(maxU - i, 0)
+                    top    := math.min(maxU + i + 1, newRowUp.size() - 1)
+
+                    break
+
+            for i = 0 to newRowDn.size() - 1
+
+                slice = newRowDn.slice(math.max(maxD - i, 0), math.min(maxD + i + 1, newRowDn.size()))
+
+                if slice.sum() / newRowDn.sum() >= vaCumu
+
+                    bottomD := math.max(maxD - i, 0)
+                    topD    := math.min(maxD + i + 1, newRowDn.size() - 1)
+
+                    break
+
+        if vatype != "Bull & Bear VA"
+
+            newValues = array.new_float()
+
+            for i = 0 to newRowUp.size() - 1
+
+                newValues.push(newRowUp.get(i) + newRowDn.get(i))
+
+
+            max = newValues.indexof(newValues.max())
+
+            for i = 0 to newValues.size() - 1
+
+                slice = newValues.slice(math.max(max - i, 0), math.min(max + i + 1, newValues.size()))
+
+                if slice.sum() / newValues.sum() >= vaCumu
+
+                    bottom := math.max(max - i, 0)
+                    top    := math.min(max + i + 1, newValues.size() - 1)
+
+                    break
+            
+
+        left = if not cond 
+
+            switch same 
+
+                "Middle" => math.round(N - math.avg(timeRow.indexof(getx), timeRow.indexof(getx2))) + 1
+                =>          getx
+
+        else 
+
+            switch same 
+
+                "Middle" => math.round(math.avg(N, N - getx2))
+                =>          N - getx2 
+
+
+        if vatype == "Bull & Bear VA"
+
+            for i = 0 to 3 
+
+                [yval, colval] = switch  
+
+                    i == 0 => [bottom , upCol]
+                    i == 1 => [top    , upCol] 
+                    i == 2 => [bottomD, dnCol]
+                    i == 3 => [topD   , dnCol]
+
+                id.push(box.new(chart.point.from_index(left, id2.get(yval)), chart.point.from_index(N, id2.get(yval)), 
+                                  bgcolor = color.new(colval, transp4), border_color = color.new(colval, transp4))),
+
+        if vatype != "Bull & Bear VA"
+
+            id.push(box.new(chart.point.from_index(left, id2.get(bottom)), chart.point.from_index(N, id2.get(bottom)), 
+                                  bgcolor = color.new(generalVAcol, transp4), border_color = color.new(generalVAcol, transp4))),
+            
+            id.push(box.new(chart.point.from_index(left, id2.get(top)), chart.point.from_index(N, id2.get(top)), 
+                                  bgcolor = color.new(generalVAcol, transp4), border_color = color.new(generalVAcol, transp4))),
+                         
+
+        if check
+
+            data.vas.keyLevelsCheck(timeRow, getx2, false)
+
+        id
+
+method setCoordsHistory(matrix<chart.point> id, newRowUp, newRowDn, oldMin, oldMax, newRange, timeRow, getx, getx2, idrow) =>
+
+    avg = math.round(math.avg(timeRow.indexof(getx), timeRow.indexof(getx2)))
+
+    for i = 0 to newRowUp.size() - 1
+
+        [calcUp, calcDn] = norm(newRowUp, newRowDn, oldMin, oldMax, newRange, i)
+
+        newSwitchUp = switch same
+
+            "Middle" => N - avg + calcUp
+            =>          N - timeRow.indexof(getx) + offset - calcUp
+
+        newXUp = switch same 
+            
+            "Middle" =>  math.min(newSwitchUp, N - avg)
+            =>           math.max(newSwitchUp, N - timeRow.indexof(getx) + offset)
+
+        newSwitchDn =  determine(N - timeRow.indexof(getx2) - offset + calcDn, 
+                                 N - timeRow.indexof(getx ) + offset - calcDn, 
+                                 N - avg  - calcDn)
+
+        newXDn      =  determine(math.min(newSwitchDn, N - timeRow.indexof(getx2) - offset),
+                                 math.max(newSwitchDn, N - timeRow.indexof(getx ) + offset),
+                                 math.max(newSwitchDn, N - avg) + 2)
+
+        id.set(0, i, chart.point.from_index(math.round(newXUp), idrow.get(i)))
+        id.set(1, i, chart.point.from_index(math.round(newXDn), idrow.get(i)))
+
+
+method setCoordsLive(matrix<chart.point> id, newRowUp, newRowDn, oldMin, oldMax, newRange, difference, newLevelsMat, timeRow) =>
+
+    avg = math.round(math.avg(last_bar_index, last_bar_index - timeRow.indexof(line.all.last().get_x2())))
+
+    for i = 0 to newRowUp.size() - 1
+
+        [calcUp, calcDn] = norm(newRowUp, newRowDn, oldMin, oldMax, newRange, i)
+
+        newSwitchUp      = switch same
+
+            "Middle" =>  avg - calcUp
+            =>           difference + offset + calcUp - 1
+
+        newXUp           = switch same 
+
+            "Middle" => math.min(newSwitchUp, avg - 1)
+            =>          math.max(newSwitchUp, difference + offset)
+
+        newSwitchDn = determine( N - offset - calcDn,
+                                 difference + offset + calcDn - 1, 
+                                 avg + calcDn - 1)
+        
+        newXDn      = determine( math.min(newSwitchDn, N - offset - 1),
+                                 math.max(newSwitchDn, difference + 1),
+                                 math.max(newSwitchDn, avg + 1))
+
+        id.add_col(id.columns(), array.from(
+                         chart.point.from_index(math.round(newXUp), newLevelsMat.get(0, i)),
+                         chart.point.from_index(math.round(newXDn), newLevelsMat.get(0, i))))
+    
+method update(matrix<float> id) => 
+
+    data.timeVolMat.add_col(0, array.from(time, volume))
+    data.HLmat     .add_col(0, array.from(high, low))
+    data.retArr    .unshift(int(math.sign(close - open)))
+
+    change = line.all.size() > line.all.size()[1] and line.all.size() > 2   
+
+    if last_bar_index - N <= 10000
+ 
+        barCond = barstate.islastconfirmedhistory
+
+        [minus, minus1] = switch barCond
+
+            true => [2, 1]
+            =>      [3, 2]
+
+        if change or barCond
+
+            all = line.all, allSize = all.size()
+
+            getx  = all.get(allSize - minus) .get_x2(), gety  = all.get(allSize - minus) .get_y2()
+            getx2 = all.get(allSize - minus1).get_x2(), gety2 = all.get(allSize - minus1).get_y2()
+ 
+            id.setLevels(gety, gety2, false)
+
+            timeRow = data.timeVolMat.row(0), idrow = id.row(0)
+
+            for i = timeRow.indexof(getx) to timeRow.indexof(getx2)
+
+                [l1, l2] = idrow.double_binary_search_leftmost(i)
+
+                div = math.abs(l1 - l2) + 1
+
+                for x = l1 to l2 
+
+                    id.effSwitch(i, x, div, 0)
+
+
+            newRange = math.floor((timeRow.indexof(getx2) - timeRow.indexof(getx)) / factor)
+            newRowUp = id.row(1), newRowDn = id.row(2)
+            oldMin   = math.min(newRowUp.min(), newRowDn.min())  
+            oldMax   = math.max(newRowUp.max(), newRowDn.max())
+
+            coordinates = matrix.new<chart.point>(2, newRowUp.size())
+
+            add  = N - timeRow.indexof(getx)
+
+            coordinates.setCoordsHistory(newRowUp, newRowDn, oldMin, oldMax, newRange, timeRow, getx, getx2, idrow)
+            coordinates.createPoly(timeRow, add, getx2, getx, false, na, idrow, na, na)
+            middle = N - math.round(math.avg(timeRow.indexof(getx), timeRow.indexof(getx2))) + 1
+            idrow.calcDelta(newRowUp, newRowDn, gety, gety2, middle)
+
+            if not livepoc
+                data.pocs  .drawPOC(add, idrow, true, newRowUp, newRowDn, false, timeRow, getx2, getx)
+            if not liveVAS
+                data.vas.calcVA(idrow, newRowUp, newRowDn, getx, getx2, timeRow, true, false)
+
+realtime () => 
+
+    if barstate.islast
+
+        var keyLevelsLive    = dataStore.new(pocs = array.new_box(), vas = array.new_box())
+        var coordinates = matrix.new<chart.point>(2, 0)
+        
+        if coordinates.columns() > 0 
+
+            for i = 0 to 1
+                polyline.all.pop().delete()
+
+            for i = 0 to coordinates.columns() - 1
+                coordinates.remove_col()
+
+        timeRow    = data.timeVolMat.row(0)
+        startIndex = timeRow.indexof(line.all.last().get_x2()) 
+
+        highs = data.HLmat.row(0).slice(0, startIndex + 1)
+        lows  = data.HLmat.row(1).slice(0, startIndex + 1)
+
+        newLevelsMat = matrix.new<float>(3, ROWS, 0.0)
+        newLevelsMat.setLevels(lows.min(), highs.max(), true)
+
+        levelsArr = newLevelsMat.row(0)
+
+        for i = 0 to startIndex
+            
+            [l1, l2] = levelsArr.double_binary_search_leftmost(i)
+
+            div = math.abs(l1 - l2) + 1
+
+            for x = l1 to l2 
+
+                newLevelsMat.effSwitch(i, x, div, 0)
+
+    
+        difference = N - startIndex
+        newRange   = math.floor((N - difference) / factor)
+        newRowUp   = newLevelsMat.row(1), newRowDn = newLevelsMat.row(2)
+        oldMin     = math.min(newRowUp.min(), newRowDn.min())  
+        oldMax     = math.max(newRowUp.max(), newRowDn.max())
+
+ 
+        coordinates.setCoordsLive(newRowUp, newRowDn, oldMin, oldMax, newRange, difference, newLevelsMat, timeRow)
+        coordinates.createPoly(timeRow, na, na, na, true, difference, na, lows, highs)
+        keyLevelsLive.pocs.drawPOC(difference, levelsArr, false, newRowUp, newRowDn, true, timeRow = timeRow, cond1 = true)
+        levelsArr.calcDelta(newRowUp, newRowDn, lows.min(), highs.max(), math.round(math.avg(N, N - startIndex)))
+        keyLevelsLive.vas.calcVA(levelsArr, newRowUp, newRowDn, startIndex, startIndex, timeRow, false, true, true)
+
+
+method keyLevelsUpdate(array<box> id, int limit, bool deletinput) => 
+
+    if id.size() > 0 
+        for i = 0 to id.size() - 1
+
+            if high < id.get(i).get_top() or low > id.get(i).get_top()
+                if id.get(i).get_right() == N - 1 
+                    id.get(i).set_right(N)
+
+            else if deletinput 
+                id.get(i).delete()
+            
+            if deletinput
+                if id.get(i).get_right() != N 
+                    id.get(i).delete()
+
+    if barstate.islast 
+
+        if id.size() > limit     
+            for i = 0 to id.size() - limit 
+                id.get(i).delete()  
+
+tLevels.tickLevels.update(), data.pocs.keyLevelsUpdate(show, delet), data.vas.keyLevelsUpdate(showVAS, deletv), realtime()

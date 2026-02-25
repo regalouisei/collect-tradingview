@@ -1,0 +1,91 @@
+//@version=6
+indicator("Quant Flow Divergence Pro Engine X (Dominance vs Pressure)", shorttitle="FLOW DIV", overlay=false)
+
+//────────────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────────────
+groupCore   = "Core"
+len         = input.int(9,  "Flow Period", minval=5, maxval=200, group=groupCore)
+smoothLen   = input.int(18, "Smoothing",   minval=5, maxval=100, group=groupCore)
+useVolBoost = input.bool(true, "Use Volume Boost", group=groupCore)
+
+groupViz  = "Visuals"
+histWidth = input.int(3, "Column Thickness", minval=1, maxval=6, group=groupViz)
+
+//────────────────────────────────────────────────────────────
+// Helpers
+//────────────────────────────────────────────────────────────
+clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+
+//────────────────────────────────────────────────────────────
+// 1) DOMINANCE (buyers - sellers), normalized to -100..+100
+//    Uses CLV (close location value) + volume participation
+//────────────────────────────────────────────────────────────
+rng = math.max(high - low, syminfo.mintick)
+clv = ((close - low) - (high - close)) / rng   // [-1..+1]
+
+volCap  = 2.5
+v       = volume
+vAvg    = ta.ema(v, len)
+vFactor = (useVolBoost and vAvg != 0.0) ? math.min(v / vAvg, volCap) : 1.0
+
+rawBuy  = math.max(clv, 0.0)  * vFactor
+rawSell = math.max(-clv, 0.0) * vFactor
+
+buySm   = ta.ema(rawBuy,  smoothLen)
+sellSm  = ta.ema(rawSell, smoothLen)
+
+domRaw  = buySm - sellSm
+
+mag     = ta.highest(math.abs(domRaw), len)
+domPct  = mag != 0.0 ? 100.0 * (domRaw / mag) : 0.0
+dom     = ta.ema(domPct, math.max(1, int(math.round(smoothLen * 0.6))))
+
+//────────────────────────────────────────────────────────────
+// 2) PRESSURE (buy vs sell), scaled to 0..100
+//────────────────────────────────────────────────────────────
+scaleTo100(x, l) =>
+    float hi = ta.highest(x, l)
+    hi != 0.0 ? 100.0 * (x / hi) : 0.0
+
+buyLine  = clamp(scaleTo100(buySm,  len), 0.0, 100.0)
+sellLine = clamp(scaleTo100(sellSm, len), 0.0, 100.0)
+
+finalLen = math.max(1, int(math.round(smoothLen * 0.6)))
+buyP     = ta.ema(buyLine,  finalLen)
+sellP    = ta.ema(sellLine, finalLen)
+
+//────────────────────────────────────────────────────────────
+// Divergence Rules (Your exact definition)
+//────────────────────────────────────────────────────────────
+bearDiv = (dom > 0) and (sellP > buyP)   // warning for longs: sellers pushing despite buyer dominance
+bullDiv = (dom < 0) and (buyP > sellP)   // warning for shorts: buyers pushing despite seller dominance
+isDiv   = bearDiv or bullDiv
+
+// Aligned flow (non-divergence)
+bullAligned = (dom > 0) and (buyP >= sellP)
+bearAligned = (dom < 0) and (sellP >= buyP)
+
+//────────────────────────────────────────────────────────────
+// Colors (Premium simple)
+//────────────────────────────────────────────────────────────
+colDiv   = color.new(color.orange, 0)
+colBull  = color.new(color.lime,   0)
+colBear  = color.new(color.red,    0)
+colFlat  = color.new(color.gray,  65)
+
+histCol =
+     isDiv        ? colDiv  :
+     bullAligned  ? colBull :
+     bearAligned  ? colBear :
+     colFlat
+
+//────────────────────────────────────────────────────────────
+// Plot: ONE column around zero using Dominance
+//────────────────────────────────────────────────────────────
+hline(0, "Zero", color=color.new(color.black, 0))
+plot(dom, "Dominance (±100)", style=plot.style_histogram, linewidth=histWidth, color=histCol)
+
+// Optional alerts
+alertcondition(bearDiv, title="Bearish Divergence Warning", message="FLOW DIV: Dominance > 0 but Sell Pressure > Buy Pressure (warning: pullback/reversal risk).")
+alertcondition(bullDiv, title="Bullish Divergence Opportunity", message="FLOW DIV: Dominance < 0 but Buy Pressure > Sell Pressure (warning for shorts; bullish opportunity).")

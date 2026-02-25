@@ -1,0 +1,231 @@
+//@version=6
+indicator(title="Fisher MPz", shorttitle="Fisher MPz")
+                                        
+// ######:   . ####:     :##:    ######:  
+// #######   #######:     ##     #######  
+// ##   :##  #:.   ##    ####    ##   :## 
+// ##    ##        ##    ####    ##    ## 
+// ##   :##        ##   :#  #:   ##   :## 
+// #######.    #####     #::#    #######: 
+// #######.    #####.   ##  ##   ######   
+// ##   :##        ##   ######   ##   ##. 
+// ##    ##        ##  .######.  ##   ##  
+// ##   :##  #:    ##  :##  ##:  ##   :## 
+// ########  #######:  ###  ###  ##    ##:
+// ######    :#####:   ##:  :##  ##    ##:
+                                        
+// ============================
+// INPUTS
+// ============================
+
+// Visual Style
+visualStyle = input.string("Classic", title="Visual Style", options=["Classic", "Filled"], group="Visual Style", tooltip="Classic: Cyan line with white trigger. Filled: Directional colored fill between lines")
+
+// Period Inputs
+Length1 = input.int(8, minval=1, title="Short Period", group="Periods", tooltip="Faster response to price changes. Lower = more sensitive, more signals")
+Length2 = input.int(13, minval=1, title="Medium Period", group="Periods", tooltip="Balanced timeframe for trend detection")
+Length3 = input.int(26, minval=1, title="Long Period", group="Periods", tooltip="Slower response, filters noise. Higher = smoother, fewer signals")
+
+// Weights
+weight1 = input.float(4.0, minval=0.1, title="Short Weight", group="Weights", tooltip="How much the short period influences the composite. Higher = more responsive")
+weight2 = input.float(2.0, minval=0.1, title="Medium Weight", group="Weights", tooltip="How much the medium period influences the composite")
+weight3 = input.float(1.0, minval=0.1, title="Long Weight", group="Weights", tooltip="How much the long period influences the composite. Higher = smoother signal")
+
+// Winsorization Parameters
+useWinsorization = input.bool(true, title="Use Winsorization", group="Winsorization", tooltip="Cap extreme price values at percentile thresholds. Reduces impact of spikes and outliers")
+winsorLookback = input.int(20, minval=10, maxval=200, title="Winsorization Lookback", group="Winsorization", tooltip="Period for calculating percentile thresholds")
+lowerPercentile = input.float(5.0, minval=0.1, maxval=49.9, title="Lower Percentile", group="Winsorization", tooltip="Cap values below this percentile. Lower = more aggressive filtering")
+upperPercentile = input.float(95.0, minval=50.1, maxval=99.9, title="Upper Percentile", group="Winsorization", tooltip="Cap values above this percentile. Higher = more aggressive filtering")
+
+// Fisher Transform Parameters
+useKalman = input.bool(true, title="Use Kalman Filter", group="Fisher Parameters", tooltip="Use Kalman filtering for optimal noise reduction. More sophisticated than EMA smoothing")
+smoothFactor = input.float(0.18, minval=0.01, maxval=0.99, title="Smoothing Factor (if Kalman off)", group="Fisher Parameters", tooltip="Controls smoothness of the indicator. Lower = more responsive, Higher = smoother but slower")
+kalmanQ = input.float(0.01, minval=0.001, maxval=0.1, title="Kalman Process Noise (Q)", group="Fisher Parameters", tooltip="How much the system can change. Lower = smoother, Higher = more responsive")
+kalmanR = input.float(0.1, minval=0.01, maxval=1.0, title="Kalman Measurement Noise (R)", group="Fisher Parameters", tooltip="Trust in measurements. Lower = follow data closely, Higher = more filtering")
+useDynamicClip = input.bool(true, title="Use Dynamic Z-Score Clipping", group="Fisher Parameters", tooltip="Automatically adjusts clipping based on recent volatility. Tighter in calm markets, wider in volatile markets")
+zScoreClip = input.float(0.7, minval=0.1, maxval=5.0, title="Base Z-Score Clip Level", group="Fisher Parameters", tooltip="Starting clip level. Dynamic clipping adjusts this between 0.05-0.2 based on volatility")
+dynamicClipLength = input.int(20, minval=5, maxval=100, title="Dynamic Clip Lookback", group="Fisher Parameters", tooltip="Period for measuring volatility to adjust clipping")
+smoothTrigger = input.bool(true, title="Add Smoothing to Trigger", group="Fisher Parameters", tooltip="Applies 2-period EMA to trigger line. Reduces false signals but adds slight lag")
+
+// Display Options
+showIndividual = input.bool(false, title="Show Individual Periods", group="Display", tooltip="Display the 3 individual Fisher transforms along with the composite")
+
+// Classic Style Colors
+compositeColor = input.color(#00D9FF, title="Composite Fisher Color (Classic)", group="Classic Style Colors", tooltip="Color for the main composite Fisher line in Classic mode")
+triggerColor = input.color(#FFFFFF, title="Trigger Line Color (Classic)", group="Classic Style Colors", tooltip="Color for the trigger line in Classic mode")
+
+// Filled Style Colors
+bullishColor = input.color(#00FFFF, title="Bullish Color (Filled)", group="Filled Style Colors", tooltip="Color for bullish direction (composite above trigger)")
+bearishColor = input.color(#FF3366, title="Bearish Color (Filled)", group="Filled Style Colors", tooltip="Color for bearish direction (composite below trigger)")
+fillOpacity = input.int(50, minval=0, maxval=100, title="Fill Opacity", group="Filled Style Colors", tooltip="Transparency of the fill area (0 = solid, 100 = invisible)")
+
+// Individual Period Colors
+shortColor = input.color(#A78BFA, title="Short Period Color", group="Individual Period Colors", tooltip="Color for short period line (if shown)")
+mediumColor = input.color(#FBBF24, title="Medium Period Color", group="Individual Period Colors", tooltip="Color for medium period line (if shown)")
+longColor = input.color(#34D399, title="Long Period Color", group="Individual Period Colors", tooltip="Color for long period line (if shown)")
+
+// Alert Options
+enableAlerts = input.bool(false, title="Enable Alerts", group="Alerts", tooltip="Enable bullish and bearish crossover alerts")
+alertOnBullish = input.bool(false, title="Alert on Bullish Crossover", group="Alerts", tooltip="Alert when composite crosses above trigger")
+alertOnBearish = input.bool(false, title="Alert on Bearish Crossover", group="Alerts", tooltip="Alert when composite crosses below trigger")
+
+// ============================
+// WINSORIZATION FUNCTION
+// ============================
+
+winsorize(src, lookback, lowerPct, upperPct) =>
+    lowerThreshold = ta.percentile_nearest_rank(src, lookback, lowerPct)
+    upperThreshold = ta.percentile_nearest_rank(src, lookback, upperPct)
+    winsorized = math.max(lowerThreshold, math.min(src, upperThreshold))
+    winsorized
+
+// ============================
+// KALMAN FILTER FUNCTION
+// ============================
+
+kalmanFilter(src, Q, R) =>
+    var float x = na  // State estimate
+    var float P = na  // Estimation error covariance
+    
+    // Initialize on first bar
+    if na(x)
+        x := src
+        P := 1.0
+    
+    // Prediction
+    xPrior = x
+    pPrior = P + Q
+    
+    // Update
+    K = pPrior / (pPrior + R)  // Kalman gain
+    x := xPrior + K * (src - xPrior)
+    P := (1 - K) * pPrior
+    
+    x
+
+// ============================
+// DYNAMIC Z-SCORE CLIPPING
+// ============================
+
+calcDynamicClip(length) =>
+    atrValue = ta.atr(length)
+    atrSma = ta.sma(ta.atr(length), length)
+    volatilityRatio = atrSma > 0 ? atrValue / atrSma : 1.0
+    
+    minClip = 0.05
+    maxClip = 0.2
+    normalizedVol = math.min(math.max((volatilityRatio - 0.5) / 1.5, 0), 1)
+    dynamicClip = minClip + (normalizedVol * (maxClip - minClip))
+    dynamicClip
+
+// ============================
+// Z-SCORE CALCULATION
+// ============================
+
+calcRobustZScore(src, length) =>
+    median = ta.median(src, length)
+    absDeviation = math.abs(src - median)
+    mad = ta.median(absDeviation, length)
+    robustStdDev = mad * 1.4826
+    zScore = robustStdDev > 0 ? (src - median) / robustStdDev : 0.0
+    [median, robustStdDev, zScore]
+
+// ============================
+// FISHER TRANSFORM FUNCTION WITH KALMAN
+// ============================
+
+fisherTransform(src, length, smoothFactor, baseClipLevel, useDynamic, dynamicLength, useKalmanSmoothing, Q, R) =>
+    [median, stdDev, zScore] = calcRobustZScore(src, length)
+    float clipLevel = useDynamic ? calcDynamicClip(dynamicLength) : baseClipLevel
+    float zScoreClipped = math.min(math.max(zScore, -clipLevel), clipLevel)
+    float normalized = zScoreClipped / clipLevel
+    
+    // Choose smoothing method
+    var float nValue1 = 0.0
+    if useKalmanSmoothing
+        nValue1 := kalmanFilter(normalized, Q, R)
+    else
+        nValue1 := smoothFactor * normalized + (1 - smoothFactor) * nz(nValue1[1])
+    
+    float nValue2 = math.min(math.max(nValue1, -.999), .999)
+    
+    var float fisher = 0.0
+    if useKalmanSmoothing
+        rawFisher = 0.5 * math.log((1 + nValue2) / (1 - nValue2))
+        fisher := kalmanFilter(rawFisher, Q, R)
+    else
+        fisher := 0.5 * math.log((1 + nValue2) / (1 - nValue2)) + 0.5 * nz(fisher[1])
+    
+    [fisher, median, stdDev]
+
+// ============================
+// PREPARE PRICE SOURCE
+// ============================
+
+// Base price source
+float rawPrice = hl2
+
+// Apply Winsorization if enabled
+float priceSource = useWinsorization ? winsorize(rawPrice, winsorLookback, lowerPercentile, upperPercentile) : rawPrice
+
+// ============================
+// CALCULATE FISHER FOR ALL PERIODS
+// ============================
+
+// Winsorized (or non-winsorized) version
+[fisher1, median1, stdDev1] = fisherTransform(priceSource, Length1, smoothFactor, zScoreClip, useDynamicClip, dynamicClipLength, useKalman, kalmanQ, kalmanR)
+[fisher2, median2, stdDev2] = fisherTransform(priceSource, Length2, smoothFactor, zScoreClip, useDynamicClip, dynamicClipLength, useKalman, kalmanQ, kalmanR)
+[fisher3, median3, stdDev3] = fisherTransform(priceSource, Length3, smoothFactor, zScoreClip, useDynamicClip, dynamicClipLength, useKalman, kalmanQ, kalmanR)
+
+// Calculate weighted composite
+float totalWeight = weight1 + weight2 + weight3
+float composite = (fisher1 * weight1 + fisher2 * weight2 + fisher3 * weight3) / totalWeight
+float trigger = smoothTrigger ? ta.ema(composite[1], 2) : composite[1]
+
+// ============================
+// DETERMINE DIRECTION
+// ============================
+
+bool isBullish = composite >= trigger
+
+// ============================
+// ALERT CONDITIONS
+// ============================
+
+bullishCross = ta.crossover(composite, trigger)
+bearishCross = ta.crossunder(composite, trigger)
+
+if enableAlerts and alertOnBullish and bullishCross
+    alert("Fisher MPz: Bullish Crossover - Composite crossed above Trigger", alert.freq_once_per_bar)
+
+if enableAlerts and alertOnBearish and bearishCross
+    alert("Fisher MPz: Bearish Crossover - Composite crossed below Trigger", alert.freq_once_per_bar)
+
+// ============================
+// PLOTTING
+// ============================
+
+// Determine colors based on style and direction
+bool isClassic = visualStyle == "Classic"
+
+// Line colors
+color mainLineColor = isClassic ? compositeColor : (isBullish ? bullishColor : bearishColor)
+color trigLineColor = isClassic ? triggerColor : (isBullish ? bullishColor : bearishColor)
+
+// Fill color with opacity
+color fillColor = isClassic ? na : color.new(isBullish ? bullishColor : bearishColor, fillOpacity)
+
+// Plot the lines
+p1 = plot(composite, color=mainLineColor, title="Composite Fisher", linewidth=2)
+p2 = plot(trigger, color=trigLineColor, title="Trigger", linewidth=2)
+
+// Fill between lines (only for Filled style)
+fill(p1, p2, color=fillColor, title="Direction Fill")
+
+// Zero line
+hline(0, color=color.new(color.gray, 50), linestyle=hline.style_dotted, title="Zero Line")
+
+// Optional: Plot individual periods
+plot(showIndividual ? fisher1 : na, color=color.new(shortColor, 30), title="Short Period", linewidth=1)
+plot(showIndividual ? fisher2 : na, color=color.new(mediumColor, 30), title="Medium Period", linewidth=1)
+plot(showIndividual ? fisher3 : na, color=color.new(longColor, 30), title="Long Period", linewidth=1)

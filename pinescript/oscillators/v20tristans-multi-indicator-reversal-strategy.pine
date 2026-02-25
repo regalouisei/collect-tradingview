@@ -1,0 +1,335 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © OhRayOhRay
+
+//@version=6
+strategy("v2.0—Tristan's Multi-Indicator Reversal Strategy", overlay=true, margin_long=100, margin_short=100, default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=10)
+
+// ==================== INPUTS ====================
+// RSI Settings
+rsiLength = input.int(14, "RSI Length", minval=1, group="RSI Settings")
+rsiOverbought = input.float(70, "RSI Overbought", minval=50, group="RSI Settings")
+rsiOversold = input.float(30, "RSI Oversold", maxval=50, group="RSI Settings")
+
+// MACD Settings
+macdFast = input.int(12, "MACD Fast Length", minval=1, group="MACD Settings")
+macdSlow = input.int(26, "MACD Slow Length", minval=1, group="MACD Settings")
+macdSignal = input.int(9, "MACD Signal Length", minval=1, group="MACD Settings")
+
+// Williams %R Settings
+wrLength = input.int(14, "Williams %R Length", minval=1, group="Williams %R Settings")
+wrOverbought = input.float(-20, "Williams %R Overbought", group="Williams %R Settings")
+wrOversold = input.float(-80, "Williams %R Oversold", group="Williams %R Settings")
+
+// Volume Settings
+volumeMA = input.int(20, "Volume MA Length", minval=1, group="Volume Settings")
+volumeMultiplier = input.float(1.5, "Volume Spike Multiplier", minval=1.0, step=0.1, group="Volume Settings")
+
+// Bollinger Bands Settings
+bbLength = input.int(20, "BB Length", minval=1, group="Bollinger Bands")
+bbMult = input.float(2.0, "BB Std Dev", minval=0.1, step=0.1, group="Bollinger Bands")
+
+// Divergence Settings
+divergenceLookback = input.int(5, "Divergence Lookback", minval=3, maxval=20, group="Divergence Settings")
+minDivergenceStrength = input.float(0.5, "Min Divergence Strength", minval=0.1, step=0.1, group="Divergence Settings")
+
+// Session Filter
+sessionChoice = input.string("New York", "Trading Session", options=["Asian", "London", "New York", "24/7"], group="Session Filter")
+
+// Define session times (in exchange timezone)
+asianSession = "2000-0400"    // Tokyo: 8:00 PM - 4:00 AM ET
+londonSession = "0300-1130"   // London: 3:00 AM - 11:30 AM ET
+nySession = "0930-1600"       // New York: 9:30 AM - 4:00 PM ET
+
+// Signal Requirements
+requireDivergence = input.bool(false, "Require Divergence", tooltip="Turn OFF for more signals", group="Signal Requirements")
+requireVolumeConfirmation = input.bool(false, "Require Volume Spike", tooltip="Turn OFF for more signals", group="Signal Requirements")
+requireReversalCandle = input.bool(false, "Require Reversal Candle Pattern", tooltip="Turn OFF for more signals", group="Signal Requirements")
+minIndicatorsAligned = input.int(2, "Min Indicators Aligned", minval=2, maxval=4, tooltip="Lower number = more signals", group="Signal Requirements")
+flipSignals = input.bool(false, "⚡ FLIP ALL SIGNALS", tooltip="ON = Completely reverses buy/sell logic. If losing, try toggling this!", group="Signal Requirements")
+
+// Risk Management
+useStopLoss = input.bool(false, "Use Stop Loss", group="Risk Management")
+stopLossPercent = input.float(2.5, "Stop Loss %", minval=0.1, step=0.1, group="Risk Management")
+useTakeProfit = input.bool(false, "Use Take Profit", group="Risk Management")
+takeProfitPercent = input.float(5.0, "Take Profit %", minval=0.1, step=0.1, group="Risk Management")
+allowPyramiding = input.bool(true, "Allow Multiple Entries (Pyramiding)", tooltip="If OFF, only one position at a time", group="Risk Management")
+pyramidingMax = input.int(10, "Max Pyramid Entries", minval=1, maxval=20, tooltip="Maximum number of entries in same direction", group="Risk Management")
+
+// ==================== INDICATOR CALCULATIONS ====================
+// RSI
+rsi = ta.rsi(close, rsiLength)
+
+// MACD
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+// Williams %R
+wr = ta.wpr(wrLength)
+
+// Volume
+vol = volume
+volMA = ta.sma(volume, volumeMA)
+volumeSpike = vol > volMA * volumeMultiplier
+
+// Bollinger Bands
+[bbMiddle, bbUpper, bbLower] = ta.bb(close, bbLength, bbMult)
+
+// ==================== SESSION FILTER ====================
+// Determine which session to check based on user selection
+selectedSession = sessionChoice == "Asian" ? asianSession : 
+                 sessionChoice == "London" ? londonSession : 
+                 sessionChoice == "New York" ? nySession : 
+                 "0000-2359"  // 24/7 option
+
+// Check if current time is within selected session
+inSession = sessionChoice == "24/7" or not na(time(timeframe.period, selectedSession))
+inNYSession = inSession  // Keep variable name for compatibility with rest of code
+
+// ==================== DIVERGENCE DETECTION ====================
+// Find pivot highs and lows for price
+pivotHigh = ta.pivothigh(high, divergenceLookback, divergenceLookback)
+pivotLow = ta.pivotlow(low, divergenceLookback, divergenceLookback)
+
+// Find pivot highs and lows for RSI
+rsiPivotHigh = ta.pivothigh(rsi, divergenceLookback, divergenceLookback)
+rsiPivotLow = ta.pivotlow(rsi, divergenceLookback, divergenceLookback)
+
+// Store previous pivots
+var float prevPriceHigh = na
+var float prevPriceLow = na
+var float prevRSIHigh = na
+var float prevRSILow = na
+var int barsFromLastHighPivot = 0
+var int barsFromLastLowPivot = 0
+
+// Update pivot tracking
+if not na(pivotHigh)
+    prevPriceHigh := pivotHigh
+    barsFromLastHighPivot := 0
+else
+    barsFromLastHighPivot += 1
+
+if not na(pivotLow)
+    prevPriceLow := pivotLow
+    barsFromLastLowPivot := 0
+else
+    barsFromLastLowPivot += 1
+
+if not na(rsiPivotHigh)
+    prevRSIHigh := rsiPivotHigh
+
+if not na(rsiPivotLow)
+    prevRSILow := rsiPivotLow
+
+// Detect Bullish Divergence (price lower low, RSI higher low)
+bullishDivergence = false
+if not na(pivotLow) and not na(prevPriceLow) and not na(prevRSILow)
+    priceLowerLow = low[divergenceLookback] < prevPriceLow
+    rsiHigherLow = rsiPivotLow > prevRSILow
+    bullishDivergence := priceLowerLow and rsiHigherLow
+
+// Detect Bearish Divergence (price higher high, RSI lower high)
+bearishDivergence = false
+if not na(pivotHigh) and not na(prevPriceHigh) and not na(prevRSIHigh)
+    priceHigherHigh = high[divergenceLookback] > prevPriceHigh
+    rsiLowerHigh = rsiPivotHigh < prevRSIHigh
+    bearishDivergence := priceHigherHigh and rsiLowerHigh
+
+// Extended divergence signal (lasts for a few bars after detection)
+var bool activeBullishDiv = false
+var bool activeBearishDiv = false
+var int bullDivBars = 0
+var int bearDivBars = 0
+
+if bullishDivergence
+    activeBullishDiv := true
+    bullDivBars := 0
+else
+    bullDivBars += 1
+    if bullDivBars > 10
+        activeBullishDiv := false
+
+if bearishDivergence
+    activeBearishDiv := true
+    bearDivBars := 0
+else
+    bearDivBars += 1
+    if bearDivBars > 10
+        activeBearishDiv := false
+
+// ==================== INDICATOR ALIGNMENT ====================
+// Bullish Signals (will trigger SELL in flipped logic)
+rsiOversoldSignal = rsi < rsiOversold and rsi > rsi[1]  // RSI oversold and turning up
+macdBullish = macdHist > 0 or ta.crossover(macdLine, signalLine)  // MACD positive or crossing up
+wrOversoldSignal = wr < wrOversold and wr > wr[1]  // Williams %R oversold and turning up
+priceBelowBB = close < bbLower or close[1] < bbLower[1]  // Price at or below lower BB
+
+// Bearish Signals (will trigger BUY in flipped logic)
+rsiOverboughtSignal = rsi > rsiOverbought and rsi < rsi[1]  // RSI overbought and turning down
+macdBearish = macdHist < 0 or ta.crossunder(macdLine, signalLine)  // MACD negative or crossing down
+wrOverboughtSignal = wr > wrOverbought and wr < wr[1]  // Williams %R overbought and turning down
+priceAboveBB = close > bbUpper or close[1] > bbUpper[1]  // Price at or above upper BB
+
+// Count aligned bullish indicators (will trigger SELL)
+bullishCount = 0
+if rsiOversoldSignal
+    bullishCount += 1
+if macdBullish
+    bullishCount += 1
+if wrOversoldSignal
+    bullishCount += 1
+if priceBelowBB
+    bullishCount += 1
+
+// Count aligned bearish indicators (will trigger BUY)
+bearishCount = 0
+if rsiOverboughtSignal
+    bearishCount += 1
+if macdBearish
+    bearishCount += 1
+if wrOverboughtSignal
+    bearishCount += 1
+if priceAboveBB
+    bearishCount += 1
+
+// ==================== REVERSAL CANDLE PATTERNS ====================
+// Bullish reversal candle (hammer-like with long lower wick)
+bullishCandle = close > open and (close - open) > (high - close) * 2 and (open - low) > (high - low) * 0.6
+
+// Bearish reversal candle (shooting star-like with long upper wick)
+bearishCandle = close < open and (open - close) > (close - low) * 2 and (high - open) > (high - low) * 0.6
+
+// ==================== FINAL BUY/SELL SIGNALS ====================
+// STANDARD LOGIC: Buy when oversold, Sell when overbought (traditional reversal)
+standardBuyConditions = bullishCount >= minIndicatorsAligned and (not requireDivergence or activeBullishDiv) and (not requireVolumeConfirmation or volumeSpike) and (not requireReversalCandle or bullishCandle) and inNYSession
+
+standardSellConditions = bearishCount >= minIndicatorsAligned and (not requireDivergence or activeBearishDiv) and (not requireVolumeConfirmation or volumeSpike) and (not requireReversalCandle or bearishCandle) and inNYSession
+
+// Apply flip if enabled (completely swaps buy and sell)
+buySignal = flipSignals ? standardSellConditions : standardBuyConditions
+sellSignal = flipSignals ? standardBuyConditions : standardSellConditions
+
+// CONFIRMED signals - only trigger after candle close
+buySignalConfirmed = buySignal and barstate.isconfirmed
+sellSignalConfirmed = sellSignal and barstate.isconfirmed
+
+// ==================== STRATEGY EXECUTION ====================
+// Track position changes and entry counts
+var int longEntryCount = 0
+var int shortEntryCount = 0
+var float lastLongEntry = na
+var float lastShortEntry = na
+
+// Detect if we should enter based on pyramiding setting
+canEnterLong = allowPyramiding ? (longEntryCount < pyramidingMax) : (strategy.position_size <= 0)
+canEnterShort = allowPyramiding ? (shortEntryCount < pyramidingMax) : (strategy.position_size >= 0)
+
+// CRITICAL FIX: Only execute strategy orders on confirmed candles
+// This ensures strategy orders match the visual signals exactly
+
+// Enter Long - ONLY ON CONFIRMED CANDLE
+if buySignalConfirmed and canEnterLong
+    strategy.entry("Long", strategy.long)
+    
+    // Only set stop/target if enabled
+    if useStopLoss or useTakeProfit
+        stopPrice = useStopLoss ? close * (1 - stopLossPercent / 100) : na
+        targetPrice = useTakeProfit ? close * (1 + takeProfitPercent / 100) : na
+        strategy.exit("Exit Long", "Long", stop=stopPrice, limit=targetPrice)
+    
+    // Track entry count
+    if strategy.position_size[1] <= 0
+        longEntryCount := 1
+        lastLongEntry := close
+    else
+        longEntryCount += 1
+
+// Enter Short - ONLY ON CONFIRMED CANDLE
+if sellSignalConfirmed and canEnterShort
+    strategy.entry("Short", strategy.short)
+    
+    // Only set stop/target if enabled
+    if useStopLoss or useTakeProfit
+        stopPrice = useStopLoss ? close * (1 + stopLossPercent / 100) : na
+        targetPrice = useTakeProfit ? close * (1 - takeProfitPercent / 100) : na
+        strategy.exit("Exit Short", "Short", stop=stopPrice, limit=targetPrice)
+    
+    // Track entry count
+    if strategy.position_size[1] >= 0
+        shortEntryCount := 1
+        lastShortEntry := close
+    else
+        shortEntryCount += 1
+
+// Detect exits (when position goes back to flat or reverses)
+wasLong = strategy.position_size[1] > 0
+wasShort = strategy.position_size[1] < 0
+isFlat = strategy.position_size == 0
+justReversedToShort = wasLong and strategy.position_size < 0
+justReversedToLong = wasShort and strategy.position_size > 0
+
+exitedLong = (wasLong and isFlat) or justReversedToShort
+exitedShort = (wasShort and isFlat) or justReversedToLong
+
+// Store exit counts before resetting
+var int displayLongExits = 0
+var int displayShortExits = 0
+
+if exitedLong
+    displayLongExits := longEntryCount
+    longEntryCount := 0
+    
+if exitedShort
+    displayShortExits := shortEntryCount
+    shortEntryCount := 0
+
+// ==================== VISUALIZATION ====================
+// Show indicator conditions for debugging (optional filters)
+showBullishSetups = bullishCount >= 2 and not buySignal  // Near-signal conditions
+showBearishSetups = bearishCount >= 2 and not sellSignal
+
+// Plot Buy/Sell Entry Signals (larger and more visible) - ONLY AFTER CANDLE CLOSE
+plotshape(buySignalConfirmed, title="Buy Signal", location=location.belowbar, color=color.new(color.lime, 0), style=shape.triangleup, size=size.large, text="BUY")
+plotshape(sellSignalConfirmed, title="Sell Signal", location=location.abovebar, color=color.new(color.red, 0), style=shape.triangledown, size=size.large, text="SELL")
+
+// Plot Exit Signals with consolidated count using labels - ONLY AFTER CANDLE CLOSE
+if exitedLong and barstate.isconfirmed
+    exitLongText = displayLongExits > 1 ? "Exit Long\nx" + str.tostring(displayLongExits) : "Exit Long"
+    label.new(bar_index, low, exitLongText, color=color.new(color.purple, 0), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if exitedShort and barstate.isconfirmed
+    exitShortText = displayShortExits > 1 ? "Exit Short\nx" + str.tostring(displayShortExits) : "Exit Short"
+    label.new(bar_index, high, exitShortText, color=color.new(color.purple, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Plot potential setups (smaller, for reference)
+plotshape(showBullishSetups and inNYSession, title="Bullish Setup", location=location.belowbar, color=color.new(color.green, 50), style=shape.circle, size=size.tiny)
+plotshape(showBearishSetups and inNYSession, title="Bearish Setup", location=location.abovebar, color=color.new(color.orange, 50), style=shape.circle, size=size.tiny)
+
+// Plot Divergence Signals (when detected) - ONLY AFTER CONFIRMATION
+plotshape(activeBullishDiv and barsFromLastLowPivot < 5 and barstate.isconfirmed, title="Bullish Divergence", location=location.bottom, color=color.new(color.aqua, 0), style=shape.diamond, size=size.small, text="DIV")
+plotshape(activeBearishDiv and barsFromLastHighPivot < 5 and barstate.isconfirmed, title="Bearish Divergence", location=location.top, color=color.new(color.fuchsia, 0), style=shape.diamond, size=size.small, text="DIV")
+
+// Highlight Active Session with dynamic label
+bgcolor(inSession ? color.new(color.blue, 95) : na, title="Active Trading Session")
+
+// Plot Volume Spike
+barcolor(volumeSpike ? color.new(color.yellow, 70) : na, title="Volume Spike")
+
+// Display Indicator Alignment Score with Session Info
+var label scoreLabel = na
+if barstate.islast
+    label.delete(scoreLabel)
+    modeText = flipSignals ? "\n(FLIPPED)" : "\n(STANDARD)"
+    sessionText = "\nSession: " + sessionChoice
+    labelText = "Bull: " + str.tostring(bullishCount) + "/4\nBear: " + str.tostring(bearishCount) + "/4" + modeText + sessionText
+    labelColor = bullishCount >= minIndicatorsAligned ? color.green : (bearishCount >= minIndicatorsAligned ? color.red : color.gray)
+    scoreLabel := label.new(bar_index, high, labelText, color=color.new(labelColor, 70), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ==================== ALERTS ====================
+// CRITICAL FIX: Alerts now use the CONFIRMED signals that only fire after candle close
+// This ensures perfect 1:1 match between visual indicators and alert notifications
+alertcondition(buySignalConfirmed, title="Reversal Buy", message="Multi-Indicator Buy Signal - Reversal Detected!")
+alertcondition(sellSignalConfirmed, title="Reversal Sell", message="Multi-Indicator Sell Signal - Reversal Detected!")
+
+// Additional alerts for exits (optional - only fire on confirmed bars)
+alertcondition(exitedLong and barstate.isconfirmed, title="Long Exit", message="Long Position Exited")
+alertcondition(exitedShort and barstate.isconfirmed, title="Short Exit", message="Short Position Exited")

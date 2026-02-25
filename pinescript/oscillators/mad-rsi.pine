@@ -1,0 +1,119 @@
+//@version=6
+indicator("MAD RSI", overlay=true)
+
+// ═══════════════════════════════════════════════════════════════════════════════ 
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════ 
+src = input(close, "Source", tooltip="Price source for all calculations.")
+rsi_length = input.int(14, "RSI Length", minval=2, maxval=100, tooltip="Lookback period for RSI. Drives the adaptive band width — when RSI is far from 50, bands widen.")
+rsi_smoothing = input.int(9, "RSI Smoothing", minval=1, maxval=50, tooltip="EMA smoothing on the RSI. Higher = smoother adaptive response. A robust alternative to Standard Deviation that resists price spikes.")
+basis_length = input.int(55, "Basis Length", minval=3, maxval=200, tooltip="SMA length for the center line of the channel.")
+vol_length = input.int(65, "MAD Length", minval=3, maxval=200, tooltip="Lookback for the Median Absolute Deviation volatility calculation.")
+vol_mult = input.float(1.3, "Volatility Multiplier", minval=0.5, maxval=5.0, step=0.1, tooltip="Base multiplier for channel width. Bands automatically widen in strong trends via the RSI-adaptive factor. Higher = wider bands = fewer signals.")
+long_threshold = input.float(85, "Long Threshold", minval=50, maxval=95, tooltip="Oscillator must cross above this level to trigger a long signal. The oscillator measures price position within the bands: 0 = lower band, 50 = basis, 100 = upper band.")
+short_threshold = input.float(37, "Short Threshold", minval=5, maxval=80, tooltip="Oscillator must cross below this level to trigger an exit signal. Lower values mean you wait longer before exiting, higher values exit earlier.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════════════════
+color col_bull = #00FF00
+color col_bear = #FF0000
+color col_accent = #76FF03
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+float raw_rsi = ta.rsi(src, rsi_length)
+float smooth_rsi = ta.ema(raw_rsi, rsi_smoothing)
+
+float basis = ta.sma(src, basis_length)
+
+float rsi_factor = math.abs(50 - smooth_rsi) / 50
+float adaptive_mult = vol_mult * (1 + rsi_factor)
+
+float median = ta.percentile_linear_interpolation(src, vol_length, 50)
+float mad = ta.sma(math.abs(src - median), vol_length)
+float dev = adaptive_mult * mad * 1.4826
+
+float upper = basis + dev
+float lower = basis - dev
+
+float band_range = upper - lower
+float oscillator = band_range > 0 ? 100 * (src - lower) / band_range : 50
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════
+bool long_cross = ta.crossover(oscillator, long_threshold)
+bool short_cross = ta.crossunder(oscillator, short_threshold)
+
+var string state = "flat"
+
+if long_cross
+    state := "long"
+else if short_cross
+    state := "flat"
+
+bool long_signal = long_cross and state[1] != "long"
+bool exit_signal = short_cross and state[1] == "long"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════════════════
+bool is_bull = oscillator > 50
+float intensity = math.abs(oscillator - 50) / 50
+
+// ── Basis line ──
+color basis_color = is_bull ? col_bull : col_bear
+plot(basis, "Basis", color=basis_color, linewidth=2)
+
+// ── Channel bands ──
+int band_transp = math.round(75 - intensity * 30)
+color band_col = is_bull ? color.new(col_bull, band_transp) : color.new(col_bear, band_transp)
+p_up = plot(upper, "Upper Band", color=band_col, linewidth=1)
+p_dn = plot(lower, "Lower Band", color=band_col, linewidth=1)
+
+// ── Gradient fill levels (3 segments per half for smoother fade) ──
+float l1 = lower + dev / 3
+float l2 = lower + 2 * dev / 3
+p_l0 = plot(lower, color=na)
+p_l1 = plot(l1, color=na)
+p_l2 = plot(l2, color=na)
+p_basis = plot(basis, color=na)
+
+float u1 = upper - dev / 3
+float u2 = upper - 2 * dev / 3
+p_u0 = plot(upper, color=na)
+p_u1 = plot(u1, color=na)
+p_u2 = plot(u2, color=na)
+
+// Transparencies: outer high (faint), inner low (strong)
+int transp_outer = math.max(0, math.min(100, math.round(90 - intensity * 10)))
+int transp_mid   = math.max(0, math.min(100, math.round(75 - intensity * 20)))
+int transp_inner = math.max(0, math.min(100, math.round(60 - intensity * 30)))
+
+color fill_col = is_bull ? col_bull : col_bear
+
+// Lower fills
+fill(p_l0, p_l1, color.new(fill_col, transp_outer), title="Lower Outer")
+fill(p_l1, p_l2, color.new(fill_col, transp_mid), title="Lower Mid")
+fill(p_l2, p_basis, color.new(fill_col, transp_inner), title="Lower Inner")
+
+// Upper fills
+fill(p_u0, p_u1, color.new(fill_col, transp_outer), title="Upper Outer")
+fill(p_u1, p_u2, color.new(fill_col, transp_mid), title="Upper Mid")
+fill(p_u2, p_basis, color.new(fill_col, transp_inner), title="Upper Inner")
+
+// ── Bar coloring ──
+color bar_col = color.from_gradient(math.max(0, math.min(100, oscillator)), 0, 100, col_bear, col_bull)
+plotcandle(open, high, low, close, title="Bars", color=bar_col, bordercolor=bar_col, wickcolor=bar_col)
+
+// ── Signals ──
+plotshape(long_signal, title="Long", style=shape.diamond, location=location.belowbar, color=col_bull, size=size.small)
+plotshape(exit_signal, title="Exit", style=shape.diamond, location=location.abovebar, color=col_bear, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(long_signal, "Long Signal", "MAD RSI: Long entry signal")
+alertcondition(exit_signal, "Exit Signal", "MAD RSI: Exit signal")

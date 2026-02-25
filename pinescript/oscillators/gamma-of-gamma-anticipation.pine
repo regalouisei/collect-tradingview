@@ -1,0 +1,378 @@
+//@version=5
+indicator("Gamma of Gamma - Anticipation", overlay=false, max_bars_back=500)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📊 INPUTS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+gogThreshold = input.float(2.0, "GoG Extreme Threshold", minval=0.5, maxval=5.0, step=0.1, tooltip="Defines how extreme the Gamma-of-Gamma deviation must be to qualify as an anticipation event; higher values produce fewer but stronger signals while lower values trigger earlier and more frequent anticipation depending on volatility and timeframe.", group="⚙️ Calculation")
+gammaLength = input.int(3, "Gamma Smoothing", minval=1, maxval=20, tooltip="Controls smoothing applied to the second derivative of volume delta; lower values increase responsiveness but add noise while higher values stabilize acceleration detection at the cost of reaction speed.", group="⚙️ Calculation")
+gogLength = input.int(5, "GoG Smoothing", minval=1, maxval=20, tooltip="Controls smoothing applied to the Gamma-of-Gamma series, filtering micro-spikes while preserving meaningful structural inflection points used for anticipation.", group="⚙️ Calculation")
+minVolume = input.float(1.2, "Min Volume Multiple", minval=0.5, maxval=3.0, step=0.1, tooltip="Requires current volume to exceed this multiple of recent average volume before signals are allowed, ensuring Gamma acceleration is supported by meaningful participation rather than thin liquidity.", group="⚙️ Calculation")
+btHoldBars = input.int(10, "Backtest Hold Bars", minval=1, maxval=50, tooltip="Defines how many bars a simulated trade is held before forced exit in the internal backtester, allowing evaluation of signal timing independent of discretionary trade management.", group="🧪 Backtester")
+optMode = input.bool(false, "Parameter Optimizer Mode", tooltip="Enables internal parameter robustness evaluation and stability metrics for tuning and research purposes, intended for optimization analysis rather than live execution.", group="🧪 Backtester")
+i_bullOrbColor = input.color(#00FF88, "Bull Signal Color", tooltip="Primary color used for bullish anticipation orbs, with glow intensity and transparency dynamically adjusted based on confidence strength and volatility conditions.", group="🎨 Signal Orbs")
+i_bearOrbColor = input.color(#FF4444, "Bear Signal Color", tooltip="Primary color used for bearish anticipation orbs, with glow intensity and transparency dynamically adjusted based on confidence strength and volatility conditions.", group="🎨 Signal Orbs")
+i_orbMinAlpha = input.int(90, "Min Orb Transparency", minval=0, maxval=90, tooltip="Maximum transparency applied to weak or low-confidence signals, causing anticipation orbs to appear faint when conviction or volatility is insufficient.", group="🎨 Signal Orbs")
+i_orbMaxAlpha = input.int(85, "Max Orb Transparency (0=solid)", minval=0, maxval=90, tooltip="Minimum transparency applied to high-confidence anticipation signals, making strong orbs appear brighter and more visually dominant.", group="🎨 Signal Orbs")
+i_showChartSignals = input.bool(true, "Show Entry Signals on Price Chart", tooltip="Display entry triangles on the main price chart for visual trade execution reference at exact price levels.", group="📍 Chart Signals")
+i_showChartExits = input.bool(true, "Show Exit Signals on Price Chart", tooltip="Display exit markers on the main price chart when positions close after hold period.", group="📍 Chart Signals")
+i_chartSignalSize = input.string("Small", "Chart Signal Size", options=["Tiny", "Small", "Normal", "Large"], tooltip="Controls the size of entry/exit triangles displayed on the main price chart.", group="📍 Chart Signals")
+i_entryBullColor = input.color(#00FF88, "Long Entry Color", tooltip="Color for long entry triangles on the price chart.", group="📍 Chart Signals")
+i_entryBearColor = input.color(#FF4444, "Short Entry Color", tooltip="Color for short entry triangles on the price chart.", group="📍 Chart Signals")
+i_exitColor = input.color(#FFD700, "Exit Marker Color", tooltip="Color for exit markers on the price chart.", group="📍 Chart Signals")
+i_showDashboard = input.bool(true, "Show Main Dashboard", tooltip="Toggles visibility of the primary dashboard displaying live Gamma state, anticipation confidence, and market context.", group="📊 Dashboard")
+i_dashPos = input.string("Top Right", "Dashboard Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Left", "Middle Right"], tooltip="Controls where the main dashboard is anchored on the chart to maximize readability while minimizing interference with price action.", group="📊 Dashboard")
+i_dashSize = input.string("Tiny", "Dashboard Text Size", options=["Tiny", "Small", "Normal", "Large"], tooltip="Controls the text size of all elements in the main dashboard.", group="📊 Dashboard")
+i_dashAlpha = input.int(95, "Dashboard Background Transparency", minval=0, maxval=100, tooltip="Sets the transparency of the main dashboard background so it blends into the chart while remaining readable.", group="📊 Dashboard")
+i_showBacktestDash = input.bool(true, "Show Backtest Dashboard", tooltip="Toggles visibility of the backtest performance dashboard displaying historical signal outcomes and evaluation metrics.", group="📈 Backtest Dashboard")
+i_btDashPos = input.string("Top Left", "Backtest Dashboard Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Left", "Middle Right"], tooltip="Controls where the backtest dashboard is anchored on the chart.", group="📈 Backtest Dashboard")
+i_btDashSize = input.string("Tiny", "Backtest Dashboard Text Size", options=["Tiny", "Small", "Normal", "Large"], tooltip="Controls the text size of all elements in the backtest dashboard.", group="📈 Backtest Dashboard")
+i_btDashAlpha = input.int(95, "Backtest Dashboard Transparency", minval=0, maxval=100, tooltip="Controls background transparency of the backtest dashboard to reduce visual clutter while preserving metric readability.", group="📈 Backtest Dashboard")
+i_showGamma = input.bool(true, "Show Gamma Line", tooltip="Displays the smoothed Gamma acceleration line representing second-order pressure changes in volume dynamics.", group="📉 Plots")
+i_showRawGoG = input.bool(true, "Show Raw GoG Line", tooltip="Displays the raw Gamma-of-Gamma series used internally for anticipation detection and advanced analytical inspection.", group="📉 Plots")
+i_bgHighlight = input.bool(true, "Highlight Extreme Zones", tooltip="Highlights background regions when Gamma-of-Gamma reaches extreme anticipation levels, visually marking potential inflection zones.", group="📉 Plots")
+i_bgAlpha = input.int(90, "Zone Highlight Transparency", minval=50, maxval=98, tooltip="Controls transparency of extreme-zone background highlights to emphasize anticipation without overpowering price action.", group="📉 Plots")
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🔧 HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+f_dashPos(pos) =>
+    pos == "Top Left" ? position.top_left : 
+     pos == "Top Right" ? position.top_right : 
+     pos == "Bottom Left" ? position.bottom_left : 
+     pos == "Bottom Right" ? position.bottom_right :
+     pos == "Middle Left" ? position.middle_left : position.middle_right
+f_textSize(sz) =>
+    sz == "Tiny" ? size.tiny : 
+     sz == "Small" ? size.small : 
+     sz == "Normal" ? size.normal : size.large
+f_headerSize(sz) =>
+    sz == "Tiny" ? size.small : 
+     sz == "Small" ? size.normal : 
+     sz == "Normal" ? size.large : size.huge
+f_color(baseColor, alpha) =>
+    color.new(baseColor, alpha)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📈 CORE CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+var float cvd = 0.0
+cvd := close > close[1] ? nz(cvd[1]) + volume : close < close[1] ? nz(cvd[1]) - volume : nz(cvd[1])
+raw_gamma = nz(cvd - 2*nz(cvd[1]) + nz(cvd[2]))
+gamma = ta.sma(raw_gamma, gammaLength)
+raw_gog = nz(gamma - 2*nz(gamma[1]) + nz(gamma[2]))
+gog = ta.sma(raw_gog, gogLength)
+gog_std = ta.stdev(gog, 50)
+gog_mean = ta.sma(gog, 50)
+gog_zscore = gog_std > 0 ? (gog - gog_mean) / gog_std : 0
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🔍 VOLUME FILTER
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+vol_sma = ta.sma(volume, 20)
+vol_active = volume > vol_sma * minVolume
+vol_ratio = vol_sma > 0 ? volume / vol_sma : 1.0
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🎯 SIGNAL GENERATION
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+var int positionState = 0 
+var int entryBar = 0
+var float entryPrice = na
+long_gog_extreme = gog_zscore < -gogThreshold
+short_gog_extreme = gog_zscore > gogThreshold
+long_signal = positionState == 0 and long_gog_extreme and vol_active
+short_signal = positionState == 0 and short_gog_extreme and vol_active
+long_confidence = long_gog_extreme ? math.min(100, (math.abs(gog_zscore) - gogThreshold) / gogThreshold * 100 + 50) : 0
+short_confidence = short_gog_extreme ? math.min(100, (math.abs(gog_zscore) - gogThreshold) / gogThreshold * 100 + 50) : 0
+bars_held = positionState != 0 ? bar_index - entryBar : 0
+time_exit = positionState != 0 and bars_held >= btHoldBars
+var bool longExitSignal = false
+var bool shortExitSignal = false
+longExitSignal := false
+shortExitSignal := false
+if time_exit
+    if positionState == 1
+        longExitSignal := true
+    if positionState == -1
+        shortExitSignal := true
+if long_signal
+    positionState := 1
+    entryBar := bar_index
+    entryPrice := close
+if short_signal
+    positionState := -1
+    entryBar := bar_index
+    entryPrice := close
+if time_exit
+    positionState := 0
+    entryBar := 0
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🧠 ONBOARD BACKTESTER
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+var int btTotalTrades = 0
+var int btWins = 0
+var int btLosses = 0
+var float btNetPct = 0.0
+var float btGrossProfit = 0.0
+var float btGrossLoss = 0.0
+var float btMaxDrawdown = 0.0
+var float btPeakEquity = 0.0
+var float btEquity = 100.0
+var int btConsecWins = 0
+var int btConsecLosses = 0
+var int btMaxConsecWins = 0
+var int btMaxConsecLosses = 0
+var int btCurrentConsec = 0
+var bool btInLong = false
+var bool btInShort = false
+var float btEntryPrice = na
+var int btEntryBarIndex = 0
+if long_signal and not btInLong and not btInShort
+    btInLong := true
+    btEntryPrice := close
+    btEntryBarIndex := bar_index
+if short_signal and not btInLong and not btInShort
+    btInShort := true
+    btEntryPrice := close
+    btEntryBarIndex := bar_index
+btExitNow = (btInLong or btInShort) and (bar_index - btEntryBarIndex >= btHoldBars)
+if btExitNow
+    float pnl = 0.0
+    if btInLong
+        pnl := (close - btEntryPrice) / btEntryPrice * 100
+    else if btInShort
+        pnl := (btEntryPrice - close) / btEntryPrice * 100   
+    btTotalTrades += 1
+    btNetPct += pnl
+    btEquity := btEquity * (1 + pnl / 100)   
+    if pnl > 0
+        btWins += 1
+        btGrossProfit += pnl
+        if btCurrentConsec >= 0
+            btCurrentConsec += 1
+        else
+            btCurrentConsec := 1
+        btMaxConsecWins := math.max(btMaxConsecWins, btCurrentConsec)
+    else
+        btLosses += 1
+        btGrossLoss += math.abs(pnl)
+        if btCurrentConsec <= 0
+            btCurrentConsec -= 1
+        else
+            btCurrentConsec := -1
+        btMaxConsecLosses := math.max(btMaxConsecLosses, math.abs(btCurrentConsec))   
+    btPeakEquity := math.max(btPeakEquity, btEquity)
+    currentDD = btPeakEquity > 0 ? (btPeakEquity - btEquity) / btPeakEquity * 100 : 0
+    btMaxDrawdown := math.max(btMaxDrawdown, currentDD)   
+    btInLong := false
+    btInShort := false
+    btEntryPrice := na
+btWinRate = btTotalTrades > 0 ? btWins / btTotalTrades * 100 : 0.0
+btAvgWin = btWins > 0 ? btGrossProfit / btWins : 0.0
+btAvgLoss = btLosses > 0 ? btGrossLoss / btLosses : 0.0
+btProfitFactor = btGrossLoss > 0 ? btGrossProfit / btGrossLoss : btGrossProfit > 0 ? 999.0 : 0.0
+btExpectancy = btTotalTrades > 0 ? btNetPct / btTotalTrades : 0.0
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🧪 OPTIMIZER METRICS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+tradeDensity = bar_index > 0 ? btTotalTrades / bar_index * 1000 : 0
+stabilityPoints = 0
+stabilityPoints += btWinRate >= 55 ? 25 : btWinRate >= 50 ? 15 : btWinRate >= 45 ? 5 : 0
+stabilityPoints += btExpectancy > 0.5 ? 25 : btExpectancy > 0.1 ? 15 : btExpectancy > 0 ? 5 : 0
+stabilityPoints += btTotalTrades >= 30 ? 25 : btTotalTrades >= 20 ? 15 : btTotalTrades >= 10 ? 5 : 0
+stabilityPoints += btProfitFactor >= 1.5 ? 25 : btProfitFactor >= 1.2 ? 15 : btProfitFactor >= 1.0 ? 5 : 0
+robustText = stabilityPoints >= 80 ? "ROBUST" : stabilityPoints >= 60 ? "STABLE" : stabilityPoints >= 40 ? "FRAGILE" : "OVERFIT"
+robustCol = stabilityPoints >= 80 ? #00FF88 : stabilityPoints >= 60 ? #00E5FF : stabilityPoints >= 40 ? #FFD600 : #FF6B35
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🎨 PLOTTING - MAIN CHART ELEMENTS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+gogColor = gog_zscore > gogThreshold ? #FF6B35 : gog_zscore < -gogThreshold ? #00FF88 : #9C27B0
+plot(gog_zscore, "GoG Z-Score", color=gogColor, linewidth=3)
+h_upper = hline(gogThreshold, "GoG Extreme High", color=color.new(#FF6B35, 50), linestyle=hline.style_dashed)
+h_lower = hline(-gogThreshold, "GoG Extreme Low", color=color.new(#00FF88, 50), linestyle=hline.style_dashed)
+hline(0, "GoG Neutral", color=color.new(color.gray, 70))
+fill(h_upper, h_lower, color=color.new(#9C27B0, 95), title="Neutral Zone")
+plot(i_showGamma ? gamma / 1e9 : na, "Gamma (scaled)", color=color.new(#2196F3, 40), linewidth=1)
+plot(i_showRawGoG ? gog / 1e9 : na, "Raw GoG (scaled)", color=color.new(#FF9800, 40), linewidth=1)
+extremeZoneColor = gog_zscore > gogThreshold ? color.new(#FF6B35, i_bgAlpha) : 
+                   gog_zscore < -gogThreshold ? color.new(#00FF88, i_bgAlpha) : na
+bgcolor(i_bgHighlight ? extremeZoneColor : na, title="Extreme Zone Highlight")
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🔮 CONFIDENCE-WEIGHTED SIGNAL ORBS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+longOrbAlpha = long_signal ? math.round(i_orbMinAlpha - (long_confidence / 100) * (i_orbMinAlpha - i_orbMaxAlpha)) : 100
+shortOrbAlpha = short_signal ? math.round(i_orbMinAlpha - (short_confidence / 100) * (i_orbMinAlpha - i_orbMaxAlpha)) : 100
+longOrbSize = long_confidence > 80 ? size.large : long_confidence > 50 ? size.normal : size.small
+shortOrbSize = short_confidence > 80 ? size.large : short_confidence > 50 ? size.normal : size.small
+plotshape(long_signal, "LONG Signal", style=shape.circle, location=location.bottom, 
+          color=color.new(i_bullOrbColor, longOrbAlpha), size=size.small)
+plotshape(long_signal and long_confidence > 50, "LONG Signal Med", style=shape.circle, location=location.bottom, 
+          color=color.new(i_bullOrbColor, math.max(0, longOrbAlpha - 15)), size=size.normal)
+plotshape(long_signal and long_confidence > 80, "LONG Signal High", style=shape.circle, location=location.bottom, 
+          color=color.new(i_bullOrbColor, math.max(0, longOrbAlpha - 30)), size=size.large)
+plotshape(short_signal, "SHORT Signal", style=shape.circle, location=location.top, 
+          color=color.new(i_bearOrbColor, shortOrbAlpha), size=size.small)
+plotshape(short_signal and short_confidence > 50, "SHORT Signal Med", style=shape.circle, location=location.top, 
+          color=color.new(i_bearOrbColor, math.max(0, shortOrbAlpha - 15)), size=size.normal)
+plotshape(short_signal and short_confidence > 80, "SHORT Signal High", style=shape.circle, location=location.top, 
+          color=color.new(i_bearOrbColor, math.max(0, shortOrbAlpha - 30)), size=size.large)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📍 CHART EXECUTION SIGNALS 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+bool showLongEntry = i_showChartSignals and long_signal
+bool showShortEntry = i_showChartSignals and short_signal
+bool showLongExit = i_showChartExits and longExitSignal
+bool showShortExit = i_showChartExits and shortExitSignal
+plotshape(showLongEntry and i_chartSignalSize == "Tiny", "Long Entry Tiny", 
+          style=shape.triangleup, location=location.belowbar, 
+          color=i_entryBullColor, size=size.tiny, force_overlay=true)
+plotshape(showLongEntry and i_chartSignalSize == "Small", "Long Entry Small", 
+          style=shape.triangleup, location=location.belowbar, 
+          color=i_entryBullColor, size=size.small, force_overlay=true)
+plotshape(showLongEntry and i_chartSignalSize == "Normal", "Long Entry Normal", 
+          style=shape.triangleup, location=location.belowbar, 
+          color=i_entryBullColor, size=size.normal, force_overlay=true)
+plotshape(showLongEntry and i_chartSignalSize == "Large", "Long Entry Large", 
+          style=shape.triangleup, location=location.belowbar, 
+          color=i_entryBullColor, size=size.large, force_overlay=true)
+plotshape(showShortEntry and i_chartSignalSize == "Tiny", "Short Entry Tiny", 
+          style=shape.triangledown, location=location.abovebar, 
+          color=i_entryBearColor, size=size.tiny, force_overlay=true)
+plotshape(showShortEntry and i_chartSignalSize == "Small", "Short Entry Small", 
+          style=shape.triangledown, location=location.abovebar, 
+          color=i_entryBearColor, size=size.small, force_overlay=true)
+plotshape(showShortEntry and i_chartSignalSize == "Normal", "Short Entry Normal", 
+          style=shape.triangledown, location=location.abovebar, 
+          color=i_entryBearColor, size=size.normal, force_overlay=true)
+plotshape(showShortEntry and i_chartSignalSize == "Large", "Short Entry Large", 
+          style=shape.triangledown, location=location.abovebar, 
+          color=i_entryBearColor, size=size.large, force_overlay=true)
+plotshape(showLongExit and i_chartSignalSize == "Tiny", "Long Exit Tiny", 
+          style=shape.xcross, location=location.abovebar, 
+          color=i_exitColor, size=size.tiny, force_overlay=true)
+plotshape(showLongExit and i_chartSignalSize == "Small", "Long Exit Small", 
+          style=shape.xcross, location=location.abovebar, 
+          color=i_exitColor, size=size.small, force_overlay=true)
+plotshape(showLongExit and i_chartSignalSize == "Normal", "Long Exit Normal", 
+          style=shape.xcross, location=location.abovebar, 
+          color=i_exitColor, size=size.normal, force_overlay=true)
+plotshape(showLongExit and i_chartSignalSize == "Large", "Long Exit Large", 
+          style=shape.xcross, location=location.abovebar, 
+          color=i_exitColor, size=size.large, force_overlay=true)
+plotshape(showShortExit and i_chartSignalSize == "Tiny", "Short Exit Tiny", 
+          style=shape.xcross, location=location.belowbar, 
+          color=i_exitColor, size=size.tiny, force_overlay=true)
+plotshape(showShortExit and i_chartSignalSize == "Small", "Short Exit Small", 
+          style=shape.xcross, location=location.belowbar, 
+          color=i_exitColor, size=size.small, force_overlay=true)
+plotshape(showShortExit and i_chartSignalSize == "Normal", "Short Exit Normal", 
+          style=shape.xcross, location=location.belowbar, 
+          color=i_exitColor, size=size.normal, force_overlay=true)
+plotshape(showShortExit and i_chartSignalSize == "Large", "Short Exit Large", 
+          style=shape.xcross, location=location.belowbar, 
+          color=i_exitColor, size=size.large, force_overlay=true)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📊 MAIN DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+if i_showDashboard and barstate.islast
+    dashTextSize = f_textSize(i_dashSize)
+    dashHeaderSize = f_headerSize(i_dashSize)
+    var table dash = table.new(f_dashPos(i_dashPos), 2, 12, 
+                               bgcolor=color.new(#0d1117, i_dashAlpha), 
+                               border_color=color.new(#30363d, 50), 
+                               border_width=1)
+    table.cell(dash, 0, 0, "🔄 GAMMA OF GAMMA", text_color=#00E5FF, text_size=dashHeaderSize, bgcolor=color.new(#00E5FF, 88))
+    table.merge_cells(dash, 0, 0, 1, 0)
+    gogStatusCol = gog_zscore > gogThreshold ? #FF6B35 : gog_zscore < -gogThreshold ? #00FF88 : #9C27B0
+    gogStatusText = gog_zscore > gogThreshold ? "🔴 EXTREME HIGH" : gog_zscore < -gogThreshold ? "🟢 EXTREME LOW" : "⚪ NEUTRAL"
+    table.cell(dash, 0, 1, gogStatusText, text_color=gogStatusCol, text_size=dashTextSize)
+    table.merge_cells(dash, 0, 1, 1, 1)
+    table.cell(dash, 0, 2, "GoG Z-Score", text_color=color.gray, text_size=dashTextSize)
+    table.cell(dash, 1, 2, str.tostring(gog_zscore, "#.##"), text_color=gogStatusCol, text_size=dashTextSize)
+    table.cell(dash, 0, 3, "Raw GoG", text_color=color.gray, text_size=dashTextSize)
+    table.cell(dash, 1, 3, str.tostring(gog, "#.##"), text_color=#00E5FF, text_size=dashTextSize)
+    table.cell(dash, 0, 4, "Gamma", text_color=color.gray, text_size=dashTextSize)
+    table.cell(dash, 1, 4, str.tostring(gamma, "#.##"), text_color=#2196F3, text_size=dashTextSize)
+    table.cell(dash, 0, 5, "CVD", text_color=color.gray, text_size=dashTextSize)
+    cvdCol = cvd > 0 ? #00FF88 : #FF6B35
+    table.cell(dash, 1, 5, str.tostring(cvd, "#.##"), text_color=cvdCol, text_size=dashTextSize)
+    volStatusText = vol_active ? "✓ Active (" + str.tostring(vol_ratio, "#.#") + "x)" : "✗ Low (" + str.tostring(vol_ratio, "#.#") + "x)"
+    volStatusCol = vol_active ? #00FF88 : #FF6B35
+    table.cell(dash, 0, 6, "Volume", text_color=color.gray, text_size=dashTextSize)
+    table.cell(dash, 1, 6, volStatusText, text_color=volStatusCol, text_size=dashTextSize)
+    table.cell(dash, 0, 7, "─────────────", text_color=color.new(#30363d, 50), text_size=dashTextSize)
+    table.merge_cells(dash, 0, 7, 1, 7)
+    sigText = long_signal ? "🟢 LONG SIGNAL" : short_signal ? "🔴 SHORT SIGNAL" : positionState == 1 ? "📈 In Long" : positionState == -1 ? "📉 In Short" : "⏳ Scanning"
+    sigCol = long_signal ? #00FF88 : short_signal ? #FF6B35 : positionState != 0 ? #FFD600 : color.gray
+    table.cell(dash, 0, 8, sigText, text_color=sigCol, text_size=dashTextSize)
+    table.merge_cells(dash, 0, 8, 1, 8)
+    if long_signal or short_signal
+        confVal = long_signal ? long_confidence : short_confidence
+        confBar = ""
+        for i = 0 to 9
+            confBar := confBar + (i < confVal / 10 ? "█" : "░")
+        confCol = confVal > 80 ? #00FF88 : confVal > 50 ? #FFD600 : #FF6B35
+        table.cell(dash, 0, 9, "Confidence: " + str.tostring(confVal, "#") + "% " + confBar, text_color=confCol, text_size=dashTextSize)
+        table.merge_cells(dash, 0, 9, 1, 9)
+    else
+        table.cell(dash, 0, 9, "Bars Held: " + str.tostring(bars_held), text_color=color.gray, text_size=dashTextSize)
+        table.merge_cells(dash, 0, 9, 1, 9)
+    if positionState != 0
+        table.cell(dash, 0, 10, "Entry: " + str.tostring(entryPrice, "#.####"), text_color=#FFD600, text_size=dashTextSize)
+        table.merge_cells(dash, 0, 10, 1, 10)
+    else
+        table.cell(dash, 0, 10, "", text_color=color.gray, text_size=dashTextSize)
+        table.merge_cells(dash, 0, 10, 1, 10)
+    table.cell(dash, 0, 11, "◈ DAFE - GoG", text_color=color.new(#00E5FF, 40), text_size=dashTextSize, bgcolor=color.new(#00E5FF, 92))
+    table.merge_cells(dash, 0, 11, 1, 11)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 📈 BACKTEST DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+if i_showBacktestDash and barstate.islast
+    btTextSize = f_textSize(i_btDashSize)
+    btHeaderSize = f_headerSize(i_btDashSize)
+    
+    var table btDash = table.new(f_dashPos(i_btDashPos), 2, optMode ? 14 : 10, 
+                                  bgcolor=color.new(#0d1117, i_btDashAlpha), 
+                                  border_color=color.new(#30363d, 60), 
+                                  border_width=1)
+    headerText = optMode ? "🧪 OPTIMIZER" : "📈 BACKTEST"
+    table.cell(btDash, 0, 0, headerText, text_color=#00E5FF, text_size=btHeaderSize, bgcolor=color.new(#00E5FF, 88))
+    table.merge_cells(btDash, 0, 0, 1, 0)
+    table.cell(btDash, 0, 1, "Total Trades", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 1, str.tostring(btTotalTrades), text_color=color.white, text_size=btTextSize)
+    wrCol = btWinRate >= 55 ? #00FF88 : btWinRate >= 45 ? #FFD600 : #FF6B35
+    table.cell(btDash, 0, 2, "Win Rate", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 2, str.tostring(btWinRate, "#.#") + "%", text_color=wrCol, text_size=btTextSize)
+    pfCol = btProfitFactor >= 1.5 ? #00FF88 : btProfitFactor >= 1.0 ? #FFD600 : #FF6B35
+    table.cell(btDash, 0, 3, "Profit Factor", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 3, str.tostring(btProfitFactor, "#.##"), text_color=pfCol, text_size=btTextSize)
+    expCol = btExpectancy > 0 ? #00FF88 : #FF6B35
+    table.cell(btDash, 0, 4, "Expectancy", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 4, str.tostring(btExpectancy, "#.##") + "%", text_color=expCol, text_size=btTextSize)
+    table.cell(btDash, 0, 5, "Net P&L", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 5, str.tostring(btNetPct, "#.##") + "%", text_color=expCol, text_size=btTextSize)
+    ddCol = btMaxDrawdown < 10 ? #00FF88 : btMaxDrawdown < 20 ? #FFD600 : #FF6B35
+    table.cell(btDash, 0, 6, "Max Drawdown", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 6, str.tostring(btMaxDrawdown, "#.##") + "%", text_color=ddCol, text_size=btTextSize)
+    table.cell(btDash, 0, 7, "Avg Win", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 7, str.tostring(btAvgWin, "#.##") + "%", text_color=#00FF88, text_size=btTextSize)
+    table.cell(btDash, 0, 8, "Avg Loss", text_color=color.gray, text_size=btTextSize)
+    table.cell(btDash, 1, 8, str.tostring(btAvgLoss, "#.##") + "%", text_color=#FF6B35, text_size=btTextSize)
+    if optMode
+        table.cell(btDash, 0, 9, "─── OPTIMIZER ───", text_color=color.new(#30363d, 50), text_size=btTextSize)
+        table.merge_cells(btDash, 0, 9, 1, 9)
+        table.cell(btDash, 0, 10, "Stability", text_color=color.gray, text_size=btTextSize)
+        table.cell(btDash, 1, 10, robustText + " (" + str.tostring(stabilityPoints) + ")", text_color=robustCol, text_size=btTextSize)
+        table.cell(btDash, 0, 11, "Trade Density", text_color=color.gray, text_size=btTextSize)
+        table.cell(btDash, 1, 11, str.tostring(tradeDensity, "#.##") + "/1K bars", text_color=#00E5FF, text_size=btTextSize)
+        table.cell(btDash, 0, 12, "γ:" + str.tostring(gammaLength) + " | GoG:" + str.tostring(gogLength), text_color=#00E5FF, text_size=btTextSize)
+        table.cell(btDash, 1, 12, "Thresh:" + str.tostring(gogThreshold, "#.#"), text_color=#00E5FF, text_size=btTextSize)
+        recText = stabilityPoints >= 80 ? "✓ Good params" : stabilityPoints >= 60 ? "○ Acceptable" : stabilityPoints >= 40 ? "△ Needs tuning" : "✗ Likely overfit"
+        table.cell(btDash, 0, 13, recText, text_color=robustCol, text_size=btTextSize)
+        table.merge_cells(btDash, 0, 13, 1, 13)
+    else
+        table.cell(btDash, 0, 9, "⚡ Enable Optimizer Mode for tuning ⚡", text_color=color.new(#00E5FF, 40), text_size=btTextSize, bgcolor=color.new(#00E5FF, 92))
+        table.merge_cells(btDash, 0, 9, 1, 9)
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+// 🔔 ALERTS
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════
+alertcondition(long_signal, title="GoG Long Signal", message="GoG Long Signal - Extreme negative z-score with volume confirmation")
+alertcondition(short_signal, title="GoG Short Signal", message="GoG Short Signal - Extreme positive z-score with volume confirmation")
+alertcondition(long_signal or short_signal, title="GoG Any Signal", message="GoG Signal Detected")

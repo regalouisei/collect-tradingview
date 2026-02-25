@@ -1,0 +1,216 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Interakktive
+
+//@version=6
+indicator("Market Participation Gradient [Interakktive]", shorttitle = "MPG", overlay = false, precision = 2, max_labels_count = 0, max_lines_count = 0, max_boxes_count = 0)
+
+//==============================================================================
+// ABOUT THIS INDICATOR
+//==============================================================================
+// MPG measures market participation quality by analyzing:
+//   - EFFICIENCY: How direct is price movement? (displacement / path)
+//   - ACTIVITY: Is volume confirming the move? (volume ratio)
+//
+// The oscillator shows:
+//   - LEVEL (0-100): How much participation exists
+//   - COLOR: Quality of participation
+//       • Teal = Clean (efficient moves with volume)
+//       • Magenta = Absorbed (high volume, low efficiency = trapped)
+//       • Grey = Neutral
+//
+// Tiers:
+//   - THIN (0-20): Low participation, market drifting
+//   - BUILDING (20-40): Participation emerging
+//   - STRONG (40-65): Solid participation
+//   - EXTREME (65+): Climactic (potential exhaustion)
+//
+// This is a diagnostic primitive, NOT a signal generator.
+//==============================================================================
+
+//==============================================================================
+// SECTION 1: INPUTS
+//==============================================================================
+
+GRP_CORE = "MPG — Core"
+GRP_VISUAL = "MPG — Visuals"
+GRP_EXPORT = "Data Window"
+
+// Core Inputs
+atrLen = input.int(14, "ATR Length", minval = 5, maxval = 50, group = GRP_CORE, tooltip = "ATR period for normalization.")
+effLen = input.int(10, "Efficiency Lookback", minval = 5, maxval = 50, group = GRP_CORE, tooltip = "Bars for efficiency calculation.")
+volLen = input.int(14, "Volume Average Length", minval = 5, maxval = 50, group = GRP_CORE, tooltip = "Lookback for volume baseline.")
+smoothLen = input.int(5, "Smoothing Length", minval = 1, maxval = 20, group = GRP_CORE, tooltip = "EMA smoothing. 1 = no smoothing.")
+
+// Visual Inputs
+showHistogram = input.bool(true, "Show Histogram", group = GRP_VISUAL, tooltip = "Display participation histogram.")
+showLine = input.bool(true, "Show Trend Line", group = GRP_VISUAL, tooltip = "Display smoothed participation line.")
+showBands = input.bool(true, "Show Tier Bands", group = GRP_VISUAL, tooltip = "Display tier reference lines.")
+showPaneTint = input.bool(false, "Show Pane Background", group = GRP_VISUAL, tooltip = "Tint oscillator pane background.")
+theme = input.string("Cinematic", "Theme", options = ["Cinematic", "Vivid"], group = GRP_VISUAL, tooltip = "Cinematic = subtle, Vivid = brighter.")
+
+// Export Inputs
+showExports = input.bool(false, "Show Data Window Values", group = GRP_EXPORT, tooltip = "Export values to data window.")
+
+// HUD Inputs
+GRP_HUD = "MPG — HUD"
+showHUD = input.bool(true, "Show Status Line HUD", group = GRP_HUD, tooltip = "Display MPG state in TradingView status line (top bar). Open-source compliant — no tables.")
+hudDetail = input.string("Minimal", "HUD Detail", options = ["Minimal", "Full"], group = GRP_HUD, tooltip = "Minimal = MPG + Tier. Full = adds Dir and Quality.")
+
+//==============================================================================
+// SECTION 2: CONSTANTS & HELPERS
+//==============================================================================
+
+// Brand Colors (Interakktive Visual Style Guide)
+colorPositive = #00B3A4      // Teal — clean participation
+colorNegative = #C2185B      // Magenta — absorbed/poor
+colorAmber = #F9A825         // Amber — transitional/building
+colorNeutral = #8A8A8A       // Grey — thin/neutral
+
+safeDiv(num, denom) => (na(denom) or denom == 0.0) ? na : num / denom
+clamp01(val) => na(val) ? na : math.max(0.0, math.min(1.0, val))
+
+//==============================================================================
+// SECTION 3: CORE COMPUTATION
+//==============================================================================
+
+// --- ATR for normalization ---
+atrVal = ta.atr(atrLen)
+
+// --- EFFICIENCY (0 to 1) ---
+// Displacement / Total Path — how direct is the move?
+// Guarded for early bars
+closeAtLen = not na(close[effLen]) ? close[effLen] : na
+displacement = na(closeAtLen) ? na : math.abs(close - closeAtLen)
+stepSum = math.sum(math.abs(close - close[1]), effLen)
+efficiency = (not na(displacement) and not na(stepSum) and stepSum > 0) ? clamp01(safeDiv(displacement, stepSum)) : na
+
+// --- ACTIVITY (centered at 1.0) ---
+// Volume relative to average
+volAvg = ta.sma(volume, volLen)
+hasVolume = (not na(volume) and volume > 0 and not na(volAvg) and volAvg > 0) ? true : false
+activity = hasVolume ? safeDiv(volume, volAvg) : 1.0
+
+// FX fallback: range vs ATR (capped to prevent explosion)
+rangeActivity = safeDiv(high - low, atrVal)
+rangeActivityCapped = na(rangeActivity) ? 1.0 : math.min(rangeActivity, 2.5)
+activityFinal = hasVolume ? math.min(activity, 3.0) : rangeActivityCapped
+
+// --- PARTICIPATION SCORE (0-100) ---
+// Pure participation = Efficiency × Activity factor
+// No "result" duplication — efficiency already captures movement quality
+activityFactor = math.sqrt(activityFinal)  // Diminishing returns on volume
+participationRaw = na(efficiency) ? na : efficiency * activityFactor
+participation = na(participationRaw) ? na : clamp01(participationRaw) * 100.0
+
+// --- SMOOTHED OUTPUT ---
+mpg = na(participation) ? na : ta.ema(participation, smoothLen)
+
+// --- MOMENTUM ---
+mpgPrev = not na(mpg[1]) ? mpg[1] : na
+momentum = (na(mpg) or na(mpgPrev)) ? 0.0 : mpg - mpgPrev
+
+// --- QUALITY ASSESSMENT ---
+// Quality determines color for STRONG/EXTREME tiers:
+// Clean = high efficiency regardless of activity level
+// Absorbed = high activity but low efficiency (volume without direction)
+// Neutral = moderate efficiency
+isAbsorbed = (not na(efficiency) and activityFinal > 1.5 and efficiency < 0.30) ? true : false
+isClean = (not na(efficiency) and efficiency > 0.55) ? true : false
+
+// Quality: 1=clean, -1=absorbed, 0=neutral
+// For STRONG/EXTREME: show actual quality, don't force clean
+quality = isAbsorbed ? -1 : (isClean ? 1 : 0)
+
+// --- TIER CLASSIFICATION ---
+mpgTier = na(mpg) ? 0 : (mpg < 20.0 ? 0 : (mpg < 40.0 ? 1 : (mpg < 65.0 ? 2 : 3)))
+
+// --- DIRECTION (momentum-based) ---
+mpgDir = momentum > 3.0 ? 1 : (momentum < -3.0 ? -1 : 0)
+
+// --- BASE COLOR (tier-aware) ---
+// THIN (0) = Grey — nothing happening
+// BUILDING (1) = Amber — transitional
+// STRONG (2) / EXTREME (3) = Quality-based (Teal/Magenta/Grey if neutral)
+tierColor = mpgTier == 0 ? colorNeutral : (mpgTier == 1 ? colorAmber : (quality == 1 ? colorPositive : (quality == -1 ? colorNegative : colorNeutral)))
+baseColor = tierColor
+
+//==============================================================================
+// SECTION 4: READINESS
+//==============================================================================
+
+isReady = (bar_index >= effLen and not na(atrVal) and not na(mpg)) ? true : false
+
+//==============================================================================
+// SECTION 5: VISUAL CALCULATIONS
+//==============================================================================
+
+// Base color already calculated above in quality section
+
+// Histogram alpha (0-10 per style guide)
+histAlpha = theme == "Vivid" ? 2 : 6
+
+// Line alpha  
+lineAlpha = theme == "Vivid" ? 0 : 5
+
+// Pane tint alpha
+paneTintAlpha = theme == "Vivid" ? 88 : 92
+
+//==============================================================================
+// SECTION 6: OSCILLATOR PLOTS
+//==============================================================================
+
+// Histogram
+histColor = isReady ? color.new(baseColor, histAlpha) : na
+plot(showHistogram and isReady ? mpg : na, "MPG Histogram", color = histColor, style = plot.style_columns, linewidth = 2)
+
+// Trend Line
+lineColor = isReady ? color.new(baseColor, lineAlpha) : na
+plot(showLine and isReady ? mpg : na, "MPG Line", color = lineColor, style = plot.style_line, linewidth = 2)
+
+// Tier Reference Bands
+bandColor = color.new(colorNeutral, 70)
+plot(showBands ? 20.0 : na, "Thin/Building", color = bandColor, style = plot.style_line, linewidth = 1)
+plot(showBands ? 40.0 : na, "Building/Strong", color = bandColor, style = plot.style_line, linewidth = 1)
+plot(showBands ? 65.0 : na, "Strong/Extreme", color = bandColor, style = plot.style_line, linewidth = 1)
+
+// Pane background tint
+paneTintColor = (showPaneTint and isReady) ? color.new(baseColor, paneTintAlpha) : na
+bgcolor(paneTintColor, title = "Pane Tint")
+
+//==============================================================================
+// SECTION 7: STATUS LINE HUD (Open-Source Compliant)
+//==============================================================================
+
+// Status line HUD shows values in TradingView's top bar — no tables/panels
+// Minimal = MPG + Tier only (clean). Full = adds Dir and Quality.
+hudTier = isReady ? mpgTier * 1.0 : na
+hudDir = isReady ? mpgDir * 1.0 : na
+hudQual = isReady ? quality * 1.0 : na
+hudLvl = isReady ? mpg : na
+
+// Status line colors match bar colors
+hudColor = isReady ? baseColor : colorNeutral
+
+// Gating: Minimal shows Level + Tier, Full adds Dir + Quality
+showHudCore = showHUD ? true : false
+hudFull = (showHUD and hudDetail == "Full") ? true : false
+
+plot(showHudCore ? hudLvl : na, "MPG (0-100)", color = hudColor, display = display.status_line)
+plot(showHudCore ? hudTier : na, "Tier (0-3)", color = hudColor, display = display.status_line)
+plot(hudFull ? hudDir : na, "Dir (-1/0/1)", color = hudColor, display = hudFull ? display.status_line : display.none)
+plot(hudFull ? hudQual : na, "Quality (-1/0/1)", color = hudColor, display = hudFull ? display.status_line : display.none)
+
+//==============================================================================
+// SECTION 8: DATA WINDOW EXPORTS
+//==============================================================================
+
+plot(showExports ? mpg : na, "MPG Level (0-100)", display = display.data_window)
+plot(showExports ? efficiency * 100 : na, "Efficiency %", display = display.data_window)
+plot(showExports ? activityFinal : na, "Activity Ratio", display = display.data_window)
+plot(showExports ? momentum : na, "Momentum", display = display.data_window)
+plot(showExports ? quality * 1.0 : na, "Quality (-1/0/1)", display = display.data_window)
+plot(showExports ? mpgTier * 1.0 : na, "Tier (0-3)", display = display.data_window)
+
+//==============================================================================
+// END OF SCRIPT
+//==============================================================================

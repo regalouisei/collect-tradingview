@@ -1,0 +1,235 @@
+//@version=5
+strategy("EMA Touch (5m) | Rolling Prev-EMA Limit | Time Window | SL/TP | Correct Re-entry Modes",
+     overlay=true,
+     pyramiding=0,
+     calc_on_every_tick=true,
+     process_orders_on_close=false)
+
+//====================
+// Inputs
+//====================
+string tz = "America/New_York"
+
+emaLen     = input.int(10, "EMA Length", minval=1)
+qty        = input.int(1, "Qty", minval=1)
+
+stopPts    = input.float(75.0, "Stop (points)", minval=0.25, step=0.25)
+targetPts  = input.float(150.0, "Target (points)", minval=0.25, step=0.25)
+
+enableLongs  = input.bool(true, "Enable Longs")
+enableShorts = input.bool(true, "Enable Shorts")
+
+// Time window (NY)
+useTimeWindow = input.bool(true, "Use trade time window")
+startH = input.int(9,  "Start hour (NY)", minval=0, maxval=23)
+startM = input.int(45, "Start minute (NY)", minval=0, maxval=59)
+endH   = input.int(15, "End hour (NY)",   minval=0, maxval=23)
+endM   = input.int(0,  "End minute (NY)", minval=0, maxval=59)
+
+// Optional: stop “following” after N bars (0 = unlimited)
+maxFollowBars = input.int(0, "Max bars to keep a pending order (0 = unlimited)", minval=0)
+
+// Re-entry modes
+reentryMode = input.string("Wait for stop bar close", "Re-entry Mode",
+     options=["None", "Wait for stop bar close", "Require flip confirmation", "Require stretch + flip"])
+
+stretchPts = input.float(30.0, "Stretch distance (points) — only for 'Require stretch + flip'", minval=0.25, step=0.25)
+
+// Force flat (NY)
+useForceFlat = input.bool(true, "Force flat by time")
+flatH = input.int(16, "Force flat hour (NY)", minval=0, maxval=23)
+flatM = input.int(45, "Force flat minute (NY)", minval=0, maxval=59)
+
+//====================
+// Time (NY)
+//====================
+nyH = hour(time, tz)
+nyM = minute(time, tz)
+
+bool inWindow = true
+if useTimeWindow
+    bool afterStart = (nyH > startH) or (nyH == startH and nyM >= startM)
+    bool beforeEnd  = (nyH < endH)   or (nyH == endH and nyM <= endM)
+    inWindow := afterStart and beforeEnd
+
+bool forceFlat = useForceFlat and ((nyH > flatH) or (nyH == flatH and nyM >= flatM))
+
+//====================
+// EMA + rolling limit (prev-bar EMA)
+//====================
+float ema = ta.ema(close, emaLen)
+float entryLimit = ema[1]
+
+// Mechanical direction based on previous candle
+bool trendLong  = close[1] > ema[1]
+bool trendShort = close[1] < ema[1]
+
+//====================
+// Stop detection + blocks
+//====================
+var int lastClosedCount = 0
+
+// Same-direction blocks
+var bool blockLong = false
+var bool blockShort = false
+
+// Wait-one-bar blocks
+var int blockLongUntilBar = na
+var int blockShortUntilBar = na
+
+// For "stretch + flip" we need to remember if stretch happened
+var bool longStretchDone = false
+var bool shortStretchDone = false
+
+int cc = strategy.closedtrades
+if cc > lastClosedCount
+    int idx = cc - 1
+    string eid = strategy.closedtrades.exit_id(idx)
+    float pl = strategy.closedtrades.profit(idx)
+    bool stopped = pl < 0
+
+    if stopped and eid == "L-Exit"
+        if reentryMode == "Wait for stop bar close"
+            blockLongUntilBar := bar_index + 1
+        if reentryMode == "Require flip confirmation"
+            blockLong := true
+        if reentryMode == "Require stretch + flip"
+            blockLong := true
+            longStretchDone := false
+
+    if stopped and eid == "S-Exit"
+        if reentryMode == "Wait for stop bar close"
+            blockShortUntilBar := bar_index + 1
+        if reentryMode == "Require flip confirmation"
+            blockShort := true
+        if reentryMode == "Require stretch + flip"
+            blockShort := true
+            shortStretchDone := false
+
+    lastClosedCount := cc
+
+// Wait-one-bar logic
+bool longWaitBlocked  = (reentryMode == "Wait for stop bar close") and not na(blockLongUntilBar) and bar_index < blockLongUntilBar
+bool shortWaitBlocked = (reentryMode == "Wait for stop bar close") and not na(blockShortUntilBar) and bar_index < blockShortUntilBar
+
+if reentryMode == "Wait for stop bar close"
+    if not na(blockLongUntilBar) and bar_index >= blockLongUntilBar
+        blockLongUntilBar := na
+    if not na(blockShortUntilBar) and bar_index >= blockShortUntilBar
+        blockShortUntilBar := na
+
+// Require flip confirmation (correct direction)
+// Long stopped -> allow longs again only after close > EMA
+// Short stopped -> allow shorts again only after close < EMA
+if reentryMode == "Require flip confirmation"
+    if blockLong and close > ema
+        blockLong := false
+    if blockShort and close < ema
+        blockShort := false
+
+// Require stretch + flip (correct direction)
+// Long stopped -> must first stretch below EMA - X, then later close back above EMA
+// Short stopped -> must first stretch above EMA + X, then later close back below EMA
+if reentryMode == "Require stretch + flip"
+    if blockLong and not longStretchDone and close <= (ema - stretchPts)
+        longStretchDone := true
+    if blockLong and longStretchDone and close > ema
+        blockLong := false
+        longStretchDone := false
+
+    if blockShort and not shortStretchDone and close >= (ema + stretchPts)
+        shortStretchDone := true
+    if blockShort and shortStretchDone and close < ema
+        blockShort := false
+        shortStretchDone := false
+
+// Clear everything at force flat
+if forceFlat
+    blockLong := false
+    blockShort := false
+    blockLongUntilBar := na
+    blockShortUntilBar := na
+    longStretchDone := false
+    shortStretchDone := false
+
+//====================
+// Rolling order age tracking (optional)
+//====================
+var int longFollowBars  = 0
+var int shortFollowBars = 0
+
+bool flat = strategy.position_size == 0
+
+bool longBlocked =
+     (reentryMode == "Require flip confirmation" and blockLong) or
+     (reentryMode == "Require stretch + flip" and blockLong) or
+     (reentryMode == "Wait for stop bar close" and longWaitBlocked)
+
+bool shortBlocked =
+     (reentryMode == "Require flip confirmation" and blockShort) or
+     (reentryMode == "Require stretch + flip" and blockShort) or
+     (reentryMode == "Wait for stop bar close" and shortWaitBlocked)
+
+// IMPORTANT: only block SAME direction. Opposite direction can trade normally.
+bool wantLongOrder  = (not forceFlat) and inWindow and flat and enableLongs  and trendLong  and not na(entryLimit) and (reentryMode == "None" or not longBlocked)
+bool wantShortOrder = (not forceFlat) and inWindow and flat and enableShorts and trendShort and not na(entryLimit) and (reentryMode == "None" or not shortBlocked)
+
+if not wantLongOrder
+    longFollowBars := 0
+else
+    longFollowBars += 1
+
+if not wantShortOrder
+    shortFollowBars := 0
+else
+    shortFollowBars += 1
+
+bool longAllowed  = wantLongOrder  and (maxFollowBars == 0 or longFollowBars <= maxFollowBars)
+bool shortAllowed = wantShortOrder and (maxFollowBars == 0 or shortFollowBars <= maxFollowBars)
+
+//====================
+// Entries (ROLLING limit at prev EMA)
+//====================
+if longAllowed
+    strategy.entry("L-EMA", strategy.long, qty=qty, limit=entryLimit)
+else
+    strategy.cancel("L-EMA")
+
+if shortAllowed
+    strategy.entry("S-EMA", strategy.short, qty=qty, limit=entryLimit)
+else
+    strategy.cancel("S-EMA")
+
+// reset follow counters after fill
+if not flat
+    longFollowBars := 0
+    shortFollowBars := 0
+
+//====================
+// Exits (fixed points from avg fill)
+//====================
+if strategy.position_size > 0
+    float avg = strategy.position_avg_price
+    float stopPrice   = avg - stopPts
+    float targetPrice = avg + targetPts
+    strategy.exit("L-Exit", from_entry="L-EMA", stop=stopPrice, limit=targetPrice)
+
+if strategy.position_size < 0
+    float avg = strategy.position_avg_price
+    float stopPrice   = avg + stopPts
+    float targetPrice = avg - targetPts
+    strategy.exit("S-Exit", from_entry="S-EMA", stop=stopPrice, limit=targetPrice)
+
+//====================
+// Force flat
+//====================
+if forceFlat
+    strategy.cancel("L-EMA")
+    strategy.cancel("S-EMA")
+    strategy.close_all(comment="Flat by time")
+
+//====================
+// Plots
+//====================
+plot(ema, "EMA", linewidth=2)
+plot(entryLimit, "Prev EMA (rolling limit)", style=plot.style_linebr)

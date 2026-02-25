@@ -1,0 +1,165 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © RedKTrader
+
+//@version=5
+indicator(title='RedK Auto-Step Ladder Trader', shorttitle='Ladder_Trader v2.0', overlay=true, timeframe='', timeframe_gaps=false)
+// ===================================================================================================================
+//                              Functions Section
+// ===================================================================================================================
+// step function (version 2)
+// this function picks a step size based on the price range
+// it will then scale the step value up/down based on TF changes
+// change and personalize these ranges as needed
+f_step(x) =>
+    initstep = 
+      x < 2     ? 0.01  : x < 5     ? 0.02  :
+      x < 10    ? 0.10  : x < 30    ? 0.20  : 
+      x < 100   ? 1.00  : x < 300   ? 2.00  : 
+      x < 500   ? 5.00  : x < 1000  ? 10.0  : 
+      x < 2000  ? 20.0  : x < 5000  ? 50.0  : 
+      x < 10000 ? 100.0 : x < 20000 ? 200.0 : 
+      x < 50000 ? 500.  : 1000.0
+
+    //Adjust step value up or down for different timeframes
+    adjstep = timeframe.isweekly ? initstep * 2 : 
+      timeframe.ismonthly ? initstep * 5 : 
+      timeframe.isintraday and timeframe.multiplier > 60 ? initstep / 2 : 
+      timeframe.isintraday and timeframe.multiplier <= 60 ? initstep / 5 : 
+      initstep
+
+    // need to replace the 4's in weekly and minutes with 5's
+    // cause we want to track the mental increments of traders - round values are more effective 
+    _incstr = str.tostring(adjstep)
+    _newstr = str.replace_all(_incstr, '4', '5')
+    str.tonumber(_newstr)
+// =============================================================================
+// the rounding function chooses the type of step rounding to apply
+// we can use either a regular rounding up/down to nearest step (ex: for step size = 10, a value of 17 becomes 20 and a value of 13 becomes 10)
+// or an integer type, which considers only the "fully completed" step level (ex: for step size = 10, both values of 13 and 17 become 10)
+f_rounding(_value, _step, _option) =>
+    _option == 'Round up/down' ? math.round(_value / _step) * _step : int(_value / _step) * _step
+
+//==============================================================================   
+// Compund Ratio Moving Average function
+f_CoraWave(_source, _length, _s) =>
+    numerator   = 0.0, denom = 0.0
+    c_weight    = 0.0, r_multi = 2.0
+    Start_Wt    = 0.01     // Start Weight & r_multi are set to basic values here.
+    End_Wt      = _length    // use length as initial End Weight to calculate base "r"
+    
+    r = math.pow(End_Wt / Start_Wt, 1 / (_length - 1)) - 1
+    base = 1 + r * r_multi
+
+    for i = 0 to _length - 1 by 1
+        c_weight    := Start_Wt * math.pow(base, _length - i)
+        numerator   += _source[i] * c_weight
+        denom       += c_weight
+        denom
+
+    cora_raw    = numerator / denom
+    cora_wave   = ta.wma(cora_raw, _s)
+    cora_wave
+// ========================================================================================================================================================    
+//                              inputs
+// ========================================================================================================================================================
+avgtype     = input.string  (title='Ladder Line Type', defval='Donchian Midline', options=['CoRa_Wave', 'Donchian Midline'],    inline='MA Type')
+length      = input.int     (title='  Length',              defval=10, minval=1,                                                inline='MA Type')
+price       = input.source  (title='(CoRa Only) Source',    defval=hlc3,                                                    inline='Cora Only')  
+smooth      = input.int     (title='Smoothing',             defval=3, minval=1,                                             inline='Cora Only')  
+
+
+
+s_use       = input.bool    (title='',                      defval=true,                                                    inline='Step',  group='Step')
+s_size      = input.float   (title='Step        Size [0 = Auto]', defval=0.0, minval=0,                                     inline='Step',  group='Step')
+r_option    = input.string  (title='Step Calculation', defval='Round up/down', options=['Round up/down', 'Whole Step'],                     group='Step')
+
+g_source    = input.source  (title='Source', defval=hlc3,                                                       inline='Signal',  group='Signal')
+g_length    = input.int     (title='Length', defval=5, minval=2,                                                inline='Signal',  group='Signal')
+g_smooth    = input.int     (title='Smooth', defval=3, minval=1,                                                inline='Signal',  group='Signal')
+
+
+tr_show     = input.bool    (title='', defval=true, inline='ATR Envelope', group='Envelopes')
+tr_len      = input.int     (title='ATR Envelope   Length', defval=20, minval=0, step=1,                        inline='ATR Envelope', group='Envelopes')
+tr_multi    = input.float   (title='Multi', defval=1.25, minval=0, step=0.25,                                   inline='ATR Envelope', group='Envelopes')
+
+e_show      = input.bool    (title='', defval=false,                                                            inline='Pct Envelope', group='Envelopes')
+e_pct       = input.float   (title='Pct Envelope           %', defval=2.0, minval=0, step=0.25,                 inline='Pct Envelope', group='Envelopes')
+
+// ===================================================================================================================
+//                          Calculation
+// ===================================================================================================================
+
+
+// Ladder Line calculation
+ladder      = avgtype == 'CoRa_Wave' ? f_CoraWave(price, length, smooth) : (ta.highest(length) + ta.lowest(length)) / 2
+
+//Apply Stepping to Ladder Line -- added condition that base price needs to be > 0.01, as micro prices will break this part
+//also removed cases with div/0 
+// -- may come back and fine tune the auto-step algo for micro prices
+s_apply     = s_use and price > 0.01
+
+s           = s_apply ? s_size == 0.0 ? f_step(price) : s_size : 0.0
+ladder_s    = s_apply and s > 0.0 ? f_rounding(ladder, s, r_option) : ladder
+
+
+// Signal Calculation  -- signal line is a CoRa_Wave with (default) fast speed and relatively large smoothness (5 & 3) - as a proxy for price
+
+Signal      = f_CoraWave(g_source, g_length, g_smooth)
+
+// Calculate Envelopes
+e_upper     = ladder_s * (1 + e_pct / 100)
+e_lower     = ladder_s * (1 - e_pct / 100)
+
+// while the pct envelope is a static absolute value, the ATR will change with each bar
+// below we use a new ATR value only when the channel step changes - non-stepping/unrestricted ATR is still avaialble by disabling the stepping option
+
+ATR         = ta.atr(tr_len) * tr_multi
+ATR_us      = ATR
+ATR_ls      = ATR
+ATR_us      := ta.change(ladder_s) != 0 ? ATR : ATR_us[1]
+ATR_ls      := ta.change(ladder_s) != 0 ? ATR : ATR_ls[1]
+ATR_upper   = ladder_s + ATR_us
+ATR_lower   = ladder_s - ATR_ls
+
+
+// ===================================================================================================================
+//                              Plot
+// ===================================================================================================================
+
+c_up    = color.new(color.aqua, 0)
+c_dn    = color.new(color.orange, 0)
+c_lad   = Signal >= ladder_s ? c_up : c_dn 
+
+c_env   = color.new(color.silver, 50)
+c_ATR   = color.new(color.yellow, 50)
+
+//v2.0 - Display the step size on the indicator status line & in the Data Window
+plotchar(s, title = "Step Size", char = "", location=location.top, color=color.white)
+
+//Signal plot is hidden by default - recommend to expose only when tweaking settings
+plot(Signal, title='Signal', color=color.white, display=display.none)
+
+PStyle = plot.style_line
+plot_ladder = plot(ladder_s, title='Ladder Line', style=PStyle, color=c_lad, linewidth=3)
+
+
+//PStyle1 = plot.style_stepline
+PStyle1 = plot.style_line  //change default plot style to regular line for consistency
+
+plot(tr_show ? ATR_upper : na, 'Upper ATR Envelope', style=PStyle1, color=c_ATR)
+plot(tr_show ? ATR_lower : na, 'Lower ATR Envelope', style=PStyle1, color=c_ATR)
+
+plot(e_show ? e_upper : na, 'Upper Pct Envelope', style=PStyle1, color=c_env)
+plot(e_show ? e_lower : na, 'Lower Pct Envelope', style=PStyle1, color=c_env)
+
+// ========================================================================================================================
+// v2.0 - Enable alerts for direction change up or down or either
+// ========================================================================================================================
+
+// alertcondition() supports variable resolution
+AlertUp = ta.crossover(Signal, ladder_s)
+AlertDn = ta.crossunder(Signal, ladder_s)
+
+alertcondition(AlertUp,             "Price Swing Up",      "Ladder: Price Swing Up Detected!")                // explicit swing up
+alertcondition(AlertDn,             "Price Swing Down",    "Ladder: Price Swing Down Detected!")              // explicit swing down
+alertcondition(AlertUp or AlertDn,  "Price Swing Up/Down", "Ladder: Price Swing Up/Down Detected!")           // Any swing

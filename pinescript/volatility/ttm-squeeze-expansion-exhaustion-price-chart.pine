@@ -1,0 +1,608 @@
+//@version=5
+indicator("TTM Squeeze +Expansion + Exhaustion (price chart)", overlay=true, max_boxes_count=500)
+
+//────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────
+len     = input.int(20, "Length", minval=5)
+bbMult  = input.float(2.0, "BB Mult", step=0.1)
+kcMult  = input.float(1.5, "KC Mult", step=0.1)
+
+// Oscillator scaling/smoothing
+normLookbk = input.int(200, "Vol Norm Lookback", minval=50)
+smoothLen  = input.int(5, "Oscillator Smoothing (EMA)", minval=1)
+
+lowZone    = input.float(20.0, "Low Zone (Squeeze ON max)", step=0.5)
+highZone   = input.float(80.0, "High Zone", step=0.5)
+
+momLen     = input.int(20, "TTM Mom Length", minval=5)
+
+// Box settings
+boxPadATR       = input.float(0.0, "Box Padding ATR", step=0.05, minval=0.0)
+minSqueezeBars  = input.int(5, "Min squeeze bars", minval=1,
+     tooltip="Require at least this many consecutive squeezeOn bars before drawing a box.")
+
+//────────────────────────────────────────
+// BB/KC Ratio Percentile (0–100) — Triangle Strength
+//────────────────────────────────────────
+grpRatio = "BB/KC Ratio Percentile (0–100) — Triangle Strength"
+useBBKCPRFilter = input.bool(true, "Enable BB/KC ratio percentile strength highlight", group=grpRatio)
+ratioLookback   = input.int(252, "Ratio percentile lookback", minval=50, group=grpRatio)
+bbkcPRMin       = input.float(60.0, "Strong if BB/KC PR >= (min)", step=1.0, minval=0, maxval=100, group=grpRatio)
+bbkcPRMax       = input.float(100.0,"Strong if BB/KC PR <= (max)", step=1.0, minval=0, maxval=100, group=grpRatio)
+
+//────────────────────────────────────────
+// Vol Expansion Acceleration Filter
+//────────────────────────────────────────
+grpAccel = "Vol Expansion Acceleration Filter"
+useAccelFilter   = input.bool(true, "Require expansion acceleration for STRONG highlight", group=grpAccel)
+accelSmoothLen   = input.int(5, "Vol% smoothing (EMA) for accel", minval=1, group=grpAccel)
+minVel           = input.float(0.25, "Min velocity (Vol%/bar)", step=0.05, group=grpAccel)
+minAccel         = input.float(0.05, "Min acceleration (Δvelocity)", step=0.01, group=grpAccel)
+requireVelPos    = input.bool(true, "Require velocity > 0 (expanding)", group=grpAccel)
+
+//────────────────────────────────────────
+// Triangle style (normal vs strong)
+//────────────────────────────────────────
+grpTriStyle = "Triangle Style"
+triUpColor        = input.color(color.lime,   "Up triangle (normal)",   group=grpTriStyle)
+triDownColor      = input.color(color.red,    "Down triangle (normal)", group=grpTriStyle)
+triUpStrongColor  = input.color(color.green,  "Up triangle (STRONG)",   group=grpTriStyle)
+triDnStrongColor  = input.color(color.maroon, "Down triangle (STRONG)", group=grpTriStyle)
+triSize           = input.string("Small", "Triangle size", options=["Tiny","Small","Normal","Large","Huge"], group=grpTriStyle)
+
+//────────────────────────────────────────
+// Style inputs (Green squeeze box)
+//────────────────────────────────────────
+grpBoxStyle = "Green Squeeze Box Style"
+boxGreenFillColor   = input.color(color.green, "Fill color", group=grpBoxStyle)
+boxGreenFillAlpha   = input.int(85, "Fill transparency (0-100)", minval=0, maxval=100, group=grpBoxStyle)
+boxGreenBorderColor = input.color(color.green, "Border color", group=grpBoxStyle)
+boxGreenBorderAlpha = input.int(25, "Border transparency (0-100)", minval=0, maxval=100, group=grpBoxStyle)
+boxGreenBorderWidth = input.int(1, "Border width", minval=1, maxval=4, group=grpBoxStyle)
+
+//────────────────────────────────────────
+// Post-break zones — STORE MANY, SHOW FEW (fallback)
+//────────────────────────────────────────
+grpZones = "Post-break Zones (store many / show few)"
+showZones       = input.bool(true, "Show post-break zone boxes", group=grpZones)
+
+showSupN        = input.int(5, "Show # support boxes (below) [1–5]", minval=1, maxval=5, group=grpZones)
+showResN        = input.int(5, "Show # resistance boxes (above) [1–5]", minval=1, maxval=5, group=grpZones)
+
+storeSupN       = input.int(150, "Store # support ranges (below)", minval=5, maxval=1000, group=grpZones)
+storeResN       = input.int(150, "Store # resistance ranges (above)", minval=5, maxval=1000, group=grpZones)
+
+// clamp how far left we draw (prevents history buffer crash)
+maxDrawBackBars = input.int(1100, "Max bars to draw boxes left (prevents buffer error)", minval=200, maxval=5000, group=grpZones)
+
+zoneFillAlpha    = input.int(88, "Zone fill transparency (0-100)", minval=0, maxval=100, group=grpZones)
+zoneBorderAlpha  = input.int(15, "Zone border transparency (0-100)", minval=0, maxval=100, group=grpZones)
+zoneBorderWidth  = input.int(1, "Zone border width", minval=1, maxval=4, group=grpZones)
+
+supportZoneColor = input.color(color.new(color.lime, 0),   "Support zone color", group=grpZones)
+resistZoneColor  = input.color(color.new(color.red,  0),   "Resistance zone color", group=grpZones)
+
+showZoneDots     = input.bool(true, "Show zone entry/break dots", group=grpZones)
+entryDotColorSup = input.color(color.lime, "Entry dot (support)", group=grpZones)
+entryDotColorRes = input.color(color.red,  "Entry dot (resistance)", group=grpZones)
+breakDotColorUp  = input.color(color.green,  "Break ABOVE resistance dot", group=grpZones)
+breakDotColorDn  = input.color(color.maroon, "Break BELOW support dot", group=grpZones)
+
+//────────────────────────────────────────
+// Alerts inputs
+//────────────────────────────────────────
+grpAlerts = "Alerts"
+enableAlertconditions = input.bool(true, "Enable alertcondition() rules", group=grpAlerts)
+enableAlertCalls      = input.bool(false, "Enable alert() calls (Any alert() function call)", group=grpAlerts,
+     tooltip="If ON, the script will call alert() when signals occur. Use one alert set to 'Any alert() function call'.")
+
+//────────────────────────────────────────
+// Helpers
+//────────────────────────────────────────
+clamp01(x) =>
+    x < 0 ? 0.0 : x > 1 ? 1.0 : x
+
+inRange(x, lo, hi) =>
+    x >= lo and x <= hi
+
+// wick overlap test
+inZone(_top, _bot) =>
+    not na(_top) and not na(_bot) and high >= _bot and low <= _top
+
+//────────────────────────────────────────
+// BB + KC
+//────────────────────────────────────────
+basis = ta.sma(close, len)
+dev   = bbMult * ta.stdev(close, len)
+
+bbU = basis + dev
+bbL = basis - dev
+
+atr = ta.atr(len)
+kcU = basis + kcMult * atr
+kcL = basis - kcMult * atr
+
+squeezeOn  = (bbU < kcU) and (bbL > kcL)
+squeezeOff = (bbU > kcU) and (bbL < kcL)
+
+//────────────────────────────────────────
+// Volatility Oscillator normalization
+//────────────────────────────────────────
+bbWidth = (bbU - bbL)
+kcWidth = (kcU - kcL)
+
+bbWidthPct = basis != 0 ? (bbWidth / basis) * 100.0 : na
+
+minW    = ta.lowest(bbWidthPct, normLookbk)
+maxW    = ta.highest(bbWidthPct, normLookbk)
+rangeW  = maxW - minW
+w01_raw = rangeW != 0 ? (bbWidthPct - minW) / rangeW : 0.0
+w01     = clamp01(w01_raw)
+
+// Oscillator
+oscRaw =
+     squeezeOn
+         ? (w01 * lowZone)
+         : (lowZone + w01 * (100.0 - lowZone))
+
+volOsc = ta.ema(oscRaw, smoothLen)
+volCrossDown80 = ta.crossunder(volOsc, highZone)
+
+//────────────────────────────────────────
+// BB/KC Ratio Percentile (0–100)
+//────────────────────────────────────────
+bbkcRatio = kcWidth != 0 ? (bbWidth / kcWidth) : na
+bbkcPR    = ta.percentrank(bbkcRatio, ratioLookback)  // 0..100
+bbkcPRInRange = useBBKCPRFilter and not na(bbkcPR) and inRange(bbkcPR, bbkcPRMin, bbkcPRMax)
+
+//────────────────────────────────────────
+// Vol Expansion Acceleration (on normalized Vol%)
+//────────────────────────────────────────
+volPct      = w01 * 100.0
+volPctSm    = ta.ema(volPct, accelSmoothLen)
+vel         = volPctSm - volPctSm[1]
+accel       = vel - vel[1]
+
+accelOK =
+     (not useAccelFilter) ? true :
+     (not na(vel) and not na(accel)) and
+     (requireVelPos ? (vel > 0) : true) and
+     (vel >= minVel) and
+     (accel >= minAccel)
+
+strongHighlight = (useBBKCPRFilter ? bbkcPRInRange : true) and accelOK
+
+//────────────────────────────────────────
+// TTM Momentum
+//────────────────────────────────────────
+hh  = ta.highest(high, momLen)
+ll  = ta.lowest(low, momLen)
+mid = (hh + ll) / 2.0
+val = close - ((mid + ta.sma(close, momLen)) / 2.0)
+mom = ta.linreg(val, momLen, 0)
+
+//────────────────────────────────────────
+// Diamonds
+//────────────────────────────────────────
+greenDiamond = volCrossDown80 and mom < 0
+redDiamond   = volCrossDown80 and mom > 0
+
+plotshape(greenDiamond, style=shape.diamond, color=color.green, size=size.small, location=location.belowbar)
+plotshape(redDiamond,   style=shape.diamond, color=color.red,   size=size.small, location=location.abovebar)
+
+//────────────────────────────────────────
+// Min squeeze bar counter
+//────────────────────────────────────────
+var int sqCount = 0
+sqCount := squeezeOn ? (sqCount + 1) : 0
+validSqueeze = squeezeOn and (sqCount >= minSqueezeBars)
+
+//────────────────────────────────────────
+// Squeeze Box Logic
+//────────────────────────────────────────
+pad = atr * boxPadATR
+
+var box   sqBox             = na
+var float runHigh           = na
+var float runLow            = na
+var int   sqStart           = na
+
+var float lastValidHigh     = na
+var float lastValidLow      = na
+var bool  lastValidExists   = false
+
+var bool  thisSqBecameValid = false
+var bool  pendingBreak      = false
+
+startSqueeze = squeezeOn and not squeezeOn[1]
+endSqueeze   = not squeezeOn and squeezeOn[1]
+
+// Start tracking a new squeeze
+if startSqueeze
+    runHigh := high
+    runLow  := low
+    sqStart := bar_index
+    thisSqBecameValid := false
+
+// Update running bounds for every squeeze bar
+if squeezeOn
+    runHigh := na(runHigh) ? high : math.max(runHigh, high)
+    runLow  := na(runLow)  ? low  : math.min(runLow, low)
+
+// Once squeeze is valid, update last valid bounds to full squeeze range
+if squeezeOn and validSqueeze
+    thisSqBecameValid := true
+    lastValidHigh := runHigh
+    lastValidLow  := runLow
+    lastValidExists := true
+
+// Draw/update the green box only when squeeze is valid
+if squeezeOn and validSqueeze
+    float topNow = runHigh + pad
+    float botNow = runLow  - pad
+
+    color fillC   = color.new(boxGreenFillColor, boxGreenFillAlpha)
+    color borderC = color.new(boxGreenBorderColor, boxGreenBorderAlpha)
+
+    if na(sqBox)
+        sqBox := box.new(sqStart, topNow, bar_index, botNow,
+             bgcolor=fillC,
+             border_color=borderC,
+             border_width=boxGreenBorderWidth)
+    else
+        box.set_left(sqBox, sqStart)
+        box.set_right(sqBox, bar_index)
+        box.set_top(sqBox, topNow)
+        box.set_bottom(sqBox, botNow)
+        box.set_bgcolor(sqBox, fillC)
+        box.set_border_color(sqBox, borderC)
+        box.set_border_width(sqBox, boxGreenBorderWidth)
+
+// When squeeze ends: if it was valid => arm pendingBreak
+if endSqueeze
+    if thisSqBecameValid and lastValidExists
+        pendingBreak := true
+
+    sqBox := na
+    runHigh := na
+    runLow := na
+    sqStart := na
+    thisSqBecameValid := false
+
+// Break logic: require CLOSE above/below the last valid squeeze bounds
+breakUp   = pendingBreak and lastValidExists and close > (lastValidHigh + pad)
+breakDown = pendingBreak and lastValidExists and close < (lastValidLow  - pad)
+
+//────────────────────────────────────────
+// Triangles (CONST-SAFE sizes) + Strong highlight
+//────────────────────────────────────────
+upColor   = strongHighlight ? triUpStrongColor  : triUpColor
+downColor = strongHighlight ? triDnStrongColor  : triDownColor
+
+isTiny   = triSize == "Tiny"
+isSmall  = triSize == "Small"
+isNormal = triSize == "Normal"
+isLarge  = triSize == "Large"
+isHuge   = triSize == "Huge"
+
+plotshape(breakUp   and isTiny,   style=shape.triangleup,   color=upColor,   size=size.tiny,   location=location.belowbar)
+plotshape(breakDown and isTiny,   style=shape.triangledown, color=downColor, size=size.tiny,   location=location.abovebar)
+plotshape(breakUp   and isSmall,  style=shape.triangleup,   color=upColor,   size=size.small,  location=location.belowbar)
+plotshape(breakDown and isSmall,  style=shape.triangledown, color=downColor, size=size.small,  location=location.abovebar)
+plotshape(breakUp   and isNormal, style=shape.triangleup,   color=upColor,   size=size.normal, location=location.belowbar)
+plotshape(breakDown and isNormal, style=shape.triangledown, color=downColor, size=size.normal, location=location.abovebar)
+plotshape(breakUp   and isLarge,  style=shape.triangleup,   color=upColor,   size=size.large,  location=location.belowbar)
+plotshape(breakDown and isLarge,  style=shape.triangledown, color=downColor, size=size.large,  location=location.abovebar)
+plotshape(breakUp   and isHuge,   style=shape.triangleup,   color=upColor,   size=size.huge,   location=location.belowbar)
+plotshape(breakDown and isHuge,   style=shape.triangledown, color=downColor, size=size.huge,   location=location.abovebar)
+
+if breakUp or breakDown
+    pendingBreak := false
+
+//────────────────────────────────────────
+// Post-break zones (store many, show few, fallback)
+//────────────────────────────────────────
+
+// STORED ranges (MOST RECENT first)
+var array<int>   supStoreLeft = array.new_int()
+var array<float> supStoreTop  = array.new_float()
+var array<float> supStoreBot  = array.new_float()
+
+var array<int>   resStoreLeft = array.new_int()
+var array<float> resStoreTop  = array.new_float()
+var array<float> resStoreBot  = array.new_float()
+
+// DISPLAY boxes (mirror first showSupN/showResN stored items)
+var array<box>   supBoxes = array.new_box()
+var array<bool>  supWasIn = array.new_bool()
+
+var array<box>   resBoxes = array.new_box()
+var array<bool>  resWasIn = array.new_bool()
+
+f_styleSupport(_bx) =>
+    if not na(_bx)
+        box.set_bgcolor(_bx, color.new(supportZoneColor, zoneFillAlpha))
+        box.set_border_color(_bx, color.new(supportZoneColor, zoneBorderAlpha))
+        box.set_border_width(_bx, zoneBorderWidth)
+
+f_styleResist(_bx) =>
+    if not na(_bx)
+        box.set_bgcolor(_bx, color.new(resistZoneColor, zoneFillAlpha))
+        box.set_border_color(_bx, color.new(resistZoneColor, zoneBorderAlpha))
+        box.set_border_width(_bx, zoneBorderWidth)
+
+f_storeSup(_left, _top, _bot) =>
+    array.unshift(supStoreLeft, _left)
+    array.unshift(supStoreTop,  _top)
+    array.unshift(supStoreBot,  _bot)
+    while array.size(supStoreTop) > storeSupN
+        array.pop(supStoreLeft), array.pop(supStoreTop), array.pop(supStoreBot)
+
+f_storeRes(_left, _top, _bot) =>
+    array.unshift(resStoreLeft, _left)
+    array.unshift(resStoreTop,  _top)
+    array.unshift(resStoreBot,  _bot)
+    while array.size(resStoreTop) > storeResN
+        array.pop(resStoreLeft), array.pop(resStoreTop), array.pop(resStoreBot)
+
+f_clampLeft(_storedLeft) =>
+    int minLeft = bar_index - maxDrawBackBars
+    _storedLeft < minLeft ? minLeft : _storedLeft
+
+f_syncSupport() =>
+    int want = math.min(showSupN, array.size(supStoreTop))
+
+    while array.size(supBoxes) > want
+        box bxDel = array.pop(supBoxes)
+        array.pop(supWasIn)
+        if not na(bxDel)
+            box.delete(bxDel)
+
+    while array.size(supBoxes) < want
+        int i = array.size(supBoxes)
+        int   l  = f_clampLeft(array.get(supStoreLeft, i))
+        float t  = array.get(supStoreTop,  i)
+        float b  = array.get(supStoreBot,  i)
+        box bx = box.new(l, t, bar_index, b)
+        f_styleSupport(bx)
+        array.push(supBoxes, bx)
+        array.push(supWasIn, false)
+
+    int n = array.size(supBoxes)
+    if n > 0
+        for i = 0 to n - 1
+            box bx = array.get(supBoxes, i)
+            int   l  = f_clampLeft(array.get(supStoreLeft, i))
+            float t  = array.get(supStoreTop,  i)
+            float b  = array.get(supStoreBot,  i)
+            if not na(bx)
+                box.set_left(bx, l)
+                box.set_top(bx, t)
+                box.set_bottom(bx, b)
+                f_styleSupport(bx)
+
+f_syncResist() =>
+    int want = math.min(showResN, array.size(resStoreTop))
+
+    while array.size(resBoxes) > want
+        box bxDel = array.pop(resBoxes)
+        array.pop(resWasIn)
+        if not na(bxDel)
+            box.delete(bxDel)
+
+    while array.size(resBoxes) < want
+        int i = array.size(resBoxes)
+        int   l  = f_clampLeft(array.get(resStoreLeft, i))
+        float t  = array.get(resStoreTop,  i)
+        float b  = array.get(resStoreBot,  i)
+        box bx = box.new(l, t, bar_index, b)
+        f_styleResist(bx)
+        array.push(resBoxes, bx)
+        array.push(resWasIn, false)
+
+    int n = array.size(resBoxes)
+    if n > 0
+        for i = 0 to n - 1
+            box bx = array.get(resBoxes, i)
+            int   l  = f_clampLeft(array.get(resStoreLeft, i))
+            float t  = array.get(resStoreTop,  i)
+            float b  = array.get(resStoreBot,  i)
+            if not na(bx)
+                box.set_left(bx, l)
+                box.set_top(bx, t)
+                box.set_bottom(bx, b)
+                f_styleResist(bx)
+
+// Create stored zones from squeeze breaks
+if showZones and breakUp and lastValidExists
+    f_storeSup(bar_index, lastValidHigh + pad, lastValidLow - pad)
+    f_syncSupport()
+
+if showZones and breakDown and lastValidExists
+    f_storeRes(bar_index, lastValidHigh + pad, lastValidLow - pad)
+    f_syncResist()
+
+// Extend displayed boxes to the right each bar
+if showZones
+    int nS = array.size(supBoxes)
+    if nS > 0
+        for i = 0 to nS - 1
+            box bx = array.get(supBoxes, i)
+            if not na(bx)
+                box.set_right(bx, bar_index)
+
+    int nR = array.size(resBoxes)
+    if nR > 0
+        for i = 0 to nR - 1
+            box bx = array.get(resBoxes, i)
+            if not na(bx)
+                box.set_right(bx, bar_index)
+
+// Zone dots + “break removes newest, reveals older”
+bool supEnterAny = false
+bool resEnterAny = false
+bool supBreakAny = false
+bool resBreakAny = false
+
+// SUPPORT: only index 0 can be broken (close < bottom)
+if showZones
+    int nS2 = array.size(supBoxes)
+    if nS2 > 0
+        for i = nS2 - 1 to 0
+            float t = array.get(supStoreTop, i)
+            float b = array.get(supStoreBot, i)
+            bool was = array.get(supWasIn, i)
+
+            bool inNow = inZone(t, b)
+            bool enterNow = showZoneDots and inNow and not was
+            supEnterAny := supEnterAny or enterNow
+
+            bool breakNow = showZoneDots and close < b
+            if breakNow and i == 0
+                supBreakAny := true
+                array.remove(supStoreLeft, 0)
+                array.remove(supStoreTop,  0)
+                array.remove(supStoreBot,  0)
+                f_syncSupport()
+                break
+            else
+                array.set(supWasIn, i, inNow)
+
+// RESIST: only index 0 can be broken (close > top)
+if showZones
+    int nR2 = array.size(resBoxes)
+    if nR2 > 0
+        for i = nR2 - 1 to 0
+            float t = array.get(resStoreTop, i)
+            float b = array.get(resStoreBot, i)
+            bool was = array.get(resWasIn, i)
+
+            bool inNow = inZone(t, b)
+            bool enterNow = showZoneDots and inNow and not was
+            resEnterAny := resEnterAny or enterNow
+
+            bool breakNow = showZoneDots and close > t
+            if breakNow and i == 0
+                resBreakAny := true
+                array.remove(resStoreLeft, 0)
+                array.remove(resStoreTop,  0)
+                array.remove(resStoreBot,  0)
+                f_syncResist()
+                break
+            else
+                array.set(resWasIn, i, inNow)
+
+// Plot dots
+plotshape(supEnterAny, style=shape.circle, color=entryDotColorSup, size=size.tiny,  location=location.belowbar)
+plotshape(resEnterAny, style=shape.circle, color=entryDotColorRes, size=size.tiny,  location=location.abovebar)
+plotshape(supBreakAny, style=shape.circle, color=breakDotColorDn,  size=size.small, location=location.abovebar)
+plotshape(resBreakAny, style=shape.circle, color=breakDotColorUp,  size=size.small, location=location.belowbar)
+
+//────────────────────────────────────────
+// Any Bullish / Any Bearish (INCLUDES ENTRY DOTS)
+// Bullish: greenDiamond OR breakUp OR resEnterAny OR resBreakAny
+// Bearish: redDiamond   OR breakDown OR supEnterAny OR supBreakAny
+//────────────────────────────────────────
+anyBullish = greenDiamond or breakUp or resEnterAny or resBreakAny
+anyBearish = redDiamond   or breakDown or supEnterAny or supBreakAny
+
+//────────────────────────────────────────
+// Alerts (alertcondition() entries show up in dropdown)
+//────────────────────────────────────────
+
+// Diamonds
+alertcondition(enableAlertconditions and greenDiamond,
+     title="Green Diamond",
+     message="Green Diamond on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and redDiamond,
+     title="Red Diamond",
+     message="Red Diamond on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and (greenDiamond or redDiamond),
+     title="Any Diamond",
+     message="Diamond signal on {{ticker}} ({{interval}}). Close={{close}}")
+
+// Triangle Breaks
+alertcondition(enableAlertconditions and breakUp,
+     title="Triangle Up Break",
+     message="Triangle UP break above squeeze range on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and breakDown,
+     title="Triangle Down Break",
+     message="Triangle DOWN break below squeeze range on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and (breakUp or breakDown),
+     title="Any Triangle Break",
+     message="Triangle break on {{ticker}} ({{interval}}). Close={{close}}")
+
+// Strong triangle (optional)
+strongBreakUp   = breakUp and strongHighlight
+strongBreakDown = breakDown and strongHighlight
+
+alertcondition(enableAlertconditions and strongBreakUp,
+     title="STRONG Triangle Up (BB/KC PR + Accel filters met)",
+     message="STRONG Triangle UP (BB/KC PR in range + expansion accel) on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and strongBreakDown,
+     title="STRONG Triangle Down (BB/KC PR + Accel filters met)",
+     message="STRONG Triangle DOWN (BB/KC PR in range + expansion accel) on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and (strongBreakUp or strongBreakDown),
+     title="Any STRONG Triangle (BB/KC PR + Accel filters met)",
+     message="STRONG Triangle (BB/KC PR in range + expansion accel) on {{ticker}} ({{interval}}). Close={{close}}")
+
+// Zone dot alerts
+alertcondition(enableAlertconditions and supEnterAny,
+     title="Entered Support Zone (small dot)",
+     message="Price ENTERED a SUPPORT zone on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and resEnterAny,
+     title="Entered Resistance Zone (small dot)",
+     message="Price ENTERED a RESISTANCE zone on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and supBreakAny,
+     title="Broke BELOW Support Zone (medium dot)",
+     message="Close BROKE BELOW the MOST RECENT SUPPORT zone (removed; older becomes active) on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and resBreakAny,
+     title="Broke ABOVE Resistance Zone (medium dot)",
+     message="Close BROKE ABOVE the MOST RECENT RESIST zone (removed; older becomes active) on {{ticker}} ({{interval}}). Close={{close}}")
+
+// ✅ NEW: Any Bullish / Any Bearish (these WILL appear)
+alertcondition(enableAlertconditions and anyBullish,
+     title="Any Bullish",
+     message="BULLISH signal (Diamond/Triangle/Zone Entry/Zone Break) on {{ticker}} ({{interval}}). Close={{close}}")
+
+alertcondition(enableAlertconditions and anyBearish,
+     title="Any Bearish",
+     message="BEARISH signal (Diamond/Triangle/Zone Entry/Zone Break) on {{ticker}} ({{interval}}). Close={{close}}")
+
+// Any Signal
+alertcondition(enableAlertconditions and (anyBullish or anyBearish),
+     title="Any Signal (Bullish/Bearish)",
+     message="Signal (bullish/bearish) on {{ticker}} ({{interval}}). Close={{close}}")
+
+// Optional alert() calls (Any alert() function call)
+if enableAlertCalls
+    if greenDiamond
+        alert("Green Diamond on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if redDiamond
+        alert("Red Diamond on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if breakUp
+        alert("Triangle UP break on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if breakDown
+        alert("Triangle DOWN break on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if supEnterAny
+        alert("Entered SUPPORT zone (small dot) on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if resEnterAny
+        alert("Entered RESISTANCE zone (small dot) on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if supBreakAny
+        alert("Broke BELOW support zone (removed; fallback) on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if resBreakAny
+        alert("Broke ABOVE resistance zone (removed; fallback) on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if anyBullish
+        alert("ANY BULLISH on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)
+    if anyBearish
+        alert("ANY BEARISH on " + syminfo.ticker + " (" + timeframe.period + "). Close=" + str.tostring(close), alert.freq_once_per_bar_close)

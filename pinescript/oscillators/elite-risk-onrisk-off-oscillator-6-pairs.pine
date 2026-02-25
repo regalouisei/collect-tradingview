@@ -1,0 +1,100 @@
+//@version=6
+indicator("Elite Risk-On/Risk-Off Oscillator (6 pairs) — Symbol-Safe", overlay=false)
+
+// ===== Inputs =====
+maLen           = input.int(50, "MA Length", minval=10)
+useROC          = input.bool(true, "Use ROC for slope (else MA slope)")
+rocLen          = input.int(10, "ROC length", minval=2)
+maSlopeLookback = input.int(10, "MA slope lookback (bars)", minval=2)
+
+smoothLen       = input.int(5, "Oscillator smoothing (SMA)", minval=1)
+
+// Weights
+wCredit = input.float(2.0, "Weight: Treasury/Junk (credit lead)", minval=0)
+wOther  = input.float(1.0, "Weight: all other pairs", minval=0)
+
+// Regime thresholds (oscillator is normalized to -100..+100)
+thRiskOn  = input.int(40, "Risk-On threshold", minval=0, maxval=100)
+thRiskOff = input.int(-40, "Risk-Off threshold", minval=-100, maxval=0)
+
+// ===== Symbols (BEST solution: bare tickers; plus credit fallback) =====
+// Most TradingView "invalid symbol" issues come from exchange prefixes.
+// Using bare tickers lets TV auto-resolve symbols across data packages.
+//
+// Credit leg (safe Treasuries):
+creditSafeSym = input.string("IEI", "Credit SAFE ETF (default IEI; fallback SHY or IEF)")
+symHYG         = input.symbol("HYG", "HYG (High Yield)")
+
+// Equity internals
+symSPHB = input.symbol("SPHB", "SPHB (High Beta)")
+symSPLV = input.symbol("SPLV", "SPLV (Low Vol)")
+symIWM  = input.symbol("IWM",  "IWM (Small Caps)")
+symSPY  = input.symbol("SPY",  "SPY (S&P 500)")
+symMTUM = input.symbol("MTUM", "MTUM (Momentum)")
+symQUAL = input.symbol("QUAL", "QUAL (Quality)")
+
+// Consumer cyclicality + global risk
+symXLY  = input.symbol("XLY", "XLY (Discretionary)")
+symXLP  = input.symbol("XLP", "XLP (Staples)")
+symEEM  = input.symbol("EEM", "EEM (Emerging Markets)")
+
+// ===== Helpers =====
+getClose(sym) =>
+    request.security(sym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Use a string for the credit safe ETF so you can type SHY/IEF if IEI isn't available.
+getCloseFromTickerString(tickerStr) =>
+    request.security(tickerStr, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+ratioFromSymbols(aSym, bSym) =>
+    a = getClose(aSym)
+    b = getClose(bSym)
+    b != 0.0 ? (a / b) : na
+
+ratioFromTickerStringOverSymbol(aTickerStr, bSym) =>
+    a = getCloseFromTickerString(aTickerStr)
+    b = getClose(bSym)
+    b != 0.0 ? (a / b) : na
+
+stateFromRatio(r) =>
+    ma = ta.sma(r, maLen)
+    slopeUp = useROC ? (ta.roc(r, rocLen) > 0) : (ma > ma[maSlopeLookback])
+    slopeDn = useROC ? (ta.roc(r, rocLen) < 0) : (ma < ma[maSlopeLookback])
+    riskOn  = (r > ma) and slopeUp
+    riskOff = (r < ma) and slopeDn
+    riskOn ? 1 : (riskOff ? -1 : 0)
+
+flipState(st) =>
+    st == 1 ? -1 : (st == -1 ? 1 : 0)
+
+// ===== Build states (+1 Risk-On, -1 Risk-Off) =====
+// Credit: rising safe/junk = risk-off, so we flip it to keep +1 = risk-on
+rCredit = ratioFromTickerStringOverSymbol(creditSafeSym, symHYG)
+sCredit = flipState(stateFromRatio(rCredit))
+
+sBeta   = stateFromRatio(ratioFromSymbols(symSPHB, symSPLV))
+sSize   = stateFromRatio(ratioFromSymbols(symIWM,  symSPY))
+sTrend  = stateFromRatio(ratioFromSymbols(symMTUM, symQUAL))
+sCons   = stateFromRatio(ratioFromSymbols(symXLY,  symXLP))
+sGlobal = stateFromRatio(ratioFromSymbols(symEEM,  symSPY))
+
+// ===== Weighted composite (single line to avoid EOL continuation errors) =====
+score_raw = (wCredit * sCredit) + (wOther * sBeta) + (wOther * sSize) + (wOther * sTrend) + (wOther * sCons) + (wOther * sGlobal)
+
+// Normalize to -100..+100
+maxAbs  = (wCredit + (5.0 * wOther))
+osc_raw = maxAbs != 0.0 ? (100.0 * score_raw / maxAbs) : na
+osc     = ta.sma(osc_raw, smoothLen)
+
+// ===== Plot oscillator =====
+hline(0, "Zero", color=color.new(color.gray, 70))
+hline(thRiskOn, "Risk-On", color=color.new(color.green, 70))
+hline(thRiskOff, "Risk-Off", color=color.new(color.red, 70))
+
+oscColor = osc >= thRiskOn ? color.new(color.green, 0) : (osc <= thRiskOff ? color.new(color.red, 0) : color.new(color.gray, 0))
+plot(osc, "Elite Risk Oscillator", color=oscColor, linewidth=2)
+
+// ===== Alerts =====
+alertcondition(ta.crossover(osc, thRiskOn),  "Risk-On Trigger",  "Elite oscillator crossed up into Risk-On.")
+alertcondition(ta.crossunder(osc, thRiskOff),"Risk-Off Trigger", "Elite oscillator crossed down into Risk-Off.")
+alertcondition(ta.crossunder(sCredit, 0),    "Credit Veto (Risk-Off)", "Treasury/Junk credit signal flipped Risk-Off (stress rising).")

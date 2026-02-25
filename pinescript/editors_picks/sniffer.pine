@@ -1,0 +1,475 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © sudoMode
+
+//@version=5
+//@release=1.1.0
+indicator('Similarity Search', shorttitle = 'Sniffer', overlay = true, max_bars_back = 5000)
+
+
+// --- imports ---
+// import HeWhoMustNotBeNamed/Logger/1 as l
+
+
+// --- user input ---
+// setting groups
+general_settings   = 'General Settings'
+selection_range    = 'Selection Range'
+feature_dimensions = 'Feature Dimensions'
+
+// general settings
+lookback  = input.int(1000, title = 'Lookback', minval = 500, maxval = 4500, step = 500,
+             inline = '1', group = general_settings,
+             tooltip = 'Number of candles to back-track to find matches')
+top_n     = input.int(30, title = 'Matches', minval = 1, maxval = 100, step = 1,
+             inline = '2', group = general_settings,
+             tooltip = 'Number of top-n matches to show on the chart')
+how       = input.string('Cosine', title = 'Method',
+             options = ['Euclidean', 'Cosine', 'Manhattan', 'Lorentzian', 'Pearson'],
+             tooltip = 'Method to use for similarity calculation', inline = '3',
+             group = general_settings)
+single_bar = input(false, title = 'Single Bar', inline = '4', group = general_settings,
+             tooltip = 'Treat the entire selection as a single bar')
+// verbose   = input(false, title = 'Verbose', inline = '5', group = general_settings,
+            //  tooltip = 'Show degree of similarity')
+noise   = input.float(0.0, title = 'Noise Reduction', minval = 0.0, maxval = 1.0, step = 0.05, inline = '6', group = general_settings,
+             tooltip = 'Controls the degree of overlapping results')
+
+acceptable_noise = 1 - noise
+// selection range
+start     = input.time(timestamp('1 August 2023'), 'Start', confirm = true, inline = '6',
+             group = selection_range)
+end       = input.time(timestamp('3 August 2023'), 'End', confirm = true, inline = '6',
+             group = selection_range)
+
+
+// feature dimensions
+add_patterns      = input(false, title = 'Patterns', inline = '7', group = feature_dimensions,
+                     tooltip = 'Add mutliple ratios between wicks & body of the candle as features to bar attributes')
+add_rsi           = input(false, title = 'RSI', inline = '8', group = feature_dimensions,
+                     tooltip = 'Adds RSI as one the features to bar attributes')
+add_cci           = input(false, title = 'CCI', inline = '9', group = feature_dimensions,
+                     tooltip = 'Adds CCI as one the features to bar attributes')
+add_stochastic    = input(false, title = 'Stochastic', inline = '10', group = feature_dimensions,
+                     tooltip = 'Adds Stochastic as one the features to bar attributes')
+add_adx           = input(false, title = 'ADX', inline = '11', group = feature_dimensions,
+                     tooltip = 'Adds ADX as one the features to bar attributes')
+add_roc           = input(false, title = 'ROC', inline = '12', group = feature_dimensions,
+                     tooltip = 'Adds multiple HL2 Rate of Change as features to bar attributes')
+add_time          = input(false, title = 'Time', inline = '13', group = feature_dimensions,
+                     tooltip = 'Adds Day of the Week & Day of the Month as features to bar attributes')
+
+
+// --- utils ---
+// logger
+// var logger = l.Logger.new(minimumLevel = 'TRACE')
+// logger.init()
+
+
+// min-max scaler
+scaler(value, minimum, maximum, range_minimum = 1, range_maximum = 100) =>
+    _range = maximum - minimum
+    ((value - minimum) / _range) * (range_maximum - range_minimum) + range_minimum
+
+
+// --- models ---
+// vector
+type Vector
+    array<float> values
+
+
+// compute length of the vector
+method length(Vector self) =>
+    length = 0.0
+    for [index, value] in self.values
+        length += value * value
+    math.sqrt(length)
+    
+
+// compute dot product of two vectors
+method dot(Vector self, Vector vector) =>
+    product = 0.0
+    for i = 0 to self.values.size() - 1
+        product += self.values.get(i) * vector.values.get(i)
+    product
+
+
+// compute euclidean distance between two vectors
+method euclidean_distance(Vector self, Vector vector) =>
+    distance = 0.0
+    for [index, value] in self.values
+        difference = value - vector.values.get(index)
+        distance  += difference * difference
+    math.sqrt(distance)
+
+
+// compute manhattan distance between two vectors
+method manhattan_distance(Vector self, Vector vector) =>
+    distance = 0.0
+    for [index, value] in self.values
+        difference = math.abs(value - vector.values.get(index))
+        distance  += difference
+    distance
+
+
+// compute canberra distance between two vectors
+method canberra_distance(Vector self, Vector vector) =>
+    distance = 0.0
+    for [index, value] in self.values
+        v1 = value
+        v2 = vector.values.get(index)
+        ratio = math.abs(v1 - v2) / math.abs(v1 + v2)
+        distance  += ratio
+    distance
+
+
+// compute chebyshev distance between two vectors
+method chebyshev_distance(Vector self, Vector vector) =>
+    distance = 0.0
+    for [index, value] in self.values
+        difference = math.abs(value - vector.values.get(index))
+        if difference > distance
+            distance := difference
+    distance
+
+
+// compute minkowski distance between two vectors
+method minkowski_distance(Vector self, Vector vector) =>
+    distance = 0.0
+    for [index, value] in self.values
+        difference = math.abs(value - vector.values.get(index))
+        if difference > distance
+            distance := difference
+    distance
+
+
+// compute pearson distance between two vectors
+method pearson_distance(Vector self, Vector vector) =>
+    covariance = array.covariance(self.values, vector.values)
+    variance_1 = array.variance(self.values)
+    variance_2 = array.variance(vector.values)
+    1 - covariance / (math.sqrt(variance_1) * math.sqrt(variance_2))
+    
+
+// compute lorentzian distance between two vectors
+method lorentzian_distance(Vector self, Vector vector) =>
+    distance  = 0.0
+    length    = self.values.size() - 1
+    last_diff = self.values.get(length) - vector.values.get(length)
+    for i = 0 to length - 1
+        difference = self.values.get(i) - vector.values.get(i)
+        distance  += (difference * difference) - (last_diff * last_diff)
+    math.sqrt(distance)
+    
+
+// compute cosine distance between two vectors
+method cosine_distance(Vector self, Vector vector) =>
+    1 - self.dot(vector) / (self.length() * vector.length())
+
+
+// bar
+type Bar
+    // core features
+    int _bar_index
+    int _time
+    float _open
+    float _high
+    float _low
+    float _close
+    float _volume
+
+    // derived features
+    float _range
+    float body
+    float head
+    float tail
+
+    float btr
+    float htr
+    float ttr
+    float htb
+    float ttb
+
+    float roc_1
+    float roc_2
+    float roc_3
+    float roc_4
+
+    float rsi
+    float cci
+    float stoch
+    float dmi_p
+    float dmi_n
+    float adx
+
+    array<float> features
+    bool is_input  = false
+
+
+// set features for similarity computation
+method set_features(Bar self) =>
+    // supported features
+    _hl2    = (self._high + self._low) / 2
+    green   = self._close > self._open
+    _min    = green ? 1   : -100
+    _max    = green ? 100 : -1
+
+    // core features
+    __range = self._high - self._low
+    _body   = self._close - self._open
+    _head   = green ? self._high - self._close : self._close - self._low
+    _tail   = green ? self._open - self._low : self._high - self._open
+
+    self._volume := scaler(self._volume, ta.min(self._volume), ta.max(self._volume))
+    self._range  := scaler(__range, ta.min(__range), ta.max(__range))
+    self.body    := scaler(_body, ta.min(_body), ta.max(_body), range_minimum = _min, range_maximum = _max)
+    self.head    := scaler(_head, ta.min(_head), ta.max(_head))
+    self.tail    := scaler(_tail, ta.min(_tail), ta.max(_tail))
+
+    // derived features
+    self.btr := self.body / self._range
+    self.htr := self.head / self._range
+    self.ttr := self.tail / self._range
+    self.htb := self.head / self.body
+    self.ttb := self.tail / self.body
+
+    // price slope
+    self.roc_1 := ta.roc(_hl2, 3)
+    self.roc_2 := ta.roc(_hl2, 9)
+    self.roc_3 := ta.roc(_hl2, 27)
+    self.roc_4 := ta.roc(_hl2, 81)
+
+    // technical indicators
+    [dmi_p, dmi_n, adx] = ta.dmi(14, 14)
+    self.rsi   := ta.rsi(self._close, 14)
+    self.cci   := ta.cci(self._close, 14)
+    self.stoch := ta.stoch(self._close, self._high, self._low, 14)
+    self.dmi_p := dmi_p
+    self.dmi_n := dmi_n
+    self.adx   := adx
+
+    // populate feature space
+    self.features := array.from(self._open, self._high, self._low, self._close, self._volume)
+    if add_patterns
+        self.features.concat(array.from(self.btr, self.htr, self.ttr, self.htb, self.ttb))
+    if add_rsi
+        self.features.push(self.rsi)
+    if add_cci
+        self.features.push(self.cci)
+    if add_adx
+        self.features.concat(array.from(self.dmi_p, self.dmi_n, self.adx))
+    if add_stochastic
+        self.features.push(self.stoch)
+    if add_roc
+        self.features.concat(array.from(self.roc_1, self.roc_2, self.roc_3, self.roc_4))
+    if add_time
+        self.features.push(dayofweek(self._time))
+        self.features.push(dayofmonth(self._time))
+
+
+// load bar attributes
+method load(Bar bar) =>
+    if start <= time and time <= end
+        bar.is_input := true
+    bar.set_features()
+
+
+// bar loader
+generate_bar(_bar_index=bar_index, _time=time, _open=open, _high=high, _low=low, _close=close, _volume=volume) =>
+    bar = Bar.new(_bar_index, _time, _open, _high, _low, _close, _volume)
+    bar.load()
+    bar
+
+
+type SimilarityTracker
+    int start
+    int end
+    float _high
+    float _low
+    float similarity
+    array<Bar> bars
+
+
+type Box
+    int x1
+    float y1
+    int x2
+    float y2
+
+
+method is_overlapping_from(Box self, Box other, string direction) =>
+    // assumes that range of both boxes is equal
+    switch direction
+        'right' => (self.x1 >= other.x1) and (self.x1 <= other.x2)
+        'left' => (self.x2 >= other.x1) and (self.x2 <= other.x2)
+
+
+method compute_degree_of_overlap(Box self, Box other) =>
+    overlap = -1
+    if self.is_overlapping_from(other, 'right')
+        overlap := (other.x2 - self.x1) / (other.x2 - other.x1)
+    else if self.is_overlapping_from(other, 'left')
+        overlap := (self.x2 - other.x1) / (other.x2 - other.x1)
+    overlap
+
+
+// filters out boxes that do not match the noise reduction criteria
+method is_valid(Box self, array<Box> previous_boxes) =>
+    box_is_valid = true
+    if previous_boxes.size() > 0
+        for [index, _box] in previous_boxes
+            overlap = self.compute_degree_of_overlap(_box)
+            if overlap > acceptable_noise
+                box_is_valid := false
+                break
+    box_is_valid
+
+
+
+get_box(tracker, input_bars) =>
+    x1 = tracker.start
+    x2 = tracker.end
+    y1 = tracker._high
+    y2 = tracker._low
+    // draw a line under the bar, when user selects just one bar
+    x1 := input_bars.size() == 1 ? x1 - 1 : x1
+    x2 := input_bars.size() == 1 ? x2 + 1 : x2
+    y1 := input_bars.size() == 1 ? y2 : y1
+    _box = Box.new(x1, y1, x2, y2)
+    _box
+
+
+// controller
+type Controller
+    array<Bar> input_bars
+    array<Bar> target_bars
+    array<float> input_features
+    array<float> target_features
+    array<float> similarities
+    array<int> keys
+    array<SimilarityTracker> tracker
+    Box _box
+    array<Box> boxes
+
+
+// initialise controller
+method init(Controller self) =>
+    self.input_bars        := array.new<Bar>()
+    self.target_bars       := array.new<Bar>()
+    self.input_features    := array.new_float()
+    self.target_features   := array.new_float()
+    self.similarities      := array.new_float()
+    self.keys              := array.new_int()
+    self.tracker           := array.new<SimilarityTracker>()
+    self.boxes             := array.new<Box>()
+
+
+// record user selection
+method capture_input_bars(Controller self, Bar bar) =>
+    if bar.is_input
+        self.input_bars.push(bar)
+        self.input_features.concat(bar.features)
+
+
+method update_similarity_tracker(Controller self, start, end, _high, _low, similarity) =>
+    self.similarities.push(similarity)
+    self.tracker.push(SimilarityTracker.new(start, end, _high, _low, similarity, self.target_bars))
+    self.target_bars.clear()
+    self.target_features.clear()
+
+
+// compute degree of similarity
+method compute_similarity(Controller self) =>
+    vector_1 = Vector.new(self.input_features)
+    vector_2 = Vector.new(self.target_features)
+    switch how
+        'Canberra'   => vector_1.canberra_distance(vector_2)
+        'Chebyshev'  => vector_1.chebyshev_distance(vector_2)
+        'Cosine'     => vector_1.cosine_distance(vector_2)
+        'Euclidean'  => vector_1.euclidean_distance(vector_2)
+        'Manhattan'  => vector_1.manhattan_distance(vector_2)
+        'Lorentzian' => vector_1.lorentzian_distance(vector_2)
+        'Pearson'    => vector_1.pearson_distance(vector_2)
+        =>              vector_1.cosine_distance(vector_2)
+
+
+// compute similarity & record results in a matrix
+method generate_similarities(Controller self, Bar bar) =>
+    if barstate.islast
+        i = lookback
+        while i >= self.input_bars.size() - 1
+            float _high = na
+            float _low  = na
+            // collect target bars(left to right)
+            for j = 0 to self.input_bars.size() - 1
+                _bar = bar[i-j]
+                self.target_bars.push(_bar)
+                self.target_features.concat(_bar.features)
+                _high := na(_high) or _bar._high > _high ? _bar._high : _high
+                _low  := na(_low) or _bar._low < _low ? _bar._low : _low
+            similarity = self.compute_similarity()
+            self.update_similarity_tracker(bar_index[i], bar_index[i - (self.input_bars.size() - 1)],
+                                          _high, _low, similarity)
+            i -= 1
+        self.keys := self.similarities.sort_indices()
+
+
+// color code box border
+method color_generator(Controller self, int index, float _bar_index) =>
+    ratio = index / top_n
+    category = _bar_index == self.input_bars.get(0)._bar_index ? 0 : ratio < 0.33 ? 1 : ratio < 0.66 ? 2 : 3
+    switch category
+        0 => color.white    // user-selection
+        1 => color.lime     // top third of the top-n matches
+        2 => color.yellow   // mid third of the top-n matches
+        3 => color.red      // bottom third of the top-n matches
+
+
+// find box coordinates & draw them on screen
+method draw_box(Controller self, int index) =>
+    tracker = self.tracker.get(self.keys.get(index))
+    border_color = self.color_generator(index, tracker.start)
+    similarity = math.round(scaler(tracker.similarity, self.similarities.min(), self.similarities.max(), 100, 0))
+    // _text = verbose ? str.tostring(similarity) : ''
+    self._box := get_box(tracker, self.input_bars)
+
+    if self._box.is_valid(self.boxes)
+        box.new(self._box.x1, self._box.y1, self._box.x2, self._box.y2, border_color = border_color, bgcolor = na,
+               border_width = 2, text_size = size.large, text_color = color.white,
+               text_halign = text.align_right, text_valign = text.align_top)
+        self.boxes.push(self._box)
+
+
+method show_results(Controller self) =>
+    if barstate.islast
+        i = 0
+        while true
+            if self.boxes.size() >= top_n
+                break
+            self.draw_box(i)
+            i += 1
+
+
+// initialise & setup controller
+init_controller() =>
+    controller = Controller.new()
+    controller.init()
+    controller
+
+
+// --- driver ---
+// record bar data
+bar = generate_bar()
+
+// load controller
+var controller = init_controller()
+
+// detect user-selected bars
+controller.capture_input_bars(bar)
+
+// populate similarity matrix
+controller.generate_similarities(bar)
+
+// draw boxes around most similar fromations
+controller.show_results()
+
+// TODO: verbosity & color codes

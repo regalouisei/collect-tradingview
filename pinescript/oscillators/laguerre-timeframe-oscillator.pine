@@ -1,0 +1,159 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Coño Vista
+
+//@version=6
+indicator("Laguerre Timeframe Oscillator — 11 TF × 18 γ (Extreme, EMA100)", overlay=false)
+
+//────────────────────────────────────────────────────
+// Inputs
+//────────────────────────────────────────────────────
+groupIn   = "Input"
+src       = input.source(close, "Source (original chart)", group=groupIn)
+
+groupOsc  = "Oscillator"
+oscSmooth = input.int(100, "Oscillator EMA Smooth", minval=1, group=groupOsc)
+
+//────────────────────────────────────────────────────
+// Helpers
+//────────────────────────────────────────────────────
+clamp(x, lo, hi) =>
+    math.min(math.max(x, lo), hi)
+
+// Gradient for oscillator
+oscGradient(val, minV, maxV, tailPct) =>
+    rng  = maxV - minV
+    tail = rng * tailPct
+
+    if val <= minV + tail
+        t = clamp((val - minV) / tail, 0.0, 1.0)
+        color.from_gradient(t, 0.0, 1.0, color.red, color.gray)
+    else if val >= maxV - tail
+        t = clamp((val - (maxV - tail)) / tail, 0.0, 1.0)
+        color.from_gradient(t, 0.0, 1.0, color.gray, color.lime)
+    else
+        color.gray
+
+//────────────────────────────────────────────────────
+// MTF Source (11 TFs)
+//────────────────────────────────────────────────────
+px_1m  = request.security(syminfo.tickerid, "1",   src)
+px_3m  = request.security(syminfo.tickerid, "3",   src)
+px_5m  = request.security(syminfo.tickerid, "5",   src)
+px_10m = request.security(syminfo.tickerid, "10",  src)
+px_15m = request.security(syminfo.tickerid, "15",  src)
+px_30m = request.security(syminfo.tickerid, "30",  src)
+px_45m = request.security(syminfo.tickerid, "45",  src)
+px_1h  = request.security(syminfo.tickerid, "60",  src)
+px_2h  = request.security(syminfo.tickerid, "120", src)
+px_4h  = request.security(syminfo.tickerid, "240", src)
+px_1d  = request.security(syminfo.tickerid, "D",   src)
+
+// Store TF values
+var float[] pxTF = array.new_float(11, na)
+array.set(pxTF, 0,  px_1m)
+array.set(pxTF, 1,  px_3m)
+array.set(pxTF, 2,  px_5m)
+array.set(pxTF, 3,  px_10m)
+array.set(pxTF, 4,  px_15m)
+array.set(pxTF, 5,  px_30m)
+array.set(pxTF, 6,  px_45m)
+array.set(pxTF, 7,  px_1h)
+array.set(pxTF, 8,  px_2h)
+array.set(pxTF, 9,  px_4h)
+array.set(pxTF, 10, px_1d)
+
+//────────────────────────────────────────────────────
+// Gammas (18 levels)
+//────────────────────────────────────────────────────
+var float[] gammas = array.new_float()
+if barstate.isfirst
+    for i = 0 to 17
+        array.push(gammas, 0.10 + 0.05 * i)
+
+//────────────────────────────────────────────────────
+// Laguerre state arrays (198 lines)
+//────────────────────────────────────────────────────
+TOTAL_TF    = 11
+TOTAL_G     = 18
+TOTAL_LINES = TOTAL_TF * TOTAL_G
+
+var float[] L0 = array.new_float(TOTAL_LINES, na)
+var float[] L1 = array.new_float(TOTAL_LINES, na)
+var float[] L2 = array.new_float(TOTAL_LINES, na)
+var float[] L3 = array.new_float(TOTAL_LINES, na)
+var float[] Yp = array.new_float(TOTAL_LINES, na)
+
+//────────────────────────────────────────────────────
+// Breadth count (GREEN = Laguerre rising)
+//────────────────────────────────────────────────────
+greenCount = 0
+idx = 0
+
+for tf = 0 to TOTAL_TF - 1
+    x = array.get(pxTF, tf)
+
+    for gi = 0 to TOTAL_G - 1
+        g = array.get(gammas, gi)
+
+        p0 = array.get(L0, idx)
+        p1 = array.get(L1, idx)
+        p2 = array.get(L2, idx)
+        p3 = array.get(L3, idx)
+
+        n0 = (1.0 - g) * x + g * nz(p0)
+        n1 = -g * n0 + nz(p0) + g * nz(p1)
+        n2 = -g * n1 + nz(p1) + g * nz(p2)
+        n3 = -g * n2 + nz(p2) + g * nz(p3)
+
+        array.set(L0, idx, n0)
+        array.set(L1, idx, n1)
+        array.set(L2, idx, n2)
+        array.set(L3, idx, n3)
+
+        y = (n0 + 2*n1 + 2*n2 + n3) / 6.0
+        prevY = array.get(Yp, idx)
+
+        if y > nz(prevY)
+            greenCount += 1
+
+        array.set(Yp, idx, y)
+        idx += 1
+
+//────────────────────────────────────────────────────
+// Oscillator math
+//────────────────────────────────────────────────────
+oscRaw = float(greenCount - 99)
+
+// Smooth FIRST
+oscSmoothed = ta.ema(oscRaw, oscSmooth)
+
+// Make it more extreme
+oscExtreme = oscSmoothed * 2.0
+
+// Clamp back to scale
+osc = clamp(oscExtreme, -99.0, 99.0)
+
+//────────────────────────────────────────────────────
+// Gradient + bands
+//────────────────────────────────────────────────────
+minV = -99.0
+maxV =  99.0
+tailPct = 0.20
+
+tailSteps = int(math.round((maxV - minV) * tailPct))  // ≈40
+lowBand   = minV + tailSteps
+highBand  = maxV - tailSteps
+
+col = oscGradient(osc, minV, maxV, tailPct)
+
+//────────────────────────────────────────────────────
+// Plot
+//────────────────────────────────────────────────────
+hline(-99, "All Red", color=color.new(color.gray, 80))
+hline(0,   "50/50",   color=color.new(color.gray, 85))
+hline(99,  "All Green", color=color.new(color.gray, 80))
+
+hline(lowBand,  "Bottom 20%", color=color.new(color.red, 75))
+hline(highBand, "Top 20%",    color=color.new(color.lime, 75))
+
+plot(osc, "Laguerre TF Breadth (Extreme)", linewidth=2, color=col)

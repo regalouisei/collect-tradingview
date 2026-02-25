@@ -1,0 +1,179 @@
+// Based on "Range Oscillator (Zeiierman)"
+// © Zeiierman, licensed under CC BY-NC-SA 4.0
+// Modifications and strategy logic by jokiniemi.
+//
+// ─────────────────────────────────────────────
+// IMPORTANT DISCLAIMER / TV HOUSE RULES
+// ─────────────────────────────────────────────
+// • This script is FREE and public. I do not charge any fee for it.
+// • It is for EDUCATIONAL PURPOSES ONLY and is NOT financial advice.
+// • Backtest results can be very different from live trading.
+// • Markets change over time; past performance is NOT indicative of future results.
+// • You are fully responsible for your own decisions and risk.
+//
+// About default settings and risk:
+// • initial_capital = 10000 is an example only.
+// • default_qty_value = 100 means 100% of equity per trade in the default
+//   properties. This is AGGRESSIVE and is used only as a stress-test example.
+// • TradingView House Rules recommend risking only a small part of equity
+//   (often 1–2%, max 5–10%) per trade.
+// • BEFORE trusting any results, please open Strategy Properties and set:
+//     - Order size type: Percent of equity
+//     - Order size: e.g. 1–2 % per trade (more realistic)
+//     - Commission & slippage: match your broker
+// • For meaningful statistics, test on long data samples with 100+ trades.
+//
+// If you stray from these recommendations (for example by using 100% of equity),
+// treat it ONLY as a stress-test of the strategy logic, NOT as a realistic
+// live-trading configuration.
+//
+// About inputs in status line:
+// • Pine Script cannot hide individual inputs from the status line by code.
+// • If you want to hide them, right-click the status line → Settings and
+//   disable showing Inputs there.
+//
+// ─────────────────────────────────────────────
+// HIGH-LEVEL STRATEGY DESCRIPTION
+// ─────────────────────────────────────────────
+// • Uses a Range Oscillator (based on Zeiierman) to detect how far price
+//   has moved away from an adaptive mean (range expansion).
+// • Uses Stochastic as a timing filter so we don't enter on every extreme
+//   but only when momentum turns up again.
+// • Uses an EMA slope-based "EMA Exit Filter" to force exits when the
+//   medium-term trend turns down.
+// • Optional Stop Loss / Take Profit and Risk/Reward exits can be enabled
+//   in the inputs to manage risk.
+// • Long-only by design.
+//
+// Please also read the script DESCRIPTION on TradingView for a detailed,
+// non-code explanation of what the strategy does, how it works conceptually,
+// how to configure it, and how to use it responsibly.
+
+// Generated: 2025-11-08 12:00 Europe/Helsinki
+//@version=6
+strategy("Range Oscillator Strategy + Stoch Confirm", overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, slippage=3, margin_long=0, margin_short=0, fill_orders_on_standard_ohlc=true)
+
+// === [Backtest Period] ===
+// User-controlled backtest window. Helps avoid cherry-picking a tiny period.
+startYear  = input.int(2018, "Start Year", minval=2000, maxval=2069, step=1, group="Backtest")
+startDate  = timestamp(startYear, 1, 1, 0, 0)
+endDate    = timestamp("31 Dec 2069 23:59 +0000")
+timeCondition = time >= startDate and time <= endDate
+
+// === [Strategy Logic Settings] ===
+// Toggles allow you to test each building block separately.
+useOscEntry   = input.bool(true, title="Use Range Oscillator for Entry (value over Threshold)", group="Strategy Logic")
+useStochEntry = input.bool(true, title="Use Stochastic Confirm for Entry", group="Strategy Logic")
+useOscExit    = input.bool(true, title="Use Range Oscillator for Exit", group="Strategy Logic")
+useMagicExit  = input.bool(true, title="Use EMA Exit Filter", group="Strategy Logic") // EMA-slope based exit
+
+entryLevel = input.float(100.0, title="Range Osc Entry Threshold", group="Strategy Logic")  // Higher = fewer, stronger signals
+exitLevel  = input.float(30.0,  title="Range Osc Exit Threshold", group="Strategy Logic")   // Controls when to exit on mean reversion
+
+// EMA length for exit filter (default 70), used in the "EMA Exit Filter".
+emaLength = input.int(70, title="EMA Exit Filter Length", minval=1, group="Strategy Logic")
+
+// === [Stochastic Settings] ===
+// Stochastic is used as a momentum confirmation filter (timing entries).
+periodK     = input.int(7, title="%K Length", minval=1, group="Stochastic")
+smoothK     = input.int(3, title="%K Smoothing", minval=1, group="Stochastic")
+periodD     = input.int(3, title="%D Smoothing", minval=1, group="Stochastic")
+crossLevel  = input.float(100.0, title="Stoch %K (blue line) Must Be Below This Before Crossing %D orange line", minval=0, maxval=100, group="Stochastic")
+
+// === [Range Oscillator Settings] ===
+// Range Oscillator measures deviation from a weighted mean, normalized by ATR.
+length    = input.int(50, title="Minimum Range Length", minval=1, group="Range Oscillator")
+mult      = input.float(2.0, title="Range Width Multiplier", minval=0.1, group="Range Oscillator")
+
+// === [Risk Management] ===
+// Optional risk exits. By default SL/TP are OFF in code – you can enable them in Inputs.
+// TradingView recommends using realistic SL/TP and small risk per trade.
+useSL = input.bool(false, title="Use Stop Loss", group="Risk Management")
+slPct = input.float(1.5, title="Stop Loss (%)", minval=0.0, step=0.1, group="Risk Management") // Example: 1.5% of entry price
+useTP = input.bool(false, title="Use Take Profit", group="Risk Management")
+tpPct = input.float(3.0, title="Take Profit (%)", minval=0.0, step=0.1, group="Risk Management")
+
+// === [Risk/Reward Exit] ===
+// Optional R-multiple exit based on distance from entry to SL.
+useRR = input.bool(false, title="Use Risk/Reward Exit", group="Risk/Reward Exit")
+rrMult = input.float(1.5, title="Reward/Risk Multiplier", minval=0.1, step=0.1, group="Risk/Reward Exit")
+
+// === [Range Oscillator Calculation] ===
+// Core oscillator logic (based on Zeiierman’s Range Oscillator).
+atrRaw   = nz(ta.atr(2000), ta.atr(200))
+rangeATR = atrRaw * mult
+
+sumWeightedClose = 0.0
+sumWeights = 0.0
+for i = 0 to length - 1
+    delta = math.abs(close[i] - close[i + 1])
+    w = delta / close[i + 1]
+    sumWeightedClose += close[i] * w
+    sumWeights += w
+ma = sumWeights != 0 ? sumWeightedClose / sumWeights : na
+
+distances = array.new_float(length)
+for i = 0 to length - 1
+    array.set(distances, i, math.abs(close[i] - ma))
+maxDist = array.max(distances)
+osc = rangeATR != 0 ? 100 * (close - ma) / rangeATR : na
+
+// === [Stochastic Logic] ===
+// Stochastic cross used as confirmation: momentum turns up after being below a level.
+k = ta.sma(ta.stoch(close, high, low, periodK), smoothK)
+d = ta.sma(k, periodD)
+stochCondition = k < crossLevel and ta.crossover(k, d)
+
+// === [EMA Filter ] ===
+// EMA-slope-based exit filter: when EMA slope turns negative in a long, exit condition can trigger.
+ema     = ta.ema(close, emaLength)
+chg     = ema - ema[1]
+pct     = ema[1] != 0 ? (chg / ema[1]) * 100.0 : 0.0
+isDown  = pct < 0
+magicExitCond = useMagicExit and isDown and strategy.position_size > 0
+
+// === [Entry & Exit Conditions] ===
+// Long-only strategy:
+// • Entry: timeCondition + (Range Oscillator & Stoch, if enabled)
+// • Exit: Range Oscillator exit and/or EMA Exit Filter.
+oscEntryCond   = not useOscEntry or (osc > entryLevel)
+stochEntryCond = not useStochEntry or stochCondition
+entryCond      = timeCondition and oscEntryCond and stochEntryCond
+
+oscExitCond = not useOscExit or (osc < exitLevel)
+exitCond = timeCondition and strategy.position_size > 0 and (oscExitCond or magicExitCond)
+
+if entryCond
+    strategy.entry("Long", strategy.long)
+
+if exitCond
+    strategy.close("Long")
+
+// === [Risk Management Exits] ===
+// Optional SL/TP and RR exits (OCO). They sit on top of the main exit logic.
+// Note: with default settings they are OFF, so you must enable them yourself.
+ap      = strategy.position_avg_price
+slPrice = useSL ? ap * (1 - slPct / 100) : na
+tpPrice = useTP ? ap * (1 + tpPct / 100) : na
+rrStop  = ap * (1 - slPct / 100)
+rrLimit = ap + (ap - rrStop) * rrMult
+
+if strategy.position_size > 0
+    if useSL or useTP
+        strategy.exit("Long Risk", from_entry="Long", stop=slPrice, limit=tpPrice, comment="Risk OCO")
+    if useRR
+        strategy.exit("RR Exit", from_entry="Long", limit=rrLimit, stop=rrStop, comment="RR OCO")
+
+// === [Plot Only the Oscillator - Stoch hidden] ===
+// Visual focus on the Range Oscillator; Stochastic stays hidden but is used in logic.
+inTrade  = strategy.position_size > 0
+oscColor = inTrade ? color.green : color.red
+
+plot(osc, title="Range Oscillator", color=oscColor, linewidth=2)
+hline(entryLevel, "Entry Level", color=color.green, linestyle=hline.style_dotted)
+hline(exitLevel,  "Exit Level",  color=color.red,   linestyle=hline.style_dotted)
+plot(k, title="%K", color=color.blue, display=display.none)
+plot(d, title="%D", color=color.orange, display=display.none)
+
+// Plot EMA (hidden) so it is available but not visible on the chart.
+plot(ema, title="EMA Exit Filter", display=display.none)

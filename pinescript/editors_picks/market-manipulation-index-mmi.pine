@@ -1,0 +1,73 @@
+//@version=5
+indicator("Market Manipulation Index (MMI)", "MMI", overlay=false)
+
+// ── Inputs
+baseWin  = input.int(50, "Base Window Length", minval=10)
+sineLen  = input.int(20, "Sine Reference Period", minval=5)
+smooth   = input.int(5,  "Final Smoothing", minval=1)
+atrMult  = input.float(1.0, "ATR Multiplier for Adaptivity", minval=0.1)
+atrLen   = input.int(14, "ATR Period for Window Scaling", minval=1)
+
+// ── Adaptive Window (safe handling with fallback)
+atr_val = ta.atr(atrLen)
+adaptiveWin_raw = baseWin * (atr_val / close) * atrMult
+adaptiveWin = math.max(10, math.round(nz(adaptiveWin_raw, baseWin)))
+
+// ── Manual EMA with adaptive length
+ema_adaptive(src, len) =>
+    alpha = 2 / (len + 1)
+    var float ema = na
+    ema := na(ema[1]) ? src : alpha * src + (1 - alpha) * ema[1]
+
+// ── Sine-Fit Based MI
+sine_wave = math.sin(2 * math.pi * bar_index / sineLen)
+price     = close
+price_dev = price - ema_adaptive(close, adaptiveWin)
+sine_dev  = sine_wave - ema_adaptive(sine_wave, adaptiveWin)
+mse_sine  = ema_adaptive(math.pow(price_dev - sine_dev, 2), adaptiveWin)
+var_price = ta.variance(price, baseWin)  // Using fixed window for stability
+mi_sine   = math.min(1.0, math.max(0.0, mse_sine / var_price))
+
+// ── Predictability-Based MI
+x1 = nz(close[1])
+x2 = nz(close[2])
+sum_x1     = ema_adaptive(x1, adaptiveWin)
+sum_x2     = ema_adaptive(x2, adaptiveWin)
+sum_y      = ema_adaptive(close, adaptiveWin)
+sum_x1x1   = ema_adaptive(x1 * x1, adaptiveWin)
+sum_x2x2   = ema_adaptive(x2 * x2, adaptiveWin)
+sum_x1y    = ema_adaptive(x1 * close,  adaptiveWin)
+sum_x2y    = ema_adaptive(x2 * close,  adaptiveWin)
+sum_x1x2   = ema_adaptive(x1 * x2, adaptiveWin)
+
+denom = (sum_x1x1 * sum_x2x2 - sum_x1x2 * sum_x1x2)
+var float a = na
+var float b = na
+if denom != 0
+    a := (sum_x2x2 * sum_x1y - sum_x1x2 * sum_x2y) / denom
+    b := (sum_x1x1 * sum_x2y - sum_x1x2 * sum_x1y) / denom
+
+y_hat = a * x1 + b * x2
+residual = close - y_hat
+mse_pred = ema_adaptive(math.pow(residual, 2), adaptiveWin)
+mi_pred  = math.min(1.0, math.max(0.0, mse_pred / var_price))
+
+// ── Spectral Energy Component (Approximate Frequency Analysis)
+lowBand  = ta.ema(price, 34) - ta.ema(price, 89)   // slow structure
+highBand = price - ta.ema(price, 8)               // fast noise
+
+energyLow  = ta.variance(lowBand, baseWin)
+energyHigh = ta.variance(highBand, baseWin)
+
+spectralRatio = energyHigh / (energyHigh + energyLow)
+mi_spectral = math.min(1.0, math.max(0.0, spectralRatio))
+
+// ── Composite CMI (with Spectral Component)
+cmi_raw = (mi_sine + mi_pred + mi_spectral) / 3
+cmi = ta.ema(cmi_raw, smooth)
+
+// ── Plotting
+plot(cmi, title="Composite Manipulation Index", color=color.red, linewidth=2)
+hline(0.3, "Low MI (Clean)", color=color.green, linestyle=hline.style_dashed)
+hline(0.7, "High MI (Choppy/Manipulated)", color=color.orange, linestyle=hline.style_dashed)
+bgcolor(cmi > 0.7 ? color.new(color.red, 85) : cmi < 0.3 ? color.new(color.green, 85) : na, title="Background Highlight")

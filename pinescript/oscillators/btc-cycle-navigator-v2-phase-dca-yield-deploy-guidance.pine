@@ -1,0 +1,668 @@
+//@version=6
+// BTC Cycle Navigator v2 — Refined phase-based guidance for DCA, yield rotation, and bear deployment.
+// RSI + self-adjusting LinReg bands adapted from Zeiierman.
+// Post-peak awareness, plunge-guarded sells, DCA taper, hybrid yield deploy.
+
+indicator(
+     "BTC Cycle Navigator v2",
+     overlay         = false,
+     max_labels_count = 500,
+     max_lines_count  = 500
+)
+
+//----------------------------------------------------
+// INPUTS — START DATE
+//----------------------------------------------------
+useStartDate = input.bool(
+     true,
+     "Use start date filter",
+     group   = "Start Date",
+     tooltip = "When enabled, all logic (phases, DCA, sells, labels) only activates after the start date."
+)
+startYear = input.int(
+     2013,
+     "Start Year",
+     minval  = 2000,
+     maxval  = 2100,
+     group   = "Start Date",
+     tooltip = "Year from which the strategy logic begins."
+)
+startMonth = input.int(
+     1,
+     "Start Month",
+     minval  = 1,
+     maxval  = 12,
+     group   = "Start Date",
+     tooltip = "Month from which the strategy logic begins."
+)
+startDay = input.int(
+     1,
+     "Start Day",
+     minval  = 1,
+     maxval  = 31,
+     group   = "Start Date",
+     tooltip = "Day from which the strategy logic begins."
+)
+
+startTime   = timestamp(startYear, startMonth, startDay, 0, 0)
+bool isLive = not useStartDate or time >= startTime
+
+//----------------------------------------------------
+// INPUTS — RSI + BANDS
+//----------------------------------------------------
+rsi_src_ = input.source(
+     close,
+     "RSI Source",
+     group   = "RSI Settings",
+     tooltip = "Price source used to compute RSI."
+)
+len = input.int(
+     50,
+     "RSI Length",
+     minval  = 2,
+     maxval  = 250,
+     group   = "RSI Settings",
+     tooltip = "Base RSI lookback before WMA smoothing."
+)
+period = input.int(
+     200,
+     "LinReg Period",
+     minval  = 50,
+     maxval  = 400,
+     group   = "Linear Regression",
+     tooltip = "Lookback for the self-adjusting RSI regression bands."
+)
+deviations = input.float(
+     2.0,
+     "Deviation",
+     step    = 0.1,
+     minval  = 0.5,
+     maxval  = 4.0,
+     group   = "Linear Regression",
+     tooltip = "Band width multiplier around the RSI regression midline."
+)
+obLevel = input.int(
+     65,
+     "Overbought",
+     minval  = 50,
+     maxval  = 90,
+     group   = "Levels",
+     tooltip = "RSI above this = mature bull. DCA pauses, sells arm."
+)
+osLevel = input.int(
+     35,
+     "Oversold",
+     minval  = 10,
+     maxval  = 50,
+     group   = "Levels",
+     tooltip = "RSI below this = deep bear territory."
+)
+
+//----------------------------------------------------
+// INPUTS — DCA
+//----------------------------------------------------
+baseDCA = input.float(
+     100,
+     "Base DCA Amount (1x, USD)",
+     step    = 10,
+     minval  = 0,
+     maxval  = 100000,
+     group   = "DCA",
+     tooltip = "Your weekly base DCA in USD. Multiplied by phase factor."
+)
+
+//----------------------------------------------------
+// INPUTS — YIELD DEPLOY (hybrid model)
+//----------------------------------------------------
+yieldBasketSize = input.float(
+     100000,
+     "Yield basket size (USD)",
+     step    = 1000,
+     minval  = 0,
+     group   = "Yield Deploy",
+     tooltip = "Current size of your yield basket for deployment guidance."
+)
+yieldTargetKeep = input.float(
+     20.0,
+     "Target % of yield to keep",
+     step    = 1,
+     minval  = 0,
+     maxval  = 100,
+     group   = "Yield Deploy",
+     tooltip = "Minimum % of yield basket to preserve. Remainder is deployable."
+)
+hybridMaxPctPool = input.float(
+     4.0,
+     "Max deploy per week (% of pool)",
+     step    = 0.5,
+     minval  = 0.1,
+     maxval  = 50.0,
+     group   = "Yield Deploy",
+     tooltip = "Weekly deployment cap as % of remaining deployable pool."
+)
+hybridDeployPct = input.float(
+     25.0,
+     "Deploy % of remaining pool per week",
+     step    = 1,
+     minval  = 1,
+     maxval  = 100,
+     group   = "Yield Deploy",
+     tooltip = "Target fraction of remaining deployable pool each week before caps and scaling."
+)
+hybridRampWeeks = input.float(
+     25.0,
+     "Weeks to ramp to full capacity",
+     step    = 1,
+     minval  = 1,
+     maxval  = 200,
+     group   = "Yield Deploy",
+     tooltip = "Linear ramp from starting capacity to 100%."
+)
+hybridStartCap = input.float(
+     10.0,
+     "Starting capacity (%)",
+     step    = 1,
+     minval  = 1,
+     maxval  = 50,
+     group   = "Yield Deploy",
+     tooltip = "Initial throttle at deep bear entry."
+)
+hybridDrawdownExp = input.float(
+     3.0,
+     "Drawdown scaling exponent",
+     step    = 0.1,
+     minval  = 0.1,
+     maxval  = 5.0,
+     group   = "Yield Deploy",
+     tooltip = "Cubic (3.0) concentrates capital at deepest drawdowns."
+)
+
+//----------------------------------------------------
+// INPUTS — LOGIC TOGGLES
+//----------------------------------------------------
+useFalseFilter = input.bool(
+     true,
+     "Require prior RSI > Overbought for sell signals?",
+     group   = "Logic Toggles",
+     tooltip = "Only trigger sell rotations after RSI has confirmed overbought."
+)
+
+//----------------------------------------------------
+// INPUTS — DISPLAY: Phase Labels
+//----------------------------------------------------
+showPhaseLabels = input.bool(true, "Show phase transition labels", group="Phase Labels",
+     tooltip = "Toggle phase change labels on the RSI.")
+phaseLabelSize  = input.string("normal", "Phase label size",
+     options=["tiny","small","normal","large","huge"], group="Phase Labels",
+     tooltip = "Text size for phase transition labels.")
+
+//----------------------------------------------------
+// INPUTS — DISPLAY: Sell Labels
+//----------------------------------------------------
+showSellLabels  = input.bool(true, "Show sell signal labels", group="Sell Labels",
+     tooltip = "Toggle sell rotation labels on the RSI.")
+sellLabelSize   = input.string("normal", "Sell label size",
+     options=["tiny","small","normal","large","huge"], group="Sell Labels",
+     tooltip = "Text size for sell signal labels.")
+
+//----------------------------------------------------
+// INPUTS — DISPLAY: Background
+//----------------------------------------------------
+showPhaseBg    = input.bool(true, "Shade RSI background by phase", group="Background",
+     tooltip = "Color the RSI pane background based on current cycle phase.")
+bgTransparency = input.int(85, "Background transparency", minval=50, maxval=98, group="Background",
+     tooltip = "Higher = more transparent. 85 is subtle, 50 is bold.")
+
+//----------------------------------------------------
+// INPUTS — DISPLAY: Phase Colors
+//----------------------------------------------------
+colorDeepBear      = input.color(color.red,     "Deep Bear",       group="Phase Colors")
+colorBearRecovery  = input.color(color.orange,  "Bear Recovery",   group="Phase Colors")
+colorEarlyBull     = input.color(color.yellow,  "Early Bull",      group="Phase Colors")
+colorBullBuilding  = input.color(color.aqua,    "Bull Building",   group="Phase Colors")
+colorBullConfirmed = input.color(color.lime,    "Bull Confirmed",  group="Phase Colors")
+colorMatureBull    = input.color(color.fuchsia, "Mature Bull",     group="Phase Colors")
+colorDistribution  = input.color(color.purple,  "Distribution",    group="Phase Colors")
+colorWeakening     = input.color(color.maroon,  "Weakening",       group="Phase Colors")
+
+//----------------------------------------------------
+// INPUTS — DISPLAY: Table
+//----------------------------------------------------
+showTable     = input.bool(true, "Show guidance table", group="Table",
+     tooltip = "Toggle the action guidance table.")
+tablePosition = input.string("Top Right", "Table position",
+     options=["Top Right","Top Left","Bottom Right","Bottom Left","Top Center","Bottom Center"], group="Table",
+     tooltip = "Where to place the guidance table on the chart.")
+tableTextSize = input.string("normal", "Table text size",
+     options=["tiny","small","normal","large","huge"], group="Table",
+     tooltip = "Text size inside the table.")
+
+//----------------------------------------------------
+// ZEIIERMAN RSI + SELF-ADJUSTING LINREG BANDS
+//----------------------------------------------------
+rsi = ta.wma(ta.rsi(rsi_src_, len), 5)
+periodMinusOne = period - 1
+
+Ex  = 0.0
+Ey  = 0.0
+Ex2 = 0.0
+Exy = 0.0
+ExEx = 0.0
+
+for i = 0 to periodMinusOne
+    closeI = rsi[i]
+    Ex    += i
+    Ey    += closeI
+    Ex2   += i * i
+    Exy   += closeI * i
+    ExEx  := Ex * Ex
+
+float slope = na
+if Ex2 != ExEx
+    slope := (period * Exy - Ex * Ey) / (period * Ex2 - ExEx)
+
+ilinearRegression = (Ey - slope * Ex) / period
+intercept         = ilinearRegression + bar_index * slope
+
+deviation = 0.0
+for i = 0 to periodMinusOne
+    deviation += math.pow(rsi[i], 2) - (intercept - slope * bar_index[i])
+    break
+
+deviationNew   = deviations * math.sqrt(deviation / periodMinusOne)
+startingPointY = ta.wma(ilinearRegression + slope / periodMinusOne, 5)
+
+adjust_up   = startingPointY + ta.stdev(rsi, 20)
+adjust_down = startingPointY - ta.stdev(rsi, 20)
+
+a  = startingPointY - deviationNew + adjust_down / 20
+c1 = startingPointY
+b  = startingPointY + deviationNew - adjust_up / 20
+
+Lower_Curve = ta.wma(a, 5)
+Upper_Curve = ta.wma(b, 5)
+Mid_Curve   = c1
+
+//----------------------------------------------------
+// PHASE DETECTION (with post-peak awareness + DCA taper)
+// Only updates when isLive is true
+//----------------------------------------------------
+var string phase    = "UNKNOWN"
+var float  dcaMult  = 0.0
+var bool   postPeak = false
+
+rsiAboveMid = rsi > Mid_Curve
+rsiBelowMid = rsi < Mid_Curve
+
+isDeepBear      = rsi <= 50 and rsi <= Lower_Curve
+isBearRecovery  = rsi <= 50 and rsi > Lower_Curve and rsi <= Mid_Curve
+isEarlyBull     = rsi > Mid_Curve and rsi < 50
+isBullConfirmed = rsi > 50 and rsi > Upper_Curve
+isMatureBull    = rsi > obLevel
+isBullBuilding  = rsi > 50 and not isBullConfirmed and not isMatureBull
+
+if isLive
+    // Track post-peak: once mature bull is reached, everything after is post-peak
+    if isMatureBull
+        postPeak := true
+    if isDeepBear
+        postPeak := false
+
+    if isMatureBull
+        phase   := "MATURE_BULL"
+        dcaMult := 0
+    else if isBullConfirmed and not postPeak
+        phase   := "BULL_CONFIRMED"
+        dcaMult := 1
+    else if isBullConfirmed and postPeak
+        phase   := "DISTRIBUTION"
+        dcaMult := 0.5
+    else if isBullBuilding and not postPeak
+        phase   := "BULL_BUILDING"
+        dcaMult := 1
+    else if isBullBuilding and postPeak
+        phase   := "WEAKENING"
+        dcaMult := 0.25
+    else if isEarlyBull
+        phase   := "EARLY_BULL"
+        dcaMult := 2
+    else if isBearRecovery
+        phase   := "BEAR_RECOVERY"
+        dcaMult := 3
+    else if isDeepBear
+        phase   := "DEEP_BEAR"
+        dcaMult := 5
+    else
+        phase   := "UNKNOWN"
+        dcaMult := 1
+
+//----------------------------------------------------
+// FALSE-CYCLE FILTER + SELL DETECTION (with plunge guard)
+//----------------------------------------------------
+var bool overboughtArmed     = false
+var int  sellCount           = 0
+var bool prevAboveMid        = false
+var bool sellPausedByPlunge  = false
+var bool dcaPaused           = false
+
+if isLive
+    if rsi > obLevel
+        overboughtArmed := true
+    if rsi < 50 and rsi < Mid_Curve
+        overboughtArmed := false
+
+sellFilterOk = (not useFalseFilter) or overboughtArmed
+
+prevAboveMid      := rsi[1] > Mid_Curve[1]
+midlineBreakDown  = prevAboveMid and rsiBelowMid
+
+var string sellSignalText = "NONE"
+
+if isLive
+    // Plunge detection
+    if sellCount == 1 and rsi <= Lower_Curve
+        sellPausedByPlunge := true
+
+    if barstate.isconfirmed and sellFilterOk and midlineBreakDown and not sellPausedByPlunge
+        sellCount += 1
+        if      sellCount == 1
+            sellSignalText := "FIRST_SELL"
+        else if sellCount == 2
+            sellSignalText := "SECOND_SELL"
+            dcaPaused      := true
+        else
+            sellSignalText := "SELLS_DONE"
+    else if barstate.isnew
+        sellSignalText := "NONE"
+
+    // Reset on new bull confirmation
+    if isBullConfirmed
+        sellCount          := 0
+        sellPausedByPlunge := false
+
+    // Deep bear re-arms DCA
+    if isDeepBear
+        dcaPaused := false
+
+//----------------------------------------------------
+// YIELD DEPLOY CALCULATION (hybrid guidance)
+//----------------------------------------------------
+var int   weeksInBear = 0
+var float cycleHigh   = na
+
+if isLive
+    if isBullConfirmed and (na(cycleHigh) or close > cycleHigh)
+        cycleHigh := close
+    if isMatureBull and (na(cycleHigh) or close > cycleHigh)
+        cycleHigh := close
+
+    if isDeepBear and not isDeepBear[1]
+        weeksInBear := 0
+    if isDeepBear
+        weeksInBear += 1
+    if not isDeepBear
+        weeksInBear := 0
+
+float yieldDeploySuggestion = 0.0
+float drawdownPct           = 0.0
+
+if isLive and isDeepBear and not na(cycleHigh) and cycleHigh > 0
+    drawdownPct := math.max(0.0, (cycleHigh - close) / cycleHigh)
+
+    float keepBalance    = yieldBasketSize * (yieldTargetKeep / 100.0)
+    float remainingPool  = math.max(0.0, yieldBasketSize - keepBalance)
+
+    float startFrac  = hybridStartCap / 100.0
+    float timeFactor = math.min(1.0, startFrac + (1.0 - startFrac) * weeksInBear / hybridRampWeeks)
+    float drawdownScale = math.pow(0.5 + drawdownPct, hybridDrawdownExp)
+
+    float maxPerWeek = remainingPool * (hybridMaxPctPool / 100.0)
+    float desired = math.min(remainingPool * (hybridDeployPct / 100.0), maxPerWeek * timeFactor)
+    yieldDeploySuggestion := desired * drawdownScale
+
+//----------------------------------------------------
+// PHASE COLORS
+//----------------------------------------------------
+color phaseColor = switch phase
+    "DEEP_BEAR"      => color.new(colorDeepBear,      bgTransparency)
+    "BEAR_RECOVERY"  => color.new(colorBearRecovery,  bgTransparency)
+    "EARLY_BULL"     => color.new(colorEarlyBull,     bgTransparency)
+    "BULL_BUILDING"  => color.new(colorBullBuilding,  bgTransparency)
+    "BULL_CONFIRMED" => color.new(colorBullConfirmed, bgTransparency)
+    "MATURE_BULL"    => color.new(colorMatureBull,    bgTransparency)
+    "DISTRIBUTION"   => color.new(colorDistribution,  bgTransparency)
+    "WEAKENING"      => color.new(colorWeakening,     bgTransparency)
+    => color.new(color.gray, bgTransparency)
+
+color phaseSolid = switch phase
+    "DEEP_BEAR"      => color.new(colorDeepBear,      40)
+    "BEAR_RECOVERY"  => color.new(colorBearRecovery,  40)
+    "EARLY_BULL"     => color.new(colorEarlyBull,     40)
+    "BULL_BUILDING"  => color.new(colorBullBuilding,  40)
+    "BULL_CONFIRMED" => color.new(colorBullConfirmed, 40)
+    "MATURE_BULL"    => color.new(colorMatureBull,    40)
+    "DISTRIBUTION"   => color.new(colorDistribution,  40)
+    "WEAKENING"      => color.new(colorWeakening,     40)
+    => color.new(color.gray, 40)
+
+//----------------------------------------------------
+// ACTION + DCA + YIELD TEXT
+//----------------------------------------------------
+string actionText = switch phase
+    "DEEP_BEAR"      => "Max accumulation + deploy yield"
+    "BEAR_RECOVERY"  => "Heavy accumulation"
+    "EARLY_BULL"     => "Moderate accumulation"
+    "BULL_BUILDING"  => "Light accumulation"
+    "BULL_CONFIRMED" => "Hold — watch for sells"
+    "MATURE_BULL"    => "No DCA — sells armed"
+    "DISTRIBUTION"   => "Sell rotation zone — light DCA"
+    "WEAKENING"      => "Bull fading — minimal DCA"
+    => "Hold"
+
+string dcaText = ""
+if dcaPaused
+    dcaText := "Paused (sells complete)"
+else
+    dcaText := switch phase
+        "DEEP_BEAR"      => "5x — $"    + str.tostring(baseDCA * 5,    "#,###") + "/wk"
+        "BEAR_RECOVERY"  => "3x — $"    + str.tostring(baseDCA * 3,    "#,###") + "/wk"
+        "EARLY_BULL"     => "2x — $"    + str.tostring(baseDCA * 2,    "#,###") + "/wk"
+        "BULL_BUILDING"  => "1x — $"    + str.tostring(baseDCA * 1,    "#,###") + "/wk"
+        "BULL_CONFIRMED" => "1x — $"    + str.tostring(baseDCA * 1,    "#,###") + "/wk"
+        "MATURE_BULL"    => "Paused"
+        "DISTRIBUTION"   => "0.5x — $"  + str.tostring(baseDCA * 0.5,  "#,###") + "/wk"
+        "WEAKENING"      => "0.25x — $" + str.tostring(baseDCA * 0.25, "#,###") + "/wk"
+        => "1x — $"    + str.tostring(baseDCA * 1,    "#,###") + "/wk"
+
+string yieldText = ""
+if isLive and isDeepBear and yieldDeploySuggestion > 0
+    yieldText := "$" + str.tostring(yieldDeploySuggestion, "#,###") + "/wk from yield"
+else if isLive and isDeepBear
+    yieldText := "Waiting (ramp week " + str.tostring(weeksInBear) + ")"
+else
+    yieldText := "Not active — bear only"
+
+// Sell status
+string sellStatus = ""
+color  sellCol    = color.gray
+if sellPausedByPlunge
+    sellStatus := "Sells paused — plunge detected"
+    sellCol    := color.gray
+else if sellSignalText == "FIRST_SELL"
+    sellStatus := "ROTATE 20% to yield NOW"
+    sellCol    := color.orange
+else if sellSignalText == "SECOND_SELL"
+    sellStatus := "ROTATE 40% to yield NOW"
+    sellCol    := color.red
+else if dcaPaused
+    sellStatus := "Sells complete — DCA paused"
+    sellCol    := color.gray
+else if overboughtArmed
+    sellStatus := "Armed — watching midline"
+    sellCol    := color.orange
+else
+    sellStatus := "Not armed"
+    sellCol    := color.gray
+
+//----------------------------------------------------
+// LABEL SIZE HELPERS
+//----------------------------------------------------
+phLblSz = switch phaseLabelSize
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    "large"  => size.large
+    "huge"   => size.huge
+    => size.normal
+
+slLblSz = switch sellLabelSize
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    "large"  => size.large
+    "huge"   => size.huge
+    => size.normal
+
+tblTxtSz = switch tableTextSize
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+    "large"  => size.large
+    "huge"   => size.huge
+    => size.normal
+
+//----------------------------------------------------
+// TABLE POSITION HELPER
+//----------------------------------------------------
+tblPos = switch tablePosition
+    "Top Right"      => position.top_right
+    "Top Left"       => position.top_left
+    "Bottom Right"   => position.bottom_right
+    "Bottom Left"    => position.bottom_left
+    "Top Center"     => position.top_center
+    "Bottom Center"  => position.bottom_center
+    => position.top_right
+
+//----------------------------------------------------
+// RSI + BAND PLOTS
+//----------------------------------------------------
+col = startingPointY > startingPointY[1] ? color.blue : color.red
+
+prsi = plot(rsi,         color=color.new(col, 0),          title="RSI")
+lc   = plot(Lower_Curve, color=color.new(color.red, 0),    title="Lower Curve")
+mc   = plot(Mid_Curve,   color=color.new(color.aqua, 20),  title="Mid Curve")
+uc   = plot(Upper_Curve, color=color.new(color.lime, 0),   title="Upper Curve")
+
+fill(prsi, lc, color = rsi < a ? color.new(color.red,85)  : color.new(color.blue,100))
+fill(prsi, uc, color = rsi > b ? color.new(color.lime,85) : color.new(color.blue,100))
+fill(lc, uc,   color = color.new(color.blue,100))
+
+hline(obLevel, "Overbought", color=color.new(color.red,40))
+hline(50,      "Mid Line",   color=color.new(color.gray,50))
+hline(osLevel, "Oversold",   color=color.new(color.green,40))
+
+// Phase background — only after start date
+bgcolor(showPhaseBg and isLive ? phaseColor : na)
+
+//----------------------------------------------------
+// PHASE TRANSITION LABELS
+//----------------------------------------------------
+var string prevPhase = "UNKNOWN"
+bool phaseChanged    = phase != prevPhase
+
+if isLive and showPhaseLabels and phaseChanged and barstate.isconfirmed
+    string phLabel = switch phase
+        "DEEP_BEAR"      => "DEEP\nBEAR"
+        "BEAR_RECOVERY"  => "BEAR\nRECOVERY"
+        "EARLY_BULL"     => "EARLY\nBULL"
+        "BULL_BUILDING"  => "BULL\nBUILDING"
+        "BULL_CONFIRMED" => "BULL\nCONFIRMED"
+        "MATURE_BULL"    => "MATURE\nBULL"
+        "DISTRIBUTION"   => "DISTRI-\nBUTION"
+        "WEAKENING"      => "WEAKEN-\nING"
+        => "UNKNOWN"
+
+    label.new(
+         bar_index, rsi,
+         text      = phLabel,
+         style     = rsi > rsi[1] ? label.style_label_up : label.style_label_down,
+         color     = phaseSolid,
+         textcolor = color.white,
+         size      = phLblSz
+    )
+
+prevPhase := phase
+
+//----------------------------------------------------
+// SELL SIGNAL LABELS
+//----------------------------------------------------
+if isLive and showSellLabels and sellSignalText == "FIRST_SELL"
+    label.new(
+         bar_index, rsi,
+         text      = "SELL\n20%",
+         style     = label.style_label_down,
+         color     = color.new(color.orange, 0),
+         textcolor = color.white,
+         size      = slLblSz
+    )
+
+if isLive and showSellLabels and sellSignalText == "SECOND_SELL"
+    label.new(
+         bar_index, rsi,
+         text      = "SELL\n40%",
+         style     = label.style_label_down,
+         color     = color.new(color.red, 0),
+         textcolor = color.white,
+         size      = slLblSz
+    )
+
+//----------------------------------------------------
+// ACTION GUIDANCE TABLE
+//----------------------------------------------------
+if showTable
+    var table actionTable = table.new(tblPos, 2, 9, border_width=1)
+
+    if barstate.islast
+        table.cell(actionTable, 0, 0, "BTC CYCLE NAVIGATOR", text_color=color.white, bgcolor=phaseSolid, text_size=tblTxtSz, text_halign=text.align_center)
+        table.cell(actionTable, 1, 0, phase,                 text_color=color.white, bgcolor=phaseSolid, text_size=tblTxtSz, text_halign=text.align_center)
+
+        table.cell(actionTable, 0, 1, "Action", text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 1, actionText, text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+
+        color dcaCol = dcaPaused ? color.red : dcaMult == 0 ? color.gray : color.lime
+        table.cell(actionTable, 0, 2, "DCA", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 2, dcaText, text_color=dcaCol, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+
+        color yieldCol = isDeepBear and yieldDeploySuggestion > 0 ? color.orange : color.gray
+        table.cell(actionTable, 0, 3, "Yield Deploy", text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 3, yieldText,      text_color=yieldCol,   bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+
+        table.cell(actionTable, 0, 4, "Sell Signal", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 4, sellStatus,   text_color=sellCol,      bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+
+        table.cell(actionTable, 0, 5, "RSI", text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 5, str.tostring(rsi, "#.#"), text_color=col, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+
+        string ddText = na(cycleHigh) or cycleHigh == 0 ? "N/A" : str.tostring(drawdownPct * 100, "#.#") + "%"
+        table.cell(actionTable, 0, 6, "Drawdown", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 6, ddText,     text_color=color.red,   bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+
+        string bearText = isDeepBear ? str.tostring(weeksInBear) + " weeks" : "—"
+        table.cell(actionTable, 0, 7, "Bear Duration", text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 7, bearText,        text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=tblTxtSz)
+
+        string chText = na(cycleHigh) ? "N/A" : "$" + str.tostring(cycleHigh, "#,###")
+        table.cell(actionTable, 0, 8, "Cycle High", text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+        table.cell(actionTable, 1, 8, chText,       text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=tblTxtSz)
+
+//----------------------------------------------------
+// ALERTS
+//----------------------------------------------------
+alertcondition(isLive and phaseChanged,                                            "Phase Change",       "BTC Cycle: Phase changed")
+alertcondition(isLive and sellSignalText == "FIRST_SELL",                          "First Sell",         "BTC Cycle: Rotate 20% to yield basket")
+alertcondition(isLive and sellSignalText == "SECOND_SELL",                         "Second Sell",        "BTC Cycle: Rotate 40% to yield basket, pause DCA")
+alertcondition(isLive and sellPausedByPlunge and sellPausedByPlunge[1] == false,   "Plunge Detected",    "BTC Cycle: Sell plunge detected — holds locked, no second sell")
+alertcondition(isLive and phase == "DEEP_BEAR"    and phase[1] != "DEEP_BEAR",     "Deep Bear Entry",    "BTC Cycle: Entering DEEP BEAR — begin yield deployment")
+alertcondition(isLive and phase == "MATURE_BULL"  and phase[1] != "MATURE_BULL",   "Mature Bull Entry",  "BTC Cycle: Entering MATURE BULL — sells armed, DCA paused")
+alertcondition(isLive and phase == "DISTRIBUTION" and phase[1] != "DISTRIBUTION",  "Distribution Entry", "BTC Cycle: Entering DISTRIBUTION — sell zone, DCA tapered to 0.5x")
+alertcondition(isLive and phase == "WEAKENING"    and phase[1] != "WEAKENING",     "Weakening Entry",    "BTC Cycle: Entering WEAKENING — bull fading, DCA at 0.25x")

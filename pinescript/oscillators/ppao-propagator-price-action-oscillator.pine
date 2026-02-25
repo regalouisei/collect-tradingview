@@ -1,0 +1,128 @@
+//   ████████╗██╗  ██╗███████╗██╗    ██╗ █████╗ ███╗   ██╗███╗   ██╗ █████╗ ██████╗ ███████╗ ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗
+//   ╚══██╔══╝██║  ██║██╔════╝██║    ██║██╔══██╗████╗  ██║████╗  ██║██╔══██╗██╔══██╗██╔════╝██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝
+//      ██║   ███████║█████╗  ██║ █╗ ██║███████║██╔██╗ ██║██╔██╗ ██║███████║██████╔╝█████╗  ██║   ██║██║   ██║███████║██╔██╗ ██║   ██║   
+//      ██║   ██╔══██║██╔══╝  ██║███╗██║██╔══██║██║╚██╗██║██║╚██╗██║██╔══██║██╔══██╗██╔══╝  ██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║   
+//      ██║   ██║  ██║███████╗╚███╔███╔╝██║  ██║██║ ╚████║██║ ╚████║██║  ██║██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║   
+//      ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   
+//
+//   ORIGINAL INDICATOR BY: TheWannaBeQuant
+
+//@version=5
+indicator("PPAO - Propagator Price Action Oscillator", shorttitle="PPAO", overlay=false)
+
+//====================================================
+// Inputs
+//====================================================
+gCore = "Core"
+gPlot = "Plot Controls"
+
+lenVol   = input.int(20,    "Volatility Length",    minval=1, group=gCore)
+lenH     = input.int(14,    "Momentum Length",      minval=1, group=gCore)
+hScale   = input.float(3.0, "Hamiltonian Scale",    minval=0.1, group=gCore)
+decayMul = input.float(1.0, "Damping Multiplier",   minval=0.1, group=gCore)
+forceMul = input.float(1.0, "Forcing Scale",        minval=0.1, group=gCore)
+smooth   = input.int(5,     "Output Smoothing",     minval=1, group=gCore)
+
+showFill  = input.bool(true,  "Show 30–70 Fill", group=gPlot)
+showPhase = input.bool(false, "Show Phase",      group=gPlot)
+
+//====================================================
+// Helpers
+//====================================================
+// Pine v5 has no math.tanh(), implement stable tanh.
+tanh(float x) =>
+    float xc = math.max(math.min(x, 10.0), -10.0)      // clamp for numeric safety
+    float e  = math.exp(-2.0 * xc)
+    2.0 / (1.0 + e) - 1.0
+
+//====================================================
+// Core price action features (NA-safe)
+//====================================================
+ret = math.log(close / close[1])
+ret := nz(ret, 0.0)
+
+vol  = ta.stdev(ret, lenVol)
+atrn = ta.atr(14) / close
+mom  = ta.ema(ret, lenH)
+
+// Prevent na from poisoning recursion
+ready = not na(vol) and not na(atrn) and not na(mom)
+
+// Safe versions
+vol_  = nz(vol, 0.0)
+atrn_ = nz(atrn, 0.0)
+mom_  = nz(mom, 0.0)
+
+//====================================================
+// System terms
+//====================================================
+// Dissipative component L(t) >= 0
+L = decayMul * (vol_ + atrn_)
+
+// Oscillatory component H(t)
+H = hScale * (mom_ / (vol_ + 1e-6))
+
+// Propagator coefficients
+decay = math.exp(-L)
+cosH  = math.cos(H)
+sinH  = math.sin(H)
+
+//====================================================
+// Forcing term b(t) ~ price action (Option B: body + CLV)
+//====================================================
+body = (close - open) / close
+
+rng = high - low
+clv = rng == 0.0 ? 0.0 : (2.0 * close - high - low) / rng   // Close Location Value in [-1..+1]
+
+// Directional forcing:
+// - body captures open->close direction (scaled)
+// - clv captures where close sits within the bar (micro-structure direction)
+b1 = forceMul * ret
+b2 = forceMul * (0.7 * body + 0.3 * clv)
+
+//====================================================
+// State update (2D rotation + decay + forcing)
+//====================================================
+var float p = 0.0
+var float q = 0.0
+
+if ready
+    pNew = decay * (nz(p) * cosH - nz(q) * sinH) + b1
+    qNew = decay * (nz(p) * sinH + nz(q) * cosH) + b2
+    p := pNew
+    q := qNew
+else
+    // keep state stable during warmup
+    p := nz(p, 0.0)
+    q := nz(q, 0.0)
+
+//====================================================
+// Oscillator
+//====================================================
+energy = math.sqrt(p * p + q * q)
+
+// Phase (angle of the state vector)
+rawPhase = p == 0.0 ? (q > 0.0 ? math.pi / 2.0 : (q < 0.0 ? -math.pi / 2.0 : 0.0)) : math.atan(q / p)
+phase    = p < 0.0 ? (q >= 0.0 ? rawPhase + math.pi : rawPhase - math.pi) : rawPhase
+
+// 0..100 mapping (soft-saturated)
+oscRaw = 50.0 + 50.0 * tanh(p / (energy + 1e-6))
+osc    = ta.ema(oscRaw, smooth)
+
+//====================================================
+// Plot
+//====================================================
+hline(70, "Overbought", color=color.new(color.red, 60))
+hline(50, "Midline",    color=color.new(color.gray, 70))
+hline(30, "Oversold",   color=color.new(color.green, 60))
+
+plot(osc, "PPAO", color=color.new(color.aqua, 0), linewidth=2)
+
+// Fill bands (toggle)
+upperBand = plot(70, display=display.none)
+lowerBand = plot(30, display=display.none)
+fill(upperBand, lowerBand, color = showFill ? color.new(color.aqua, 90) : na)
+
+// Optional: phase ribbon (toggle) — radians (~ -3.14..+3.14)
+plot(showPhase ? phase : na, "Phase (radians)", color=color.new(color.orange, 70), linewidth=1)

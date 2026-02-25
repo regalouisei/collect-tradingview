@@ -1,0 +1,160 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator("Mean Deviation Trend [BackQuant]", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// Constants 
+const string g1 = "Deviation Engine"
+const string g2 = "Band & Levels"
+const string g3 = "Display"
+
+color BULL = #00ff00
+color BEAR = #ff0000
+
+// Inputs 
+int   meanLen    = input.int(21, "Mean Length",group=g1, tooltip="EMA used as the central mean anchor")
+int   devLen     = input.int(14, "Deviation Smoothing", group=g1, tooltip="Smoothing on the signed deviation from mean")
+int   devAccum   = input.int(8, "Deviation Accumulation", group=g1, tooltip="Rolling window for cumulative deviation — drives trend conviction")
+float bandTight  = input.float(0.7, "Band Tight (High Deviation)", step=0.1, group=g2, tooltip="ATR mult when deviation is strong — band hugs close")
+float bandWide   = input.float(2.6, "Band Wide (Low Deviation)", step=0.1, group=g2, tooltip="ATR mult when deviation is weak — band drifts wide")
+bool  showLevels = input.bool(true, "Show Deviation Peak Levels", group=g2)
+int   maxLvls    = input.int(8, "Max Levels", minval=2, maxval=15, group=g2)
+float fadeThr    = input.float(0.3, "Fade Threshold", minval=0.1, step=0.05, group=g2, tooltip="Deviation must drop to this fraction of its peak to plant a level")
+bool  showGlow   = input.bool(true, "Glow Effect", group=g3)
+bool  paintBars  = input.bool(true, "Color Candles", group=g3)
+bool  showFill   = input.bool(true, "Show Band Fill", group=g3)
+color bullCol    = input.color(BULL, "Bullish", inline="col", group=g3)
+color bearCol    = input.color(BEAR, "Bearish", inline="col", group=g3)
+
+// Mean & Deviation 
+mean = ta.ema(close, meanLen)
+atr  = ta.atr(14)
+
+// Signed deviation normalized by ATR
+rawDev = (close - mean) / atr
+
+// Smooth the instantaneous deviation
+devSmooth = ta.ema(rawDev, devLen)
+
+// Cumulative deviation = rolling sum → captures sustained directional pressure
+cumDev = ta.sma(devSmooth, devAccum)
+
+// Absolute magnitude
+devAbs = math.abs(cumDev)
+devHigh = ta.highest(devAbs, 80)
+devNorm = devHigh > 0 ? math.min(devAbs / devHigh, 1.0) : 0.0
+
+// Trend direction from cumulative deviation sign
+int tDir = cumDev > 0 ? 1 : -1
+bool flip = tDir != tDir[1]
+
+// Adaptive Band 
+// Strong deviation = tight band (confident trend), weak = wide band (uncertain)
+bandMult = bandWide - devNorm * (bandWide - bandTight)
+bandW = atr * bandMult
+
+float activeBand = tDir == 1 ? mean - bandW : mean + bandW
+activeBand := ta.ema(activeBand, 3)
+
+float outerBand = tDir == 1 ? mean + bandW * 0.5 : mean - bandW * 0.5
+outerBand := ta.ema(outerBand, 3)
+
+// Color 
+tCol = tDir == 1 ? color.from_gradient(devNorm, 0.05, 0.7, color.new(bullCol, 50), bullCol) : color.from_gradient(devNorm, 0.05, 0.7, color.new(bearCol, 50), bearCol)
+
+// Deviation Peak Levels 
+var float peakDev   = 0.0
+var float peakPrice = na
+var int   peakDir   = 0
+var int   peakBar   = na
+
+if devAbs > peakDev
+    peakDev   := devAbs
+    peakPrice := tDir == 1 ? high : low
+    peakDir   := tDir
+    peakBar   := bar_index
+
+// Deviation faded significantly from its peak → level at the extreme
+faded = peakDev > 0.3 and devAbs < peakDev * fadeThr
+
+type DevLvl
+    float price
+    int   dir
+    line  ln
+    bool  retested
+
+var DevLvl[] dLevels = array.new<DevLvl>()
+
+if faded and showLevels and not na(peakPrice)
+    if dLevels.size() >= maxLvls
+        DevLvl old = dLevels.shift()
+        line.delete(old.ln)
+
+    lCol = peakDir == 1 ? bullCol : bearCol
+    line ln = line.new(peakBar, peakPrice, bar_index + 60, peakPrice, color=color.new(lCol, 30), width=1, style=line.style_dashed)
+    dLevels.push(DevLvl.new(peakPrice, peakDir, ln, false))
+    peakDev   := 0.0
+    peakPrice := na
+
+if dLevels.size() > 0
+    int i = dLevels.size() - 1
+    while i >= 0
+        DevLvl lvl = dLevels.get(i)
+        bool broken = lvl.dir == 1 ? close > lvl.price + atr * 2.0 : close < lvl.price - atr * 2.0
+        if broken
+            line.delete(lvl.ln)
+            dLevels.remove(i)
+        else
+            line.set_x2(lvl.ln, bar_index + 60)
+            bool touch = math.abs(close - lvl.price) < atr * 0.25 and math.abs(close[2] - lvl.price) > atr * 0.5
+            if touch and not lvl.retested
+                rCol = lvl.dir == 1 ? bullCol : bearCol
+                yPos = close > lvl.price ? low : high
+                lStyle = close > lvl.price ? label.style_label_up : label.style_label_down
+                label.new(bar_index, yPos, "◆", style=lStyle, color=color(na), textcolor=rCol, size=size.small)
+                lvl.retested := true
+        i -= 1
+
+// Glow 
+// Glow width scales with deviation magnitude — stronger trend = bigger glow
+glowMult = 0.4 + devNorm * 1.2
+glowW = atr * 0.08 * glowMult
+
+g3p = plot(showGlow ? mean + glowW * 3 : na, display=display.none)
+g2p = plot(showGlow ? mean + glowW * 2 : na, display=display.none)
+g1p = plot(showGlow ? mean + glowW     : na, display=display.none)
+pMean = plot(mean, "Mean Core", tCol, 2)
+g1b = plot(showGlow ? mean - glowW     : na, display=display.none)
+g2b = plot(showGlow ? mean - glowW * 2 : na, display=display.none)
+g3b = plot(showGlow ? mean - glowW * 3 : na, display=display.none)
+
+fill(g3p, g2p, showGlow ? color.new(tCol, 94) : na)
+fill(g2p, g1p, showGlow ? color.new(tCol, 88) : na)
+fill(g1p, pMean, showGlow ? color.new(tCol, 78) : na)
+fill(pMean, g1b, showGlow ? color.new(tCol, 78) : na)
+fill(g1b, g2b, showGlow ? color.new(tCol, 88) : na)
+fill(g2b, g3b, showGlow ? color.new(tCol, 94) : na)
+
+// Band Plot 
+float bandBrk = flip ? float(na) : activeBand
+
+pm = plot(bandBrk, "Deviation Band", tCol, 2, plot.style_linebr)
+pp = plot(hl2, display=display.none, editable=false)
+fill(pm, pp, hl2, bandBrk, color(na), color.new(tCol, showFill ? 70 : 100), editable=false)
+
+plot(ta.ema(outerBand, 3), "Outer", color.new(tCol, 78), 1)
+
+// Candles & Signals 
+plotcandle(open, high, low, close, "Candles", tCol, tCol, bordercolor=tCol, display=paintBars ? display.all : display.none)
+
+if flip and tDir == 1
+    label.new(bar_index, low, "▲", style=label.style_label_up, color=color(na), textcolor=bullCol, size=size.normal)
+if flip and tDir == -1
+    label.new(bar_index, high, "▼", style=label.style_label_down, color=color(na), textcolor=bearCol, size=size.normal)
+
+// Alerts 
+alertcondition(flip and tDir == 1, "Dev Bull", "Mean deviation bullish {{ticker}}")
+alertcondition(flip and tDir == -1, "Dev Bear", "Mean deviation bearish {{ticker}}")
+alertcondition(faded, "Dev Faded", "Deviation peaked and faded — level planted {{ticker}}")
+alertcondition(devNorm > 0.85, "Extreme Dev", "Extreme deviation from mean {{ticker}}")

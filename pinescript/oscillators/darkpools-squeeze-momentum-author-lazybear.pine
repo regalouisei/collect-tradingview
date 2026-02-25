@@ -1,0 +1,165 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DarkPoolCrypto
+
+// ORIGINAL SCRIPT @author LazyBear 
+
+//@version=6
+indicator("DarkPool's Squeeze Momentum @author LazyBear", shorttitle="DP Squeeze Pro", overlay=false)
+
+// -------------------------------------------------------------------------
+// 🛠 INPUTS
+// -------------------------------------------------------------------------
+
+// --- Strategy Settings ---
+group_strat = "Strategy & Calculation"
+source  = input.source(close, title="Source Data", group=group_strat, tooltip="The price point used for calculations. 'Close' is standard, but 'HLC3' can smooth out noise.")
+ma_type = input.string("SMA", title="Basis MA Type", options=["SMA", "EMA", "WMA", "RMA"], group=group_strat, tooltip="Determines the Moving Average algorithm used for the centerline. \n• SMA: Standard/Stable \n• EMA: Reactive/Fast \n• WMA: Weighted to recent data")
+
+// --- BB Settings ---
+group_bb = "Bollinger Bands (Volatility)"
+bb_length = input.int(20, title="Length", group=group_bb, minval=1, tooltip="The lookback window for volatility calculations. Standard is 20.")
+bb_mult   = input.float(2.0, title="StdDev Multiplier", group=group_bb, step=0.1, tooltip="How wide the bands are. Higher values (e.g., 2.5) require more extreme compression to trigger a squeeze.")
+
+// --- KC Settings ---
+group_kc = "Keltner Channels (Range)"
+kc_length    = input.int(20, title="Length", group=group_kc, minval=1, tooltip="The lookback window for the average range (ATR) calculation.")
+kc_mult      = input.float(1.5, title="Range Multiplier", group=group_kc, step=0.1, tooltip="The factor applied to the ATR. \n• 1.5 is standard for TTM Squeeze. \n• Lower values (1.0) make squeezes harder to find. \n• Higher values (2.0) make squeezes very frequent.")
+useTrueRange = input.bool(true, title="Use True Range", group=group_kc, tooltip="If ON, uses True Range (includes gaps). If OFF, uses simple High-Low range. True Range is generally more accurate for crypto/stocks.")
+
+// --- Divergence Settings ---
+group_div = "Signal Detection"
+show_divs    = input.bool(true, title="Show Divergences", group=group_div, tooltip="Detects and labels instances where price trend contradicts momentum (often predicting a reversal).")
+div_lookback = input.int(5, title="Pivot Lookback", group=group_div, minval=1, tooltip="The number of bars required to confirm a peak/valley. \n• 5 is a balanced default. \n• 10+ will only show major macro reversals.")
+
+// --- Visuals ---
+group_style = "Visual Styling"
+color_bars      = input.bool(true, "Color Main Chart Candles?", group=group_style, tooltip="If enabled, this will override the candle colors on your main chart to match the momentum histogram.")
+show_ghost      = input.bool(true, "Show Histogram Shadow", group=group_style, tooltip="Adds a transparent 'ghost' area behind the histogram for better visual volume tracking.")
+col_bull_strong = input.color(#00E676, "Bullish Rising", group=group_style, tooltip="Momentum is positive and increasing.")
+col_bull_weak   = input.color(#4CAF50, "Bullish Weakening", group=group_style, tooltip="Momentum is positive but decreasing.")
+col_bear_strong = input.color(#FF5252, "Bearish Falling", group=group_style, tooltip="Momentum is negative and decreasing.")
+col_bear_weak   = input.color(#FF1744, "Bearish Weakening", group=group_style, tooltip="Momentum is negative but increasing.")
+
+// -------------------------------------------------------------------------
+// 🧮 CALCULATIONS
+// -------------------------------------------------------------------------
+
+// Helper Function for dynamic MA types
+get_ma(src, len, type) =>
+    switch type
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.sma(src, len)
+
+// 1. Bollinger Bands Calculation
+basis    = get_ma(source, bb_length, ma_type)
+dev      = bb_mult * ta.stdev(source, bb_length)
+bb_upper = basis + dev
+bb_lower = basis - dev
+
+// 2. Keltner Channels Calculation
+ma_kc     = get_ma(source, kc_length, ma_type)
+range_val = useTrueRange ? ta.tr : (high - low)
+range_ma  = get_ma(range_val, kc_length, ma_type) 
+kc_upper  = ma_kc + range_ma * kc_mult
+kc_lower  = ma_kc - range_ma * kc_mult
+
+// 3. Squeeze Logic
+// Squeeze ON: BB is completely inside KC
+squeeze_on  = bb_lower > kc_lower and bb_upper < kc_upper
+squeeze_off = bb_lower < kc_lower and bb_upper > kc_upper
+no_squeeze  = not squeeze_on and not squeeze_off
+
+// 4. Momentum Calculation (Linear Regression)
+highest_high = ta.highest(high, kc_length)
+lowest_low   = ta.lowest(low, kc_length)
+avg_val      = math.avg(math.avg(highest_high, lowest_low), ma_kc)
+mom_val      = ta.linreg(source - avg_val, kc_length, 0)
+
+// -------------------------------------------------------------------------
+// 🔎 DIVERGENCE LOGIC
+// -------------------------------------------------------------------------
+
+pl = ta.pivotlow(mom_val, div_lookback, div_lookback)
+ph = ta.pivothigh(mom_val, div_lookback, div_lookback)
+
+// FIX: Calculate previous occurrences outside the conditional block
+// This ensures the series consistency is maintained on every bar (removes warnings)
+pl_found = not na(pl)
+ph_found = not na(ph)
+
+prev_pl_val = ta.valuewhen(pl_found, mom_val[div_lookback], 1)
+prev_price_low = ta.valuewhen(pl_found, low[div_lookback], 1)
+
+prev_ph_val = ta.valuewhen(ph_found, mom_val[div_lookback], 1)
+prev_price_high = ta.valuewhen(ph_found, high[div_lookback], 1)
+
+// Bullish Divergence (Regular)
+bull_div = false
+if pl_found and show_divs
+    curr_pl_val = mom_val[div_lookback]
+    curr_price_low = low[div_lookback]
+    
+    // Price made Lower Low, Momentum made Higher Low
+    if curr_pl_val > prev_pl_val and curr_price_low < prev_price_low 
+        bull_div := true
+
+// Bearish Divergence (Regular)
+bear_div = false
+if ph_found and show_divs
+    curr_ph_val = mom_val[div_lookback]
+    curr_price_high = high[div_lookback]
+    
+    // Price made Higher High, Momentum made Lower High
+    if curr_ph_val < prev_ph_val and curr_price_high > prev_price_high
+        bear_div := true
+
+// -------------------------------------------------------------------------
+// 🎨 PLOTTING & VISUALS
+// -------------------------------------------------------------------------
+
+// Color Determination
+mom_color = if mom_val > 0
+    mom_val > nz(mom_val[1]) ? col_bull_strong : col_bull_weak
+else
+    mom_val < nz(mom_val[1]) ? col_bear_strong : col_bear_weak
+
+// 1. Histogram
+plot(mom_val, title="Momentum Histogram", color=mom_color, style=plot.style_columns, linewidth=1)
+// FIX: Changed linewidth from 0 to 1 (Min allowed value)
+plot(show_ghost ? mom_val : na, title="Ghost Fill", color=color.new(mom_color, 80), style=plot.style_area, linewidth=1)
+
+// 2. Squeeze Dots (Zero Line)
+sqz_color = squeeze_on ? color.red : no_squeeze ? color.blue : color.gray
+plot(0, title="Squeeze Status", color=sqz_color, style=plot.style_circles, linewidth=2)
+
+// 3. Divergence Labels
+plotshape(bull_div ? mom_val[div_lookback] : na, title="Bullish Div", style=shape.labelup, location=location.absolute, color=col_bull_strong, textcolor=color.black, text="BULL", offset=-div_lookback, size=size.tiny)
+plotshape(bear_div ? mom_val[div_lookback] : na, title="Bearish Div", style=shape.labeldown, location=location.absolute, color=col_bear_strong, textcolor=color.white, text="BEAR", offset=-div_lookback, size=size.tiny)
+
+// 4. Main Chart Bar Coloring
+// Note: We use barcolor() which affects the main chart even if overlay=false
+barcolor(color_bars ? mom_color : na, title="Candle Colors")
+
+// -------------------------------------------------------------------------
+// 🚨 ALERTS
+// -------------------------------------------------------------------------
+
+squeeze_fired_bull = squeeze_on[1] and not squeeze_on and mom_val > 0
+squeeze_fired_bear = squeeze_on[1] and not squeeze_on and mom_val < 0
+
+alertcondition(squeeze_fired_bull, title="Squeeze Fired Long", message="Volatility Squeeze fired LONG on {{ticker}}")
+alertcondition(squeeze_fired_bear, title="Squeeze Fired Short", message="Volatility Squeeze fired SHORT on {{ticker}}")
+alertcondition(bull_div, title="Bullish Divergence", message="Bullish Divergence detected on {{ticker}}")
+alertcondition(bear_div, title="Bearish Divergence", message="Bearish Divergence detected on {{ticker}}")
+
+if squeeze_fired_bull
+    alert("🟢 Squeeze Fired LONG | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if squeeze_fired_bear
+    alert("🔴 Squeeze Fired SHORT | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bull_div
+    alert("🐂 Bullish Div | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bear_div
+    alert("🐻 Bearish Div | " + syminfo.ticker, alert.freq_once_per_bar_close)

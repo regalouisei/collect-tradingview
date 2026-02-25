@@ -1,0 +1,470 @@
+//@version=6
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © HenriqueCentieiro
+
+indicator("Central Bank Liquidity Gap Indicator", overlay=false)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                                   NOTES                                       ║
+// ╠══════════════════════════════════════════════════════════════════════════════╣
+// ║  This indicator measures the divergence between global money supply growth    ║
+// ║  and S&P 500 growth to identify potential market turning points.              ║
+// ║                                                                               ║
+// ║  * China M2 weight is reduced by 50% to account for capital controls          ║
+// ║    that limit capital flow to global markets.                                 ║
+// ║                                                                               ║
+// ║  * Weights are calculated dynamically based on actual M2 values,              ║
+// ║    converted to USD using approximate exchange rates.                         ║
+// ║                                                                               ║
+// ║  * Net Liquidity = Fed Balance Sheet - TGA - Reverse Repo                     ║
+// ║    This measures actual Fed-injected liquidity in financial markets.          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ============================================
+// INPUTS - GENERAL SETTINGS
+// ============================================
+string timeFrame = input.timeframe("D", title="Time Frame", group="General Settings")
+int lookbackPeriod = input.int(4, title="Lookback Period (bars)", minval=1, maxval=252, group="General Settings", tooltip="Number of bars to calculate growth rate")
+
+// ============================================
+// INPUTS - M2 COUNTRY SELECTION (Tier 1)
+// ============================================
+bool use_us_m2 = input.bool(true, "US M2", group="Tier 1 - Major Economies", tooltip="United States M2 Money Supply")
+bool use_china_m2 = input.bool(false, "China M2 (50% weight reduction)", group="Tier 1 - Major Economies", tooltip="China M2 - Weight reduced by 50% due to capital controls limiting global capital flow")
+bool use_eurozone_m2 = input.bool(false, "Eurozone M2", group="Tier 1 - Major Economies", tooltip="European Central Bank M2 Money Supply")
+bool use_japan_m2 = input.bool(false, "Japan M2", group="Tier 1 - Major Economies", tooltip="Bank of Japan M2 Money Supply")
+
+// ============================================
+// INPUTS - M2 COUNTRY SELECTION (Tier 2)
+// ============================================
+bool use_uk_m2 = input.bool(false, "UK M2", group="Tier 2 - Other Major Economies", tooltip="Bank of England M2 Money Supply")
+bool use_canada_m2 = input.bool(false, "Canada M2", group="Tier 2 - Other Major Economies", tooltip="Bank of Canada M2 Money Supply")
+bool use_swiss_m2 = input.bool(false, "Switzerland M2", group="Tier 2 - Other Major Economies", tooltip="Swiss National Bank M2 Money Supply")
+
+// ============================================
+// INPUTS - FED NET LIQUIDITY
+// ============================================
+bool use_net_liquidity = input.bool(false, "Include Fed Net Liquidity", group="Fed Net Liquidity", tooltip="Blend Fed Net Liquidity with US M2 component.\nNet Liquidity = Fed Balance Sheet - TGA - Reverse Repo")
+float net_liquidity_weight = input.float(50.0, "Net Liquidity Blend (%)", minval=0.0, maxval=100.0, step=5.0, group="Fed Net Liquidity", tooltip="0% = Pure US M2\n50% = Equal blend\n100% = Pure Net Liquidity")
+
+// ============================================
+// INPUTS - DISPLAY OPTIONS
+// ============================================
+bool show_weights_table = input.bool(true, "Show Weights Table", group="Display")
+string table_position = input.string("top_right", "Table Position", options=["top_left", "top_right", "bottom_left", "bottom_right"], group="Display")
+string table_font_size = input.string("small", "Table Font Size", options=["tiny", "small", "normal", "large"], group="Display")
+bool show_component_lines = input.bool(false, "Show Individual Components", group="Display", tooltip="Plot individual M2 growth lines for analysis")
+
+// ============================================
+// INPUTS - BUY ZONE SIGNALS
+// ============================================
+bool show_buy_zone = input.bool(true, "Show Buy Zone", group="Buy Zone Signals", tooltip="Highlight when divergence exceeds the buy threshold")
+float buy_threshold = input.float(5.0, "Buy Threshold (%)", minval=1.0, maxval=20.0, step=0.5, group="Buy Zone Signals", tooltip="Divergence level that triggers buy zone (default: 5%)")
+bool show_zone_background = input.bool(true, "Highlight Buy Zone Background", group="Buy Zone Signals", tooltip="Shade background when in buy zone")
+
+// ============================================
+// INPUTS - CORRELATION ANALYSIS
+// ============================================
+bool show_correlation = input.bool(true, "Show Correlation Stats", group="Correlation Analysis", tooltip="Display rolling and lead correlation between liquidity and SPX")
+int corr_lookback = input.int(4, "Correlation Lookback (bars)", minval=2, maxval=252, group="Correlation Analysis", tooltip="Number of bars for rolling correlation calculation")
+int lead_periods = input.int(12, "Lead Periods", minval=1, maxval=52, group="Correlation Analysis", tooltip="Number of bars to shift for lead correlation (tests if liquidity predicts SPX)")
+bool show_corr_line = input.bool(false, "Show Correlation Line", group="Correlation Analysis", tooltip="Plot rolling correlation as a line on the chart")
+
+// ============================================
+// INPUTS - COLORS
+// ============================================
+string color_theme = input.string("Gradient Green/Red", "Color Theme", options=["Gradient Green/Red", "Gradient Cyan/Magenta", "Gradient Blue/Orange", "Gradient Teal/Pink", "Solid Classic"], group="Colors", tooltip="Choose a color theme for the histogram bars")
+color color_positive = input.color(#00E676, "Positive Color (for Solid theme)", group="Colors")
+color color_negative = input.color(#FF5252, "Negative Color (for Solid theme)", group="Colors")
+
+// ============================================
+// CURRENCY CONVERSION FACTORS (Local Currency to USD)
+// ============================================
+// These approximate exchange rates convert M2 from local currency to USD
+// Updated periodically for accuracy - last update: 2024
+float USD_FACTOR = 1.0
+float CNY_FACTOR = 0.14       // Chinese Yuan to USD
+float EUR_FACTOR = 1.08       // Euro to USD
+float JPY_FACTOR = 0.0067     // Japanese Yen to USD
+float GBP_FACTOR = 1.27       // British Pound to USD
+float CAD_FACTOR = 0.74       // Canadian Dollar to USD
+float CHF_FACTOR = 1.13       // Swiss Franc to USD
+
+float CHINA_DISCOUNT = 0.5    // 50% weight reduction for China due to capital controls
+
+// ============================================
+// FETCH M2 DATA
+// ============================================
+// Using TradingView ECONOMICS data where available, with ignore_invalid_symbol for safety
+// US M2 from FRED (most reliable)
+float us_m2_raw = request.security("FRED:M2SL", timeFrame, close, ignore_invalid_symbol=true)
+
+// International M2 - using ECONOMICS symbols (TradingView's economic data)
+float china_m2_raw = request.security("ECONOMICS:CNM2", timeFrame, close, ignore_invalid_symbol=true)
+float eurozone_m2_raw = request.security("ECONOMICS:EUM2", timeFrame, close, ignore_invalid_symbol=true)
+float japan_m2_raw = request.security("ECONOMICS:JPM2", timeFrame, close, ignore_invalid_symbol=true)
+float uk_m2_raw = request.security("ECONOMICS:GBM2", timeFrame, close, ignore_invalid_symbol=true)
+float canada_m2_raw = request.security("ECONOMICS:CAM2", timeFrame, close, ignore_invalid_symbol=true)
+float swiss_m2_raw = request.security("ECONOMICS:CHM2", timeFrame, close, ignore_invalid_symbol=true)
+
+// ============================================
+// FETCH FED LIQUIDITY COMPONENTS
+// ============================================
+float fed_balance_sheet = request.security("FRED:WALCL", timeFrame, close, ignore_invalid_symbol=true)   // Fed Total Assets
+float tga = request.security("FRED:WTREGEN", timeFrame, close, ignore_invalid_symbol=true)               // Treasury General Account
+float rrp = request.security("FRED:RRPONTSYD", timeFrame, close, ignore_invalid_symbol=true)             // Reverse Repo
+
+// ============================================
+// FETCH S&P 500 DATA
+// ============================================
+float spx_close = request.security("SP:SPX", timeFrame, close)
+
+// ============================================
+// CONVERT M2 TO USD EQUIVALENT (for weighting)
+// ============================================
+float us_m2_usd = nz(us_m2_raw, 0) * USD_FACTOR
+float china_m2_usd = nz(china_m2_raw, 0) * CNY_FACTOR * CHINA_DISCOUNT  // Apply 50% discount
+float eurozone_m2_usd = nz(eurozone_m2_raw, 0) * EUR_FACTOR
+float japan_m2_usd = nz(japan_m2_raw, 0) * JPY_FACTOR
+float uk_m2_usd = nz(uk_m2_raw, 0) * GBP_FACTOR
+float canada_m2_usd = nz(canada_m2_raw, 0) * CAD_FACTOR
+float swiss_m2_usd = nz(swiss_m2_raw, 0) * CHF_FACTOR
+
+// ============================================
+// CALCULATE TOTAL SELECTED M2 FOR DYNAMIC WEIGHTING
+// ============================================
+float total_m2_usd = (use_us_m2 ? us_m2_usd : 0.0) +
+                     (use_china_m2 ? china_m2_usd : 0.0) +
+                     (use_eurozone_m2 ? eurozone_m2_usd : 0.0) +
+                     (use_japan_m2 ? japan_m2_usd : 0.0) +
+                     (use_uk_m2 ? uk_m2_usd : 0.0) +
+                     (use_canada_m2 ? canada_m2_usd : 0.0) +
+                     (use_swiss_m2 ? swiss_m2_usd : 0.0)
+
+// Avoid division by zero
+total_m2_usd := total_m2_usd == 0 ? 1.0 : total_m2_usd
+
+// ============================================
+// CALCULATE DYNAMIC WEIGHTS
+// ============================================
+float us_weight = use_us_m2 ? us_m2_usd / total_m2_usd : 0.0
+float china_weight = use_china_m2 ? china_m2_usd / total_m2_usd : 0.0
+float eurozone_weight = use_eurozone_m2 ? eurozone_m2_usd / total_m2_usd : 0.0
+float japan_weight = use_japan_m2 ? japan_m2_usd / total_m2_usd : 0.0
+float uk_weight = use_uk_m2 ? uk_m2_usd / total_m2_usd : 0.0
+float canada_weight = use_canada_m2 ? canada_m2_usd / total_m2_usd : 0.0
+float swiss_weight = use_swiss_m2 ? swiss_m2_usd / total_m2_usd : 0.0
+
+// ============================================
+// CALCULATE GROWTH RATES (%)
+// ============================================
+// Helper function for growth calculation
+calcGrowth(float current, float previous) =>
+    previous != 0 and not na(previous) and not na(current) ? (current / previous - 1) * 100 : 0.0
+
+// M2 Growth Rates
+float us_m2_growth = use_us_m2 ? calcGrowth(us_m2_raw, us_m2_raw[lookbackPeriod]) : 0.0
+float china_m2_growth = use_china_m2 ? calcGrowth(china_m2_raw, china_m2_raw[lookbackPeriod]) : 0.0
+float eurozone_m2_growth = use_eurozone_m2 ? calcGrowth(eurozone_m2_raw, eurozone_m2_raw[lookbackPeriod]) : 0.0
+float japan_m2_growth = use_japan_m2 ? calcGrowth(japan_m2_raw, japan_m2_raw[lookbackPeriod]) : 0.0
+float uk_m2_growth = use_uk_m2 ? calcGrowth(uk_m2_raw, uk_m2_raw[lookbackPeriod]) : 0.0
+float canada_m2_growth = use_canada_m2 ? calcGrowth(canada_m2_raw, canada_m2_raw[lookbackPeriod]) : 0.0
+float swiss_m2_growth = use_swiss_m2 ? calcGrowth(swiss_m2_raw, swiss_m2_raw[lookbackPeriod]) : 0.0
+
+// Net Liquidity Calculation
+float net_liquidity = fed_balance_sheet - nz(tga, 0) - nz(rrp, 0)
+float net_liquidity_growth = calcGrowth(net_liquidity, net_liquidity[lookbackPeriod])
+
+// S&P 500 Growth
+float spx_growth = calcGrowth(spx_close, spx_close[lookbackPeriod])
+
+// ============================================
+// CALCULATE WEIGHTED GLOBAL M2 GROWTH
+// ============================================
+float weighted_m2_growth = (us_weight * us_m2_growth) +
+                           (china_weight * china_m2_growth) +
+                           (eurozone_weight * eurozone_m2_growth) +
+                           (japan_weight * japan_m2_growth) +
+                           (uk_weight * uk_m2_growth) +
+                           (canada_weight * canada_m2_growth) +
+                           (swiss_weight * swiss_m2_growth)
+
+// ============================================
+// BLEND NET LIQUIDITY (if enabled)
+// ============================================
+// Net Liquidity blends with the US M2 component only
+float final_liquidity_growth = weighted_m2_growth
+
+if use_net_liquidity and use_us_m2
+    float nl_blend = net_liquidity_weight / 100.0
+    // Create blended US component: (1 - blend) * M2 + blend * Net Liquidity
+    float us_blended_growth = (1.0 - nl_blend) * us_m2_growth + nl_blend * net_liquidity_growth
+    // Replace US M2 contribution with blended value
+    final_liquidity_growth := weighted_m2_growth - (us_weight * us_m2_growth) + (us_weight * us_blended_growth)
+else if use_net_liquidity and not use_us_m2
+    // If Net Liquidity enabled but US M2 not selected, add it as standalone component
+    // Weight it relative to total (approximate US share when not selected)
+    float nl_standalone_weight = 0.3  // ~30% weight as standalone
+    final_liquidity_growth := weighted_m2_growth * (1.0 - nl_standalone_weight) + net_liquidity_growth * nl_standalone_weight
+
+// ============================================
+// CALCULATE DIVERGENCE
+// ============================================
+float money_flow_divergence = final_liquidity_growth - spx_growth
+
+// ============================================
+// BUY ZONE DETECTION
+// ============================================
+bool in_buy_zone = money_flow_divergence >= buy_threshold
+bool buy_signal = ta.crossover(money_flow_divergence, buy_threshold)  // Just entered buy zone
+
+// ============================================
+// CALCULATE CORRELATIONS
+// ============================================
+// Rolling Correlation: How correlated are liquidity growth and SPX growth over the lookback period
+float rolling_corr = ta.correlation(final_liquidity_growth, spx_growth, corr_lookback)
+
+// Lead Correlation: Does liquidity growth predict future SPX growth?
+// Correlate past liquidity growth with current SPX growth
+float lead_corr = ta.correlation(final_liquidity_growth[lead_periods], spx_growth, corr_lookback)
+
+// ============================================
+// GRADIENT COLOR CALCULATION
+// ============================================
+// Define gradient color pairs for each theme
+// Theme: Cyan/Magenta (Default - vibrant and modern)
+color cyan_light = #00FFFF
+color cyan_dark = #006666
+color magenta_light = #FF00FF
+color magenta_dark = #660066
+
+// Theme: Green/Red (Classic trading)
+color green_light = #00E676
+color green_dark = #004D40
+color red_light = #FF5252
+color red_dark = #B71C1C
+
+// Theme: Blue/Orange (High contrast)
+color blue_light = #2196F3
+color blue_dark = #0D47A1
+color orange_light = #FF9800
+color orange_dark = #E65100
+
+// Theme: Teal/Pink (Soft modern)
+color teal_light = #1DE9B6
+color teal_dark = #00695C
+color pink_light = #F48FB1
+color pink_dark = #AD1457
+
+// Calculate gradient intensity (0-100 scale based on divergence magnitude)
+float max_divergence = 15.0  // Assume max divergence around 15%
+float divergence_abs = math.abs(money_flow_divergence)
+float intensity = math.min(divergence_abs / max_divergence * 100, 100)
+
+// Select colors based on theme and calculate gradient
+color bar_color = color.gray
+
+if color_theme == "Gradient Cyan/Magenta"
+    bar_color := money_flow_divergence >= 0 ?
+         color.from_gradient(intensity, 0, 100, cyan_dark, cyan_light) :
+         color.from_gradient(intensity, 0, 100, magenta_dark, magenta_light)
+else if color_theme == "Gradient Green/Red"
+    bar_color := money_flow_divergence >= 0 ?
+         color.from_gradient(intensity, 0, 100, green_dark, green_light) :
+         color.from_gradient(intensity, 0, 100, red_dark, red_light)
+else if color_theme == "Gradient Blue/Orange"
+    bar_color := money_flow_divergence >= 0 ?
+         color.from_gradient(intensity, 0, 100, blue_dark, blue_light) :
+         color.from_gradient(intensity, 0, 100, orange_dark, orange_light)
+else if color_theme == "Gradient Teal/Pink"
+    bar_color := money_flow_divergence >= 0 ?
+         color.from_gradient(intensity, 0, 100, teal_dark, teal_light) :
+         color.from_gradient(intensity, 0, 100, pink_dark, pink_light)
+else  // Solid Classic
+    bar_color := money_flow_divergence >= 0 ? color_positive : color_negative
+
+// ============================================
+// PLOTTING - MAIN DIVERGENCE
+// ============================================
+plot(money_flow_divergence, style=plot.style_histogram, color=bar_color, title="Money Flow Divergence", linewidth=4)
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_solid)
+
+// ============================================
+// PLOTTING - BUY ZONE VISUALS
+// ============================================
+// Buy threshold line
+hline(show_buy_zone ? buy_threshold : na, "Buy Zone Threshold", color=color.new(#00E676, 50), linestyle=hline.style_dashed, linewidth=1)
+
+// Background highlighting when in buy zone
+bgcolor(show_buy_zone and show_zone_background and in_buy_zone ? color.new(#00E676, 85) : na, title="Buy Zone Background")
+
+// ============================================
+// PLOTTING - INDIVIDUAL COMPONENTS (Optional)
+// ============================================
+// Using vibrant, distinguishable colors for each component
+plot(show_component_lines and use_us_m2 ? us_m2_growth : na, "US M2 Growth", color=#2196F3, linewidth=2)           // Bright Blue
+plot(show_component_lines and use_china_m2 ? china_m2_growth : na, "China M2 Growth", color=#F44336, linewidth=2)   // Red
+plot(show_component_lines and use_eurozone_m2 ? eurozone_m2_growth : na, "Eurozone M2 Growth", color=#FFEB3B, linewidth=2)  // Yellow
+plot(show_component_lines and use_japan_m2 ? japan_m2_growth : na, "Japan M2 Growth", color=#FF9800, linewidth=2)   // Orange
+plot(show_component_lines and use_uk_m2 ? uk_m2_growth : na, "UK M2 Growth", color=#9C27B0, linewidth=2)            // Purple
+plot(show_component_lines and use_canada_m2 ? canada_m2_growth : na, "Canada M2 Growth", color=#00BCD4, linewidth=2) // Cyan
+plot(show_component_lines and use_swiss_m2 ? swiss_m2_growth : na, "Swiss M2 Growth", color=#E91E63, linewidth=2)   // Pink
+plot(show_component_lines and use_net_liquidity ? net_liquidity_growth : na, "Net Liquidity Growth", color=#76FF03, linewidth=3)  // Lime Green (thicker)
+
+// ============================================
+// PLOTTING - CORRELATION LINE (Optional)
+// ============================================
+// Plot rolling correlation as a separate line (scaled to fit with main divergence plot)
+// Correlation ranges from -1 to 1, so we scale by 10 to make it visible alongside divergence
+plot(show_corr_line and show_correlation ? rolling_corr * 10 : na, "Rolling Correlation (×10)", color=color.new(#FFD700, 30), linewidth=2, style=plot.style_line)
+
+// ============================================
+// WEIGHTS TABLE
+// ============================================
+// Determine font size from input
+font_size = table_font_size == "tiny" ? size.tiny : table_font_size == "small" ? size.small : table_font_size == "normal" ? size.normal : table_font_size == "large" ? size.large : size.small
+
+// Count rows needed (only count what's actually selected)
+int row_count = 1  // header
+row_count += use_us_m2 ? 1 : 0
+row_count += use_china_m2 ? 1 : 0
+row_count += use_eurozone_m2 ? 1 : 0
+row_count += use_japan_m2 ? 1 : 0
+row_count += use_uk_m2 ? 1 : 0
+row_count += use_canada_m2 ? 1 : 0
+row_count += use_swiss_m2 ? 1 : 0
+row_count += (use_net_liquidity and use_us_m2) ? 1 : 0
+row_count += use_china_m2 ? 1 : 0  // footnote
+row_count += show_correlation ? 3 : 0  // separator + rolling corr + lead corr
+row_count += show_buy_zone ? 3 : 0  // separator + divergence value + signal status
+
+// Table position
+tbl_pos = table_position == "top_left" ? position.top_left : table_position == "top_right" ? position.top_right : table_position == "bottom_left" ? position.bottom_left : position.bottom_right
+
+// Table Colors - match selected theme
+color header_bg = color_theme == "Gradient Cyan/Magenta" ? #00838F :
+                  color_theme == "Gradient Green/Red" ? #2E7D32 :
+                  color_theme == "Gradient Blue/Orange" ? #1565C0 :
+                  color_theme == "Gradient Teal/Pink" ? #00796B : #2962FF
+color row_bg = #131722
+color row_bg_alt = #1E222D
+
+if show_weights_table
+    var table weights_table = table.new(tbl_pos, columns=2, rows=row_count, bgcolor=row_bg, border_width=0)
+
+    if barstate.islast
+        // Delete and recreate table to ensure correct row count
+        table.delete(weights_table)
+        weights_table := table.new(tbl_pos, columns=2, rows=row_count, bgcolor=color.new(row_bg, 0), border_width=0, border_color=na, frame_width=0)
+
+        int row = 0
+
+        // Header
+        table.cell(weights_table, 0, row, " Component ", bgcolor=header_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+        table.cell(weights_table, 1, row, " Weight ", bgcolor=header_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+        row += 1
+
+        // US M2
+        if use_us_m2
+            string us_label = use_net_liquidity ? " US M2+NL " : " US M2 "
+            table.cell(weights_table, 0, row, us_label, bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(us_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // China M2
+        if use_china_m2
+            table.cell(weights_table, 0, row, " China M2* ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(china_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Eurozone M2
+        if use_eurozone_m2
+            table.cell(weights_table, 0, row, " EU M2 ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(eurozone_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Japan M2
+        if use_japan_m2
+            table.cell(weights_table, 0, row, " Japan M2 ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(japan_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // UK M2
+        if use_uk_m2
+            table.cell(weights_table, 0, row, " UK M2 ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(uk_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Canada M2
+        if use_canada_m2
+            table.cell(weights_table, 0, row, " Canada M2 ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(canada_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Switzerland M2
+        if use_swiss_m2
+            table.cell(weights_table, 0, row, " Swiss M2 ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(swiss_weight * 100, "#.#") + "% ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Net Liquidity blend info
+        if use_net_liquidity and use_us_m2
+            table.cell(weights_table, 0, row, " NL Blend ", bgcolor=row_bg, text_color=color.yellow, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(net_liquidity_weight, "#") + "% ", bgcolor=row_bg, text_color=color.yellow, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Footnote for China
+        if use_china_m2
+            table.cell(weights_table, 0, row, " *50% disc. ", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, "", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Correlation Stats
+        if show_correlation
+            // Separator row
+            table.cell(weights_table, 0, row, "─────────", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, "─────────", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+            // Color code correlations: green for positive, red for negative
+            color rolling_corr_color = rolling_corr >= 0 ? color.new(#00E676, 0) : color.new(#FF5252, 0)
+            color lead_corr_color = lead_corr >= 0 ? color.new(#00E676, 0) : color.new(#FF5252, 0)
+
+            // Rolling Correlation - measures how liquidity and SPX move together now
+            table.cell(weights_table, 0, row, " Corr w/ SPX (" + str.tostring(corr_lookback) + "b) ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(rolling_corr, "#.##") + " ", bgcolor=row_bg, text_color=rolling_corr_color, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+            // Lead Correlation - measures if past liquidity predicts current SPX
+            table.cell(weights_table, 0, row, " Leads SPX by " + str.tostring(lead_periods) + "b ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(lead_corr, "#.##") + " ", bgcolor=row_bg, text_color=lead_corr_color, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+        // Buy Zone Signal Status
+        if show_buy_zone
+            // Separator row
+            table.cell(weights_table, 0, row, "─────────", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, "─────────", bgcolor=row_bg, text_color=color.gray, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+            // Current Divergence value
+            color div_color = money_flow_divergence >= buy_threshold ? color.new(#00E676, 0) : money_flow_divergence >= 0 ? color.new(#FFEB3B, 0) : color.new(#FF5252, 0)
+            table.cell(weights_table, 0, row, " Divergence ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, str.tostring(money_flow_divergence, "#.##") + "% ", bgcolor=row_bg, text_color=div_color, text_halign=text.align_right, text_size=font_size)
+            row += 1
+
+            // Signal Status
+            string signal_text = in_buy_zone ? "BUY ZONE" : "NEUTRAL"
+            color signal_bg = in_buy_zone ? #00E676 : row_bg
+            color signal_text_color = in_buy_zone ? #000000 : color.gray
+            table.cell(weights_table, 0, row, " Signal ", bgcolor=row_bg, text_color=color.white, text_halign=text.align_left, text_size=font_size)
+            table.cell(weights_table, 1, row, " " + signal_text + " ", bgcolor=signal_bg, text_color=signal_text_color, text_halign=text.align_right, text_size=font_size)
+
+// ============================================
+// ALERTS
+// ============================================
+alertcondition(ta.crossover(money_flow_divergence, 0), title="Divergence Turned Positive", message="Money Flow Divergence crossed above zero - Liquidity growing faster than SPX")
+alertcondition(ta.crossunder(money_flow_divergence, 0), title="Divergence Turned Negative", message="Money Flow Divergence crossed below zero - SPX growing faster than liquidity")
+alertcondition(buy_signal, title="Entered Buy Zone", message="Money Flow Divergence entered BUY ZONE - Liquidity significantly outpacing SPX")
+alertcondition(money_flow_divergence > 5, title="Large Positive Divergence", message="Money Flow Divergence above 5% - Strong liquidity surplus")
+alertcondition(money_flow_divergence < -5, title="Large Negative Divergence", message="Money Flow Divergence below -5% - Strong liquidity deficit")

@@ -1,0 +1,251 @@
+//@version=6
+indicator("Custom EMA SMA Ribbon", shorttitle="EMA Ribbon", overlay=true)
+
+// Credits: Original structure provided by user, enhanced for TradingView House Rules compliance.
+
+// ==========================================
+// INPUTS - CORE SETTINGS
+// ==========================================
+CORE_GROUP = "Core Settings"
+source = input.source(close, "Source", group=CORE_GROUP,
+     tooltip="Price source used for all moving average calculations. Close is standard for ribbons.")
+maType = input.string("EMA", "Moving Average Type", options=["EMA", "SMA"], group=CORE_GROUP,
+     tooltip="Choose EMA for faster reaction or SMA for smoother trend representation.")
+non_repainting = input.bool(true, "Non-repainting signals (bar close)", group=CORE_GROUP,
+     tooltip="When enabled, alerts and state changes are confirmed only on closed bars to prevent repainting.")
+show_chart_info = input.bool(true, "Show Chart Info", group=CORE_GROUP,
+     tooltip="Displays symbol, timeframe, and indicator name on the chart for publication clarity.")
+
+// ==========================================
+// INPUTS - LENGTHS
+// ==========================================
+LENGTH_GROUP = "Lengths"
+length1 = input.int(10, "Length 1", minval=1, group=LENGTH_GROUP,
+     tooltip="Shortest ribbon length. Sets the fastest moving average layer.")
+length2 = input.int(20, "Length 2", minval=1, group=LENGTH_GROUP,
+     tooltip="Second shortest length. Works with Length 1 to show immediate trend bias.")
+length3 = input.int(50, "Length 3", minval=1, group=LENGTH_GROUP,
+     tooltip="Intermediate length. Helps separate short-term noise from structure.")
+length4 = input.int(100, "Length 4", minval=1, group=LENGTH_GROUP,
+     tooltip="Longer length for medium-term trend structure.")
+length5 = input.int(150, "Length 5", minval=1, group=LENGTH_GROUP,
+     tooltip="Long-term length that defines the slower part of the ribbon.")
+length6 = input.int(200, "Length 6", minval=1, group=LENGTH_GROUP,
+     tooltip="Slowest length. Acts as the anchor for overall ribbon bias.")
+
+// ==========================================
+// INPUTS - STYLE
+// ==========================================
+STYLE_GROUP = "Styles"
+style1 = input.string("Solid", "Style MA1", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA1 (fastest). Use dotted for lighter visual weight.")
+style2 = input.string("Solid", "Style MA2", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA2.")
+style3 = input.string("Solid", "Style MA3", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA3.")
+style4 = input.string("Solid", "Style MA4", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA4.")
+style5 = input.string("Solid", "Style MA5", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA5.")
+style6 = input.string("Solid", "Style MA6", options=["Solid", "Dashed", "Dotted"], group=STYLE_GROUP,
+     tooltip="Line style for MA6 (slowest).")
+
+thick1 = input.int(2, "Line Thickness MA1", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA1. Higher values make the fastest line stand out.")
+thick2 = input.int(2, "Line Thickness MA2", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA2.")
+thick3 = input.int(2, "Line Thickness MA3", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA3.")
+thick4 = input.int(2, "Line Thickness MA4", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA4.")
+thick5 = input.int(2, "Line Thickness MA5", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA5.")
+thick6 = input.int(2, "Line Thickness MA6", minval=1, group=STYLE_GROUP,
+     tooltip="Thickness for MA6.")
+
+// ==========================================
+// INPUTS - VISUAL HIGHLIGHTS
+// ==========================================
+VIS_GROUP = "Visual Highlights"
+show_ribbon_background = input.bool(true, "Show Ribbon Bias Background", group=VIS_GROUP,
+     tooltip="Shades the chart background when the ribbon is fully bullish or bearish.")
+background_bull_color = input.color(#1FFF00, "Background Bullish Color", group=VIS_GROUP,
+     tooltip="Background color used when the ribbon is fully bullish.")
+background_bear_color = input.color(#B10606, "Background Bearish Color", group=VIS_GROUP,
+     tooltip="Background color used when the ribbon is fully bearish.")
+
+matrix_pos_str = input.string("Bottom Right", "Signal Matrix Position", options=["Top Right", "Top Left", "Top Center", "Bottom Right", "Bottom Left", "Bottom Center", "Middle Right", "Middle Left", "Middle Center"], group=VIS_GROUP,
+     tooltip="Select the location of the Signal Status Matrix on the chart.")
+
+COLOR_GROUP = "MA Line Colors"
+ma1_bull_color = input.color(#1FFF00, "MA1 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA1 when it is above MA2.")
+ma1_bear_color = input.color(#B10606, "MA1 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA1 when it is below MA2.")
+ma2_bull_color = input.color(#1FFF00, "MA2 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA2 when it is above MA3.")
+ma2_bear_color = input.color(#B10606, "MA2 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA2 when it is below MA3.")
+ma3_bull_color = input.color(#1FFF00, "MA3 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA3 when it is above MA4.")
+ma3_bear_color = input.color(#B10606, "MA3 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA3 when it is below MA4.")
+ma4_bull_color = input.color(#1FFF00, "MA4 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA4 when it is above MA5.")
+ma4_bear_color = input.color(#B10606, "MA4 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA4 when it is below MA5.")
+ma5_bull_color = input.color(#1FFF00, "MA5 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA5 when it is above MA6.")
+ma5_bear_color = input.color(#B10606, "MA5 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA5 when it is below MA6.")
+ma6_bull_color = input.color(#1FFF00, "MA6 Bullish Color", group=COLOR_GROUP,
+     tooltip="Color for MA6 when the ribbon is fully bullish.")
+ma6_bear_color = input.color(#B10606, "MA6 Bearish Color", group=COLOR_GROUP,
+     tooltip="Color for MA6 when the ribbon is fully bearish.")
+
+// ==========================================
+// INPUTS - SIGNALS
+// ==========================================
+SIGNAL_GROUP = "Signals"
+show_signals = input.bool(true, "Show Trend Cross Signals", group=SIGNAL_GROUP,
+     tooltip="Shows signal markers when MA1 crosses MA2 while the macro ribbon (MA3-6) is aligned.")
+signal_bull_color = input.color(#1FFF00, "Bullish Signal Color", group=SIGNAL_GROUP,
+     tooltip="Color for bullish signal markers that appear at the bottom of the chart.")
+signal_bear_color = input.color(#B10606, "Bearish Signal Color", group=SIGNAL_GROUP,
+     tooltip="Color for bearish signal markers that appear at the top of the chart.")
+
+// ==========================================
+// FUNCTIONS
+// ==========================================
+ma(src, len) =>
+    maType == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+confirm_signal(cond) =>
+    non_repainting ? (cond and barstate.isconfirmed) : cond
+
+confirm_draw(cond) =>
+    non_repainting ? (cond and barstate.isconfirmed) : cond
+
+getStyle(s) =>
+     s == "Dashed" ? plot.style_stepline :
+     s == "Dotted" ? plot.style_circles :
+     plot.style_line
+
+get_table_pos(pos_str) =>
+    pos_str == "Bottom Right" ? position.bottom_right :
+     pos_str == "Bottom Left" ? position.bottom_left :
+     pos_str == "Bottom Center" ? position.bottom_center :
+     pos_str == "Top Right" ? position.top_right :
+     pos_str == "Top Left" ? position.top_left :
+     pos_str == "Top Center" ? position.top_center :
+     pos_str == "Middle Right" ? position.middle_right :
+     pos_str == "Middle Left" ? position.middle_left :
+     position.middle_center
+
+// ==========================================
+// CALCULATIONS
+// ==========================================
+ma1 = ma(source, length1)
+ma2 = ma(source, length2)
+ma3 = ma(source, length3)
+ma4 = ma(source, length4)
+ma5 = ma(source, length5)
+ma6 = ma(source, length6)
+
+col1 = ma1 > ma2 ? ma1_bull_color : ma1_bear_color
+col2 = ma2 > ma3 ? ma2_bull_color : ma2_bear_color
+col3 = ma3 > ma4 ? ma3_bull_color : ma3_bear_color
+col4 = ma4 > ma5 ? ma4_bull_color : ma4_bear_color
+col5 = ma5 > ma6 ? ma5_bull_color : ma5_bear_color
+
+allAbove = ma1 > ma6 and ma2 > ma6 and ma3 > ma6 and ma4 > ma6 and ma5 > ma6
+allBelow = ma1 < ma6 and ma2 < ma6 and ma3 < ma6 and ma4 < ma6 and ma5 < ma6
+
+var color col6 = ma6_bull_color
+if allAbove
+    col6 := ma6_bull_color
+else if allBelow
+    col6 := ma6_bear_color
+
+macro_bullish = ma3 > ma4 and ma4 > ma5 and ma5 > ma6
+macro_bearish = ma3 < ma4 and ma4 < ma5 and ma5 < ma6
+
+bull_cross = ta.crossover(ma1, ma2)
+bear_cross = ta.crossunder(ma1, ma2)
+
+long_signal = confirm_signal(bull_cross and macro_bullish)
+short_signal = confirm_signal(bear_cross and macro_bearish)
+
+// ==========================================
+// VISUALS
+// ==========================================
+plot(ma6, color=col6, style=getStyle(style6), linewidth=thick6, title="MA6")
+plot(ma5, color=col5, style=getStyle(style5), linewidth=thick5, title="MA5")
+plot(ma4, color=col4, style=getStyle(style4), linewidth=thick4, title="MA4")
+plot(ma3, color=col3, style=getStyle(style3), linewidth=thick3, title="MA3")
+plot(ma2, color=col2, style=getStyle(style2), linewidth=thick2, title="MA2")
+plot(ma1, color=col1, style=getStyle(style1), linewidth=thick1, title="MA1")
+
+bgcolor(show_ribbon_background and confirm_draw(allAbove) ? color.new(background_bull_color, 85) : na, title="Bullish Ribbon Background")
+bgcolor(show_ribbon_background and confirm_draw(allBelow) ? color.new(background_bear_color, 85) : na, title="Bearish Ribbon Background")
+
+plotshape(show_signals and long_signal, title="Bullish Trend Cross", style=shape.circle, location=location.bottom, size=size.tiny, color=signal_bull_color)
+plotshape(show_signals and short_signal, title="Bearish Trend Cross", style=shape.circle, location=location.top, size=size.tiny, color=signal_bear_color)
+
+// ==========================================
+// CHART INFO LABEL
+// ==========================================
+var table info_table = table.new(position.top_right, 1, 1, bgcolor=color.new(color.black, 70))
+if show_chart_info and barstate.islast
+    table.cell(info_table, 0, 0, syminfo.ticker + " | " + timeframe.period + " | Custom EMA SMA Ribbon", text_color=color.white, text_size=size.tiny)
+if not show_chart_info and barstate.islast
+    table.clear(info_table, 0, 0, 0, 0)
+
+// ==========================================
+// SIGNAL STATUS MATRIX
+// ==========================================
+matrix_pos = get_table_pos(matrix_pos_str)
+var table status_matrix = table.new(matrix_pos, 2, 6, border_width=1, border_color=color.gray)
+
+if barstate.islast
+    // MA 1
+    table.cell(status_matrix, 0, 0, "MA 1", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 0, close > ma1 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma1 ? color.rgb(4, 247, 12) : color.rgb(255, 4, 4))
+    
+    // MA 2
+    table.cell(status_matrix, 0, 1, "MA 2", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 1, close > ma2 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma2 ? color.rgb(4, 247, 12) : color.rgb(255, 4, 4))
+    
+    // MA 3
+    table.cell(status_matrix, 0, 2, "MA 3", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 2, close > ma3 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma3 ? color.rgb(4, 247, 12) : color.rgb(255, 4, 4))
+    
+    // MA 4
+    table.cell(status_matrix, 0, 3, "MA 4", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 3, close > ma4 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma4 ? color.rgb(4, 247, 12) : color.rgb(255, 4 , 4))
+    
+    // MA 5
+    table.cell(status_matrix, 0, 4, "MA 5", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 4, close > ma5 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma5 ? color.rgb(4, 247, 12) : color.rgb(255, 4, 4))
+    
+    // MA 6
+    table.cell(status_matrix, 0, 5, "MA 6", text_color=color.white, bgcolor=color.rgb(0, 0, 0))
+    table.cell(status_matrix, 1, 5, close > ma6 ? "LONG" : "SHORT", text_color=color.rgb(0, 0, 0), bgcolor=close > ma6 ? color.rgb(4, 247, 12) : color.rgb(255, 4, 4))
+
+// ==========================================
+// ALERTS (CONFIRMED BAR WHEN NON-REPAINTING)
+// ==========================================
+alertcondition(confirm_signal(allAbove), title="Ribbon Fully Bullish (Confirmed)",
+     message="Ribbon fully bullish on {{ticker}} {{interval}} at {{close}}. All moving averages are above the slowest line.")
+alertcondition(confirm_signal(allBelow), title="Ribbon Fully Bearish (Confirmed)",
+     message="Ribbon fully bearish on {{ticker}} {{interval}} at {{close}}. All moving averages are below the slowest line.")
+
+alertcondition(confirm_signal(ta.crossover(ma1, ma2)), title="Fast Cross Up (Confirmed)",
+     message="Fast MA crossed above MA2 on {{ticker}} {{interval}} at {{close}}.")
+alertcondition(confirm_signal(ta.crossunder(ma1, ma2)), title="Fast Cross Down (Confirmed)",
+     message="Fast MA crossed below MA2 on {{ticker}} {{interval}} at {{close}}.")
+
+alertcondition(long_signal, title="Trend-Filtered Bullish Cross (Confirmed)",
+     message="Bullish signal on {{ticker}} {{interval}} at {{close}}. MA1 crossed above MA2 while MA3-6 are aligned bullish.")
+alertcondition(short_signal, title="Trend-Filtered Bearish Cross (Confirmed)",
+     message="Bearish signal on {{ticker}} {{interval}} at {{close}}. MA1 crossed below MA2 while MA3-6 are aligned bearish.")

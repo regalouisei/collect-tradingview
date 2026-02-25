@@ -1,0 +1,159 @@
+//@version=6
+indicator("Baseline Deviation Oscillator [Alpha Extract]", overlay=false)
+
+// ═══════════════════════════════════════════════════════════════
+// CORE FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+hlMedian(series float src, simple int length) =>
+    var float median = na
+    if bar_index >= length - 1
+        window = array.new_float()
+        for i = 0 to length - 1
+            array.push(window, src[i])
+        array.sort(window)
+        lenW = array.size(window)
+        median := lenW % 2 == 1 ?
+              array.get(window, lenW / 2) :
+              (array.get(window, lenW/2 - 1) + array.get(window, lenW/2)) / 2
+    median
+
+atrBands(series float src, simple int atrLen, float upperMult, float lowerMult) =>
+    a = ta.atr(atrLen)
+    [src + upperMult * a, src - lowerMult * a]
+
+// Flexible baseline MA 
+ma(series float src, simple int length, simple string type) =>
+    if type == "EMA"
+        ta.ema(src, length)
+    else if type == "RMA"
+        ta.rma(src, length)
+    else if type == "SMA"
+        ta.sma(src, length)
+    else if type == "WMA"
+        ta.wma(src, length)
+    else if type == "HMA"
+        ta.hma(src, length)
+    else if type == "TEMA"
+        ema1 = ta.ema(src, length)
+        ema2 = ta.ema(ema1, length)
+        ema3 = ta.ema(ema2, length)
+        3 * ema1 - 3 * ema2 + ema3
+    else
+        ta.ema(src, length)
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+
+grpCore   = "Core"
+grpLevels = "Levels"
+grpDisp   = "Display"
+
+maType          = input.string("EMA", "Baseline MA", options=["EMA","RMA","SMA","WMA","HMA","TEMA"], group=grpCore)
+srcType         = input.string("Close", "Source", options=["Close","Open","HL2","HLC3","OHLC4"], group=grpCore)
+maLength        = input.int(23, "Baseline Length", minval=5, maxval=200, group=grpCore)
+hlFilterLength  = input.int(4, "HL Median Filter Length", minval=3, maxval=25, group=grpCore)
+atrLength       = input.int(14, "ATR Length (Normalization)", minval=5, maxval=100, group=grpCore)
+smoothLen       = input.int(5, "Oscillator Smoothing", minval=1, maxval=50, group=grpCore)
+
+dynWindow       = input.int(120, "Dynamic Window", minval=20, maxval=500, group=grpLevels)
+dynSmooth       = input.int(10, "Dynamic Smooth", minval=1, maxval=200, group=grpLevels)
+dynExpansion    = input.float(0.2, "Dynamic Expansion", minval=0.0, maxval=2.0, step=0.05, group=grpLevels)
+
+showCloud       = input.bool(true, "Show Cloud (Osc vs Signal)", group=grpDisp)
+showLabels      = input.bool(true, "Show Threshold Labels", group=grpDisp)
+signalLenMult   = input.float(1.5, "Signal Length Multiplier", minval=1.0, maxval=3.0, step=0.1, group=grpDisp)
+
+// Palette
+bullColor   = color.new(#00e5a8, 0)
+bearColor   = color.new(#ff4d6d, 0)
+neutralLine = color.new(#cfd3d7, 0)
+topZone     = color.new(bearColor, 88)
+botZone     = color.new(bullColor, 88)
+
+// ═══════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════
+
+src = srcType == "Close" ? close : srcType == "Open" ? open : srcType == "HL2" ? hl2 : srcType == "HLC3" ? hlc3 : ohlc4
+baselineRaw = ma(src, maLength, maType)
+baseline    = hlMedian(baselineRaw, hlFilterLength)
+
+// Use atrBands around baseline with 1x multipliers to create an ATR-normalized scale
+[uband, lband] = atrBands(baseline, atrLength, 1.0, 1.0)
+scale = math.max(1e-10, (uband - lband) * 0.5)  
+
+oscRaw = (close - baseline) / scale
+osc    = ta.ema(oscRaw, smoothLen)
+sigLen = math.max(2, math.round(smoothLen * signalLenMult))
+sig    = ta.ema(osc, sigLen)
+
+// Direction color for the line
+oscCol = osc >= 0 ? bullColor : bearColor
+
+// Dynamic level calculations
+posPeak      = ta.highest(osc, dynWindow)
+negTrough    = ta.lowest(osc, dynWindow)
+dynUpperRaw  = ta.ema(posPeak, dynSmooth)
+dynLowerRaw  = ta.ema(negTrough, dynSmooth)
+dynUpperBase = math.max(nz(dynUpperRaw, 0), 0)
+dynLowerBase = math.min(nz(dynLowerRaw, 0), 0)
+dynUpperExt  = dynUpperBase * (1 + dynExpansion)
+dynLowerExt  = dynLowerBase * (1 + dynExpansion)
+
+activeUpper        = dynUpperBase
+activeUpperExtreme = dynUpperExt
+activeLower        = math.abs(dynLowerBase)
+activeLowerExtreme = math.abs(dynLowerExt)
+
+// ═══════════════════════════════════════════════════════════════
+// LEVELS AND ZONES
+// ═══════════════════════════════════════════════════════════════
+
+zeroPlot   = plot(0, title="Zero", color=color.new(neutralLine, 40))
+uPlot      = plot(activeUpper,           title="+Upper",   color=color.new(bearColor, 70))
+uuPlot     = plot(activeUpperExtreme,    title="+Extreme", color=color.new(bearColor, 60))
+lPlot      = plot(-activeLower,          title="-Upper",   color=color.new(bullColor, 70))
+llPlot     = plot(-activeLowerExtreme,   title="-Extreme", color=color.new(bullColor, 60))
+
+// Zone fills
+fill(uPlot,  uuPlot,  color=topZone, title="Overbought Zone")
+fill(lPlot,  llPlot,  color=botZone, title="Oversold Zone")
+
+// ═══════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════
+
+pOsc = plot(osc,  title="BDO",          color=oscCol, linewidth=2)
+pSig = plot(sig,  title="Signal",       color=color.new(neutralLine, 30), linewidth=1)
+
+// Cloud fill must be declared in global scope; toggle via color
+cloudColor = osc >= sig ? color.new(bullColor, 90) : color.new(bearColor, 90)
+fill(pOsc, pSig, color=showCloud ? cloudColor : na, title="Cloud")
+
+// ═══════════════════════════════════════════════════════════════
+// Threshold bounces and crosses
+// ═══════════════════════════════════════════════════════════════
+
+bullBounce = ta.crossover(osc, -activeLower) or ta.crossover(osc, -activeLowerExtreme)
+bearBounce = ta.crossunder(osc,  activeUpper) or ta.crossunder(osc,  activeUpperExtreme)
+zeroUp     = ta.crossover(osc, 0)
+zeroDn     = ta.crossunder(osc, 0)
+
+
+// Optional labels
+if showLabels
+    if bullBounce
+        label.new(bar_index, osc, text="BULL", color=color.new(bullColor, 0), textcolor=color.black, style=label.style_label_up, size=size.small)
+    if bearBounce
+        label.new(bar_index, osc, text="BEAR", color=color.new(bearColor, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════
+
+alertcondition(bullBounce, "BDO Bullish Bounce", "BDO: Bullish bounce from oversold zone")
+alertcondition(bearBounce, "BDO Bearish Bounce", "BDO: Bearish bounce from overbought zone")
+alertcondition(zeroUp,     "BDO Zero Cross Up",  "BDO: Crossed above zero")
+alertcondition(zeroDn,     "BDO Zero Cross Down","BDO: Crossed below zero")

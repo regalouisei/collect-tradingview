@@ -1,0 +1,300 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator(title="Fair Value Lead-Lag Model [BackQuant]",overlay=false)
+
+// Groups
+const string grpAsset = "Reference Asset Settings"
+const string grpModel = "Lead-Lag Model"
+const string grpForecast = "Forecast Settings"
+const string grpFV = "Fair Value Calculation"
+const string grpVis = "Visual Settings"
+
+// Define User Inputs
+string refSymbol = input.symbol("GOLD", "Reference Symbol", group=grpAsset, tooltip="Symbol to compare against (e.g., GOLD, DXY, SPX)")
+string refTimeframe = input.timeframe("", "Reference Timeframe", group=grpAsset, tooltip="Leave empty to use the chart timeframe")
+
+int leadLagPeriod = input.int(0, "Lead/Lag Periods", group=grpModel, tooltip="Positive means the reference leads the chart by N bars, negative means the chart leads the reference by N bars")
+int correlationLength = input.int(50, "Correlation Length",  group=grpModel, tooltip="Number of bars used to compute correlation between price and the reference")
+int rollingWindow = input.int(20, "Rolling Window",group=grpModel, tooltip="Bars used to estimate the rolling fair value relationship")
+
+string fvMethod = input.string("Ratio", "FV Method", ["Ratio", "Spread", "Z-Score", "Beta-Adjusted"], group=grpFV, tooltip="Method for deriving fair value: Ratio and Spread compare levels, Z-Score normalizes each series, Beta-Adjusted uses rolling beta")
+int normalizePeriod = input.int(100, "Normalization Period", group=grpFV, tooltip="Bars used to standardize deviations for thresholds")
+float upperThreshold = input.float(2.0, "Upper Threshold",  step=0.1, group=grpFV, tooltip="Standard deviation level treated as overvalued")
+float lowerThreshold = input.float(-2.0, "Lower Threshold",  step=0.1, group=grpFV, tooltip="Standard deviation level treated as undervalued")
+
+bool showFV = input.bool(true, "Show Fair Value", group=grpVis, inline="fv", tooltip="Plot the fair value line on the price chart")
+color fvColor = input.color(#ffffff, " ", group=grpVis, inline="fv")
+int fvWidth = input.int(2, "FV Line Width", minval=1, group=grpVis, inline="fv", tooltip="Line width for the fair value plot")
+
+bool showBands = input.bool(true, "Show Standard Deviation Bands", group=grpVis, inline="sb", tooltip="Plot ±1, ±2, ±3 standard deviation bands around fair value")
+int bandLen = input.int(100, "Volatility Lookback Length", group=grpVis, inline="sb", tooltip="Bars used to compute residual volatility between price and fair value")
+int bandWidth = input.int(1, "Band Width", minval=1, group=grpVis, tooltip="Line width for the standard deviation band plots")
+
+color bullColor = input.color(#00ff00, "Bullish Color", group=grpVis, inline="col")
+color bearColor = input.color(#ff0000, "Bearish Color", group=grpVis, inline="col")
+color neutralColor = input.color(#787b86, "Neutral Color", group=grpVis, inline="col")
+bool showDevLine = input.bool(false, "Show Deviation Line", group=grpVis, tooltip="Plot the deviation series as a line in the indicator pane")
+bool showZones = input.bool(true, "Show Threshold Zones", group=grpVis, tooltip="Shade regions beyond the upper and lower thresholds")
+bool showOscillator = input.bool(true, "Show Oscillator", group=grpVis, tooltip="Show the deviation as a column oscillator in the indicator pane")
+bool showTbl = input.bool(true, "Show Table", group=grpVis, tooltip="Display a summary table with reference, deviation, correlation, and method")
+bool showCorrelation = input.bool(false, "Show Correlation", group=grpVis, tooltip="Plot the correlation series for context")
+bool darkMode = input.bool(true, "Dark Mode", group=grpVis, tooltip="Use table text colors that suit dark charts; turn off for light charts")
+
+
+// Get Reference Data 
+string resolvedTF = refTimeframe == "" ? timeframe.period : refTimeframe
+[refOpen,refHigh,refLow,refClose] = request.security(refSymbol, resolvedTF, [open,high,low,close], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Apply lead/lag offset
+float refPriceShifted = leadLagPeriod >= 0 ? refClose[leadLagPeriod] : refClose
+float currentPrice = leadLagPeriod < 0 ? close[math.abs(leadLagPeriod)] : close
+
+var array<float> priceArray = array.new_float()
+var array<float> refArray = array.new_float()
+
+// Add current values
+if not na(currentPrice) and not na(refPriceShifted)
+    array.push(priceArray, currentPrice)
+    array.push(refArray, refPriceShifted)
+
+// Limit array size to rolling window
+if array.size(priceArray) > rollingWindow
+    array.shift(priceArray)
+    array.shift(refArray)
+
+// Fair Value Calculation
+float fairValue = na
+float deviation = na
+
+if array.size(priceArray) >= rollingWindow and not na(currentPrice) and not na(refPriceShifted)
+    if fvMethod == "Ratio"
+        // Ratio method
+        float avgRatio = ta.sma(currentPrice / refPriceShifted, rollingWindow)
+        fairValue := refPriceShifted * avgRatio
+        float ratioNow = currentPrice / refPriceShifted
+        float ratioStd = ta.stdev(currentPrice / refPriceShifted, normalizePeriod)
+        deviation := ratioStd > 0 ? (ratioNow - avgRatio) / ratioStd : 0
+    
+    else if fvMethod == "Spread"
+        // Spread method
+        float avgSpread = ta.sma(currentPrice - refPriceShifted, rollingWindow)
+        fairValue := refPriceShifted + avgSpread
+        float spreadNow = currentPrice - refPriceShifted
+        float spreadStd = ta.stdev(currentPrice - refPriceShifted, normalizePeriod)
+        deviation := spreadStd > 0 ? (spreadNow - avgSpread) / spreadStd : 0
+    
+    else if fvMethod == "Z-Score"
+        // Z-score normalized
+        float priceMean = ta.sma(currentPrice, rollingWindow)
+        float priceStd = ta.stdev(currentPrice, rollingWindow)
+        float refMean = ta.sma(refPriceShifted, rollingWindow)
+        float refStd = ta.stdev(refPriceShifted, rollingWindow)
+        
+        float priceZ = priceStd > 0 ? (currentPrice - priceMean) / priceStd : 0
+        float refZ = refStd > 0 ? (refPriceShifted - refMean) / refStd : 0
+        
+        deviation := priceZ - refZ
+        fairValue := priceMean + (refZ * priceStd)
+    
+    else // Beta-Adjusted
+        float covariance = array.covariance(priceArray, refArray)
+        float refVariance = array.variance(refArray)
+        float beta = refVariance > 0 ? covariance / refVariance : 1
+        
+        float priceMean = array.avg(priceArray)
+        float refMean = array.avg(refArray)
+        
+        fairValue := priceMean + beta * (refPriceShifted - refMean)
+        float residual = currentPrice - fairValue
+        float residualStd = ta.stdev(currentPrice - fairValue, normalizePeriod)
+        deviation := residualStd > 0 ? residual / residualStd : 0
+
+// Correlation
+float correlation =  ta.correlation(currentPrice, refPriceShifted, correlationLength) 
+
+// Fair Value Signals
+bool overvalued = not na(deviation) and deviation > upperThreshold
+bool undervalued = not na(deviation) and deviation < lowerThreshold
+bool fairValued = not overvalued and not undervalued
+
+// Signal strength
+float signalStrength = not na(deviation) ? math.abs(deviation) / upperThreshold * 100 : 0
+
+// Trend alignment
+bool bullishAlignment = not na(currentPrice) and not na(fairValue) and currentPrice > fairValue and correlation > 0.5
+bool bearishAlignment = not na(currentPrice) and not na(fairValue) and currentPrice < fairValue and correlation > 0.5
+
+// Plotting
+// Main deviation plot
+color deviationColor = overvalued ? bearColor : undervalued ? bullColor : neutralColor
+plot(showDevLine?deviation:na, "Fair Value Deviation", color=deviationColor, linewidth=2)
+
+var plotcol = #1dcaff4d
+
+// Positive range (0 to 3)
+if deviation >= 0 and deviation < 0.5
+    plotcol := #1dcaff4d
+else if deviation >= 0.5 and deviation < 1
+    plotcol := #1e9b254d
+else if deviation >= 1 and deviation < 1.5
+    plotcol := #00ff003d
+else if deviation >= 1.5 and deviation < 2
+    plotcol := #00ff0080
+else if deviation >= 2 and deviation < 2.5
+    plotcol := #33ff00fc
+else if deviation >= 2.5 and deviation <= 3
+    plotcol := #33ff00fc
+else if deviation <= 0 and deviation > -0.5
+    plotcol := #e651004d
+else if deviation <= -0.5 and deviation > -1
+    plotcol := #7715154d
+else if deviation <= -1 and deviation > -1.5
+    plotcol := #ff00004d
+else if deviation <= -1.5 and deviation > -2
+    plotcol := #ff000080
+else if deviation <= -2 and deviation > -2.5
+    plotcol := #ff0000
+else if deviation <= -2.5 and deviation >= -3
+    plotcol := #ff0000
+
+plot(showOscillator?deviation:na, "Deviation Oscillator", color=plotcol, style=plot.style_columns)
+
+// Correlation
+plot(showCorrelation?(correlation * upperThreshold):na, "Correlation (scaled)", color=color.new(#d900ff, 30), linewidth=1)
+
+// Signal markers
+plotshape(overvalued and not overvalued[1], "Overvalued Signal", shape.triangledown, location.top, bearColor, size=size.tiny)
+plotshape(undervalued and not undervalued[1], "Undervalued Signal", shape.triangleup, location.bottom, bullColor, size=size.tiny)
+
+// Plot FV on price
+plot(showFV ? fairValue : na, title="Fair Value", color=fvColor, linewidth=fvWidth, force_overlay=true)
+
+float residual   = not na(fairValue) ? close - fairValue : na
+float residualSd = ta.stdev(residual, bandLen)
+
+float fv_p1 = fairValue + 1.0 * residualSd
+float fv_m1 = fairValue - 1.0 * residualSd
+float fv_p2 = fairValue + 2.0 * residualSd
+float fv_m2 = fairValue - 2.0 * residualSd
+float fv_p3 = fairValue + 3.0 * residualSd
+float fv_m3 = fairValue - 3.0 * residualSd
+
+// Plot bands
+plot(fv_m1, "FV -1 Sigma", color=color.new(bullColor,60), linewidth=bandWidth, force_overlay=true)
+plot(fv_m2, "FV -2 Sigma", color=color.new(bullColor,60), linewidth=bandWidth, force_overlay=true)
+plot(fv_m3, "FV -3 Sigma", color=color.new(bullColor,60), linewidth=bandWidth, force_overlay=true)
+plot(fv_p1, "FV +1 Sigma", color=color.new(bearColor,60), linewidth=bandWidth, force_overlay=true)
+plot(fv_p2, "FV +2 Sigma", color=color.new(bearColor,60), linewidth=bandWidth, force_overlay=true)
+plot(fv_p3, "FV +3 Sigma", color=color.new(bearColor,60), linewidth=bandWidth, force_overlay=true)
+
+color signalCol = na
+if overvalued and not overvalued[1]
+    signalCol:= color.new(bearColor,80)
+else if undervalued and not undervalued[1]
+    signalCol:=color.new(bullColor,80)
+bgcolor(signalCol, title = "Overvalued-Undervalued Signals")
+
+
+obupper = plot(showZones ? upperThreshold : na , "+", bearColor, editable = false)
+osupper = plot(showZones ? lowerThreshold+0.5 : na , "-", bullColor, editable = false)
+oblower = plot(showZones ? upperThreshold-0.5 : na , "+", bearColor, editable = false)
+oslower = plot(showZones ? lowerThreshold : na , "-", bullColor, editable = false)
+fill(obupper, oblower, color.new(bearColor,70), 'OB Fill')
+fill(osupper, oslower, color.new(bullColor,70), 'OS Fill')
+
+
+// Table 
+if barstate.islast and showTbl
+    var table infoTable = table.new(position.top_right, 2, 10, frame_color=#ffffff, frame_width=1, border_color=color.new(color.gray, 60), border_width=1)
+    
+    table.cell(infoTable, 0, 0, "Fair Value Model", bgcolor=color.new(color.gray, 70), text_color=darkMode?#ffffff:#000000, text_size=size.normal)
+    table.merge_cells(infoTable,0,0,1,0)
+    
+    table.cell(infoTable, 0, 1, "Reference", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 1, refSymbol, text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    
+    string lagText = leadLagPeriod > 0 ? "Ref Leads +" + str.tostring(leadLagPeriod) : leadLagPeriod < 0 ? "Chart Leads +" + str.tostring(math.abs(leadLagPeriod)) : "No Offset"
+    table.cell(infoTable, 0, 2, "Lead/Lag", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 2, lagText, text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    
+    color devColor = overvalued ? bearColor : undervalued ? bullColor : neutralColor
+    table.cell(infoTable, 0, 3, "Deviation", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 3, not na(deviation) ? str.tostring(deviation, "#.##") : "N/A", text_color=devColor, text_size=size.normal)
+    
+    string statusText = overvalued ? "OVERVALUED" : undervalued ? "UNDERVALUED" : "FAIR VALUED"
+    table.cell(infoTable, 0, 4, "Status", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 4, statusText, text_color=devColor, text_size=size.normal)
+    
+    color corrColor = color.from_gradient(correlation, -1,1,bearColor, bullColor)
+    table.cell(infoTable, 0, 5, "Correlation", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 5, str.tostring(correlation, "#.##"), text_color=corrColor, text_size=size.normal)
+
+    table.cell(infoTable, 0, 6, "Signal Strength", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 6, str.tostring(signalStrength, "#.#") + "%", text_color=devColor, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 7, "Fair Value", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 7, not na(fairValue) ? str.tostring(fairValue, format.mintick) : "N/A", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    
+    table.cell(infoTable, 0, 8, "Method", text_color = darkMode?#ffffff:#000000, text_size=size.normal)
+    table.cell(infoTable, 1, 8, fvMethod, text_color=darkMode?#ffffff:#000000, text_size=size.normal)
+
+
+
+// Alert Conditions
+// helpers
+bool crossUpFV = ta.crossover(close, fairValue)
+bool crossDnFV = ta.crossunder(close, fairValue)
+
+bool crossUpP1 = ta.crossover(close, fv_p1)
+bool crossDnP1 = ta.crossunder(close, fv_p1)
+bool crossUpM1 = ta.crossover(close, fv_m1)
+bool crossDnM1 = ta.crossunder(close, fv_m1)
+
+bool crossUpP2 = ta.crossover(close, fv_p2)
+bool crossDnP2 = ta.crossunder(close, fv_p2)
+bool crossUpM2 = ta.crossover(close, fv_m2)
+bool crossDnM2 = ta.crossunder(close, fv_m2)
+
+bool crossUpP3 = ta.crossover(close, fv_p3)
+bool crossDnP3 = ta.crossunder(close, fv_p3)
+bool crossUpM3 = ta.crossover(close, fv_m3)
+bool crossDnM3 = ta.crossunder(close, fv_m3)
+
+alertcondition(overvalued and not overvalued[1], "Overvalued Alert", "Asset overvalued vs reference on {{exchange}}:{{ticker}}")
+alertcondition(undervalued and not undervalued[1], "Undervalued Alert", "Asset undervalued vs reference on {{exchange}}:{{ticker}}")
+alertcondition(ta.cross(deviation, 0), "Fair Value Cross", "Asset crossed fair value on {{exchange}}:{{ticker}}")
+alertcondition(ta.cross(correlation, 0.7), "High Correlation", "High correlation detected on {{exchange}}:{{ticker}}")
+
+// FV crosses
+alertcondition(crossUpFV, "Price Crossed Above FV", "Price crossed above Fair Value on {{exchange}}:{{ticker}}")
+alertcondition(crossDnFV, "Price Crossed Below FV", "Price crossed below Fair Value on {{exchange}}:{{ticker}}")
+
+// Entering ±Sigma zones
+alertcondition(crossUpP1, "Entered +1Sigma Zone", "Price entered +1Sigma above FV on {{exchange}}:{{ticker}}")
+alertcondition(crossDnM1, "Entered -1Sigma Zone", "Price entered -1Sigma below FV on {{exchange}}:{{ticker}}")
+alertcondition(crossUpP2, "Entered +2Sigma Zone", "Price entered +2Sigma above FV on {{exchange}}:{{ticker}}")
+alertcondition(crossDnM2, "Entered -2Sigma Zone", "Price entered -2Sigma below FV on {{exchange}}:{{ticker}}")
+alertcondition(crossUpP3, "Entered +3Sigma Zone", "Price entered +3Sigma above FV on {{exchange}}:{{ticker}}")
+alertcondition(crossDnM3, "Entered -3Sigma Zone", "Price entered -3Sigma below FV on {{exchange}}:{{ticker}}")
+
+// Re-entry toward FV from extremes
+alertcondition(ta.crossunder(close, fv_p1) and close > fairValue, "Re-enter From +1Sigma", "Price re-entered toward FV from +1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(close,  fv_m1) and close < fairValue, "Re-enter From -1Sigma", "Price re-entered toward FV from -1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(close, fv_p2) and close > fairValue, "Re-enter From +2Sigma", "Price re-entered toward FV from +2Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(close,  fv_m2) and close < fairValue, "Re-enter From -2Sigma", "Price re-entered toward FV from -2Sigma on {{exchange}}:{{ticker}}")
+
+// Deviation level crosses 
+alertcondition(ta.crossover(deviation,  1.0), "Deviation Crossed +1Sigma", "Deviation crossed +1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(deviation, 1.0), "Deviation Fell Below +1Sigma", "Deviation fell below +1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(deviation,  2.0), "Deviation Crossed +2Sigma", "Deviation crossed +2Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(deviation, 2.0), "Deviation Fell Below +2Sigma", "Deviation fell below +2Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(deviation, -1.0), "Deviation Crossed -1Sigma", "Deviation crossed -1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(deviation,  -1.0), "Deviation Rose Above -1Sigma", "Deviation rose above -1Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossunder(deviation, -2.0), "Deviation Crossed -2Sigma", "Deviation crossed -2Sigma on {{exchange}}:{{ticker}}")
+alertcondition(ta.crossover(deviation,  -2.0), "Deviation Rose Above -2Sigma", "Deviation rose above -2Sigma on {{exchange}}:{{ticker}}")
+
+// FV slope flip
+float fvSlope = not na(fairValue) and not na(fairValue[1]) ? fairValue - fairValue[1] : na
+alertcondition(ta.cross(fvSlope, 0), "FV Slope Flip", "Fair Value slope changed sign on {{exchange}}:{{ticker}}")

@@ -1,0 +1,510 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © loxx
+
+//@version=5
+indicator("Black Scholes Option Pricing Model w/ Greeks [Loxx]", 
+     shorttitle ="BSOPMG",
+     overlay = true, 
+     max_lines_count = 500)
+
+if not timeframe.isdaily
+    runtime.error("Error: Invald timeframe. Indicator only works on daily timeframe.") 
+
+import loxx/loxxexpandedsourcetypes/4
+
+//constants
+color darkGreenColor = #1B7E02 
+string callString = "Call"
+string putString = "Put"
+
+string rogersatch = "Roger-Satchell"
+string parkinson = "Parkinson"
+string c2c = "Close-to-Close"
+string gkvol = "Garman-Klass"
+string gkzhvol = "Garman-Klass-Yang-Zhang"
+string ewmavolstr = "Exponential Weighted Moving Average"
+
+string timtoolbar= "Time Now = Current time in UNIX format. It is the number of milliseconds that have elapsed since 00:00:00 UTC, 1 January 1970."
+string timtoolnow = "Time Bar = The time function returns the UNIX time of the current bar for the specified timeframe and session or NaN if the time point is out of session."
+string timetooltrade = "Trading Day = The beginning time of the trading day the current bar belongs to, in UNIX format (the number of milliseconds that have elapsed since 00:00:00 UTC, 1 January 1970)."
+
+ewmavol(float src, int per) => 
+    float lambda = (per - 1) / (per + 1)
+    float temp = na
+    temp := lambda * nz(temp[1], math.pow(src, 2)) + (1.0 - lambda) * math.pow(src, 2)
+    out = math.sqrt(temp)
+    out
+    
+rogerssatchel(int per) =>
+    float sum = math.sum(math.log(high/ close) * math.log(high / open)
+         + math.log(low / close) * math.log(low / open), per) / per
+    float out = math.sqrt(sum) 
+    out
+
+closetoclose(float src, int per) => 
+    float avg = ta.sma(src, per)
+    float[] sarr = array.new_float(0)
+    for i = 0 to per - 1 
+        array.push(sarr, math.pow(nz(src[i]) - avg, 2))
+    float out = math.sqrt(array.sum(sarr) / (per - 1))
+    out 
+
+parkinsonvol(int per)=>
+    float volConst = 1.0 / (4.0 * per * math.log(2))
+    float sum = volConst * math.sum(math.pow(math.log(high / low), 2), per)
+    float out = math.sqrt(sum) 
+    out
+
+garmanKlass(int per)=>
+    float hllog = math.log(high / low)
+    float oplog = math.log(close / open)
+    float garmult = (2 * math.log(2) - 1)
+    float parkinsonsum = 1 / (2 * per) * math.sum(math.pow(hllog, 2), per)
+    float garmansum = garmult / per * math.sum(math.pow(oplog, 2), per)
+    float sum = parkinsonsum - garmansum
+    float devpercent = math.sqrt(sum)  
+    devpercent
+
+gkyzvol(int per)=>
+    float gzkylog = math.log(open / nz(close[1]))
+    float pklog = math.log(high / low)
+    float gklog = math.log(close / open)
+    float garmult = (2 * math.log(2) - 1)
+    float gkyzsum = 1 / per * math.sum(math.pow(gzkylog, 2), per)
+    float parkinsonsum = 1 / (2 * per) * math.sum(math.pow(pklog, 2), per)
+    float garmansum = garmult / per * math.sum(math.pow(gklog, 2), per)
+    float sum = gkyzsum + parkinsonsum - garmansum
+    float devpercent = math.sqrt(sum)  
+    devpercent
+
+f_tickFormat() =>
+    _s = str.tostring(syminfo.mintick)
+    _s := str.replace_all(_s, '25', '00')
+    _s := str.replace_all(_s, '5', '0')
+    _s := str.replace_all(_s, '1', '0')
+    _s
+
+// N(0,1) density
+f(float x)=> 
+    float out = math.exp(-x * x * 0.5) / math.sqrt(2 * math.pi)
+    out 
+
+// Boole's Rule
+Boole(float StartPoint, float EndPoint, int n)=>
+    float[] X = array.new<float>(n + 1 , 0)
+    float[] Y = array.new<float>(n + 1 , 0)
+    float delta_x = (EndPoint - StartPoint) / n
+    for i = 0 to n
+        array.set(X, i, StartPoint + i * delta_x)
+        array.set(Y, i, f(array.get(X, i)))
+    float sum = 0
+    for t = 0 to (n - 1) / 4 
+        int ind = 4 * t
+        sum += (1 / 45.0) * 
+             (14 * array.get(Y, ind) 
+             + 64 * array.get(Y, ind + 1) 
+             + 24 * array.get(Y, ind + 2) 
+             + 64 * array.get(Y, ind + 3) 
+             + 14 * array.get(Y, ind + 4)) 
+             * delta_x
+    sum
+
+// alternate function not used
+// Waissi and Rossin normal cdf approximation
+normCDF(float z)=>
+    float b1 = -0.0004406
+    float b2 =  0.0418198
+    float b3 =  0.9
+    out = 1.0 / (1.0 + math.exp(-math.sqrt(math.pi) * (b1 * math.pow(z, 5) + b2 * math.pow(z, 3) + b3 * z)))
+    out
+
+// N(0,1) cdf by Boole's Rule
+N(float x)=> 
+    float out = Boole(-10.0, x, 240)
+    out
+
+d1(float S, float K, float r, float q, float v, float T)=>
+    float d1 = (math.log(S / K) + T * (r - q + 0.5 * v * v)) / (v * math.sqrt(T))
+    d1
+
+d2(float S, float K, float r, float q, float v, float T)=>
+    float d1 = (math.log(S / K) + T * (r - q + 0.5 * v * v)) / (v * math.sqrt(T))
+    d2 = d1 - v * math.sqrt(T)
+    d2
+
+// Black-Scholes Option Price
+BSPrice(float S, float K, float r, float T, float q, float v, string PutCall)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float call = S * math.exp(-q * T) * N(d1) - math.exp(-r * T) * K * N(d2)
+    float out = 0
+    out := PutCall == callString ? call : call - S * math.exp(-q * T) + K * math.exp(-r * T)
+    out 
+
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+// 1° Order Greeks
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+
+// Black-Scholes Delta or Spot Delta
+BSDelta(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float out = OpType == callString ? math.exp(-q * T) * N(d1) : math.exp(-q * T) * (N(d1) - 1)
+    out
+
+// Black-Scholes Vega or Zeta
+BSVega(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float out = S * math.exp(-q * T) * f(d1) * math.sqrt(T)
+    out
+
+// Black-Scholes Theta
+BSTheta(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float b = r - q 
+    float num = S * math.exp((b - r) * T) * f(d1) * v
+    float dom = 2 * math.sqrt(T)
+    float mult1 = 0
+    float mult2 = 0
+    float out = 0
+    if (OpType == callString)
+        mult1 := (b - r) * S * math.exp((b - r) * T) * N(d1)
+        mult2 := r * K * math.exp(-r * T) * N(d2)
+        out := -num / dom - mult1 - mult2
+    else
+        mult1 := (b - r) * S * math.exp((b - r) * T) * N(-d1)
+        mult2 := r * K * math.exp(-r * T) * N(-d2)
+        out := -num / dom + mult1 + mult2
+    out
+
+// Black-Scholes Rho or Rho Call Futures Option
+BSRho(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d2 = d2(S, K, r, q, v, T)
+    float price = BSPrice(S, K, r, T, q, v, OpType)
+    float out = 0
+    if OpType == callString
+        out := syminfo.type == "futures" ? - T * price : T * K * math.exp(-r * T) * N(d2)
+    else
+        out :=  syminfo.type == "futures" ? - T * price : -T * K * math.exp(-r * T) * N(-d2)
+    out
+
+// Black-Scholes Lambda, omega, or elasticity 
+BSLambda(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float price = BSPrice(S, K, T, r, q, v, OpType)
+    float delta = OpType == callString ? math.exp(-q * T) * N(d1) : math.exp(-q * T) * (N(d1) - 1)
+    float out = delta * S / price
+    out
+
+// Black-Scholes Epsilon
+BSEpsilon(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float out = OpType == callString ? -S * T * math.exp(-q * T) * N(d2) : S * T * math.exp(-q * T) * N(d1) 
+    out
+
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+// 2nd Order Greeks
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+
+// Black-Scholes Gamma or Convexity
+BSGamma(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float out = (f(d1) * math.exp(-q * T)) / (S * v * math.sqrt(T))
+    out
+
+// Black-Scholes Vanna, DdeltaDvol, or DVegaDSpot
+BSVanna(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float out = ((-math.exp(-q * T) * d2) / v) * f(d1)
+    out
+
+// Black-Scholes Charm, Delta Bleed, or DDeltaDTime
+BSCharm(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float b = r - q
+    float out = 0
+    if OpType == callString
+        out := -math.exp((b - r) * T) * (f(d1) * (b / (v * math.sqrt(T)) - d2 / (2 * T)) + (b - r) * N(d1))
+    else
+        out := -math.exp((b - r) * T) * (f(d1) * (b / (v * math.sqrt(T)) - d2 / (2 * T)) - (b - r) * N(-d1))
+    out 
+
+// Black-Scholes Vomma, DvegaDvol, or volga
+BSVomma(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float vega = BSVega(S, K, T, r, q, v)
+    float out = vega * ((d1 * d2) / v)
+    out 
+
+// Black-Scholes Veta
+BSVeta(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float out = -S * math.exp(-q * T) * f(d1) * math.sqrt(T) * (q + ((r - q) * d1)/ (v * math.sqrt(T)) - ((1 + d1 * d2) / (2 * T)))
+    out
+
+// Black-Scholes Vera or rhova
+BSVera(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float v2 = math.pow(v, 2)
+    float out = math.exp(-r * T) * (1 / K) * (1 / math.sqrt(2 * math.pi * v2 * T)) * math.exp((-1 / (2 * v2 * T)) * math.pow(math.log(K / S) - ((r - q) - 0.5 * v2) * T, 2))
+    out
+
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+// 3rd Order Greeks
+//////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+
+// Black-Scholes Speed or DGammaDSpot
+BSSpeed(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float gamma = BSGamma(S, K, r, q, v, T)
+    float dv = 1 + d1 / (v * math.sqrt(T))
+    float out = -gamma * (dv / S)
+    out
+
+// Black-Scholes Zomma
+BSZomma(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float gamma = BSGamma(S, K, r, q, v, T)
+    float d1d2 = (d1 * d2) - 1
+    float out = gamma * (d1d2 / v)
+    out
+
+// Black-Scholes Color, Gamma Bleed
+BSColor(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float b = (r - q)
+    float gamma = BSGamma(S, K, r, q, v, T)
+    float out = gamma * ((r - b) + (b * d1) / (v * math.sqrt(T)) + (1 - d1 * d2) / (2 * T))
+    out 
+
+// Black-Scholes Ultima or DVommaDVol
+BSUltima(float S, float K, float T, float r, float q, float v)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float vomma = BSVomma(S, K, T, r, q, v)
+    float out =  vomma * (1 / v) * (d1 * d2 + d1 / d2 - d2 / d1 - 1)
+    out 
+
+// Black-Scholes Dual Delta or Strike Delta
+BSDualDelta(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d2 = d2(S, K, r, q, v, T)
+    float out = OpType == callString ? -math.exp(-r * T) * N(d2) : math.exp(-r * T) * N(-d2)
+    out
+
+// Black-Scholes Dual Gamma or Strike Gamma
+BSDualGamma(float S, float K, float T, float r, float q, float v, string OpType)=>
+    float d1 = d1(S, K, r, q, v, T)
+    float d2 = d2(S, K, r, q, v, T)
+    float out = math.exp(-r * T) * (f(d2) / (K * v * math.sqrt(T)))
+    out
+
+smthtype = input.string("Kaufman", "Heikin-Ashi Better Caculation Type", options = ["AMA", "T3", "Kaufman"], group = "Spot Price Settings")
+srcin = input.string("Close", "Spot Price", group= "Spot Price Settings", 
+     options = 
+     ["Close", "Open", "High", "Low", "Median", "Typical", "Weighted", "Average", "Average Median Body", "Trend Biased", "Trend Biased (Extreme)", 
+     "HA Close", "HA Open", "HA High", "HA Low", "HA Median", "HA Typical", "HA Weighted", "HA Average", "HA Average Median Body", "HA Trend Biased", "HA Trend Biased (Extreme)",
+     "HAB Close", "HAB Open", "HAB High", "HAB Low", "HAB Median", "HAB Typical", "HAB Weighted", "HAB Average", "HAB Average Median Body", "HAB Trend Biased", "HAB Trend Biased (Extreme)"])
+
+float K = input.float(275, "Strike Price", group = "Basic Settings")   
+string OpType = input.string(callString, "Option type", options = [callString, putString], group = "Basic Settings")   
+string greeksshow = input.string("First-order", title = "Greeks to Show", options =["First-order", "Second-order", "Third-order"], group = "Basic Settings")
+
+float v = input.float(25.6, "% Implied Volatility", group = "Implied Volatility Settings") / 100
+int histvolper = input.int(22, "Historical Volatility Period", group = "Historical Volatility Settings", tooltip =  "Not used in calculation. This is here for comparison to implied volatility")
+string hvoltype = input.string(c2c, "Historical Volatility Type", options = [c2c, gkvol, gkzhvol, rogersatch, ewmavolstr, parkinson], group = "Historical Volatility Settings")
+
+string rfrtype = input.string("USD", "Option Base Currency", options = ['USD', 'GBP', 'JPY', 'CAD', 'CNH', 'SGD', 'INR', 'AUD', 'SEK', 'NOK', 'DKK'], group = "Risk-free Rate Settings", tooltip = "Automatically pulls 10-year bond yield from corresponding currency")
+float rfrman = input.float(3.97, "% Manual Risk-free Rate", group = "Risk-free Rate Settings") / 100
+bool usdrsrman = input.bool(false, "Use manual input for Risk-free Rate?", group = "Risk-free Rate Settings")
+
+float divsman = input.float(7.5, "% Manual Yearly Dividend Yield", group = "Dividend Settings") / 100
+bool usediv = input.bool(false, "Adjust for Dividends?", tooltip = "Only works if divdends exist for the current ticker", group = "Dividend Settings")
+bool autodiv = input.bool(true, "Automatically Calculate Yearly Dividend Yield?", tooltip = "Only works if divdends exist for the current ticker", group = "Dividend Settings")
+
+string timein = input.string("Time Now", title = "Time Now Type", options = ["Time Now", "Time Bar", "Trading Day"], group = "Time Intrevals", tooltip = timtoolnow + "; " + timtoolbar + "; " + timetooltrade)
+int daysinyear = input.int(252, title = "Days in Year", minval = 1, maxval = 365, group = "Time Intrevals", tooltip = "Typically 252 or 365")
+float hoursinday = input.float(24, title = "Hours Per Day", minval = 1, maxval = 24, group = "Time Intrevals", tooltip = "Typically 6.5, 8, or 24")
+
+int thruMonth = input.int(3, title = "Expiry Month", minval = 1, maxval = 12, group = "Expiry Date/Time")
+int thruDay = input.int(31, title = "Expiry Day", minval = 1, maxval = 31, group = "Expiry Date/Time")
+int thruYear = input.int(2023, title = "Expiry Year", minval = 1970, group = "Expiry Date/Time")
+int mins = input.int(0, title = "Expiry Minute", minval = 0, maxval = 60, group = "Expiry Date/Time")
+int hours = input.int(9, title = "Expiry Hour", minval = 0, maxval = 24, group = "Expiry Date/Time")
+int secs = input.int(0, title = "Expiry Second", minval = 0, maxval = 60, group = "Expiry Date/Time")
+
+
+// seconds per year given inputs above
+int spyr = math.round(daysinyear * hoursinday * 60 * 60)
+
+// precision calculation miliseconds in time intreval from time equals now
+start = timein == "Time Now" ? timenow : timein == "Time Bar" ? time : time_tradingday
+finish = timestamp(thruYear, thruMonth, thruDay, hours, mins, secs) 
+temp = (finish - start) 
+float T = (finish - start) / spyr / 1000
+
+float q = usediv ? (autodiv ? request.dividends(syminfo.tickerid) / close * 4 : divsman) : 0
+
+string byield = switch rfrtype
+    "USD"=> 'US10Y'
+    "GBP"=> 'GB10Y'
+    "JPY"=> 'US10Y'
+    "CAD"=> 'CA10Y'
+    "CNH"=> 'CN10Y'
+    "SGD"=> 'SG10Y'
+    "INR"=> 'IN10Y'
+    "AUD"=> 'AU10Y'
+    "USEKSD"=> 'SE10Y'
+    "NOK"=> 'NO10Y'
+    "DKK"=> 'DK10Y'
+    => 'US10Y'
+
+kfl=input.float(0.666, title="* Kaufman's Adaptive MA (KAMA) Only - Fast End", group = "Moving Average Inputs")
+ksl=input.float(0.0645, title="* Kaufman's Adaptive MA (KAMA) Only - Slow End", group = "Moving Average Inputs")
+amafl = input.int(2, title="* Adaptive Moving Average (AMA) Only - Fast", group = "Moving Average Inputs")
+amasl = input.int(30, title="* Adaptive Moving Average (AMA) Only - Slow", group = "Moving Average Inputs")
+
+haclose = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close)
+haopen = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, open)
+hahigh = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, high)
+halow = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, low)
+hamedian = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, hl2)
+hatypical = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, hlc3)
+haweighted = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, hlcc4)
+haaverage = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, ohlc4)
+
+float spot = switch srcin
+    "Close" => loxxexpandedsourcetypes.rclose()
+    "Open" => loxxexpandedsourcetypes.ropen()
+    "High" => loxxexpandedsourcetypes.rhigh()
+    "Low" => loxxexpandedsourcetypes.rlow()
+    "Median" => loxxexpandedsourcetypes.rmedian()
+    "Typical" => loxxexpandedsourcetypes.rtypical()
+    "Weighted" => loxxexpandedsourcetypes.rweighted()
+    "Average" => loxxexpandedsourcetypes.raverage()
+    "Average Median Body" => loxxexpandedsourcetypes.ravemedbody()
+    "Trend Biased" => loxxexpandedsourcetypes.rtrendb()
+    "Trend Biased (Extreme)" => loxxexpandedsourcetypes.rtrendbext()
+    "HA Close" => loxxexpandedsourcetypes.haclose(haclose)
+    "HA Open" => loxxexpandedsourcetypes.haopen(haopen)
+    "HA High" => loxxexpandedsourcetypes.hahigh(hahigh)
+    "HA Low" => loxxexpandedsourcetypes.halow(halow)
+    "HA Median" => loxxexpandedsourcetypes.hamedian(hamedian)
+    "HA Typical" => loxxexpandedsourcetypes.hatypical(hatypical)
+    "HA Weighted" => loxxexpandedsourcetypes.haweighted(haweighted)
+    "HA Average" => loxxexpandedsourcetypes.haaverage(haaverage)
+    "HA Average Median Body" => loxxexpandedsourcetypes.haavemedbody(haclose, haopen)
+    "HA Trend Biased" => loxxexpandedsourcetypes.hatrendb(haclose, haopen, hahigh, halow)
+    "HA Trend Biased (Extreme)" => loxxexpandedsourcetypes.hatrendb(haclose, haopen, hahigh, halow)
+    "HAB Close" => loxxexpandedsourcetypes.habclose(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Open" => loxxexpandedsourcetypes.habopen(smthtype, amafl, amasl, kfl, ksl)
+    "HAB High" => loxxexpandedsourcetypes.habhigh(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Low" => loxxexpandedsourcetypes.hablow(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Median" => loxxexpandedsourcetypes.habmedian(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Typical" => loxxexpandedsourcetypes.habtypical(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Weighted" => loxxexpandedsourcetypes.habweighted(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Average" => loxxexpandedsourcetypes.habaverage(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Average Median Body" => loxxexpandedsourcetypes.habavemedbody(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Trend Biased" => loxxexpandedsourcetypes.habtrendb(smthtype, amafl, amasl, kfl, ksl)
+    "HAB Trend Biased (Extreme)" => loxxexpandedsourcetypes.habtrendbext(smthtype, amafl, amasl, kfl, ksl)
+    => haclose
+
+float r = usdrsrman ? rfrman : request.security(byield, timeframe.period, close) / 100
+
+float hvolout = switch hvoltype
+    parkinson => parkinsonvol(histvolper)
+    rogersatch => rogerssatchel(histvolper) 
+    c2c => closetoclose(math.log(spot / nz(spot[1])), histvolper) 
+    gkvol => garmanKlass(histvolper) 
+    gkzhvol => gkyzvol(histvolper) 
+    ewmavolstr => ewmavol(math.log(spot / nz(spot[1])), histvolper) 
+
+if barstate.islast
+
+    float tempr = syminfo.type == "futures" ? 0 : r 
+
+    price =     BSPrice(spot, K, r, T, q, v, OpType)
+
+    // 1rst order
+    delta =     BSDelta(spot, K, T, r, q, v, OpType)
+    vega =      BSVega(spot, K, T, r, q, v)
+    theta =     BSTheta(spot, K, T, r, q, v, OpType)
+    rho =       BSRho(spot, K, T, r, q, v, OpType)
+    lambda =    BSLambda(spot, K, T, r, q, v, OpType)
+    epsilon =   BSEpsilon(spot, K, T, r, q, v, OpType)
+
+    // 2nd order
+    gamma =     BSGamma(spot, K, T, r, q, v)
+    vanna =     BSVanna(spot, K, T, r, q, v)
+    charm =     BSCharm(spot, K, T, r, q, v, OpType)
+    vomma =     BSVomma(spot, K, T, r, q, v)
+    veta =      BSVeta(spot, K, T, r, q, v, OpType)
+    vera =      BSVera(spot, K, T, r, q, v, OpType)
+
+    // 3rd order
+    speed =     BSSpeed(spot, K, T, r, q, v)
+    zomma =     BSZomma(spot, K, T, r, q, v)
+    colorz =    BSColor(spot, K, T, r, q, v)
+    ultima =    BSUltima(spot, K, T, r, q, v)
+    dualdelta = BSDualDelta(spot, K, T, r, q, v, OpType)
+    dualgamma = BSDualGamma(spot, K, T, r, q, v, OpType)
+
+    var testTable = table.new(position = position.middle_right, columns = 1, rows = 22, bgcolor = color.yellow, border_width = 1)
+
+    table.cell(table_id = testTable, column = 0, row = 0,  text = "  Inputs for European " + OpType + " Option", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 1,  text = "  Spot Price: " + str.tostring(spot, f_tickFormat()) , bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 2,  text = "  Strike Price: " + str.tostring(K, f_tickFormat()), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 3,  text = "  Volatility (annual): " + str.tostring(v * 100, "##.##") + "%  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 4,  text = "  Risk-free Rate Type: " + rfrtype , bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 5,  text = "  Risk-free Rate: " + str.tostring(tempr * 100, "##.##") + "%  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 6,  text = "  Dividend Yield (annual): " + str.tostring(q * 100, "##.##") + "%  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 7,  text = "  Time Now: " + str.format("{0,date,MMMM dd, yyyy - HH:mm:ss}", timenow) + "  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 8,  text = "  Expiry Date: " + str.format("{0,date,MMMM dd, yyyy - HH:mm:ss}", finish) + "  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+
+    table.cell(table_id = testTable, column = 0, row = 9,  text = "  Output  ", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 10, text = "  Price: " + str.tostring(price, f_tickFormat()), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+
+    table.cell(table_id = testTable, column = 0, row = 11, text = "  Calculated Values  ", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 12, text = "  Hist. Volatility Type: " + hvoltype, bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 13, text = "  Hist. Daily Volatility: " + str.tostring(hvolout * 100, "##.##") + "%  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+    table.cell(table_id = testTable, column = 0, row = 14, text = "  Hist. Annualized Volatility: " + str.tostring(hvolout * math.sqrt(daysinyear) * 100, "##.##") + "%  ", bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+
+    if greeksshow == "First-order"
+        table.cell(table_id = testTable, column = 0, row = 15, text = "  First-order Greeks  ", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 16, text = "  Delta: " + str.tostring(delta, "##.#####"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 17, text = "  Vega: " + str.tostring(vega, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 18, text = "  Theta: " + str.tostring(theta, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 19, text = "  Rho: " + str.tostring(rho, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 20, text = "  Lambda: " + str.tostring(lambda, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 21, text = "  Epsilon: " + str.tostring(epsilon, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+
+    if greeksshow == "Second-order"
+        table.cell(table_id = testTable, column = 0, row = 15, text = "  Second-order Greeks  ", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 16, text = "  Gamma: " + str.tostring(gamma, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 17, text = "  Vanna: " + str.tostring(vanna, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 18, text = "  Charm: " + str.tostring(charm, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 19, text = "  Vomma: " + str.tostring(vomma, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 20, text = "  Veta: " + str.tostring(veta, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 21, text = "  Vera: " + str.tostring(vera, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+
+    if greeksshow == "Third-order"
+        table.cell(table_id = testTable, column = 0, row = 15, text = "  Third-order Greeks  ", bgcolor=color.yellow, text_color = color.black, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 16, text = "  Speed: " + str.tostring(zomma, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 17, text = "  Color: " + str.tostring(colorz, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 18, text = "  Ultima: " + str.tostring(ultima, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 19, text = "  Dual Delta: " + str.tostring(dualdelta, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)
+        table.cell(table_id = testTable, column = 0, row = 20, text = "  Dual Gamma: " + str.tostring(dualgamma, "##.########"), bgcolor=darkGreenColor, text_color = color.white, text_size = size.normal)

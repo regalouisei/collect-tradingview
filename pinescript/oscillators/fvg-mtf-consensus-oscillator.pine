@@ -1,0 +1,183 @@
+// ============================================================================
+// FVG Consensus Oscillator - Fuzzy MTF
+// Inspired by Zeiierman's Multitimeframe Fair Value Gap Indicator
+// https://www.tradingview.com/script/EOyGZOjA-Multitimeframe-Fair-Value-Gap-FVG-Zeiierman/
+// ============================================================================
+// This oscillator derives its core trend calculation from Zeiierman's 
+// Chebyshev Type 1 filter implementation. Extended with momentum, deviation,
+// and slope components combined into a weighted consensus oscillator.
+// Multi-timeframe version with weighted TF combination.
+// ============================================================================
+
+//@version=6
+indicator("FVG Consensus Oscillator - Fuzzy MTF", overlay=false)
+
+// === TIMEFRAME INPUTS ===
+bool useMTF = input.bool(true, "Enable Multi-Timeframe", group="Timeframes", tooltip="When enabled, the oscillator combines signals from multiple timeframes. When disabled, only the current chart timeframe is used.")
+string tf1 = input.timeframe("", "TF1 (Chart)", group="Timeframes", tooltip="First timeframe - typically your chart timeframe. Leave empty to use current chart. Lowest weight in the combined signal.")
+string tf2 = input.timeframe("60", "TF2 (Medium)", group="Timeframes", tooltip="Second timeframe - typically 1-4 hours. Medium weight in the combined signal. Should be higher than TF1.")
+string tf3 = input.timeframe("240", "TF3 (High)", group="Timeframes", tooltip="Third timeframe - typically 4H or Daily. Highest weight in the combined signal. Dominant timeframe for trend direction.")
+float wtf1 = input.float(1.0, "TF1 Weight", minval=0, maxval=3, step=0.1, group="Timeframes", tooltip="Weight of TF1 in the combined oscillator. Lower weight = less influence on the final signal.")
+float wtf2 = input.float(2.0, "TF2 Weight", minval=0, maxval=3, step=0.1, group="Timeframes", tooltip="Weight of TF2 in the combined oscillator. Medium weight gives balanced influence.")
+float wtf3 = input.float(3.0, "TF3 Weight", minval=0, maxval=3, step=0.1, group="Timeframes", tooltip="Weight of TF3 in the combined oscillator. Highest weight makes this the dominant timeframe.")
+
+// === DISPLAY OPTIONS ===
+bool showAllTF = input.bool(false, "Show All Timeframes", group="Display", tooltip="When enabled, shows individual oscillator lines for each timeframe in addition to the combined line.")
+bool showCombined = input.bool(true, "Show Combined Line", group="Display", tooltip="Shows the weighted combination of all timeframes as the main oscillator line.")
+bool showZoneBg = input.bool(false, "Show Zone Background", group="Display", tooltip="When enabled, shades the background based on the current zone (darker = more extreme zones). Disabled by default for cleaner charts.")
+
+// === TREND FILTER INPUTS ===
+float trendRp = input.float(4.0, "Trend Ripple", group="Trend Filter", tooltip="Controls the passband ripple of the Chebyshev filter. Higher values = faster response but more overshoot. Lower values = smoother trend line but slower reaction. Range 1-10, default 4 works well for most timeframes.")
+float trendFc = input.float(0.1, "Trend Cutoff", group="Trend Filter", tooltip="Cutoff frequency of the trend filter. Lower values = smoother, longer-term trend. Higher values = more sensitive to price changes. Range 0.01-0.5, default 0.1 balances smoothness and responsiveness.")
+int normLen = input.int(50, "Normalization Length", minval=10, group="Trend Filter", tooltip="Lookback period for normalizing the oscillator components to -100/+100 range. Longer periods = more stable scaling but slower adaptation. Shorter = faster adaptation but potentially erratic scaling. 50 bars is a good default.")
+
+// === COMPONENT WEIGHTS ===
+float wMom = input.float(1.0, "Momentum Weight", minval=0, maxval=3, step=0.1, group="Components", tooltip="Weight of the Momentum component (trend velocity/speed of change). Higher weight emphasizes how fast the trend is moving. Set to 0 to disable this component entirely.")
+float wDev = input.float(1.0, "Deviation Weight", minval=0, maxval=3, step=0.1, group="Components", tooltip="Weight of the Deviation component (price distance from trend). Higher weight emphasizes how far price has stretched from the trend line - useful for mean reversion signals.")
+float wSlope = input.float(1.0, "Slope Weight", minval=0, maxval=3, step=0.1, group="Components", tooltip="Weight of the Slope component (3-bar trend direction). Higher weight emphasizes the short-term directional bias of the trend. Helps confirm trend changes.")
+
+// === ZONE THRESHOLDS ===
+int zoneNeutral = input.int(5, "Neutral Zone", minval=1, maxval=20, group="Zones", tooltip="Oscillator values between +/- this threshold are considered neutral (no clear bias). Signals in this zone are typically low probability. Small values = tighter neutral zone.")
+int zoneCont = input.int(25, "Continuation Zone", minval=10, maxval=40, group="Zones", tooltip="Threshold for the Continuation zone. When oscillator is between Neutral and this value, it suggests trend continuation setups. Good for pullback entries in direction of trend.")
+int zoneDeep = input.int(50, "Deep Swing Zone", minval=30, maxval=70, group="Zones", tooltip="Threshold for Deep Swing zone. Values beyond this indicate extended moves with potential for larger reversals. Beyond this = Reversal zone where counter-trend setups become interesting.")
+
+// === SIGNAL FILTERS ===
+int cooldown = input.int(3, "Signal Cooldown Bars", minval=1, maxval=10, group="Signals", tooltip="Minimum bars between signals to prevent clustering. After a signal fires, no new signals for this many bars. Higher values = fewer but potentially higher quality signals.")
+float minTurn = input.float(2.0, "Min Turn Size", minval=0.1, maxval=10, step=0.1, group="Signals", tooltip="Minimum oscillator change required to register a turn signal. Filters out tiny wiggles and noise. Higher values = only significant turning points generate signals.")
+int tfConsensus = input.int(2, "TF Consensus Required", minval=1, maxval=3, group="Signals", tooltip="Minimum number of timeframes that must agree on direction for a signal to trigger. Higher = more conservative signals. 2 = at least 2 of 3 TFs must agree.")
+
+// === FVG TREND CALCULATION FUNCTION ===
+calcOscillator(float src, float closePrice) =>
+    // Chebyshev Type 1 Filter
+    float epsilon = math.sqrt(math.pow(10, trendRp/10) - 1)
+    float d = math.sqrt(1 + epsilon*epsilon)
+    float c = 1 / math.tan(math.pi * trendFc)
+    float normCoef = 1 / (1 + d*c + c*c)
+    
+    var float fvgTrend = na
+    fvgTrend := bar_index < 2 ? src : normCoef*src + 2*normCoef*src[1] + normCoef*src[2] - (2*normCoef*(1-c*c))*nz(fvgTrend[1]) - (normCoef*(1-d*c+c*c))*nz(fvgTrend[2])
+    
+    // Three raw oscillator components
+    float rawMom = fvgTrend - fvgTrend[1]
+    float rawDev = closePrice - fvgTrend
+    float rawSlope = ta.change(fvgTrend, 3)
+    
+    // Normalize each individually
+    float maxMom = ta.highest(math.abs(rawMom), normLen)
+    float maxDev = ta.highest(math.abs(rawDev), normLen)
+    float maxSlope = ta.highest(math.abs(rawSlope), normLen)
+    
+    float oscMom = maxMom != 0 ? rawMom / maxMom * 100 : 0
+    float oscDev = maxDev != 0 ? rawDev / maxDev * 100 : 0
+    float oscSlope = maxSlope != 0 ? rawSlope / maxSlope * 100 : 0
+    
+    // Weighted consensus
+    float totalWeight = wMom + wDev + wSlope
+    float osc = totalWeight > 0 ? (oscMom * wMom + oscDev * wDev + oscSlope * wSlope) / totalWeight : 0
+    
+    [osc, fvgTrend]
+
+// === CALCULATE OSCILLATOR FOR EACH TIMEFRAME ===
+// TF1 (Chart timeframe)
+[osc1, trend1] = request.security(syminfo.tickerid, tf1, calcOscillator(hlc3, close), lookahead=barmerge.lookahead_off)
+
+// TF2 (Medium timeframe)
+[osc2, trend2] = request.security(syminfo.tickerid, tf2, calcOscillator(hlc3, close), lookahead=barmerge.lookahead_off)
+
+// TF3 (High timeframe)
+[osc3, trend3] = request.security(syminfo.tickerid, tf3, calcOscillator(hlc3, close), lookahead=barmerge.lookahead_off)
+
+// === COMBINED WEIGHTED OSCILLATOR ===
+float totalTFWeight = wtf1 + wtf2 + wtf3
+float oscCombined = useMTF and totalTFWeight > 0 ? (osc1 * wtf1 + osc2 * wtf2 + osc3 * wtf3) / totalTFWeight : osc1
+
+// === TREND DIRECTION ===
+bool trend1Up = trend1 > trend1[1]
+bool trend2Up = trend2 > trend2[1]
+bool trend3Up = trend3 > trend3[1]
+
+// Count bullish timeframes
+int bullCount = (trend1Up ? 1 : 0) + (trend2Up ? 1 : 0) + (trend3Up ? 1 : 0)
+bool combinedTrendUp = bullCount >= 2
+
+// Oscillator color based on combined trend
+color oscColorCombined = combinedTrendUp ? color.rgb(240, 174, 252) : color.rgb(84, 19, 95)
+color oscColor1 = trend1Up ? color.new(color.aqua, 50) : color.new(color.aqua, 80)
+color oscColor2 = trend2Up ? color.new(color.yellow, 50) : color.new(color.yellow, 80)
+color oscColor3 = trend3Up ? color.new(color.orange, 50) : color.new(color.orange, 80)
+
+// === ZONE DETECTION ===
+float absOsc = math.abs(oscCombined)
+string zone = absOsc > zoneDeep ? "REV" : absOsc > zoneCont ? "DEEP" : absOsc > zoneNeutral ? "CONT" : "NEUT"
+
+// === TURNING POINT DETECTION WITH MTF CONSENSUS ===
+float turnSize = math.abs(oscCombined - oscCombined[1])
+bool turningUp = oscCombined > oscCombined[1] and oscCombined[1] <= oscCombined[2] and turnSize >= minTurn
+bool turningDown = oscCombined < oscCombined[1] and oscCombined[1] >= oscCombined[2] and turnSize >= minTurn
+
+// TF consensus check
+bool osc1Up = osc1 > osc1[1]
+bool osc2Up = osc2 > osc2[1]
+bool osc3Up = osc3 > osc3[1]
+int upCount = (osc1Up ? 1 : 0) + (osc2Up ? 1 : 0) + (osc3Up ? 1 : 0)
+int downCount = 3 - upCount
+
+bool consensusUp = useMTF ? upCount >= tfConsensus : true
+bool consensusDown = useMTF ? downCount >= tfConsensus : true
+
+// === COOLDOWN TRACKING ===
+var int lastSignalBar = 0
+bool cooldownOk = bar_index - lastSignalBar >= cooldown
+
+// === SIGNALS WITH COOLDOWN AND CONSENSUS ===
+bool signalUp = turningUp and cooldownOk and consensusUp
+bool signalDown = turningDown and cooldownOk and consensusDown
+
+if signalUp or signalDown
+    lastSignalBar := bar_index
+
+// === SIGNAL COLORS BY ZONE ===
+color colNeut = color.gray
+color colCont = color.aqua
+color colDeep = color.green
+color colRev = color.orange
+
+color signalCol = zone == "REV" ? colRev : zone == "DEEP" ? colDeep : zone == "CONT" ? colCont : colNeut
+
+// === ZONE BACKGROUND ===
+color zoneBg = showZoneBg ? (absOsc > zoneDeep ? color.new(color.gray, 70) : absOsc > zoneCont ? color.new(color.gray, 80) : absOsc > zoneNeutral ? color.new(color.gray, 88) : na) : na
+
+// === PLOTS ===
+hline(0, "Zero", color.gray)
+hline(zoneNeutral, "Neutral+", color.gray, linestyle=hline.style_dashed)
+hline(-zoneNeutral, "Neutral-", color.gray, linestyle=hline.style_dashed)
+hline(zoneCont, "Cont+", color.gray, linestyle=hline.style_dashed)
+hline(-zoneCont, "Cont-", color.gray, linestyle=hline.style_dashed)
+hline(zoneDeep, "Deep+", color.gray, linestyle=hline.style_dashed)
+hline(-zoneDeep, "Deep-", color.gray, linestyle=hline.style_dashed)
+
+bgcolor(zoneBg)
+
+// Individual TF lines (optional)
+plot(showAllTF ? osc1 : na, "TF1 Oscillator", oscColor1, 1)
+plot(showAllTF ? osc2 : na, "TF2 Oscillator", oscColor2, 1)
+plot(showAllTF ? osc3 : na, "TF3 Oscillator", oscColor3, 1)
+
+// Combined line
+plot(showCombined ? oscCombined : na, "Combined Consensus", oscColorCombined, 2)
+
+// === SIGNALS ===
+plotshape(signalUp, "Turn Up", shape.triangleup, location.bottom, signalCol, size=size.tiny)
+plotshape(signalDown, "Turn Down", shape.triangledown, location.top, signalCol, size=size.tiny)
+
+// === INFO TABLE ===
+var table infoTable = table.new(position.top_right, 4, 2, bgcolor=color.new(color.black, 80))
+if barstate.islast and useMTF
+    table.cell(infoTable, 0, 0, "TF1", text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 0, "TF2", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 2, 0, "TF3", text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 3, 0, "CMB", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 1, str.tostring(osc1, "#.#"), text_color=osc1Up ? color.green : color.red, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(osc2, "#.#"), text_color=osc2Up ? color.green : color.red, text_size=size.small)
+    table.cell(infoTable, 2, 1, str.tostring(osc3, "#.#"), text_color=osc3Up ? color.green : color.red, text_size=size.small)
+    table.cell(infoTable, 3, 1, str.tostring(oscCombined, "#.#"), text_color=combinedTrendUp ? color.green : color.red, text_size=size.small)

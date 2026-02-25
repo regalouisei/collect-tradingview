@@ -1,0 +1,216 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("Enhanced Holt-Winters RSI [BOSWaves]", overlay=false)
+
+//──────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────
+
+// Data Source
+src = input.source(close, "Source", group="Data", tooltip="Price data source for calculations (default: close)")
+
+// Holt-Winters Parameters
+alpha = input.float(0.3, "Level (α)", minval=0.01, maxval=0.99, step=0.05, group="Holt-Winters", tooltip="Level smoothing factor - lower values = smoother but slower response")
+beta = input.float(0.1, "Trend (β)", minval=0.01, maxval=0.99, step=0.05, group="Holt-Winters", tooltip="Trend smoothing factor - controls how quickly trend changes are recognized")
+gamma = input.float(0.2, "Seasonal (γ)", minval=0.01, maxval=0.99, step=0.05, group="Holt-Winters", tooltip="Seasonal smoothing factor - adjusts sensitivity to cyclical patterns")
+seasonL = input.int(20, "Season Length", minval=2, maxval=50, group="Holt-Winters", tooltip="Number of bars in one seasonal cycle (typical: 20 for daily data)")
+deltaSmooth = input.int(3, "Delta Smoothing", minval=1, maxval=10, group="Holt-Winters", tooltip="Smoothing period for price-forecast difference - higher values reduce choppiness")
+
+// RSI Parameters
+rsiLen = input.int(14, "RSI Length", minval=2, group="RSI Settings", tooltip="Period for RSI calculation - higher values = smoother oscillator")
+obLevel = input.float(70, "Overbought Level", minval=50, maxval=100, group="RSI Settings", tooltip="RSI threshold for overbought conditions")
+osLevel = input.float(30, "Oversold Level", minval=0, maxval=50, group="RSI Settings", tooltip="RSI threshold for oversold conditions")
+smoothType = input.string("EMA", "Smoothing Type", options=["None", "SMA", "EMA"], group="RSI Settings", tooltip="Type of smoothing to apply to oscillator line")
+smoothLen = input.int(3, "Smoothing Length", minval=1, maxval=20, group="RSI Settings", tooltip="Period for oscillator smoothing - higher values = smoother line")
+
+// Display Options
+showCandles = input.bool(true, "Color Candles", group="Display", tooltip="Color candles based on RSI levels (green=oversold, red=overbought)")
+showOscillator = input.bool(true, "Show Oscillator Panel", group="Display", tooltip="Show RSI oscillator in separate panel below chart")
+showTable = input.bool(true, "Show Info Table", group="Display", tooltip="Show information table in top-right corner")
+showSignals = input.bool(true, "Show Buy/Sell Signals", group="Display", tooltip="Display buy and sell signals on chart")
+
+// Signal Settings
+volThreshold = input.float(100, "Volume Threshold %", minval=50, maxval=300, step=10, group="Signals", tooltip="Minimum volume percentage for signal confirmation")
+rsiMomentumPeriod = input.int(3, "RSI Momentum Period", minval=1, maxval=10, group="Signals", tooltip="Period for detecting RSI momentum shifts")
+signalCooloff = input.int(10, "Signal Cooloff Period", minval=1, maxval=50, group="Signals", tooltip="Minimum number of bars between signals to prevent overlap")
+
+// Signal Colors
+bullColor = input.color(color.new(#00ff00, 0), "Bullish", group="Colors", tooltip="Color for bullish signals and oversold conditions")
+bearColor = input.color(color.new(#ff0000, 0), "Bearish", group="Colors", tooltip="Color for bearish signals and overbought conditions")
+neutralColor = input.color(color.new(color.yellow, 40), "Neutral", group="Colors", tooltip="Color for neutral market conditions")
+
+//──────────────────────────────────────────────────────────────
+// HOLT-WINTERS TRIPLE EXPONENTIAL SMOOTHING
+//──────────────────────────────────────────────────────────────
+
+var float level = na
+var float trend = 0.0
+var float[] season = array.new_float(seasonL, 0.0)
+
+if bar_index >= seasonL
+    if na(level)
+        level := src
+        trend := src - src[1]
+    else
+        lastSeason = array.get(season, (bar_index - seasonL) % seasonL)
+        prevLevel = level
+        level := alpha * (src - lastSeason) + (1 - alpha) * (level + trend)
+        trend := beta * (level - prevLevel) + (1 - beta) * trend
+        newSeason = gamma * (src - level) + (1 - gamma) * lastSeason
+        array.set(season, bar_index % seasonL, newSeason)
+
+seasonComp = array.get(season, bar_index % seasonL)
+forecast = level + trend + seasonComp
+
+//──────────────────────────────────────────────────────────────
+// RSI-LIKE OSCILLATOR
+//──────────────────────────────────────────────────────────────
+
+delta = ta.ema(src - forecast, deltaSmooth)
+up = math.max(delta, 0)
+down = math.abs(math.min(delta, 0))
+
+avgUp = ta.rma(up, rsiLen)
+avgDown = ta.rma(down, rsiLen)
+
+// Proper RSI calculation with bounds checking
+rs = avgDown == 0 ? 0 : avgUp / avgDown
+hwRSI = avgDown == 0 and avgUp == 0 ? 50 : avgDown == 0 ? 100 : 100 - (100 / (1 + rs))
+
+// Ensure values stay within 0-100 range (safety bounds)
+hwRSI := math.max(0, math.min(100, hwRSI))
+
+// Apply smoothing to oscillator
+hwRSI_smooth = smoothType == "SMA" ? ta.sma(hwRSI, smoothLen) : smoothType == "EMA" ? ta.ema(hwRSI, smoothLen) : hwRSI
+
+// Volume calculation
+volMA = ta.sma(volume, 20)
+volPercent = (volume / volMA) * 100
+
+//──────────────────────────────────────────────────────────────
+// SIGNAL GENERATION
+//──────────────────────────────────────────────────────────────
+
+// Track last signal bar
+var int lastBuyBar = na
+var int lastSellBar = na
+
+// Volume confirmation
+highVolume = volPercent > volThreshold
+
+// Calculate RSI momentum - compare current RSI to recent average
+rsiMA = ta.sma(hwRSI_smooth, rsiMomentumPeriod)
+rsiMomentum = hwRSI_smooth - rsiMA
+
+// Detect momentum shifts
+momentumTurningUp = rsiMomentum > rsiMomentum[1] and rsiMomentum[1] <= rsiMomentum[2]
+momentumTurningDown = rsiMomentum < rsiMomentum[1] and rsiMomentum[1] >= rsiMomentum[2]
+
+// Buy signal: RSI in oversold or near oversold, momentum turning up, volume confirmation
+buyCondition1 = hwRSI_smooth < osLevel + 15
+buyCondition2 = momentumTurningUp
+buyCondition3 = hwRSI_smooth > hwRSI_smooth[1]
+buyCooloffOk = na(lastBuyBar) or (bar_index - lastBuyBar) >= signalCooloff
+buySignal = buyCondition1 and buyCondition2 and buyCondition3 and highVolume and buyCooloffOk
+
+// Sell signal: RSI in overbought or near overbought, momentum turning down, volume confirmation  
+sellCondition1 = hwRSI_smooth > obLevel - 15
+sellCondition2 = momentumTurningDown
+sellCondition3 = hwRSI_smooth < hwRSI_smooth[1]
+sellCooloffOk = na(lastSellBar) or (bar_index - lastSellBar) >= signalCooloff
+sellSignal = sellCondition1 and sellCondition2 and sellCondition3 and highVolume and sellCooloffOk
+
+// Update last signal bars
+if buySignal
+    lastBuyBar := bar_index
+if sellSignal
+    lastSellBar := bar_index
+
+// Strong signals when deep in extreme zones
+strongBuySignal = buySignal and hwRSI_smooth < osLevel
+strongSellSignal = sellSignal and hwRSI_smooth > obLevel
+
+//──────────────────────────────────────────────────────────────
+// VISUALIZATION
+//──────────────────────────────────────────────────────────────
+
+// Candle coloring - maintains color until opposite extreme is reached
+var color currentCandleColor = neutralColor
+
+if hwRSI_smooth > obLevel
+    currentCandleColor := bearColor
+else if hwRSI_smooth < osLevel
+    currentCandleColor := bullColor
+
+candleColor = currentCandleColor
+
+plotcandle(showCandles ? open : na, showCandles ? high : na, showCandles ? low : na, showCandles ? close : na, color=candleColor, wickcolor=candleColor, bordercolor=candleColor, force_overlay=true, title="HW Candles")
+
+// Buy and Sell signals
+plotshape(showSignals and buySignal, "Buy Signal", shape.triangleup, location.belowbar, color.new(bullColor, 0), size=size.small, force_overlay=true)
+plotshape(showSignals and sellSignal, "Sell Signal", shape.triangledown, location.abovebar, color.new(bearColor, 0), size=size.small, force_overlay=true)
+
+// Strong signals (in extreme zones with momentum)
+plotshape(showSignals and strongBuySignal, "Strong Buy", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.normal, force_overlay=true)
+plotshape(showSignals and strongSellSignal, "Strong Sell", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size=size.normal, force_overlay=true)
+
+//──────────────────────────────────────────────────────────────
+// OSCILLATOR PANEL
+//──────────────────────────────────────────────────────────────
+
+oscColor = hwRSI_smooth > obLevel ? bearColor : hwRSI_smooth < osLevel ? bullColor : neutralColor
+
+plot(showOscillator ? hwRSI_smooth : na, "HW RSI", color=oscColor, linewidth=2)
+
+obHline = hline(showOscillator ? obLevel : na, "Overbought", color=color.new(bearColor, 50), linestyle=hline.style_dashed)
+midHline = hline(showOscillator ? 50 : na, "Neutral", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+osHline = hline(showOscillator ? osLevel : na, "Oversold", color=color.new(bullColor, 50), linestyle=hline.style_dashed)
+
+obFillTop = hline(showOscillator ? 100 : na, color=na)
+fill(obFillTop, obHline, color=showOscillator ? color.new(bearColor, 90) : na)
+
+osFillBottom = hline(showOscillator ? 0 : na, color=na)
+fill(osHline, osFillBottom, color=showOscillator ? color.new(bullColor, 90) : na)
+
+//──────────────────────────────────────────────────────────────
+// ALERTS
+//──────────────────────────────────────────────────────────────
+
+alertcondition(buySignal, "Buy Signal", "BUY: HW RSI momentum turning up in oversold zone with high volume")
+alertcondition(sellSignal, "Sell Signal", "SELL: HW RSI momentum turning down in overbought zone with high volume")
+alertcondition(strongBuySignal, "Strong Buy Signal", "STRONG BUY: HW RSI momentum reversal deep in oversold")
+alertcondition(strongSellSignal, "Strong Sell Signal", "STRONG SELL: HW RSI momentum reversal deep in overbought")
+
+//──────────────────────────────────────────────────────────────
+// INFO TABLE
+//──────────────────────────────────────────────────────────────
+
+var table infoTable = table.new(position.top_right, 2, 5, border_width=1, force_overlay = true)
+
+if barstate.islast and showTable
+    // Consistent opacity for all value cells in column 2
+    cellOpacity = 70
+    
+    table.cell(infoTable, 0, 0, "HW RSI", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(infoTable, 1, 0, str.tostring(hwRSI_smooth, "#.##"), text_color=color.white, bgcolor=color.new(candleColor, cellOpacity))
+    
+    table.cell(infoTable, 0, 1, "Trend", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    trendStr = trend > 0 ? "▲ " + str.tostring(trend, "#.##") : "▼ " + str.tostring(trend, "#.##")
+    trendColor = trend > 0 ? bullColor : bearColor
+    table.cell(infoTable, 1, 1, trendStr, text_color=color.white, bgcolor=color.new(trendColor, cellOpacity))
+    
+    table.cell(infoTable, 0, 2, "Volume", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    volStr = str.tostring(volPercent, "#") + "%"
+    volColor = volPercent > 120 ? color.green : volPercent < 80 ? color.red : color.gray
+    table.cell(infoTable, 1, 2, volStr, text_color=color.white, bgcolor=color.new(volColor, cellOpacity))
+    
+    status = hwRSI_smooth > obLevel ? "Overbought" : hwRSI_smooth < osLevel ? "Oversold" : "Neutral"
+    table.cell(infoTable, 0, 3, "Status", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(infoTable, 1, 3, status, text_color=color.white, bgcolor=color.new(candleColor, cellOpacity))
+
+    table.cell(infoTable, 0, 4, "Traffic Light", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    trafficLightColor = hwRSI_smooth < osLevel ? color.lime : hwRSI_smooth > obLevel ? color.red : color.yellow
+    trafficLightSymbol = hwRSI_smooth < osLevel ? "🟢" : hwRSI_smooth > obLevel ? "🔴" : "🟡"
+    table.cell(infoTable, 1, 4, trafficLightSymbol, text_color=color.white, bgcolor=color.new(trafficLightColor, cellOpacity))

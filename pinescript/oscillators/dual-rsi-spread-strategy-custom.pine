@@ -1,0 +1,198 @@
+//@version=6
+indicator("Dual RSI Spread Strategy [Custom]", shorttitle="Dual RSI", overlay=false)
+
+// ==========================================
+// 1. 输入设置 (Inputs)
+// ==========================================
+
+// --- 分组：RSI 设置 ---
+grp_rsi = "RSI 设置 (Settings)"
+src = input.source(close, "来源 (Source)", group=grp_rsi)
+len_short = input.int(13, "短周期 RSI 长度 (Short Length)", minval=1, group=grp_rsi)
+len_long = input.int(42, "长周期 RSI 长度 (Long Length)", minval=1, group=grp_rsi)
+
+// --- 分组：平滑设置 ---
+grp_smooth = "平滑 (Smoothing)"
+use_smooth = input.bool(false, "启用 RSI 平滑 (Enable Smoothing)", group=grp_smooth)
+smooth_type = input.string("SMA", "类型 (Type)", options=["SMA", "EMA", "RMA", "WMA"], group=grp_smooth)
+smooth_len = input.int(14, "长度 (Length)", minval=1, group=grp_smooth)
+
+// --- 分组：RSI 差值信号 (买入/卖出) ---
+grp_signal = "差值交易信号 (Spread Signals)"
+diff_threshold = input.int(20, "RSI 差值阈值 (Spread Threshold)", minval=1, group=grp_signal, tooltip="当双线差值 > 20 时触发")
+show_spread_labels = input.bool(true, "显示差值买卖标签 (Show Spread Labels)", group=grp_signal)
+
+// --- 分组：散度/背离设置 (新增功能) ---
+grp_div = "散度/背离 (Divergence)"
+calculateDivergence = input.bool(false, "计算散度 (Calculate Divergence)", group=grp_div)
+// 这里保留官方逻辑的固定参数，如果需要可开放为 input
+lookbackRight = 5
+lookbackLeft = 5
+rangeUpper = 60
+rangeLower = 5
+col_div_bull = input.color(color.green, "看涨背离颜色 (Bullish Color)", group=grp_div)
+col_div_bear = input.color(color.red, "看跌背离颜色 (Bearish Color)", group=grp_div)
+col_text = input.color(color.white, "文字颜色 (Text Color)", group=grp_div)
+
+// --- 分组：样式 ---
+grp_style = "样式 (Style)"
+col_rsi_short = input.color(color.new(#2962FF, 0), "短周期 RSI 颜色", group=grp_style)
+col_rsi_long = input.color(color.new(#E040FB, 0), "长周期 RSI 颜色", group=grp_style)
+col_spread_buy = input.color(color.green, "差值买入信号颜色", group=grp_style)
+col_spread_sell = input.color(color.red, "差值卖出信号颜色", group=grp_style)
+
+// ==========================================
+// 2. RSI 计算逻辑
+// ==========================================
+
+// 计算原始 RSI
+rsi_s = ta.rsi(src, len_short)
+rsi_l = ta.rsi(src, len_long)
+
+// 辅助函数：计算移动平均
+get_ma(source, length, type) =>
+    switch type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "RMA" => ta.rma(source, length)
+        "WMA" => ta.wma(source, length)
+        => ta.sma(source, length)
+
+// 最终 RSI (平滑或原始)
+rsi_final_s = use_smooth ? get_ma(rsi_s, smooth_len, smooth_type) : rsi_s
+rsi_final_l = use_smooth ? get_ma(rsi_l, smooth_len, smooth_type) : rsi_l
+
+// ==========================================
+// 3. 差值信号逻辑 (Spread Signals)
+// ==========================================
+
+diff = rsi_final_s - rsi_final_l
+// 差值买卖条件
+cond_sell_spread = diff >= diff_threshold             // 短 - 长 > 20
+cond_buy_spread = (rsi_final_l - rsi_final_s) >= diff_threshold // 长 - 短 > 20
+
+// ==========================================
+// 4. 散度/背离计算逻辑 (Divergence Logic)
+// ==========================================
+
+// 我们使用【短周期 RSI】来计算背离，因为它更灵敏
+rsi_div_src = rsi_final_s 
+
+// 辅助函数：判断范围
+_inRange(bool cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+// 变量初始化
+plFound = false
+phFound = false
+bullCond = false
+bearCond = false
+
+rsiLBR = rsi_div_src[lookbackRight]
+
+// 核心背离算法 (参考你提供的代码)
+if calculateDivergence
+    // -------------------------------------------------------------------------
+    // Regular Bullish (看涨背离：价格创新低，RSI抬高)
+    // -------------------------------------------------------------------------
+    // 寻找 RSI 的 Pivot Low
+    plFound := not na(ta.pivotlow(rsi_div_src, lookbackLeft, lookbackRight))
+    // 逻辑：当前 Pivot RSI > 上一个 Pivot RSI，且上一个 Pivot 在指定范围内
+    rsiHL = rsiLBR > ta.valuewhen(plFound, rsiLBR, 1) and _inRange(plFound[1])
+    // 价格：当前 Pivot 对应的价格 Low < 上一个 Pivot 对应的价格 Low
+    lowLBR = low[lookbackRight]
+    priceLL = lowLBR < ta.valuewhen(plFound, lowLBR, 1)
+    
+    bullCond := priceLL and rsiHL and plFound
+
+    // -------------------------------------------------------------------------
+    // Regular Bearish (看跌背离：价格创新高，RSI走低)
+    // -------------------------------------------------------------------------
+    // 寻找 RSI 的 Pivot High
+    phFound := not na(ta.pivothigh(rsi_div_src, lookbackLeft, lookbackRight))
+    // 逻辑：当前 Pivot RSI < 上一个 Pivot RSI
+    rsiLH = rsiLBR < ta.valuewhen(phFound, rsiLBR, 1) and _inRange(phFound[1])
+    // 价格：当前 Pivot 对应的价格 High > 上一个 Pivot 对应的价格 High
+    highLBR = high[lookbackRight]
+    priceHH = highLBR > ta.valuewhen(phFound, highLBR, 1)
+    
+    bearCond := priceHH and rsiLH and phFound
+
+// ==========================================
+// 5. 绘图 (Plotting)
+// ==========================================
+
+// 5.1 背景线
+h_upper = hline(70, "Upper Band", color=color.gray, linestyle=hline.style_dashed)
+hline(50, "Middle Band", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+h_lower = hline(30, "Lower Band", color=color.gray, linestyle=hline.style_dashed)
+fill(h_upper, h_lower, color=color.new(#787B86, 90), title="Background Fill")
+
+// 5.2 RSI 线条
+plot(rsi_final_s, "Short RSI", color=col_rsi_short, linewidth=2)
+plot(rsi_final_l, "Long RSI", color=col_rsi_long, linewidth=2)
+
+// 5.3 差值信号 (Spread Labels)
+plotshape(show_spread_labels and cond_buy_spread, title="差值买入", style=shape.labelup, location=location.bottom, color=col_spread_buy, textcolor=color.white, text="买入", size=size.tiny)
+plotshape(show_spread_labels and cond_sell_spread, title="差值卖出", style=shape.labeldown, location=location.top, color=col_spread_sell, textcolor=color.white, text="卖出", size=size.tiny)
+
+// 5.4 散度/背离绘图 (Divergence Plots)
+// 注意：由于 pivot 检测有滞后 (lookbackRight)，我们需要使用 offset 将线条画在正确的位置
+
+noneColor = color.new(color.white, 100)
+
+// 绘制 Bullish 连线
+plot(
+     plFound and calculateDivergence ? rsiLBR : na,
+     offset    = -lookbackRight,
+     title     = "Regular Bullish Line",
+     linewidth = 2,
+     color     = (bullCond ? col_div_bull : noneColor),
+     display   = display.all
+     )
+
+// 绘制 Bullish 标签
+plotshape(
+     bullCond and calculateDivergence ? rsiLBR : na,
+     offset    = -lookbackRight,
+     title     = "Regular Bullish Label",
+     text      = " Bull ",
+     style     = shape.labelup,
+     location  = location.absolute,
+     color     = col_div_bull,
+     textcolor = col_text
+     )
+
+// 绘制 Bearish 连线
+plot(
+     phFound and calculateDivergence ? rsiLBR : na,
+     offset    = -lookbackRight,
+     title     = "Regular Bearish Line",
+     linewidth = 2,
+     color     = (bearCond ? col_div_bear : noneColor),
+     display   = display.all
+     )
+
+// 绘制 Bearish 标签
+plotshape(
+     bearCond and calculateDivergence ? rsiLBR : na,
+     offset    = -lookbackRight,
+     title     = "Regular Bearish Label",
+     text      = " Bear ",
+     style     = shape.labeldown,
+     location  = location.absolute,
+     color     = col_div_bear,
+     textcolor = col_text
+     )
+
+// ==========================================
+// 6. 告警 (Alerts)
+// ==========================================
+// 差值告警
+alertcondition(cond_buy_spread, title="触发差值买入", message="RSI差值买入：长周期 - 短周期 > 20")
+alertcondition(cond_sell_spread, title="触发差值卖出", message="RSI差值卖出：短周期 - 长周期 > 20")
+
+// 背离告警 (注意：由于 Pivot 确认需要时间，此告警会在背离确认后的K线触发)
+alertcondition(bullCond and calculateDivergence, title="触发看涨背离 (Bull)", message="发现 RSI 看涨背离 (Bullish Divergence)")
+alertcondition(bearCond and calculateDivergence, title="触发看跌背离 (Bear)", message="发现 RSI 看跌背离 (Bearish Divergence)")

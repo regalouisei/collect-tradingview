@@ -1,0 +1,384 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator("Elite Session Volume Distribution Engine [JOAT]", shorttitle="ESV [JOAT]", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+
+// ────────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────────────────────────
+
+// Volume Profile Settings
+vpGroup = "Volume Profile Settings"
+vpRows = input.int(24, "Profile Rows", minval=10, maxval=50, group=vpGroup)
+vpLookback = input.int(100, "Lookback Bars", minval=20, group=vpGroup)
+showVP = input.bool(true, "Show Volume Profile", group=vpGroup)
+vpWidth = input.int(25, "Profile Width", minval=10, maxval=100, group=vpGroup)
+
+// Session Settings
+sessionGroup = "Session Settings"
+showSessions = input.bool(true, "Show Session Levels", group=sessionGroup)
+showSessionBoxes = input.bool(false, "Show Session Background Boxes", group=sessionGroup)
+asianSession = input.session("2000-0000", "Asian Session", group=sessionGroup)
+londonSession = input.session("0300-1200", "London Session", group=sessionGroup)
+nySession = input.session("0830-1700", "NY Session", group=sessionGroup)
+
+// POC Settings
+pocGroup = "POC Settings"
+showPOC = input.bool(true, "Show Point of Control", group=pocGroup)
+showVAH = input.bool(true, "Show Value Area High", group=pocGroup)
+showVAL = input.bool(true, "Show Value Area Low", group=pocGroup)
+vaPercent = input.float(70, "Value Area %", minval=50, maxval=90, step=5, group=pocGroup)
+
+// Volume Analysis
+volGroup = "Volume Analysis"
+volMaLength = input.int(20, "Volume MA Length", minval=1, group=volGroup)
+showVolBars = input.bool(true, "Show Colored Volume Bars", group=volGroup)
+volThreshold = input.float(1.5, "High Volume Threshold", minval=1.0, step=0.1, group=volGroup)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// COLOR DEFINITIONS
+// ────────────────────────────────────────────────────────────────────────────────
+
+pocColor = color.rgb(255, 235, 59)
+vahColor = color.rgb(100, 181, 246)
+valColor = color.rgb(100, 181, 246)
+vpBullColor = color.rgb(76, 175, 80)
+vpBearColor = color.rgb(244, 67, 54)
+asianColor = color.rgb(255, 152, 0)
+londonColor = color.rgb(33, 150, 243)
+nyColor = color.rgb(156, 39, 176)
+highVolBullColor = color.rgb(0, 255, 0)
+highVolBearColor = color.rgb(255, 0, 0)
+normalVolColor = color.rgb(120, 120, 120)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// VOLUME PROFILE CALCULATIONS
+// ────────────────────────────────────────────────────────────────────────────────
+
+var float[] priceArray = array.new<float>()
+var float[] volumeArray = array.new<float>()
+
+// Calculate price range (must be in global scope for consistency)
+highestPrice = ta.highest(high, vpLookback)
+lowestPrice = ta.lowest(low, vpLookback)
+
+if barstate.islast and showVP
+    // Calculate price range
+    priceRange = highestPrice - lowestPrice
+    rowHeight = priceRange / vpRows
+    
+    // Initialize arrays
+    array.clear(priceArray)
+    array.clear(volumeArray)
+    
+    for i = 0 to vpRows - 1
+        array.push(priceArray, lowestPrice + (i * rowHeight))
+        array.push(volumeArray, 0.0)
+    
+    // Accumulate volume in each price row
+    for i = 0 to vpLookback - 1
+        barHigh = high[i]
+        barLow = low[i]
+        barVolume = volume[i]
+        barRange = barHigh - barLow
+        
+        if barRange > 0
+            for j = 0 to vpRows - 1
+                rowPrice = array.get(priceArray, j)
+                rowTop = rowPrice + rowHeight
+                
+                // Calculate overlap
+                overlapHigh = math.min(barHigh, rowTop)
+                overlapLow = math.max(barLow, rowPrice)
+                overlap = math.max(0, overlapHigh - overlapLow)
+                
+                if overlap > 0
+                    volumeContribution = (overlap / barRange) * barVolume
+                    currentVol = array.get(volumeArray, j)
+                    array.set(volumeArray, j, currentVol + volumeContribution)
+    
+    // Find POC and Value Area
+    maxVolume = array.max(volumeArray)
+    pocIndex = array.indexof(volumeArray, maxVolume)
+    pocPrice = array.get(priceArray, pocIndex)
+    
+    // Calculate Value Area
+    totalVolume = array.sum(volumeArray)
+    targetVolume = totalVolume * (vaPercent / 100)
+    
+    var int vahIndex = pocIndex
+    var int valIndex = pocIndex
+    var float accumulatedVolume = array.get(volumeArray, pocIndex)
+    
+    // Expand value area
+    while accumulatedVolume < targetVolume and (vahIndex < vpRows - 1 or valIndex > 0)
+        upVolume = vahIndex < vpRows - 1 ? array.get(volumeArray, vahIndex + 1) : 0
+        downVolume = valIndex > 0 ? array.get(volumeArray, valIndex - 1) : 0
+        
+        if upVolume > downVolume and vahIndex < vpRows - 1
+            vahIndex += 1
+            accumulatedVolume += upVolume
+        else if valIndex > 0
+            valIndex -= 1
+            accumulatedVolume += downVolume
+        else if vahIndex < vpRows - 1
+            vahIndex += 1
+            accumulatedVolume += upVolume
+        else
+            break
+    
+    vahPrice = array.get(priceArray, vahIndex) + rowHeight
+    valPrice = array.get(priceArray, valIndex)
+    
+    // Draw Volume Profile
+    maxBarWidth = vpWidth
+    for i = 0 to vpRows - 1
+        rowPrice = array.get(priceArray, i)
+        rowVolume = array.get(volumeArray, i)
+        barWidth = (rowVolume / maxVolume) * maxBarWidth
+        
+        rowColor = close > rowPrice ? vpBullColor : vpBearColor
+        
+        box.new(bar_index, rowPrice, bar_index + int(barWidth), rowPrice + rowHeight,
+                border_color=color.new(rowColor, 30),
+                bgcolor=color.new(rowColor, 70),
+                border_width=1)
+    
+    // Draw POC
+    if showPOC
+        line.new(bar_index - vpLookback, pocPrice, bar_index + 20, pocPrice,
+                 color=pocColor, width=3, style=line.style_solid, extend=extend.right)
+        label.new(bar_index + 20, pocPrice, "POC",
+                 style=label.style_label_left, color=pocColor,
+                 textcolor=color.black, size=size.small)
+    
+    // Draw VAH
+    if showVAH
+        line.new(bar_index - vpLookback, vahPrice, bar_index + 20, vahPrice,
+                 color=vahColor, width=2, style=line.style_dashed, extend=extend.right)
+        label.new(bar_index + 20, vahPrice, "VAH",
+                 style=label.style_label_left, color=vahColor,
+                 textcolor=color.white, size=size.tiny)
+    
+    // Draw VAL
+    if showVAL
+        line.new(bar_index - vpLookback, valPrice, bar_index + 20, valPrice,
+                 color=valColor, width=2, style=line.style_dashed, extend=extend.right)
+        label.new(bar_index + 20, valPrice, "VAL",
+                 style=label.style_label_left, color=valColor,
+                 textcolor=color.white, size=size.tiny)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED SESSION ANALYSIS WITH BREAKOUT DETECTION
+// ────────────────────────────────────────────────────────────────────────────────
+
+
+inAsianSession = not na(time(timeframe.period, asianSession))
+inLondonSession = not na(time(timeframe.period, londonSession))
+inNYSession = not na(time(timeframe.period, nySession))
+
+var float asianHigh = na
+var float asianLow = na
+var float londonHigh = na
+var float londonLow = na
+var float nyHigh = na
+var float nyLow = na
+var bool asianBreakoutHigh = false
+var bool asianBreakoutLow = false
+
+// Track Asian Session with breakout detection
+if inAsianSession
+    asianHigh := na(asianHigh) ? high : math.max(asianHigh, high)
+    asianLow := na(asianLow) ? low : math.min(asianLow, low)
+    asianBreakoutHigh := false
+    asianBreakoutLow := false
+else if not inAsianSession[1] and inAsianSession[2]
+    asianHigh := na
+    asianLow := na
+
+// Detect Asian range breakouts during London session
+if inLondonSession and not na(asianHigh) and not na(asianLow)
+    if close > asianHigh and not asianBreakoutHigh
+        asianBreakoutHigh := true
+        label.new(bar_index, high, "Asian High\nBreakout", 
+                 style=label.style_label_down, color=color.new(londonColor, 0), 
+                 textcolor=color.white, size=size.small)
+    
+    if close < asianLow and not asianBreakoutLow
+        asianBreakoutLow := true
+        label.new(bar_index, low, "Asian Low\nBreakdown", 
+                 style=label.style_label_up, color=color.new(londonColor, 0), 
+                 textcolor=color.white, size=size.small)
+
+// Track London Session
+if inLondonSession
+    londonHigh := na(londonHigh) ? high : math.max(londonHigh, high)
+    londonLow := na(londonLow) ? low : math.min(londonLow, low)
+else if not inLondonSession[1] and inLondonSession[2]
+    londonHigh := na
+    londonLow := na
+
+// Track NY Session
+if inNYSession
+    nyHigh := na(nyHigh) ? high : math.max(nyHigh, high)
+    nyLow := na(nyLow) ? low : math.min(nyLow, low)
+else if not inNYSession[1] and inNYSession[2]
+    nyHigh := na
+    nyLow := na
+
+// Plot Session Levels with enhanced styling (only current session)
+currentSessionHigh = inAsianSession and not na(asianHigh) ? asianHigh : inLondonSession and not na(londonHigh) ? londonHigh : inNYSession and not na(nyHigh) ? nyHigh : na
+
+currentSessionLow = inAsianSession and not na(asianLow) ? asianLow : inLondonSession and not na(londonLow) ? londonLow : inNYSession and not na(nyLow) ? nyLow : na
+
+currentSessionColor = inAsianSession ? asianColor : inLondonSession ? londonColor : inNYSession ? nyColor : color.gray
+
+plot(showSessions and not na(currentSessionHigh) ? currentSessionHigh : na, "Session High", currentSessionColor, 2, plot.style_line)
+plot(showSessions and not na(currentSessionLow) ? currentSessionLow : na, "Session Low", currentSessionColor, 2, plot.style_line)
+
+// Session Background with gradient (optional)
+bgcolor(showSessionBoxes and inAsianSession ? color.new(asianColor, 95) : na, title="Asian Session BG")
+bgcolor(showSessionBoxes and inLondonSession ? color.new(londonColor, 95) : na, title="London Session BG")
+bgcolor(showSessionBoxes and inNYSession ? color.new(nyColor, 95) : na, title="NY Session BG")
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED VOLUME ANALYSIS WITH DELTA TRACKING
+// ────────────────────────────────────────────────────────────────────────────────
+
+volMA = ta.sma(volume, volMaLength)
+isHighVol = volume > volMA * volThreshold
+isBullBar = close > open
+isBearBar = close < open
+
+// Volume Delta Calculation (Buying vs Selling Pressure)
+buyVolume = isBullBar ? volume : 0
+sellVolume = isBearBar ? volume : 0
+volumeDelta = ta.cum(buyVolume) - ta.cum(sellVolume)
+volumeDeltaMA = ta.sma(volumeDelta, 20)
+
+// Delta Trend
+deltaRising = volumeDelta > volumeDeltaMA
+deltaFalling = volumeDelta < volumeDeltaMA
+
+volBarColor = isHighVol and isBullBar ? highVolBullColor :
+              isHighVol and isBearBar ? highVolBearColor :
+              isBullBar ? color.new(vpBullColor, 50) :
+              color.new(vpBearColor, 50)
+
+// Barcolor must be in global scope
+barcolor(showVolBars ? volBarColor : na)
+
+// Enhanced Volume Spike Detection with Trend Confirmation
+volumeSpike = volume > volMA * 2.0
+climaxVolume = volume > volMA * 3.0
+trendConfirmedSpike = volumeSpike and ((isBullBar and deltaRising) or (isBearBar and deltaFalling))
+
+// Volume Spike Bull - split into two for constant size
+plotshape(volumeSpike and isBullBar and trendConfirmedSpike ? high : na, "Volume Spike Bull Strong",
+         shape.triangleup, location.belowbar, 
+         color.new(highVolBullColor, 0),
+         size=size.small)
+
+plotshape(volumeSpike and isBullBar and not trendConfirmedSpike ? high : na, "Volume Spike Bull Weak",
+         shape.triangleup, location.belowbar, 
+         color.new(highVolBullColor, 50),
+         size=size.tiny)
+
+// Volume Spike Bear - split into two for constant size
+plotshape(volumeSpike and isBearBar and trendConfirmedSpike ? low : na, "Volume Spike Bear Strong",
+         shape.triangledown, location.abovebar, 
+         color.new(highVolBearColor, 0),
+         size=size.small)
+
+plotshape(volumeSpike and isBearBar and not trendConfirmedSpike ? low : na, "Volume Spike Bear Weak",
+         shape.triangledown, location.abovebar, 
+         color.new(highVolBearColor, 50),
+         size=size.tiny)
+
+// Climax Volume - split into bull and bear for constant location
+plotshape(climaxVolume and isBullBar ? high : na, "Climax Volume Bull",
+         shape.diamond, location.belowbar,
+         color.new(color.yellow, 0), size=size.small)
+
+plotshape(climaxVolume and isBearBar ? low : na, "Climax Volume Bear",
+         shape.diamond, location.abovebar,
+         color.new(color.yellow, 0), size=size.small)
+
+// Volume Exhaustion - split into bull and bear for constant location
+volExhaustion = climaxVolume and ((isBullBar and close < close[1]) or (isBearBar and close > close[1]))
+plotshape(volExhaustion and isBullBar ? high : na, "Volume Exhaustion Bull",
+         shape.xcross, location.abovebar,
+         color.new(color.orange, 0), size=size.small)
+
+plotshape(volExhaustion and isBearBar ? low : na, "Volume Exhaustion Bear",
+         shape.xcross, location.belowbar,
+         color.new(color.orange, 0), size=size.small)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED INFORMATION TABLE
+// ────────────────────────────────────────────────────────────────────────────────
+
+var table infoTable = table.new(position.bottom_right, 2, 8,
+                                 bgcolor=color.new(color.black, 85),
+                                 frame_color=color.new(color.gray, 50),
+                                 frame_width=1,
+                                 border_width=1,
+                                 border_color=color.new(color.gray, 50))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Value", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 1, "Volume", text_color=color.white, text_size=size.small)
+    volStatus = isHighVol ? "HIGH" : "NORMAL"
+    volStatusColor = isHighVol ? color.new(color.yellow, 30) : color.new(color.gray, 70)
+    table.cell(infoTable, 1, 1, volStatus, bgcolor=volStatusColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 2, "Vol MA", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(volMA, format.volume), text_color=color.white, text_size=size.small)
+    
+    currentSession = inNYSession ? "NY" : inLondonSession ? "London" : inAsianSession ? "Asian" : "None"
+    sessionColor = inNYSession ? color.new(nyColor, 30) :
+                   inLondonSession ? color.new(londonColor, 30) :
+                   inAsianSession ? color.new(asianColor, 30) : color.new(color.gray, 70)
+    
+    table.cell(infoTable, 0, 3, "Session", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, currentSession, bgcolor=sessionColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 4, "Rel Vol", text_color=color.white, text_size=size.small)
+    relVol = volume / volMA
+    table.cell(infoTable, 1, 4, str.tostring(relVol, "#.##") + "x", text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 5, "Trend", text_color=color.white, text_size=size.small)
+    trendText = isBullBar ? "Bullish" : "Bearish"
+    trendColor = isBullBar ? color.new(vpBullColor, 30) : color.new(vpBearColor, 30)
+    table.cell(infoTable, 1, 5, trendText, bgcolor=trendColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 6, "Vol Delta", text_color=color.white, text_size=size.small)
+    deltaText = deltaRising ? "Rising" : "Falling"
+    deltaColor = deltaRising ? color.new(vpBullColor, 30) : color.new(vpBearColor, 30)
+    table.cell(infoTable, 1, 6, deltaText, bgcolor=deltaColor, text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 7, "Climax", text_color=color.white, text_size=size.small)
+    climaxText = climaxVolume ? "YES" : volExhaustion ? "EXHAUST" : "No"
+    climaxColor = climaxVolume ? color.new(color.yellow, 30) : 
+                  volExhaustion ? color.new(color.orange, 30) : color.new(color.gray, 70)
+    table.cell(infoTable, 1, 7, climaxText, bgcolor=climaxColor, text_color=color.white, text_size=size.small)
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ENHANCED ALERTS
+// ────────────────────────────────────────────────────────────────────────────────
+
+alertcondition(volumeSpike, "Volume Spike", "Volume spike detected")
+alertcondition(climaxVolume, "Climax Volume", "Climax volume detected - Potential reversal")
+alertcondition(volumeSpike and close > open and close > ta.ema(close, 20), "Bullish Volume Spike", "Strong bullish volume spike")
+alertcondition(volumeSpike and close < open and close < ta.ema(close, 20), "Bearish Volume Spike", "Strong bearish volume spike")
+alertcondition(inAsianSession and not inAsianSession[1], "Asian Session Start", "Asian session started")
+alertcondition(inLondonSession and not inLondonSession[1], "London Session Start", "London session started")
+alertcondition(inNYSession and not inNYSession[1], "NY Session Start", "NY session started")
+alertcondition(close > asianHigh and inLondonSession, "Asian High Breakout", "Price broke above Asian session high")
+alertcondition(close < asianLow and inLondonSession, "Asian Low Breakdown", "Price broke below Asian session low")
+alertcondition(volume > volMA * 3, "Extreme Volume", "Extreme volume detected - 3x average")
+alertcondition(isHighVol and isBullBar and close > high[1], "Bullish Breakout Volume", "Bullish breakout with high volume")
+alertcondition(isHighVol and isBearBar and close < low[1], "Bearish Breakdown Volume", "Bearish breakdown with high volume")

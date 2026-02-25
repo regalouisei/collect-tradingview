@@ -1,0 +1,250 @@
+//@version=5 
+indicator('Triple Stochastic RSI', 'TSRSI', overlay = false, precision = 2, max_lines_count = 500, max_labels_count = 500)
+
+// ===== Inputs (match your original defaults)
+kInput          = input.int(3,  'K',           minval = 1, maxval = 50)
+dInput          = input.int(3,  'D',           minval = 1, maxval = 50)
+rsiInput        = input.int(14, 'RSI',         minval = 1, maxval = 50)
+multiInput      = input.int(3,  '2nd Multi',   minval = 2, maxval = 50)
+multi2Input     = input.int(6,  '3rd Multi',   minval = 2, maxval = 50)
+overboughtInput = input.int(80, 'Overbought',  minval = 0, maxval = 100)
+oversoldInput   = input.int(20, 'Oversold',    minval = 0, maxval = 100)
+showStatsInput  = input.bool(true, 'Show Stats Overlay?')
+lookbackPeriod  = input.int(1000, 'Lookback Period', minval = 100, maxval = 5000)
+
+// ===== Colors 
+colSlowestK = color.rgb(255, 111, 0)  
+colSlowestD = color.rgb(201,  93,  16)  
+colSlowK    = color.rgb(230, 0, 255)  
+colSlowD    = color.rgb(158, 4, 185)  
+colFastK    = color.rgb(2, 244, 54, 14)  
+colFastD    = color.rgb(  0, 168,  87)  
+colMid      = color.rgb( 68,  68,  68)  
+colHL       = color.rgb(102, 102, 102)  
+fillSlowest = color.rgb(255, 106, 0, 75)
+fillSlow    = color.rgb(217, 4, 255, 75)
+fillFast    = color.rgb(2, 255, 133, 75)
+fillChan    = color.rgb(68, 68, 68, 100)
+
+// ===== StochRSI helper (0–100, no extra smoothing)
+stoch_rsi_0100(src, rsi_len, stoch_len) =>
+    r  = ta.rsi(src, rsi_len)
+    hi = ta.highest(r, stoch_len)
+    lo = ta.lowest(r,  stoch_len)
+    (r - lo) / math.max(hi - lo, 0.001) * 100
+
+// ===== Triple StochRSI with proper %K smoothing and consistent multipliers
+// Treat kInput as the %K smoothing length (classic Stoch flow).
+baseStochLen = rsiInput  // common pattern: Stoch window tracks RSI len
+
+// FAST lane
+rawFast = stoch_rsi_0100(close, rsiInput, baseStochLen)
+fastK   = ta.sma(rawFast, math.max(1, kInput))
+fastD   = ta.sma(fastK,   math.max(1, dInput))
+
+// SLOW lane (multiplied)
+rsiLen2   = rsiInput      * multiInput
+stochLen2 = baseStochLen  * multiInput
+kLen2     = math.max(1, kInput * multiInput)
+dLen2     = math.max(1, dInput * multiInput)
+
+rawSlow = stoch_rsi_0100(close, rsiLen2, stochLen2)
+slowK   = ta.sma(rawSlow, kLen2)
+slowD   = ta.sma(slowK,   dLen2)
+
+// SLOWEST lane (multiplied again)
+rsiLen3   = rsiInput      * multi2Input
+stochLen3 = baseStochLen  * multi2Input
+kLen3     = math.max(1, kInput * multi2Input)
+dLen3     = math.max(1, dInput * multi2Input)
+
+rawSlowest = stoch_rsi_0100(close, rsiLen3, stochLen3)
+slowestK   = ta.sma(rawSlowest, kLen3)
+slowestD   = ta.sma(slowestK,   dLen3)
+
+// ===== K vs D states
+fastTrendLong     = fastK > fastD
+fastTrendShort    = fastK < fastD
+slowTrendLong     = slowK > slowD
+slowTrendShort    = slowK < slowD
+slowestTrendLong  = slowestK > slowestD
+slowestTrendShort = slowestK < slowestD
+
+// ===== Trend states (midline)
+fastTrendBullish     = fastK >= 51
+fastTrendBearish     = fastK <= 49
+slowTrendBullish     = slowK >= 51
+slowTrendBearish     = slowK <= 49
+slowestTrendBullish  = slowestK >= 51
+slowestTrendBearish  = slowestK <= 49
+
+// ===== Store booleans per bar for streak stats (both above & below 50)
+var fastAbove = array.new_bool()
+var fastBelow = array.new_bool()
+var slowAbove = array.new_bool()
+var slowBelow = array.new_bool()
+var slstAbove = array.new_bool()
+var slstBelow = array.new_bool()
+
+array.push(fastAbove, fastK > 50)
+array.push(fastBelow, fastK < 50)
+array.push(slowAbove, slowK > 50)
+array.push(slowBelow, slowK < 50)
+array.push(slstAbove, slowestK > 50)
+array.push(slstBelow, slowestK < 50)
+
+// Keep arrays bounded
+if array.size(fastAbove) > lookbackPeriod
+    array.shift(fastAbove), array.shift(fastBelow), array.shift(slowAbove), array.shift(slowBelow), array.shift(slstAbove), array.shift(slstBelow)
+
+// ===== Streak helpers
+avgStreakLen(arr) =>
+    sz = array.size(arr)
+    streaks = array.new_float()
+    curr = 0.0
+    if sz > 0
+        for i = 0 to sz - 1
+            v = array.get(arr, i)
+            if v
+                curr += 1
+            else if curr > 0
+                array.push(streaks, curr)
+                curr := 0
+        if curr > 0
+            array.push(streaks, curr)
+    total = 0.0
+    cnt = array.size(streaks)
+    if cnt > 0
+        for j = 0 to cnt - 1
+            total += array.get(streaks, j)
+        total / cnt
+    else
+        0.0
+
+currStreakLen(arr) =>
+    sz = array.size(arr)
+    c = 0
+    if sz > 0
+        for i = 0 to sz - 1
+            idx = sz - 1 - i
+            v = array.get(arr, idx)
+            if v
+                c += 1
+            else
+                break
+    c
+
+// ===== Compute stats on last bar
+var fastAboveMid = 0.0, fastBelowMid = 0.0
+var slowAboveMid = 0.0, slowBelowMid = 0.0
+var slstAboveMid = 0.0, slstBelowMid = 0.0
+var currentFastAboveMid = 0, currentFastBelowMid = 0
+var currentSlowAboveMid = 0, currentSlowBelowMid = 0
+var currentSlstAboveMid = 0, currentSlstBelowMid = 0
+
+if barstate.islast
+    fastAboveMid := avgStreakLen(fastAbove)
+    fastBelowMid := avgStreakLen(fastBelow)
+    slowAboveMid := avgStreakLen(slowAbove)
+    slowBelowMid := avgStreakLen(slowBelow)
+    slstAboveMid := avgStreakLen(slstAbove)
+    slstBelowMid := avgStreakLen(slstBelow)
+
+    currentFastAboveMid := currStreakLen(fastAbove)
+    currentFastBelowMid := currStreakLen(fastBelow)
+    currentSlowAboveMid := currStreakLen(slowAbove)
+    currentSlowBelowMid := currStreakLen(slowBelow)
+    currentSlstAboveMid := currStreakLen(slstAbove)
+    currentSlstBelowMid := currStreakLen(slstBelow)
+
+// ===== Sentiment
+sentiment = slowK > 50 and slowestK > 50 ? (fastK < oversoldInput ? "Bullish Sentiment, Buy Zone" : "Bullish Sentiment") : slowK < 50 and slowestK < 50 ? (fastK > overboughtInput ? "Bearish Sentiment, Sell Zone" : "Bearish Sentiment") : "Neutral Sentiment"
+
+// ===== “At/Over average” flags (valid on last bar)
+fastAboveAvgSignal    = barstate.islast and (fastK    > 50) and (currentFastAboveMid >= fastAboveMid)
+fastBelowAvgSignal    = barstate.islast and (fastK    < 50) and (currentFastBelowMid >= fastBelowMid)
+slowAboveAvgSignal    = barstate.islast and (slowK    > 50) and (currentSlowAboveMid >= slowAboveMid)
+slowBelowAvgSignal    = barstate.islast and (slowK    < 50) and (currentSlowBelowMid >= slowBelowMid)
+slowestAboveAvgSignal = barstate.islast and (slowestK > 50) and (currentSlstAboveMid >= slstAboveMid)
+slowestBelowAvgSignal = barstate.islast and (slowestK < 50) and (currentSlstBelowMid >= slstBelowMid)
+
+
+// ===== Plots (use returned plot IDs so we can fill without duplicate plots)
+p_slk = plot(slowestK, 'Slowest K', colSlowestK, 2)
+p_sld = plot(slowestD, 'Slowest D', colSlowestD)
+p_sk  = plot(slowK,    'Slow K',    colSlowK,    2)
+p_sd  = plot(slowD,    'Slow D',    colSlowD)
+p_fk  = plot(fastK,    'Fast K',    colFastK,    2)
+p_fd  = plot(fastD,    'Fast D',    colFastD)
+
+// ===== Fills (reuse the *visible* plot IDs above)
+fill(p_slk, p_sld, fillSlowest, 'Slowest Fill')
+fill(p_sk,  p_sd,  fillSlow,    'Slow Fill')
+fill(p_fk,  p_fd,  fillFast,    'Fast Fill')
+
+// ===== Levels + Channel Fill
+p_ob = plot(overboughtInput * 1.0, 'Overbought', colHL)
+plot(50.0, 'Mid', colMid)
+p_os = plot(oversoldInput   * 1.0, 'Oversold',   colHL)
+fill(p_ob, p_os, fillChan, 'Channel Fill')
+
+// ===== Stats Table 
+if showStatsInput
+    var table stats = table.new(position.top_right, 3, 6, bgcolor = color.new(color.black, 90), border_width = 1)
+    if barstate.islast
+        // Row 0: Header (center cell only; others blank)
+        table.cell(stats, 0, 0, '',                text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 1, 0, 'Stochastic Mid Stats', text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 0, '',                text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+
+        // Row 1: Column headers
+        table.cell(stats, 0, 1, 'Stoch',            text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+        table.cell(stats, 1, 1, 'Current',          text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 1, 'Avg ▲ / Avg ▼',    text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+
+        // Row 2: Fast
+        table.cell(stats, 0, 2, 'Fast', text_color = colFastK, text_size = size.small, text_halign = text.align_left)
+        table.cell(stats, 1, 2, str.tostring(currentFastAboveMid > 0 ? currentFastAboveMid : currentFastBelowMid) + (currentFastAboveMid > 0 ? ' ▲' : ' ▼'), text_color = colFastK, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 2, str.tostring(math.round(fastAboveMid)) + ' ▲ / ' + str.tostring(math.round(fastBelowMid)) + ' ▼', text_color = colFastK, text_size = size.small, text_halign = text.align_center)
+
+        // Row 3: Slow
+        table.cell(stats, 0, 3, 'Slow', text_color = colSlowK, text_size = size.small, text_halign = text.align_left)
+        table.cell(stats, 1, 3, str.tostring(currentSlowAboveMid > 0 ? currentSlowAboveMid : currentSlowBelowMid) + (currentSlowAboveMid > 0 ? ' ▲' : ' ▼'), text_color = colSlowK, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 3, str.tostring(math.round(slowAboveMid)) + ' ▲ / ' + str.tostring(math.round(slowBelowMid)) + ' ▼', text_color = colSlowK, text_size = size.small, text_halign = text.align_center)
+
+        // Row 4: Slowest
+        table.cell(stats, 0, 4, 'Slowest', text_color = colSlowestK, text_size = size.small, text_halign = text.align_left)
+        table.cell(stats, 1, 4, str.tostring(currentSlstAboveMid > 0 ? currentSlstAboveMid : currentSlstBelowMid) + (currentSlstAboveMid > 0 ? ' ▲' : ' ▼'), text_color = colSlowestK, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 4, str.tostring(math.round(slstAboveMid)) + ' ▲ / ' + str.tostring(math.round(slstBelowMid)) + ' ▼', text_color = colSlowestK, text_size = size.small, text_halign = text.align_center)
+
+        // Row 5: Sentiment (center cell only)
+        table.cell(stats, 0, 5, '', text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 1, 5, (slowK > 50 and slowestK > 50 ? (fastK < oversoldInput ? "Bullish Sentiment, Buy Zone" : "Bullish Sentiment") : slowK < 50 and slowestK < 50 ? (fastK > overboughtInput ? "Bearish Sentiment, Sell Zone" : "Bearish Sentiment") : "Neutral Sentiment"), text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+        table.cell(stats, 2, 5, '', text_color = chart.fg_color, text_size = size.small, text_halign = text.align_center)
+
+
+// === K/D cross signals in OB/OS for 2nd (Slow) & 3rd (Slowest) lanes
+
+crossUpSlowOS   = ta.crossover(slowK, slowD)      and (slowK     < oversoldInput and slowD     < oversoldInput)
+crossDownSlowOB = ta.crossunder(slowK, slowD)     and (slowK     > overboughtInput and slowD   > overboughtInput)
+
+crossUpSlstOS   = ta.crossover(slowestK, slowestD)  and (slowestK < oversoldInput and slowestD < oversoldInput)
+crossDownSlstOB = ta.crossunder(slowestK, slowestD) and (slowestK > overboughtInput and slowestD > overboughtInput)
+
+// Plotted Signal Circles (Only Slow and Slowest K/D)
+
+// 2nd multi (Slow) 
+plot(series = crossUpSlowOS   ? -5  : na, title = 'Slow OS Cross-Up',   color = colSlowK,    linewidth = 3, style = plot.style_circles)
+plot(series = crossDownSlowOB ? 105 : na, title = 'Slow OB Cross-Down', color = colSlowK,    linewidth = 3, style = plot.style_circles)
+
+// 3rd multi (Slowest)
+plot(series = crossUpSlstOS   ? -5  : na, title = 'Slowest OS Cross-Up',   color = colSlowestK, linewidth = 3, style = plot.style_circles)
+plot(series = crossDownSlstOB ? 105 : na, title = 'Slowest OB Cross-Down', color = colSlowestK, linewidth = 3, style = plot.style_circles)
+
+// Alerts 
+
+alertcondition(crossUpSlowOS, 'Slow OS Cross-Up Alert', 'Slow Stoch crossover in oversold zone')
+alertcondition(crossDownSlowOB, 'Slow OB Cross-Down Alert', 'Slow Stoch crossunder in overbought zone')
+
+alertcondition(crossUpSlstOS, 'Slowest OS Cross-Up Alert', 'Slowest Stoch crossover in oversold zone')
+alertcondition(crossDownSlstOB, 'Slowest OB Cross-Down Alert', 'Slowest Stoch crossunder in overbought zone')

@@ -1,0 +1,286 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+//@version=6
+strategy("Squared9 Pro v1", overlay=true, max_labels_count=500,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=2,
+     commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ────────────────────────────────────────────────
+// Inputs – Organized with groups & inline
+// ────────────────────────────────────────────────
+
+// === General & Display ===
+pivotLeftRight     = input.int(10,    "Pivot Lookback (Left/Right)", minval=3, group="General & Display")
+proximityPct       = input.float(1.75, "Gann Proximity Tolerance (%)", minval=0.1, step=0.1, group="General & Display")
+
+useCardinal        = input.bool(true,  "Use Cardinal Levels",     inline="CardOrd", group="General & Display")
+useOrdinal         = input.bool(true,  "Use Ordinal Levels",     inline="CardOrd", group="General & Display")
+plotCardinal       = input.bool(true,  "Plot Cardinal Levels",   inline="Plot",    group="General & Display")
+plotOrdinal        = input.bool(true,  "Plot Ordinal Levels",    inline="Plot",    group="General & Display")
+
+htf                = input.timeframe("240", "Higher Timeframe Filter", group="General & Display")
+htfEmaLen          = input.int(50,    "HTF EMA Length", group="General & Display")
+
+// === Core Indicators ===
+stochLen           = input.int(200,   "Stochastic Length",       inline="StochSmooth", group="Core Indicators")
+smoothK            = input.int(62,    "Stoch %K Smoothing",      inline="StochSmooth", group="Core Indicators")
+smoothD            = input.int(13,    "Stoch %D Smoothing",      group="Core Indicators")
+
+macdFast           = input.int(12,    "MACD Fast",    inline="MACD", group="Core Indicators")
+macdSlow           = input.int(26,    "MACD Slow",    inline="MACD", group="Core Indicators")
+macdSignal         = input.int(9,     "MACD Signal",  inline="MACD", group="Core Indicators")
+
+// === Signal Filters ===
+useGannProximity   = input.bool(true,  "Require Gann Proximity",           group="Signal Filters")
+useDivergence      = input.bool(true,  "Require Divergence (Stoch or MACD)", group="Signal Filters")
+useStrongCandle    = input.bool(true,  "Require Strong Candle Body",       group="Signal Filters")
+useHTFAlignment    = input.bool(true,  "Require HTF Trend Alignment",      group="Signal Filters")
+useFallbackDiv     = input.bool(true,  "Fallback: Oversold/Overbought when no pivot div", group="Signal Filters")
+
+divLookback        = input.int(8,     "Divergence Swing Lookback", group="Signal Filters")
+candleBodyRatio    = input.float(0.5, "Min Candle Body Ratio (0.1–1.0)", minval=0.1, maxval=1.0, step=0.05, group="Signal Filters")
+minPivotRangeMult  = input.float(0.5, "Min Pivot Range × ATR (for anchor update)", group="Signal Filters")
+
+// === Risk & Position Management ===
+atrLength          = input.int(14,    "ATR Length", minval=5, group="Risk & Position Management")
+
+atrMultSL          = input.float(1.7, "ATR Multiplier – Stop Loss",   minval=0.5, step=0.1, inline="SLTP", group="Risk & Position Management")
+atrMultTP          = input.float(3.2, "ATR Multiplier – Take Profit", minval=1.0, step=0.1, inline="SLTP", group="Risk & Position Management")
+
+useFixedSLTP       = input.bool(true, "Use Fixed ATR SL/TP (disable for trailing only)", group="Risk & Position Management")
+useTrailingStop    = input.bool(false,"Enable Trailing Stop", group="Risk & Position Management")
+trailMult          = input.float(2.5, "Trailing ATR Multiplier", minval=1.0, step=0.1, group="Risk & Position Management")
+
+// === Alerts & Misc ===
+showAlerts         = input.bool(true,  "Create Alert Conditions", group="Alerts & Misc")
+
+// ────────────────────────────────────────────────
+// Calculations
+// ────────────────────────────────────────────────
+htfEma   = request.security(syminfo.tickerid, htf, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+htfBull  = close > htfEma
+htfBear  = close < htfEma
+
+k  = ta.stoch(close, high, low, stochLen)
+d  = ta.sma(k, smoothK)
+d2 = ta.sma(d, smoothD)
+
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+atrVal = ta.atr(atrLength)
+
+pivotLow  = ta.pivotlow(low,  pivotLeftRight, pivotLeftRight)
+pivotHigh = ta.pivothigh(high, pivotLeftRight, pivotLeftRight)
+
+var float lastPivotLow  = na
+var float lastPivotHigh = na
+
+// Improved pivot filter: check range on the actual pivot bar
+if not na(pivotLow) and (high[pivotLeftRight] - low[pivotLeftRight]) > atrVal[pivotLeftRight] * minPivotRangeMult
+    lastPivotLow := pivotLow
+
+if not na(pivotHigh) and (high[pivotLeftRight] - low[pivotLeftRight]) > atrVal[pivotLeftRight] * minPivotRangeMult
+    lastPivotHigh := pivotHigh
+
+float midPoint = na(lastPivotLow) or na(lastPivotHigh) ? na : (lastPivotLow + lastPivotHigh) / 2
+bool useHighAsAnchor = not na(midPoint) and close < midPoint
+float anchorPrice = useHighAsAnchor ? lastPivotHigh : lastPivotLow
+
+var float[] gannLevels = array.new_float(0)
+
+float gann45   = na
+float gann90   = na
+float gann135  = na
+float gann180  = na
+float gann225  = na
+float gann270  = na
+float gann315  = na
+float gann360  = na
+
+if not na(anchorPrice) and anchorPrice > 0
+    float sqrtAnchor = math.sqrt(anchorPrice)
+    int direction = useHighAsAnchor ? -1 : 1
+    
+    gann45   := math.pow(sqrtAnchor + direction * 0.125, 2)
+    gann90   := math.pow(sqrtAnchor + direction * 0.25,  2)
+    gann135  := math.pow(sqrtAnchor + direction * 0.375, 2)
+    gann180  := math.pow(sqrtAnchor + direction * 0.5,   2)
+    gann225  := math.pow(sqrtAnchor + direction * 0.625, 2)
+    gann270  := math.pow(sqrtAnchor + direction * 0.75,  2)
+    gann315  := math.pow(sqrtAnchor + direction * 0.875, 2)
+    gann360  := math.pow(sqrtAnchor + direction * 1.0,   2)
+
+array.clear(gannLevels)
+if useCardinal
+    array.push(gannLevels, gann90)
+    array.push(gannLevels, gann180)
+    array.push(gannLevels, gann270)
+    array.push(gannLevels, gann360)
+if useOrdinal
+    array.push(gannLevels, gann45)
+    array.push(gannLevels, gann135)
+    array.push(gannLevels, gann225)
+    array.push(gannLevels, gann315)
+
+bool nearGann = false
+for i = 0 to array.size(gannLevels) - 1
+    float lvl = array.get(gannLevels, i)
+    if not na(lvl) and math.abs(close - lvl) <= close * (proximityPct / 100)
+        nearGann := true
+
+// ────────────────────────────────────────────────
+// Divergence Detection (Improved)
+// ────────────────────────────────────────────────
+stochLow  = ta.pivotlow(d2, divLookback, divLookback)
+stochHigh = ta.pivothigh(d2, divLookback, divLookback)
+
+priceLow  = ta.pivotlow(low, divLookback, divLookback)
+priceHigh = ta.pivothigh(high, divLookback, divLookback)
+
+// Track approximate previous swing points
+var float prevPriceLow  = na
+var float prevPriceHigh = na
+var float prevStochLow  = na
+var float prevStochHigh = na
+var float prevHistLow   = na
+var float prevHistHigh  = na
+
+if not na(priceLow)
+    prevPriceLow  := priceLow[divLookback * 2]
+    prevStochLow  := d2[divLookback * 2]
+if not na(priceHigh)
+    prevPriceHigh := priceHigh[divLookback * 2]
+    prevStochHigh := d2[divLookback * 2]
+
+histLow  = ta.pivotlow(hist, divLookback, divLookback)
+histHigh = ta.pivothigh(hist, divLookback, divLookback)
+
+if not na(histLow)
+    prevHistLow  := hist[divLookback * 2]
+if not na(histHigh)
+    prevHistHigh := hist[divLookback * 2]
+
+// Bullish
+bool stochBullDiv = not na(priceLow) and not na(stochLow) and
+   priceLow < prevPriceLow and
+   stochLow > prevStochLow and
+   stochLow < 40
+
+bool macdBullDiv  = not na(histLow) and not na(priceLow) and
+   histLow > prevHistLow and
+   priceLow < prevPriceLow and
+   histLow < 0
+
+bool fallbackBullDiv = d2 < 35
+
+// Bearish
+bool stochBearDiv = not na(priceHigh) and not na(stochHigh) and
+   priceHigh > prevPriceHigh and
+   stochHigh < prevStochHigh and
+   stochHigh > 60
+
+bool macdBearDiv  = not na(histHigh) and not na(priceHigh) and
+   histHigh < prevHistHigh and
+   priceHigh > prevPriceHigh and
+   histHigh > 0
+
+bool fallbackBearDiv = d2 > 65
+
+bool hasBullDiv  = (stochBullDiv or macdBullDiv or (useFallbackDiv and fallbackBullDiv))
+bool hasBearDiv  = (stochBearDiv or macdBearDiv or (useFallbackDiv and fallbackBearDiv))
+
+bullCandle = close > open and (close - open) >= (high - low) * candleBodyRatio
+bearCandle = close < open and (open - close) >= (high - low) * candleBodyRatio
+
+bool gannOk       = not useGannProximity or nearGann
+bool divOkBull    = not useDivergence or hasBullDiv
+bool candleOkBull = not useStrongCandle or bullCandle
+bool htfOkBull    = not useHTFAlignment or htfBull
+
+bool longSignal  = gannOk and divOkBull and candleOkBull and htfOkBull
+
+bool gannOkShort   = not useGannProximity or nearGann
+bool divOkBear     = not useDivergence or hasBearDiv
+bool candleOkBear  = not useStrongCandle or bearCandle
+bool htfOkBear     = not useHTFAlignment or htfBear
+
+bool shortSignal = gannOkShort and divOkBear and candleOkBear and htfOkBear
+
+// ────────────────────────────────────────────────
+// Strategy Entries & Exits
+// ────────────────────────────────────────────────
+var float entryPrice = na
+var float entryATR   = na
+
+// Entries
+if longSignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+    entryPrice := close
+    entryATR   := atrVal
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+    entryPrice := close
+    entryATR   := atrVal
+
+// Exits – Long
+if strategy.position_size > 0
+    float slLong  = useFixedSLTP ? (entryPrice - entryATR * atrMultSL) : na
+    float tpLong  = useFixedSLTP ? (entryPrice + entryATR * atrMultTP) : na
+    int   trailDist = useTrailingStop ? math.round(atrVal * trailMult / syminfo.mintick) : na
+    
+    strategy.exit("Exit Long", from_entry="Long",
+         stop         = slLong,
+         limit        = tpLong,
+         trail_points = trailDist,
+         trail_offset = trailDist)
+
+// Exits – Short
+if strategy.position_size < 0
+    float slShort = useFixedSLTP ? (entryPrice + entryATR * atrMultSL) : na
+    float tpShort = useFixedSLTP ? (entryPrice - entryATR * atrMultTP) : na
+    int   trailDist = useTrailingStop ? math.round(atrVal * trailMult / syminfo.mintick) : na
+    
+    strategy.exit("Exit Short", from_entry="Short",
+         stop         = slShort,
+         limit        = tpShort,
+         trail_points = trailDist,
+         trail_offset = trailDist)
+
+// ────────────────────────────────────────────────
+// Visuals
+// ────────────────────────────────────────────────
+plotshape(longSignal,  "LONG",  style=shape.triangleup,   location=location.belowbar, color=color.lime,   size=size.normal)
+plotshape(shortSignal, "SHORT", style=shape.triangledown, location=location.abovebar, color=color.red,    size=size.normal)
+
+bgcolor(longSignal ? color.new(color.green, 88) : shortSignal ? color.new(color.red, 88) : na)
+
+// Gann plots...
+plot(gann90,   title="Gann 90°",   color = longSignal or shortSignal ? color.orange : color.new(color.orange, 70), linewidth=2)
+plot(gann180,  title="Gann 180°",  color = longSignal or shortSignal ? color.new(#00d4d4, 0) : color.new(#00d4d4, 80), linewidth=3)
+plot(gann270,  title="Gann 270°",  color = longSignal or shortSignal ? color.blue : color.new(color.blue, 80), linewidth=2)
+plot(gann360,  title="Gann 360°",  color = longSignal or shortSignal ? color.yellow : color.new(color.yellow, 80), linewidth=2)
+
+// Ordinal plots (conditional display)
+plot(gann45,   title="45°",  color=color.fuchsia, style=plot.style_circles, linewidth=1, display=plotOrdinal?display.all:display.none)
+plot(gann135,  title="135°", color=color.purple,  style=plot.style_circles, linewidth=1, display=plotOrdinal?display.all:display.none)
+plot(gann225,  title="225°", color=color.teal,    style=plot.style_circles, linewidth=1, display=plotOrdinal?display.all:display.none)
+plot(gann315,  title="315°", color=color.aqua,    style=plot.style_circles, linewidth=1, display=plotOrdinal?display.all:display.none)
+
+// Anchor debug label
+if barstate.islast and not na(anchorPrice)
+    label.new(bar_index, high, "Anchor: " + str.tostring(anchorPrice, "#.##") + (useHighAsAnchor ? " (High)" : " (Low)"), 
+              style=label.style_label_down, color=color.gray, textcolor=color.white, size=size.small)
+
+// ────────────────────────────────────────────────
+// Alerts
+// ────────────────────────────────────────────────
+alertcondition(showAlerts and longSignal,
+     title   = "Squared9 Pro",
+     message = "Squared9 Pro LONG @ {{close}} | Price: {{close}}, Anchor: {{plot_0}}"
+     )
+
+alertcondition(showAlerts and shortSignal,
+     title   = "Squared9 Pro",
+     message = "Squared9 Pro SHORT @ {{close}} | Price: {{close}}, Anchor: {{plot_0}}"
+     )

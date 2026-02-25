@@ -1,0 +1,177 @@
+//@version=5
+indicator("DCA + VA (Value Averaging) | UA version", shorttitle="DCA+VA | UA", overlay=false, max_labels_count=500)
+
+//=============================
+// Inputs (Ukrainian UI)
+//=============================
+groupVis="Візуалізація"
+lineMode=input.string("Капітал+Кеш","Лінія показує",options=["Капітал+Кеш","Лише капітал"],group=groupVis)
+showTable=input.bool(true,"Показати таблицю",group=groupVis)
+showRightLabels=input.bool(true,"Показати підписи справа",group=groupVis)
+showDots=input.bool(true,"Показати точки угод",group=groupVis)
+
+groupStart="Старт"
+startDate=input.time(timestamp("2015-01-01T00:00:00"),"Старт з дати",group=groupStart)
+
+groupDCA="DCA (класичний)"
+dcaFreq=input.string("Тиждень","Як часто інвестуємо",options=["Тиждень","Місяць","Півроку","Рік"],group=groupDCA)
+dcaAmount=input.float(250.0,"Сума інвестиції ($)",group=groupDCA,minval=0.0)
+
+groupVA="VA (Value Averaging)"
+vaFreq=input.string("Тиждень","Як часто інвестуємо (робимо VA крок)",options=["Тиждень","Місяць","Півроку","Рік"],group=groupVA)
+vaDeposit=input.float(250.0,"Регулярне поповнення ($)",group=groupVA,minval=0.0)
+vaCagr=input.float(12.0,"Цільова дохідність на рік (%)",group=groupVA,minval=0.0,step=0.1,tooltip="Ціль VA застосовується до інвестованої частини (вартість активів). На кожному VA кроці ціль оновлюється як: Ціль = ПопередняЦіль*(1+g) + Регулярне поповнення, де g=(1+річна)^(1/N)-1, N=52/12/2/1 залежно від частоти.")
+vaSellExcess=input.bool(true,"Продаємо зайве, якщо потрібно",group=groupVA,tooltip="Якщо інвестована частина вище цілі, продаємо до цілі (переводимо різницю в кеш).")
+vaAddExtra=input.bool(true,"Готові докладати додатково на просадках",group=groupVA,tooltip="Якщо кешу не вистачає, можемо докласти додатково, щоб наблизитись до цілі.")
+vaMaxExtra=input.float(0.0,"Макс. докласти за період ($, 0=без ліміту)",group=groupVA,minval=0.0)
+vaUseTax=input.bool(false,"Враховувати податок на продаж",group=groupVA)
+vaTaxRate=input.float(19.0,"Податок на прибуток (%)",group=groupVA,minval=0.0,step=0.1)
+
+//=============================
+// Period triggers (calendar-bound)
+//=============================
+isW=ta.change(time("W"))
+isM=ta.change(time("M"))
+m=month(time)
+isHY=isM and (m==1 or m==7)
+isY=isM and (m==1)
+
+inRange=time>=startDate
+firstBar=inRange and not inRange[1]
+
+dcaPeriod=dcaFreq=="Тиждень"?isW:dcaFreq=="Місяць"?isM:dcaFreq=="Півроку"?isHY:isY
+vaPeriod=vaFreq=="Тиждень"?isW:vaFreq=="Місяць"?isM:vaFreq=="Півроку"?isHY:isY
+
+dcaEvent=firstBar or (inRange and dcaPeriod)
+vaEvent=firstBar or (inRange and vaPeriod)
+
+//=============================
+// DCA state
+//=============================
+var float dcaCash=0.0
+var float dcaAccum=0.0
+var float dcaCost=0.0
+var float dcaShares=0.0
+var bool dcaDidBuy=false
+dcaDidBuy:=false
+
+if dcaEvent and dcaAmount>0
+    dcaCash+=dcaAmount
+    dcaAccum+=dcaAmount
+    float spend=math.min(dcaCash,dcaAmount)
+    if spend>0
+        dcaCash-=spend
+        dcaCost+=spend
+        dcaShares+=spend/close
+        dcaDidBuy:=true
+
+//=============================
+// VA state
+//=============================
+var float vaCash=0.0
+var float vaAccum=0.0
+var float vaCost=0.0
+var float vaShares=0.0
+var float vaTarget=0.0
+var bool vaDidBuy=false
+var bool vaDidSell=false
+vaDidBuy:=false
+vaDidSell:=false
+
+vaN=vaFreq=="Тиждень"?52.0:vaFreq=="Місяць"?12.0:vaFreq=="Півроку"?2.0:1.0
+vaG=math.pow(1.0+vaCagr/100.0,1.0/vaN)-1.0
+
+if vaEvent and vaDeposit>0
+    vaCash+=vaDeposit
+    vaAccum+=vaDeposit
+    vaTarget:=(vaTarget*(1.0+vaG))+vaDeposit
+
+if vaEvent and vaTarget>0
+    float holdings=vaShares*close
+    float diff=vaTarget-holdings
+    if diff>0
+        float need=diff
+        if vaAddExtra and need>vaCash
+            float req=need-vaCash
+            float extra=vaMaxExtra>0?math.min(req,vaMaxExtra):req
+            if extra>0
+                vaCash+=extra
+                vaAccum+=extra
+        float spend=math.min(vaCash,need)
+        if spend>0
+            vaCash-=spend
+            vaCost+=spend
+            vaShares+=spend/close
+            vaDidBuy:=true
+    if diff<0 and vaSellExcess and vaShares>0
+        float sellAmt=math.min(-diff,holdings)
+        float sharesToSell=sellAmt/close
+        float portionCost=vaCost*(sharesToSell/vaShares)
+        float profit=sellAmt-portionCost
+        float tax=(vaUseTax and profit>0)?profit*(vaTaxRate/100.0):0.0
+        float proceeds=sellAmt-tax
+        vaCash+=proceeds
+        vaCost-=portionCost
+        vaShares-=sharesToSell
+        if vaShares<=0
+            vaShares:=0
+            vaCost:=0
+        vaDidSell:=true
+
+//=============================
+// Series (line mode)
+//=============================
+includeCash=lineMode=="Капітал+Кеш"
+dcaHold=dcaShares*close
+vaHold=vaShares*close
+dcaLine=includeCash?(dcaHold+dcaCash):dcaHold
+vaLine=includeCash?(vaHold+vaCash):vaHold
+dcaProfitPct=dcaAccum>0?(dcaLine/dcaAccum-1.0)*100.0:na
+vaProfitPct=vaAccum>0?(vaLine/vaAccum-1.0)*100.0:na
+
+//=============================
+// Plots (yellow thick lines + dots)
+//=============================
+plot(dcaLine,"DCA",color=color.new(color.yellow,0),linewidth=3)
+plot(vaLine,"VA",color=color.new(color.yellow,50),linewidth=3)
+plot(showDots and dcaDidBuy?dcaLine:na,"DCA купівлі",color=color.new(color.lime,0),linewidth=2,style=plot.style_circles)
+plot(showDots and vaDidBuy?vaLine:na,"VA купівлі",color=color.new(color.lime,0),linewidth=2,style=plot.style_circles)
+plot(showDots and vaDidSell?vaLine:na,"VA продажі",color=color.new(color.red,0),linewidth=2,style=plot.style_circles)
+
+//=============================
+// Table (Ukrainian, rounded dollars)
+//=============================
+tableColor = color.new(color.gray, 5)
+var table t=table.new(position.middle_left,3,6, frame_color = tableColor, frame_width = 3)
+if barstate.islast and showTable
+    table.cell(t,0,0,"Показник", text_color = tableColor, text_size = size.auto)
+    table.cell(t,1,0,"DCA", text_color = tableColor)
+    table.cell(t,2,0,"VA", text_color = tableColor)
+    table.cell(t,0,1,"Накопичено", text_color = tableColor)
+    table.cell(t,1,1,"$"+str.tostring(math.round(dcaAccum)), text_color = tableColor)
+    table.cell(t,2,1,"$"+str.tostring(math.round(vaAccum)), text_color = tableColor)
+    table.cell(t,0,2,"Інвестовано", text_color = tableColor)
+    table.cell(t,1,2,"$"+str.tostring(math.round(dcaCost)), text_color = tableColor)
+    table.cell(t,2,2,"$"+str.tostring(math.round(vaCost)), text_color = tableColor)
+    table.cell(t,0,3,"Кеш", text_color = tableColor)
+    table.cell(t,1,3,"$"+str.tostring(math.round(dcaCash)), text_color = tableColor)
+    table.cell(t,2,3,"$"+str.tostring(math.round(vaCash)), text_color = tableColor)
+    table.cell(t,0,4,"Капітал", text_color = tableColor)
+    table.cell(t,1,4,"$"+str.tostring(math.round(dcaLine)), text_color = tableColor)
+    table.cell(t,2,4,"$"+str.tostring(math.round(vaLine)), text_color = tableColor)
+    table.cell(t,0,5,"Прибуток %", text_color = tableColor)
+    table.cell(t,1,5,(na(dcaProfitPct)?"n/a":str.tostring(dcaProfitPct,format.mintick)+"%"), text_color = tableColor)
+    table.cell(t,2,5,(na(vaProfitPct)?"n/a":str.tostring(vaProfitPct,format.mintick)+"%"), text_color = tableColor)
+
+//=============================
+// Right-side labels (rounded dollars)
+//=============================
+var label dLbl=na
+var label vLbl=na
+if barstate.islast and showRightLabels
+    if not na(dLbl)
+        label.delete(dLbl)
+    if not na(vLbl)
+        label.delete(vLbl)
+    dLbl:=label.new(bar_index,dcaLine,"DCA: $"+str.tostring(math.round(dcaLine)),style=label.style_label_left,color=color.new(color.yellow,0),textcolor=color.black)
+    vLbl:=label.new(bar_index,vaLine,"VA: $"+str.tostring(math.round(vaLine)),style=label.style_label_left,color=color.new(color.yellow,50),textcolor=color.black)

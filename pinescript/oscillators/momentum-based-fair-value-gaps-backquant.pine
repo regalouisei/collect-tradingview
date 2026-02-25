@@ -1,0 +1,385 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator(
+ title="Momentum-Based Fair Value Gaps [BackQuant]",
+ shorttitle="Mom-FVGs [BackQuant]",
+ overlay=true,
+ max_boxes_count=500,
+ max_labels_count=500
+ )
+
+// User Inputs
+const string grpFVG = "Fair Value Gap Settings"
+const string grpMomentum = "Momentum Settings"
+const string grpVis = "Visual Settings"
+const string grpFilter = "Filters"
+
+// FVG Settings
+int fvgLookback = input.int(15, "Max FVG Display", minval=5, maxval=200, step=1, group=grpFVG, tooltip="Maximum number of FVG zones to keep on chart. Older zones are dropped first for performance.")
+bool showBullFVG = input.bool(true, "Show Bullish FVGs", group=grpFVG, tooltip="Toggle display of bullish gaps (low[0] > high[2]).")
+bool showBearFVG = input.bool(true, "Show Bearish FVGs", group=grpFVG, tooltip="Toggle display of bearish gaps (high[0] < low[2]).")
+bool extendFVG = input.bool(true, "Extend Unfilled FVGs", group=grpFVG, tooltip="Keep drawing the right edge of an unfilled FVG to the current bar.")
+bool autoRemoveFilled = input.bool(true, "Remove Filled FVGs", group=grpFVG, tooltip="Automatically delete an FVG once price fully fills it.")
+
+// Momentum Settings
+int rsiLength = input.int(14, "RSI Length", minval=2, maxval=100, step=1, group=grpMomentum, tooltip="RSI lookback length applied to the chosen source.")
+int rsiSmooth = input.int(3, "RSI Smoothing", minval=1, maxval=20, step=1, group=grpMomentum, tooltip="Simple moving average applied to RSI for steadier coloring.")
+string rsiSource = input.string("Returns", "RSI Source", ["Returns", "Close", "Volume"], group=grpMomentum, tooltip="Returns uses % change over the Momentum Lookback. Close uses price. Volume uses raw volume.")
+int momentumLookback = input.int(5, "Momentum Lookback", minval=1, maxval=50, step=1, group=grpMomentum, tooltip="Bars used to compute % returns when RSI Source = Returns.")
+
+// UI Settings
+string heatmapStyle = input.string("Palette", "Heatmap Style", ["Gradient","Discrete","Simple","Palette"], group=grpVis,tooltip="Gradient blends colors by RSI, Discrete uses bins, Simple uses two-tone above/below 50.")
+string paletteName = input.string("Jet", "Palette Name", ["Viridis","Plasma","Inferno","Magma","Cividis","Turbo","Jet","Red-Green","Blue-White-Red"], group=grpVis)
+int colorIntensity = input.int(30, "Fill Transparency %", minval=0, maxval=100, step=5, group=grpVis, tooltip="Higher values are more transparent. 0 is opaque, 100 is invisible.")
+bool showLabels = input.bool(false, "Show RSI Labels", group=grpVis, tooltip="Print RSI value for each new FVG.")
+
+// Filters
+float minFvgSize = input.float(0.1, "Min FVG Size %", minval=0.01, maxval=10.0, step=0.01, group=grpFilter, tooltip="Minimum gap height as a percent of current price for a zone to render.")
+bool filterByRSI = input.bool(false, "Filter by RSI Extremes", group=grpFilter, tooltip="Only create bullish FVGs when RSI <= Oversold and bearish FVGs when RSI >= Overbought.")
+float rsiOverbought = input.float(70, "RSI Overbought", minval=50, maxval=100, step=1, group=grpFilter, tooltip="Threshold for bearish FVG filtering and alert logic.")
+float rsiOversold = input.float(30, "RSI Oversold", minval=0, maxval=50, step=1, group=grpFilter, tooltip="Threshold for bullish FVG filtering and alert logic.")
+
+// Momentum Calculation
+float sourceData = 0.0
+if rsiSource == "Returns"
+    // Calculate returns over momentum lookback period
+    sourceData := (close - close[momentumLookback]) / close[momentumLookback] * 100
+else if rsiSource == "Close"
+    sourceData := close
+else
+    sourceData := volume
+
+// Calculate RSI
+float rsi = ta.rsi(sourceData, rsiLength)
+float rsiSmoothed = ta.sma(rsi, rsiSmooth)
+
+// Normalize RSI to 0-100 for color mapping
+float rsiNormalized = rsiSmoothed
+
+// FVG Detection
+// Bullish FVG: gap between high[2] and low[0], with low[0] > high[2]
+bool bullFVG = low > high[2] and close > open
+float bullFVGTop = low
+float bullFVGBottom = high[2]
+float bullFVGSize = bullFVGTop - bullFVGBottom
+float bullFVGPercent = (bullFVGSize / close) * 100
+
+// Bearish FVG: gap between low[2] and high[0], with high[0] < low[2]
+bool bearFVG = high < low[2] and close < open
+float bearFVGTop = low[2]
+float bearFVGBottom = high
+float bearFVGSize = bearFVGTop - bearFVGBottom
+float bearFVGPercent = (bearFVGSize / close) * 100
+
+// Apply size filter
+bullFVG := bullFVG and bullFVGPercent >= minFvgSize
+bearFVG := bearFVG and bearFVGPercent >= minFvgSize
+
+// Apply RSI filter
+if filterByRSI
+    bullFVG := bullFVG and rsiSmoothed < rsiOversold
+    bearFVG := bearFVG and rsiSmoothed > rsiOverbought
+
+// FVG Storage and Tracking 
+var array<box> bullFVGBoxes = array.new<box>()
+var array<label> bullFVGLabels = array.new<label>()
+var array<float> bullFVGTops = array.new_float()
+var array<float> bullFVGBottoms = array.new_float()
+var array<float> bullFVGRSI = array.new_float()
+
+var array<box> bearFVGBoxes = array.new<box>()
+var array<label> bearFVGLabels = array.new<label>()
+var array<float> bearFVGTops = array.new_float()
+var array<float> bearFVGBottoms = array.new_float()
+var array<float> bearFVGRSI = array.new_float()
+
+getHeatmapColor(float rsiValue, bool isBullish) =>
+    color resultColor = na
+    if heatmapStyle == "Gradient"
+        if isBullish
+            resultColor := color.from_gradient(rsiValue, 0, 100, color.new(color.blue, colorIntensity + 20), color.new(color.lime, colorIntensity))
+        else
+            resultColor := color.from_gradient(rsiValue, 0, 100, color.new(color.purple, colorIntensity + 20), color.new(color.red, colorIntensity))
+    else if heatmapStyle == "Discrete"
+        if rsiValue >= 70
+            resultColor := color.new(#ff0000, colorIntensity)
+        else if rsiValue >= 60
+            resultColor := color.new(#ff9900, colorIntensity)
+        else if rsiValue >= 50
+            resultColor := color.new(#ffe600, colorIntensity + 10)
+        else if rsiValue >= 40
+            resultColor := color.new(#008cff, colorIntensity + 10)
+        else if rsiValue >= 30
+            resultColor := color.new(#00ffe5, colorIntensity)
+        else
+            resultColor := color.new(#00ff00, colorIntensity)
+    else if heatmapStyle == "Simple"
+        if isBullish
+            resultColor := rsiValue > 50 ? color.new(#00ff00, colorIntensity) : color.new(#00ff00, colorIntensity + 30)
+        else
+            resultColor := rsiValue > 50 ? color.new(#ff0000, colorIntensity) : color.new(#ff0000, colorIntensity + 30)
+    else 
+        if paletteName == "Viridis"
+            if rsiValue >= 86
+                resultColor := color.new(#FDE725, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#A0DA39, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#4AC16D, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#1F9E89, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#2D708E, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#453781, colorIntensity)
+            else
+                resultColor := color.new(#440154, colorIntensity)
+        else if paletteName == "Plasma"
+            if rsiValue >= 86
+                resultColor := color.new(#F0F921, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#FCA636, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#E16462, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#B12A90, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#6A00A8, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#4C0073, colorIntensity)
+            else
+                resultColor := color.new(#0D0887, colorIntensity)
+        else if paletteName == "Inferno"
+            if rsiValue >= 86
+                resultColor := color.new(#FCFFA4, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#FCA50A, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#DD513A, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#932667, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#420A68, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#1F0C48, colorIntensity)
+            else
+                resultColor := color.new(#000004, colorIntensity)
+        else if paletteName == "Magma"
+            if rsiValue >= 86
+                resultColor := color.new(#FCFDBF, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#F29E2E, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#E35933, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#B63679, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#721F81, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#2C115F, colorIntensity)
+            else
+                resultColor := color.new(#000004, colorIntensity)
+        else if paletteName == "Cividis"
+            if rsiValue >= 86
+                resultColor := color.new(#FDEA45, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#B7C67E, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#86A37F, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#5C7F7E, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#3B5B75, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#1E3A66, colorIntensity)
+            else
+                resultColor := color.new(#00204C, colorIntensity)
+        else if paletteName == "Turbo"
+            if rsiValue >= 86
+                resultColor := color.new(#E35B2A, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#FEE74D, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#B5E44A, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#58E06E, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#3BB3EB, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#3B5BAA, colorIntensity)
+            else
+                resultColor := color.new(#23171B, colorIntensity)
+        else if paletteName == "Jet"
+            if rsiValue >= 86
+                resultColor := color.new(#7F0000, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#FF0000, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#FF7F00, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#FFFF00, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#00FFFF, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#0000FF, colorIntensity)
+            else
+                resultColor := color.new(#00007F, colorIntensity)
+        else if paletteName == "Red-Green"
+            if rsiValue >= 86
+                resultColor := color.new(#F44336, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#FF5722, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#FFA726, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#808080, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#8BC34A, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#4CAF50, colorIntensity)
+            else
+                resultColor := color.new(#00FF00, colorIntensity)
+        else if paletteName == "Blue-White-Red"
+            if rsiValue >= 86
+                resultColor := color.new(#0000FF, colorIntensity)
+            else if rsiValue >= 72
+                resultColor := color.new(#6666FF, colorIntensity)
+            else if rsiValue >= 58
+                resultColor := color.new(#AAAAFF, colorIntensity)
+            else if rsiValue >= 44
+                resultColor := color.new(#F0F0F0, colorIntensity)
+            else if rsiValue >= 30
+                resultColor := color.new(#FFAAAA, colorIntensity)
+            else if rsiValue >= 16
+                resultColor := color.new(#FF6666, colorIntensity)
+            else
+                resultColor := color.new(#FF0000, colorIntensity)
+    resultColor
+
+// Create New FVGs 
+if bullFVG and showBullFVG
+    // Store FVG data
+    array.push(bullFVGTops, bullFVGTop)
+    array.push(bullFVGBottoms, bullFVGBottom)
+    array.push(bullFVGRSI, rsiSmoothed)
+    
+    // Create box
+    color boxColor = getHeatmapColor(rsiSmoothed, true)
+
+    box fvgBox = box.new(bar_index - 2, bullFVGTop, bar_index, bullFVGBottom,bgcolor=boxColor,border_color=color.new(#ffffff, 100),border_width=1, text= str.tostring(rsiSmoothed, "#.#"), text_size = size.auto)
+    array.push(bullFVGBoxes, fvgBox)
+    
+    // Create label
+    if showLabels
+        string labelText = str.tostring(rsiSmoothed, "#.#")
+        color labelColor = rsiSmoothed > 50 ? color.green : color.blue
+        label fvgLabel = label.new(bar_index - 1, bullFVGTop,text=labelText,style=label.style_label_down,color=color.new(labelColor, 70),textcolor=labelColor,size=size.small)
+        array.push(bullFVGLabels, fvgLabel)
+
+if bearFVG and showBearFVG
+    // Store FVG data
+    array.push(bearFVGTops, bearFVGTop)
+    array.push(bearFVGBottoms, bearFVGBottom)
+    array.push(bearFVGRSI, rsiSmoothed)
+    
+    // Create box
+    color boxColor = getHeatmapColor(rsiSmoothed, false)
+    box fvgBox = box.new(bar_index - 2, bearFVGTop, bar_index, bearFVGBottom,bgcolor=boxColor,border_color=color.new(#ffffff, 100),border_width=1, text= str.tostring(rsiSmoothed, "#.#"), text_size = size.auto)
+    array.push(bearFVGBoxes, fvgBox)
+    
+    // Create label
+    if showLabels
+        string labelText = str.tostring(rsiSmoothed, "#.#")
+        color labelColor = rsiSmoothed > 50 ? color.red : color.purple
+        label fvgLabel = label.new(bar_index - 1, bearFVGBottom,text=labelText,style=label.style_label_up,color=color.new(labelColor, 70),textcolor=labelColor,size=size.small)
+        array.push(bearFVGLabels, fvgLabel)
+
+
+// Update Bullish FVGs
+if array.size(bullFVGBoxes) > 0
+    for i = array.size(bullFVGBoxes) - 1 to 0
+        if i >= 0 and i < array.size(bullFVGBoxes)
+            box currentBox = array.get(bullFVGBoxes, i)
+            float fvgTop = array.get(bullFVGTops, i)
+            float fvgBottom = array.get(bullFVGBottoms, i)
+            float fvgRSI = array.get(bullFVGRSI, i)
+            
+            // Check if filled
+            bool isFilled = low <= fvgBottom
+            
+            if isFilled and autoRemoveFilled
+                box.delete(currentBox)
+                array.remove(bullFVGBoxes, i)
+                array.remove(bullFVGTops, i)
+                array.remove(bullFVGBottoms, i)
+                array.remove(bullFVGRSI, i)
+                if i < array.size(bullFVGLabels)
+                    label.delete(array.get(bullFVGLabels, i))
+                    array.remove(bullFVGLabels, i)
+            else if extendFVG
+                box.set_right(currentBox, bar_index)
+
+// Update Bearish FVGs
+if array.size(bearFVGBoxes) > 0
+    for i = array.size(bearFVGBoxes) - 1 to 0
+        if i >= 0 and i < array.size(bearFVGBoxes)
+            box currentBox = array.get(bearFVGBoxes, i)
+            float fvgTop = array.get(bearFVGTops, i)
+            float fvgBottom = array.get(bearFVGBottoms, i)
+            float fvgRSI = array.get(bearFVGRSI, i)
+            
+            // Check if filled
+            bool isFilled = high >= fvgTop
+            
+            if isFilled and autoRemoveFilled
+                box.delete(currentBox)
+                array.remove(bearFVGBoxes, i)
+                array.remove(bearFVGTops, i)
+                array.remove(bearFVGBottoms, i)
+                array.remove(bearFVGRSI, i)
+                if i < array.size(bearFVGLabels)
+                    label.delete(array.get(bearFVGLabels, i))
+                    array.remove(bearFVGLabels, i)
+            else if extendFVG
+                box.set_right(currentBox, bar_index)
+
+// Limit array sizes
+while array.size(bullFVGBoxes) > fvgLookback
+    box.delete(array.shift(bullFVGBoxes))
+    array.shift(bullFVGTops)
+    array.shift(bullFVGBottoms)
+    array.shift(bullFVGRSI)
+    if array.size(bullFVGLabels) > 0
+        label.delete(array.shift(bullFVGLabels))
+
+while array.size(bearFVGBoxes) > fvgLookback
+    box.delete(array.shift(bearFVGBoxes))
+    array.shift(bearFVGTops)
+    array.shift(bearFVGBottoms)
+    array.shift(bearFVGRSI)
+    if array.size(bearFVGLabels) > 0
+        label.delete(array.shift(bearFVGLabels))
+
+// Alerts
+bool bullFVGExtreme = bullFVG and rsiSmoothed <= rsiOversold
+bool bearFVGExtreme = bearFVG and rsiSmoothed >= rsiOverbought
+
+bool bullFVGFilled = false
+bool bearFVGFilled = false
+
+if bullFVGBottoms.size() > 0
+    float lastBullBottom = bullFVGBottoms.get(bullFVGBottoms.size() - 1)
+    bullFVGFilled := low <= lastBullBottom
+
+if bearFVGTops.size() > 0
+    float lastBearTop = bearFVGTops.get(bearFVGTops.size() - 1)
+    bearFVGFilled := high >= lastBearTop
+
+alertcondition(bullFVG, "New Bullish FVG", "New Bullish FVG detected on {{exchange}}:{{ticker}}")
+alertcondition(bearFVG, "New Bearish FVG", "New Bearish FVG detected on {{exchange}}:{{ticker}}")
+alertcondition(bullFVGFilled, "Bull FVG Filled", "Bullish FVG filled on {{exchange}}:{{ticker}}")
+alertcondition(bearFVGFilled, "Bear FVG Filled", "Bearish FVG filled on {{exchange}}:{{ticker}}")
+alertcondition(bullFVGExtreme, "Extreme Oversold FVG", "Bullish FVG with extreme oversold RSI on {{exchange}}:{{ticker}}")
+alertcondition(bearFVGExtreme, "Extreme Overbought FVG", "Bearish FVG with extreme overbought RSI on {{exchange}}:{{ticker}}")

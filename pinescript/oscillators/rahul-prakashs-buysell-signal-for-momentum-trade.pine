@@ -1,0 +1,192 @@
+// This Pine ScriptT code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Rahul
+
+//@version=6
+indicator("Rahul BUY/SELL signal for momentum trade", overlay=true)
+
+// === Inputs ===
+lengthVolSMA   = input.int(20, "Volume SMA Length")
+bbLength       = input.int(20, "BB Length")
+bbMult         = input.float(2.0, "BB Multiplier")
+rsiLength      = input.int(14, "RSI Length")
+dmiLength      = input.int(14, "DMI/ADX Length")
+trendLookback  = input.int(20, "Trendline Lookback")
+stochLen       = input.int(14, "Stoch %K Length")
+stochKSmooth   = input.int(3,  "%K Smooth")
+stochDSmooth   = input.int(3,  "%D Smooth")
+useVWAP        = input.bool(true, "Use VWAP Condition?")
+
+// RSI Value
+rsi = ta.rsi(close, rsiLength)
+
+// Stochastic
+kRaw = ta.stoch(close, high, low, stochLen)
+k = ta.sma(kRaw, stochKSmooth)
+dval = ta.sma(k, stochDSmooth)
+
+// Bollinger Band calculation
+basis = ta.sma(close, bbLength)
+dev   = bbMult * ta.stdev(close, bbLength)
+upperBB = basis + dev * 2
+lowerBB = basis - dev * 2
+// Calculate middle of the range
+middle = (upperBB + lowerBB) / 2
+
+bbRange = upperBB - lowerBB
+
+// ADX calculation
+downMove = low[1] - low
+upMove = high - high[1]
+plusDM = (upMove > downMove and upMove > 0) ? upMove : 0
+minusDM = (downMove > upMove and downMove > 0) ? downMove : 0
+tr = math.max(math.max(high - low, math.abs(high - close[1])), math.abs(low - close[1]))
+ATR = ta.rma(tr, dmiLength)
+plusDI = 100 * ta.rma(plusDM, dmiLength) / ATR
+minusDI = 100 * ta.rma(minusDM, dmiLength) / ATR
+dx = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+adx = ta.rma(dx, dmiLength)
+
+// EMAs
+ema5 = ta.ema(close, 5)
+ema13 = ta.ema(close, 13)
+ema26 = ta.ema(close, 26)
+ema50 = ta.ema(close, 50)
+
+// === Common Signal Function ===
+f_signals(_close, _high, _low, _volume, isBuy) =>
+    volSMA = ta.sma(_volume, lengthVolSMA)
+    volumeCond = _volume >= volSMA
+ 
+    // Updated BB condition logic
+    bbCond = isBuy 
+     ? (close > middle or close >= upperBB)  // Buy: challenge upper band or price in upper half
+     : (close < middle or close <= lowerBB)  // Sell: challenge lower band or price in lower half
+
+    rsiCond = isBuy ? rsi >= 60 or rsi > rsi[1] : rsi <= 40 or rsi < rsi[1]
+    dmiCond = adx >= 15 and (isBuy ? plusDI > minusDI : minusDI > plusDI)
+
+    emaCond = isBuy ? ema5 > ema13 and ema13 > ema26 : ema5 < ema13 and ema13 < ema26
+    ema50Cond = isBuy ? _close > ema50 : _close < ema50
+
+    stochCond = isBuy ? ta.crossover(k, dval) or k > k[1] : ta.crossunder(k, dval) or k < k[1]
+
+    vwapCond = useVWAP ? (isBuy ? _close > ta.vwap : _close < ta.vwap) : true
+
+    barCond = isBuy ? _close > open : _close < open
+
+    // Trendline (basic linear regression approximation)
+    var float sl = na
+    var float itc = na
+    sumX = 0.0
+    sumY = 0.0
+    sumXY = 0.0
+    sumXX = 0.0
+    if bar_index > trendLookback
+        for i = 0 to trendLookback - 1
+            x = i
+            y = isBuy ? _high[i] : _low[i]
+            sumX := sumX + x
+            sumY := sumY + y
+            sumXY := sumXY + x * y
+            sumXX := sumXX + x * x
+        denom = trendLookback * sumXX - sumX * sumX
+        if denom != 0
+            sl := (trendLookback * sumXY - sumX * sumY) / denom
+            itc := (sumY - sl * sumX) / trendLookback
+    trVal = sl * trendLookback + itc
+    trendBreak = not na(trVal) and (isBuy ? _close > trVal : _close < trVal)
+
+    [volumeCond, bbCond, rsiCond, dmiCond, emaCond, ema50Cond, stochCond, vwapCond, barCond, trendBreak]
+
+[bvc, bbc, brc, bdc, bec, b50c, bsc, bvcw, bbarc, btc] = f_signals(close, high, low, volume, true)
+[sellvc, sellbc, sellrc, selldc, sellec, sell50c, sellsc, sellvwap, sellbar, selltrend] = f_signals(close, high, low, volume, false)
+
+buySignal = bvc and bbc and brc and bdc and bec and b50c and bbarc and btc
+sellSignal = sellvc and sellbc and sellrc and selldc and sellec and sell50c and sellbar and selltrend
+
+plotshape(buySignal, title="Buy Signal", location=location.belowbar, style=shape.labelup, size=size.small, color=color.green, text="B", textcolor=color.white)
+plotshape(sellSignal, title="Sell Signal", location=location.abovebar, style=shape.labeldown, size=size.small, color=color.red, text="S", textcolor=color.white)
+
+alertcondition(buySignal, title="Buy Alert", message="Buy Signal Triggered")
+alertcondition(sellSignal, title="Sell Alert", message="Sell Signal Triggered")
+
+// Individual Components
+buyDMI  = bdc
+buyStoch= bsc
+buyEMA  = bec
+
+sellDMI  = selldc
+sellStoch= sellsc
+sellEMA  = sellec
+
+// Dynamic evaluation for condition type
+getDMICrossoverLabel(isBuy, diCond) =>
+    isBuy ? diCond ? "+DI > -DI" : "-DI > +DI" : "Flat"
+
+// Dynamic evaluation for condition type
+getPricePosition(isBuy, cond) =>
+    isBuy ? (cond ? "Above" : "-") : (cond ? "Below" : "-")
+
+// Dynamic evaluation for condition type
+getEMAsPosition(isBuy, cond) =>
+    upSide = (ema5 > ema13 and ema13 > ema26) ? 'GC Upside' : '-'
+    downSide = (ema5 < ema13 and ema13 < ema26) ? 'GC downside' : '-'
+    isBuy ? upSide : downSide
+
+getStochasticCrossover(isBuy, k, dval, stochCross) =>
+    isBuy ? (stochCross ? "PCO" : (k > k[1] ? "Uptick" : "Flat")) : (ta.crossunder(k, dval) ? "NCO" : (k < k[1] ? "Downtick" : "Flat"))
+
+getBBDirection() =>
+     (close >= upperBB * 0.98 ? 'BBUC' : (close <= lowerBB * 1.02 ? 'BBDC' : close > middle ? 'Upper Half' : close < middle ? 'Lower Half' : '-'))
+
+// Use dynamic bias and current condition states
+volumeLabel = bvc ? 'YES' : 'NO'
+vwapLabel = bvcw ? 'Above' : 'Below'
+dmiLabel   = bdc ? getDMICrossoverLabel(true, plusDI > minusDI) : getDMICrossoverLabel(false, plusDI < minusDI)
+stochSignalBuy  = getStochasticCrossover(true, k, dval, ta.crossover(k, dval))
+stochSignalSell = getStochasticCrossover(false, k, dval, ta.crossunder(k, dval))
+stochLabel = bsc ? stochSignalBuy : stochSignalSell
+emaLabel   = bec ? getEMAsPosition(true, bec) : getEMAsPosition(false, sellec)
+ema50Label = b50c ? getPricePosition(true, b50c) : getPricePosition(false, sell50c)
+barLabel = bbarc ? 'Bullish Bar' : sellbar ? 'Bearish Bar' : 'Neutral bar'
+trendLabel = btc ? 'Bullish Trend' : selltrend ? 'Bearish Trend' : '-'
+bbLabel = getBBDirection()
+
+// Dynamic colors
+volumeColor = volumeLabel == "YES" ? color.green : color.red
+dmiColor   = (dmiLabel == "PCO" or dmiLabel == "Uptick") ? color.green : color.red
+stochColor = (stochSignalBuy == "PCO" or stochSignalBuy == "Uptick") ? color.green : (stochSignalSell == 'NCO' or stochSignalBuy == 'Downtick') ? color.red : color.black
+emaColor   = emaLabel == "GC Upside" ? color.green : emaLabel == "GC downside" ? color.red : color.black
+ema50Color = ema50Label == "Above" ? color.green : ema50Label == "Below" ? color.red : color.black
+barColor = barLabel == "Bullish Bar" ? color.green : barLabel == "Bearish Bar" ? color.red : color.black
+trendColor = trendLabel == "Bullish Trend" ? color.green : trendLabel == "Bearish Trend" ? color.red : color.black
+vwapColor = vwapLabel == "Above" ? color.green : color.red
+bbColor = (bbLabel == "BBUC" or bbLabel == "Upper Half") ? color.green : (bbLabel == "BBDC" or bbLabel == "Lower Half") ? color.red : color.black
+
+// === Detailed Signal Table ===
+var table fullTable = table.new(position.bottom_right, 3, 12, frame_color=color.gray, border_width=1)
+if bar_index % 5 == 0
+    rsiColor = rsi >= 60 ? color.green : rsi <= 40 ? color.red : color.orange
+    table.cell(fullTable, 0, 0, "Condition", text_color=color.white, bgcolor=color.black)
+    table.cell(fullTable, 1, 0, "Status", text_color=color.white, bgcolor=color.black)
+    table.cell(fullTable, 2, 0, "Value", text_color=color.white, bgcolor=color.black)   
+    table.cell(fullTable, 2, 4, stochLabel, text_color=stochColor, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 5, dmiLabel, text_color=dmiColor, bgcolor=color.new(color.black, 85))
+
+for m = 0 to 10
+    labelText = m == 0 ? "Vol SMA >= 20" : m == 1 ? "Bollinger" : m == 2 ? "RSI" : m == 3 ? "Stoch" : m == 4 ? "DMI" : m == 5 ? "ADX" : m == 6 ? "EMA stack" : m == 7 ? "EMA50" : m == 8 ? "VWAP" : m == 9 ? "Bar" : "Trend Break"
+    conditionBuy = m == 0 ? bvc : m == 1 ? bbc : m == 2 ? brc : m == 3 ? bsc : m == 4 ? bdc : m == 5 ? (adx >= 14.9) : m == 6 ? bec : m == 7 ? b50c : m == 8 ? bvcw : m == 9 ? bbarc : btc
+    conditionSell = m == 0 ? sellvc : m == 1 ? sellbc : m == 2 ? sellrc : m == 3 ? sellsc : m == 4 ? selldc : m == 5 ? adx >= 14.9 : m == 6 ? sellec : m == 7 ? sell50c : m == 8 ? sellvwap : m == 9 ? sellbar : selltrend
+
+    table.cell(fullTable, 0, m + 1, labelText, text_color=color.white, bgcolor=color.black)
+    table.cell(fullTable, 1, m + 1, (conditionBuy ? 'BUY' : conditionSell ? 'SELL' : '?'), text_color=conditionBuy ? color.green : conditionSell ? color.red : color.black, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 1, volumeLabel, text_color=volumeColor, bgcolor=color.new(color.black, 85))    
+    table.cell(fullTable, 2, 2, bbLabel, text_color=bbColor, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 3, str.tostring(rsi, "#.00"), text_color=color.black, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 1, 6, '> 14', text_color=color.black, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 6, str.tostring(adx, "#.00"), text_color=color.black, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 7, emaLabel, text_color=emaColor, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 8, ema50Label, text_color=ema50Color, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 9, ema50Label, text_color=ema50Color, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 10, barLabel, text_color=barColor, bgcolor=color.new(color.black, 85))
+    table.cell(fullTable, 2, 11, trendLabel, text_color=trendColor, bgcolor=color.new(color.black, 85))

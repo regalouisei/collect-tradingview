@@ -1,0 +1,109 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Neighboring Price Dispersion [LuxAlgo]", "LuxAlgo - Neighboring Price Dispersion", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color MAIN_COLOR = #2196f3
+color NONE       = color.new(MAIN_COLOR, 100)
+color FILL       = color.new(MAIN_COLOR, 50)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int bufferSizeInput = input.int(5000, "Historical Buffer (Bars)", minval = 100, maxval = 20000, tooltip = "Number of historical bars to keep in the price distribution.")
+int kInput          = input.int(50,   "Neighboring Range (K)",   minval = 5,   tooltip = "Number of neighbors to check on each side of the current price position in the sorted distribution.")
+int smoothInput     = input.int(1,    "Smoothing",               minval = 1,   tooltip = "SMA smoothing applied to the dispersion calculation.")
+int maLength        = input.int(9,    "MA Length",               minval = 1,   tooltip = "Signal average length.")
+float multiplier    = input.float(1,  "CMean Multiplier",        minval = 0,   tooltip = "Cumulative mean multiplier.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> priceArray  = array.new<float>()
+var array<float> sortedArray = array.new<float>()
+
+// Helper to remove a value from the sorted distribution
+removeValue(float val) =>
+    if not na(val) and array.size(sortedArray) > 0
+        int idx = array.binary_search_leftmost(sortedArray, val)
+        // Ensure we found the exact value before removing to keep arrays in sync
+        if idx < array.size(sortedArray) and array.get(sortedArray, idx) == val
+            array.remove(sortedArray, idx)
+
+// Helper to add a value to the sorted distribution while maintaining order
+addValue(float val) =>
+    if not na(val)
+        int idx = 0
+        if array.size(sortedArray) > 0
+            idx := array.binary_search_leftmost(sortedArray, val)
+            // If value is greater than the element at idx, we insert after it
+            if val > array.get(sortedArray, idx)
+                idx += 1
+        array.insert(sortedArray, idx, val)
+
+// Calculate dispersion before updating the buffer (no bias)
+float dispersion = na
+
+if array.size(sortedArray) > 0
+    // Find the position of the current close in the sorted distribution
+    int idx = array.binary_search_leftmost(sortedArray, close)
+    
+    // Get neighboring slice idx - K to idx + K
+    int startIdx = math.max(0, idx - kInput)
+    int endIdx   = math.min(array.size(sortedArray) - 1, idx + kInput)
+    
+    // Extract slice and calculate dispersion (Stdev)
+    // We check if the range is large enough to avoid misleadingly small stdevs at edges
+    if endIdx > startIdx and endIdx - startIdx >= kInput
+        float[] slice = array.slice(sortedArray, startIdx, endIdx + 1)
+        dispersion := array.stdev(slice)
+
+// Add current OHLC values to the buffers for the next bar
+// Maintain buffer size (4 values per bar)
+if array.size(priceArray) >= bufferSizeInput * 4
+    for i = 1 to 4
+        float oldVal = array.shift(priceArray)
+        removeValue(oldVal)
+
+// Add current values
+array.push(priceArray, open)
+addValue(open)
+array.push(priceArray, high)
+addValue(high)
+array.push(priceArray, low)
+addValue(low)
+array.push(priceArray, close)
+addValue(close)
+
+// Apply smoothing - preserve na for discovery gaps
+float smoothedDisp = ta.sma(dispersion, smoothInput)
+float finalDisp    = not na(dispersion) ? smoothedDisp : na
+
+// MA
+finalDispMA = ta.sma(finalDisp, maLength)
+diff = finalDisp - finalDispMA
+
+// Cumulative Mean
+cmean = ta.cum(finalDisp) / (bar_index+1) * multiplier
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plotDispersion = plot(finalDisp, "Dispersion", color = MAIN_COLOR, style = plot.style_linebr)
+plotZero       = plot(0,         "Zero Level",  display = display.none)
+
+plot(finalDispMA, "Dispersion MA", #ff5d00)
+plot(math.min(diff, 0), "Dispersion MA", color.new(color.gray, 80), style = plot.style_area)
+plot(cmean, "Cumulative Mean", chart.fg_color)
+
+// New Discovery Highlights: bgcolor when dispersion is na
+bgcolor(na(dispersion) ? color.new(MAIN_COLOR, 85) : na)
+
+// Volatility/Metric Style: Gradient fill 100% transparent at 0
+fill(plotDispersion, plotZero, finalDisp, 0, not na(finalDisp) ? FILL : na, NONE)
+
+//---------------------------------------------------------------------------------------------------------------------}

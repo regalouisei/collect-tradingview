@@ -1,0 +1,128 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator("Dual Neighboring Price Dispersion [LuxAlgo]", "LuxAlgo - Dual Neighboring Price Dispersion", overlay = false)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color BULL_NONE  = color.new(BULL_COLOR, 100)
+color BEAR_NONE  = color.new(BEAR_COLOR, 100)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+int bufferSizeInput = input.int(1000, "Historical Buffer (Bars)", minval = 100, maxval = 20000, tooltip = "Number of historical bars to keep in the price distribution.")
+int kInput          = input.int(50,   "Neighboring Range (K)",   minval = 5,   tooltip = "Number of neighbors to check on each side of the current price position in the sorted distribution.")
+int smoothInput     = input.int(1,    "Smoothing",               minval = 1,   tooltip = "SMA smoothing applied to the dispersion components.")
+float multInput     = input.float(2.0, "Cumulative Mean Multiplier", minval = 0.0, step = 0.1, tooltip = "Multiplier applied to the cumulative mean levels.")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var array<float> priceArray  = array.new<float>()
+var array<float> sortedArray = array.new<float>()
+
+// Helper to remove a value from the sorted distribution
+removeValue(float val) =>
+    if not na(val) and array.size(sortedArray) > 0
+        int idx = array.binary_search_leftmost(sortedArray, val)
+        if idx < array.size(sortedArray) and array.get(sortedArray, idx) == val
+            array.remove(sortedArray, idx)
+
+// Helper to add a value to the sorted distribution while maintaining order
+addValue(float val) =>
+    if not na(val)
+        int idx = 0
+        if array.size(sortedArray) > 0
+            idx := array.binary_search_leftmost(sortedArray, val)
+            if val > array.get(sortedArray, idx)
+                idx += 1
+        array.insert(sortedArray, idx, val)
+
+// Calculate dual dispersion before updating the buffer (no bias)
+float bullDispersion = na
+float bearDispersion = na
+
+if array.size(sortedArray) > 0
+    // Find the position of the current close in the sorted distribution
+    int idx = array.binary_search_leftmost(sortedArray, close)
+    int size = array.size(sortedArray)
+
+    // 1. Bearish Component: idx - K to idx (neighborhood of prices lower than current close)
+    int bearStart = math.max(0, idx - kInput)
+    if idx > bearStart and idx - bearStart >= 2
+        float[] bearSlice = array.slice(sortedArray, bearStart, idx + 1)
+        bearDispersion := array.stdev(bearSlice)
+
+    // 2. Bullish Component: idx to idx + K (neighborhood of prices higher than current close)
+    int bullEnd = math.min(size - 1, idx + kInput)
+    if bullEnd > idx and bullEnd - idx >= 2
+        float[] bullSlice = array.slice(sortedArray, idx, bullEnd + 1)
+        bullDispersion := array.stdev(bullSlice)
+
+// Update the buffer for the next bar
+if array.size(priceArray) >= bufferSizeInput * 4
+    for i = 1 to 4
+        float oldVal = array.shift(priceArray)
+        removeValue(oldVal)
+
+// Add current OHLC values
+array.push(priceArray, open)
+addValue(open)
+array.push(priceArray, high)
+addValue(high)
+array.push(priceArray, low)
+addValue(low)
+array.push(priceArray, close)
+addValue(close)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Apply smoothing - explicitly preserve na for discovery gaps
+//---------------------------------------------------------------------------------------------------------------------{
+float smoothedBull = ta.sma(bullDispersion, smoothInput)
+float smoothedBear = -ta.sma(bearDispersion, smoothInput)
+
+float finalBull = not na(bullDispersion) ? smoothedBull : na
+float finalBear = not na(bearDispersion) ? smoothedBear : na
+
+// Calculate cumulative means
+var float cumSumBull = 0.0
+var int cumCountBull = 0
+if not na(finalBull)
+    cumSumBull  += finalBull
+    cumCountBull += 1
+float cumMeanBull = cumCountBull > 0 ? (cumSumBull / cumCountBull) * multInput : na
+
+var float cumSumBear = 0.0
+var int cumCountBear = 0
+if not na(finalBear)
+    cumSumBear  += finalBear
+    cumCountBear += 1
+float cumMeanBear = cumCountBear > 0 ? (cumSumBear / cumCountBear) * multInput : na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Visuals
+//---------------------------------------------------------------------------------------------------------------------{
+plotBull = plot(finalBull, "Bullish Dispersion", color = BULL_COLOR, style = plot.style_linebr)
+plotBear = plot(finalBear, "Bearish Dispersion", color = BEAR_COLOR, style = plot.style_linebr)
+
+// Cumulative Mean Plots
+plot(cumMeanBull, "Bullish Cumulative Mean", color = color.new(BULL_COLOR, 30), style = plot.style_linebr, linestyle = plot.linestyle_dashed)
+plot(cumMeanBear, "Bearish Cumulative Mean", color = color.new(BEAR_COLOR, 30), style = plot.style_linebr, linestyle = plot.linestyle_dashed)
+
+plotZero = plot(0,         "Zero Level",         color = chart.fg_color, style = plot.style_circles, display = display.none)
+
+// New Discovery Highlights: bgcolor when dispersion is na
+bgcolor(na(bullDispersion) ? color.new(BULL_COLOR, 85) : na)
+bgcolor(na(bearDispersion) ? color.new(BEAR_COLOR, 85) : na)
+
+// Fill from indicator value to zero with transparency gradient fading toward zero
+// Use color na when indicator is na to prevent fill connection across gaps
+fill(plotBull, plotZero, finalBull, 0, not na(finalBull) ? color.new(BULL_COLOR, 50) : na, BULL_NONE)
+fill(plotBear, plotZero, 0, finalBear, BEAR_NONE, not na(finalBear) ? color.new(BEAR_COLOR, 50) : na)
+
+//---------------------------------------------------------------------------------------------------------------------}

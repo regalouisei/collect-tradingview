@@ -1,0 +1,853 @@
+//@version=6
+indicator('Dynamic Equity Allocation Model', shorttitle = 'DEAM', overlay = false, precision = 1, scale = scale.right, max_bars_back = 500)
+
+// DYNAMIC EQUITY ALLOCATION MODEL
+
+// Quantitative framework for dynamic portfolio allocation between stocks and cash.
+// Analyzes five dimensions: market regime, risk metrics, valuation, sentiment,
+// and macro conditions to generate allocation recommendations (0-100% equity).
+//
+// Uses real-time data from TradingView including fundamentals (P/E, ROE, ERP),
+// volatility indicators (VIX), credit spreads, yield curves, and market structure.
+
+// INPUT PARAMETERS
+
+group1 = 'Model Configuration'
+model_type = input.string('Adaptive', 'Allocation Model Type', options = ['Conservative', 'Balanced', 'Aggressive', 'Adaptive'], group = group1, tooltip = 'Conservative: Slower to increase equity, Aggressive: Faster allocation changes, Adaptive: Dynamic based on regime')
+
+use_crisis_detection = input.bool(true, 'Enable Crisis Detection System', group = group1, tooltip = 'Automatic detection and response to crisis conditions')
+
+use_regime_model = input.bool(true, 'Use Market Regime Detection', group = group1, tooltip = 'Identify Bull/Bear/Crisis regimes for dynamic allocation')
+
+group2 = 'Portfolio Risk Management'
+target_portfolio_volatility = input.float(12.0, 'Target Portfolio Volatility (%)', minval = 3, maxval = 20, step = 0.5, group = group2, tooltip = 'Target portfolio volatility (Cash reduces volatility: 50% Equity = ~10% vol, 100% Equity = ~20% vol)')
+
+max_portfolio_drawdown = input.float(15.0, 'Maximum Portfolio Drawdown (%)', minval = 5, maxval = 35, step = 2.5, group = group2, tooltip = 'Maximum acceptable PORTFOLIO drawdown (not market drawdown - portfolio with cash has lower drawdown)')
+
+enable_portfolio_risk_scaling = input.bool(true, 'Enable Portfolio Risk Scaling', group = group2, tooltip = 'Scale allocation based on actual portfolio risk characteristics (recommended)')
+
+risk_lookback = input.int(252, 'Risk Calculation Period (Days)', minval = 60, maxval = 504, group = group2, tooltip = 'Period for calculating volatility and risk metrics')
+
+group3 = 'Component Weights (Total = 100%)'
+w_regime = input.float(35.0, 'Market Regime Weight (%)', minval = 0, maxval = 100, step = 5, group = group3)
+w_risk = input.float(25.0, 'Risk Metrics Weight (%)', minval = 0, maxval = 100, step = 5, group = group3)
+w_valuation = input.float(20.0, 'Valuation Weight (%)', minval = 0, maxval = 100, step = 5, group = group3)
+w_sentiment = input.float(15.0, 'Sentiment Weight (%)', minval = 0, maxval = 100, step = 5, group = group3)
+w_macro = input.float(5.0, 'Macro Weight (%)', minval = 0, maxval = 100, step = 5, group = group3)
+
+group4 = 'Crisis Detection Thresholds'
+crisis_vix_threshold = input.float(40, 'Crisis VIX Level', minval = 30, maxval = 80, group = group4, tooltip = 'VIX level indicating crisis conditions (COVID peaked at 82)')
+
+crisis_drawdown_threshold = input.float(15, 'Crisis Drawdown Threshold (%)', minval = 10, maxval = 30, group = group4, tooltip = 'Market drawdown indicating crisis conditions')
+
+crisis_credit_spread = input.float(500, 'Crisis Credit Spread (bps)', minval = 300, maxval = 1000, group = group4, tooltip = 'High yield spread indicating crisis conditions')
+
+group5 = 'Display Settings'
+show_components = input.bool(false, 'Show Component Breakdown', group = group5, tooltip = 'Display individual component analysis lines')
+show_regime_background = input.bool(true, 'Show Dynamic Background', group = group5, tooltip = 'Color background based on allocation signals')
+show_reference_lines = input.bool(false, 'Show Reference Lines', group = group5, tooltip = 'Display allocation percentage reference lines')
+show_dashboard = input.bool(true, 'Show Analytics Dashboard', group = group5, tooltip = 'Display comprehensive analytics table')
+show_confidence_bands = input.bool(false, 'Show Confidence Bands', group = group5, tooltip = 'Display uncertainty quantification bands')
+smoothing_period = input.int(3, 'Smoothing Period', minval = 1, maxval = 10, group = group5, tooltip = 'Smoothing to reduce allocation noise')
+background_intensity = input.int(95, 'Background Intensity (%)', minval = 90, maxval = 99, group = group5, tooltip = 'Higher values = more transparent background')
+
+// Styling Options
+color_scheme = input.string('EdgeTools', 'Color Theme', options = ['Gold', 'EdgeTools', 'Behavioral', 'Quant', 'Ocean', 'Fire', 'Matrix', 'Arctic'], group = 'Appearance', tooltip = 'Professional color themes')
+use_dark_mode = input.bool(true, 'Optimize for Dark Theme', group = 'Appearance')
+main_line_width = input.int(3, 'Main Line Width', minval = 1, maxval = 5, group = 'Appearance')
+
+// DATA RETRIEVAL
+
+// Market Data
+sp500 = request.security('SPY', timeframe.period, close)
+sp500_high = request.security('SPY', timeframe.period, high)
+sp500_low = request.security('SPY', timeframe.period, low)
+sp500_volume = request.security('SPY', timeframe.period, volume)
+
+// Volatility Indicators
+vix = request.security('VIX', timeframe.period, close)
+vix9d = request.security('VIX9D', timeframe.period, close)
+vxn = request.security('VXN', timeframe.period, close)
+
+// Fixed Income and Credit
+us2y = request.security('US02Y', timeframe.period, close)
+us10y = request.security('US10Y', timeframe.period, close)
+us3m = request.security('US03MY', timeframe.period, close)
+hyg = request.security('HYG', timeframe.period, close)
+lqd = request.security('LQD', timeframe.period, close)
+tlt = request.security('TLT', timeframe.period, close)
+
+// Safe Haven Assets
+gold = request.security('GLD', timeframe.period, close)
+usd = request.security('DXY', timeframe.period, close)
+yen = request.security('JPYUSD', timeframe.period, close)
+
+// Financial data with fallback values
+get_financial_data(symbol, fin_id, period, fallback) =>
+    data = request.financial(symbol, fin_id, period, ignore_invalid_symbol = true)
+    na(data) ? fallback : data
+
+// SPY fundamental metrics
+spy_earnings_per_share = get_financial_data('AMEX:SPY', 'EARNINGS_PER_SHARE_BASIC', 'TTM', 20.0)
+spy_operating_earnings_yield = get_financial_data('AMEX:SPY', 'OPERATING_EARNINGS_YIELD', 'FY', 4.5)
+spy_dividend_yield = get_financial_data('AMEX:SPY', 'DIVIDENDS_YIELD', 'FY', 1.8)
+spy_buyback_yield = get_financial_data('AMEX:SPY', 'BUYBACK_YIELD', 'FY', 2.0)
+spy_net_margin = get_financial_data('AMEX:SPY', 'NET_MARGIN', 'TTM', 12.0)
+spy_debt_to_equity = get_financial_data('AMEX:SPY', 'DEBT_TO_EQUITY', 'FY', 0.5)
+spy_return_on_equity = get_financial_data('AMEX:SPY', 'RETURN_ON_EQUITY', 'FY', 15.0)
+spy_free_cash_flow = get_financial_data('AMEX:SPY', 'FREE_CASH_FLOW', 'TTM', 100000000)
+spy_ebitda = get_financial_data('AMEX:SPY', 'EBITDA', 'TTM', 200000000)
+spy_pe_forward = get_financial_data('AMEX:SPY', 'PRICE_EARNINGS_FORWARD', 'FY', 18.0)
+spy_total_debt = get_financial_data('AMEX:SPY', 'TOTAL_DEBT', 'FY', 500000000)
+spy_total_equity = get_financial_data('AMEX:SPY', 'TOTAL_EQUITY', 'FY', 1000000000)
+spy_enterprise_value = get_financial_data('AMEX:SPY', 'ENTERPRISE_VALUE', 'FY', 30000000000)
+spy_revenue_growth = get_financial_data('AMEX:SPY', 'REVENUE_ONE_YEAR_GROWTH', 'TTM', 5.0)
+
+// Market Breadth Indicators
+nya = request.security('NYA', timeframe.period, close)
+rut = request.security('IWM', timeframe.period, close)
+
+// Sector Performance
+xlk = request.security('XLK', timeframe.period, close)
+xlu = request.security('XLU', timeframe.period, close)
+xlf = request.security('XLF', timeframe.period, close)
+
+// MARKET REGIME DETECTION
+
+// Calculate Market Trend
+sma_20 = ta.sma(sp500, 20)
+sma_50 = ta.sma(sp500, 50)
+sma_200 = ta.sma(sp500, 200)
+ema_10 = ta.ema(sp500, 10)
+
+// Market Structure Score
+trend_strength = 0.0
+trend_strength := trend_strength + (sp500 > sma_20 ? 1 : -1)
+trend_strength := trend_strength + (sp500 > sma_50 ? 1 : -1)
+trend_strength := trend_strength + (sp500 > sma_200 ? 2 : -2)
+trend_strength := trend_strength + (sma_50 > sma_200 ? 2 : -2)
+
+// Volatility Regime
+returns = math.log(sp500 / sp500[1])
+realized_vol_20d = ta.stdev(returns, 20) * math.sqrt(252) * 100
+realized_vol_60d = ta.stdev(returns, 60) * math.sqrt(252) * 100
+ewma_vol = ta.ema(math.pow(returns, 2), 20)
+realized_vol = math.sqrt(ewma_vol * 252) * 100
+vol_premium = vix - realized_vol
+
+// Drawdown Calculation
+running_max = ta.highest(sp500, risk_lookback)
+current_drawdown = (running_max - sp500) / running_max * 100
+
+// Regime Score
+regime_score = 0.0
+
+// Trend Component (40%)
+if trend_strength >= 4
+    regime_score := regime_score + 40
+    regime_score
+else if trend_strength >= 2
+    regime_score := regime_score + 30
+    regime_score
+else if trend_strength >= 0
+    regime_score := regime_score + 20
+    regime_score
+else if trend_strength >= -2
+    regime_score := regime_score + 10
+    regime_score
+else
+    regime_score := regime_score + 0
+    regime_score
+
+// Volatility Component (30%)
+if vix < 15
+    regime_score := regime_score + 30
+    regime_score
+else if vix < 20
+    regime_score := regime_score + 25
+    regime_score
+else if vix < 25
+    regime_score := regime_score + 15
+    regime_score
+else if vix < 35
+    regime_score := regime_score + 5
+    regime_score
+else
+    regime_score := regime_score + 0
+    regime_score
+
+// Drawdown Component (30%)
+if current_drawdown < 3
+    regime_score := regime_score + 30
+    regime_score
+else if current_drawdown < 7
+    regime_score := regime_score + 20
+    regime_score
+else if current_drawdown < 12
+    regime_score := regime_score + 10
+    regime_score
+else if current_drawdown < 20
+    regime_score := regime_score + 5
+    regime_score
+else
+    regime_score := regime_score + 0
+    regime_score
+
+// Classify Regime
+market_regime = regime_score >= 80 ? 'Strong Bull' : regime_score >= 60 ? 'Bull Market' : regime_score >= 40 ? 'Neutral' : regime_score >= 20 ? 'Correction' : regime_score >= 10 ? 'Bear Market' : 'Crisis'
+
+// RISK-BASED ALLOCATION
+
+// Calculate Market Risk
+parkinson_hl = math.log(sp500_high / sp500_low)
+parkinson_vol = parkinson_hl / (2 * math.sqrt(math.log(2))) * math.sqrt(252) * 100
+
+garman_klass_vol = math.sqrt((0.5 * math.pow(math.log(sp500_high / sp500_low), 2) - (2 * math.log(2) - 1) * math.pow(math.log(sp500 / sp500[1]), 2)) * 252) * 100
+
+market_volatility_20d = math.max(ta.stdev(returns, 20) * math.sqrt(252) * 100, parkinson_vol)
+market_volatility_60d = ta.stdev(returns, 60) * math.sqrt(252) * 100
+market_drawdown = current_drawdown
+
+// Initialize risk allocation
+risk_allocation = 50.0
+
+if enable_portfolio_risk_scaling
+    // Volatility-based allocation
+    vol_based_allocation = target_portfolio_volatility / math.max(market_volatility_20d, 5.0) * 100
+    vol_based_allocation := math.max(0, math.min(100, vol_based_allocation))
+
+    // Drawdown-based allocation
+    dd_based_allocation = 100.0
+    if market_drawdown > 1.0
+        dd_based_allocation := max_portfolio_drawdown / market_drawdown * 100
+        dd_based_allocation := math.max(0, math.min(100, dd_based_allocation))
+        dd_based_allocation
+
+    // Combine (conservative)
+    risk_allocation := math.min(vol_based_allocation, dd_based_allocation)
+
+    // Dynamic adjustment
+    current_equity_estimate = 50.0
+    estimated_portfolio_vol = current_equity_estimate / 100 * market_volatility_20d
+    estimated_portfolio_dd = current_equity_estimate / 100 * market_drawdown
+
+    vol_utilization = estimated_portfolio_vol / target_portfolio_volatility
+    dd_utilization = estimated_portfolio_dd / max_portfolio_drawdown
+    risk_utilization = math.max(vol_utilization, dd_utilization)
+
+    risk_adjustment_factor = 1.0
+    if risk_utilization > 1.0
+        risk_adjustment_factor := math.exp(-0.5 * (risk_utilization - 1.0))
+        risk_adjustment_factor := math.max(0.5, risk_adjustment_factor)
+        risk_adjustment_factor
+    else if risk_utilization < 0.9
+        risk_adjustment_factor := 1.0 + 0.2 * math.log(1.0 / risk_utilization)
+        risk_adjustment_factor := math.min(1.3, risk_adjustment_factor)
+        risk_adjustment_factor
+
+    risk_allocation := risk_allocation * risk_adjustment_factor
+    risk_allocation
+
+else
+    vol_scalar = target_portfolio_volatility / math.max(market_volatility_20d, 10)
+    vol_scalar := math.min(1.5, math.max(0.2, vol_scalar))
+
+    drawdown_penalty = 0.0
+    if current_drawdown > max_portfolio_drawdown
+        drawdown_penalty := (current_drawdown - max_portfolio_drawdown) / max_portfolio_drawdown
+        drawdown_penalty := math.min(1.0, drawdown_penalty)
+        drawdown_penalty
+
+    risk_allocation := 100 * vol_scalar * (1 - drawdown_penalty)
+    risk_allocation
+
+risk_allocation := math.max(0, math.min(100, risk_allocation))
+
+// VALUATION ANALYSIS
+
+// Valuation Metrics
+actual_pe_ratio = spy_earnings_per_share > 0 ? sp500 / spy_earnings_per_share : spy_pe_forward
+actual_earnings_yield = nz(spy_operating_earnings_yield, 0) > 0 ? spy_operating_earnings_yield : 100 / actual_pe_ratio
+total_shareholder_yield = spy_dividend_yield + spy_buyback_yield
+
+// Equity Risk Premium (multi-method calculation)
+method1_erp = actual_earnings_yield - us10y
+method2_erp = actual_earnings_yield + spy_buyback_yield - us10y
+
+payout_ratio = spy_dividend_yield > 0 and actual_earnings_yield > 0 ? spy_dividend_yield / actual_earnings_yield : 0.4
+sustainable_growth = spy_return_on_equity * (1 - payout_ratio) / 100
+method3_erp = spy_dividend_yield + sustainable_growth * 100 - us10y
+
+implied_growth = spy_revenue_growth * 0.7
+method4_erp = total_shareholder_yield + implied_growth - us10y
+
+equity_risk_premium = method1_erp * 0.35 + method2_erp * 0.30 + method3_erp * 0.20 + method4_erp * 0.15
+
+ev_ebitda_ratio = spy_enterprise_value > 0 and spy_ebitda > 0 ? spy_enterprise_value / spy_ebitda : 15.0
+debt_equity_health = spy_debt_to_equity < 1.0 ? 1.2 : spy_debt_to_equity < 2.0 ? 1.0 : 0.8
+
+// Valuation Score
+base_valuation_score = 50.0
+
+if equity_risk_premium > 4
+    base_valuation_score := 95
+    base_valuation_score
+else if equity_risk_premium > 3
+    base_valuation_score := 85
+    base_valuation_score
+else if equity_risk_premium > 2
+    base_valuation_score := 70
+    base_valuation_score
+else if equity_risk_premium > 1
+    base_valuation_score := 55
+    base_valuation_score
+else if equity_risk_premium > 0
+    base_valuation_score := 40
+    base_valuation_score
+else if equity_risk_premium > -1
+    base_valuation_score := 25
+    base_valuation_score
+else
+    base_valuation_score := 10
+    base_valuation_score
+
+growth_adjustment = spy_revenue_growth > 10 ? 10 : spy_revenue_growth > 5 ? 5 : 0
+margin_adjustment = spy_net_margin > 15 ? 5 : spy_net_margin < 8 ? -5 : 0
+roe_adjustment = spy_return_on_equity > 20 ? 5 : spy_return_on_equity < 10 ? -5 : 0
+
+valuation_score = base_valuation_score + growth_adjustment + margin_adjustment + roe_adjustment
+valuation_score := math.max(0, math.min(100, valuation_score * debt_equity_health))
+
+// SENTIMENT ANALYSIS
+
+// VIX Term Structure
+vix_term_structure = vix9d > 0 ? vix / vix9d : 1
+backwardation = vix_term_structure > 1.05
+steep_backwardation = vix_term_structure > 1.15
+
+// Safe Haven Flows
+gold_momentum = ta.roc(gold, 20)
+dollar_momentum = ta.roc(usd, 20)
+yen_momentum = ta.roc(yen, 20)
+treasury_momentum = ta.roc(tlt, 20)
+
+safe_haven_flow = gold_momentum * 0.3 + treasury_momentum * 0.3 + dollar_momentum * 0.25 + yen_momentum * 0.15
+
+// Advanced Sentiment Analysis
+vix_percentile = ta.percentrank(vix, 252)
+vix_zscore = (vix - ta.sma(vix, 252)) / ta.stdev(vix, 252)
+
+vix_momentum = ta.roc(vix, 5)
+vvix_proxy = ta.stdev(vix_momentum, 20) * math.sqrt(252)
+
+risk_reversal_proxy = (vix - realized_vol) / realized_vol
+
+// Sentiment Score
+base_sentiment = 50.0
+
+vix_adjustment = 0.0
+if vix_zscore < -1.5
+    vix_adjustment := 40
+    vix_adjustment
+else if vix_zscore < -0.5
+    vix_adjustment := 20
+    vix_adjustment
+else if vix_zscore < 0.5
+    vix_adjustment := 0
+    vix_adjustment
+else if vix_zscore < 1.5
+    vix_adjustment := -20
+    vix_adjustment
+else
+    vix_adjustment := -40
+    vix_adjustment
+
+term_structure_adjustment = backwardation ? -15 : steep_backwardation ? -30 : 5
+vvix_adjustment = vvix_proxy > 2.0 ? -10 : vvix_proxy < 1.0 ? 10 : 0
+
+sentiment_score = base_sentiment + vix_adjustment + term_structure_adjustment + vvix_adjustment
+sentiment_score := math.max(0, math.min(100, sentiment_score))
+
+// MACRO ANALYSIS
+
+// Yield Curve
+yield_spread_2_10 = us10y - us2y
+yield_spread_3m_10 = us10y - us3m
+
+// Credit Conditions
+hyg_return = ta.roc(hyg, 20)
+lqd_return = ta.roc(lqd, 20)
+tlt_return = ta.roc(tlt, 20)
+
+hyg_duration = 4.0
+lqd_duration = 8.0
+tlt_duration = 17.0
+
+hyg_log_returns = math.log(hyg / hyg[1])
+lqd_log_returns = math.log(lqd / lqd[1])
+hyg_volatility = ta.stdev(hyg_log_returns, 20) * math.sqrt(252)
+lqd_volatility = ta.stdev(lqd_log_returns, 20) * math.sqrt(252)
+
+hyg_yield_proxy = -math.log(hyg / hyg[252]) * 100
+lqd_yield_proxy = -math.log(lqd / lqd[252]) * 100
+tlt_yield = us10y
+
+hyg_spread = (hyg_yield_proxy - tlt_yield) * 100
+lqd_spread = (lqd_yield_proxy - tlt_yield) * 100
+
+hyg_distance = (hyg - ta.lowest(hyg, 252)) / (ta.highest(hyg, 252) - ta.lowest(hyg, 252))
+lqd_distance = (lqd - ta.lowest(lqd, 252)) / (ta.highest(lqd, 252) - ta.lowest(lqd, 252))
+default_risk_proxy = 2.0 - (hyg_distance + lqd_distance)
+
+credit_spread = hyg_spread * 0.5 + (hyg_volatility - lqd_volatility) * 1000 * 0.3 + default_risk_proxy * 200 * 0.2
+credit_spread := math.max(50, credit_spread)
+
+credit_market_health = hyg_return > lqd_return ? 1 : -1
+flight_to_quality = tlt_return > (hyg_return + lqd_return) / 2
+
+// Macro Score
+macro_score = 50.0
+
+yield_curve_score = 0
+if yield_spread_2_10 > 1.5 and yield_spread_3m_10 > 2
+    yield_curve_score := 40
+    yield_curve_score
+else if yield_spread_2_10 > 0.5 and yield_spread_3m_10 > 1
+    yield_curve_score := 30
+    yield_curve_score
+else if yield_spread_2_10 > 0 and yield_spread_3m_10 > 0
+    yield_curve_score := 20
+    yield_curve_score
+else if yield_spread_2_10 < 0 or yield_spread_3m_10 < 0
+    yield_curve_score := 10
+    yield_curve_score
+else
+    yield_curve_score := 5
+    yield_curve_score
+
+credit_conditions_score = 0
+if credit_spread < 200 and not flight_to_quality
+    credit_conditions_score := 30
+    credit_conditions_score
+else if credit_spread < 400 and credit_market_health > 0
+    credit_conditions_score := 20
+    credit_conditions_score
+else if credit_spread < 600
+    credit_conditions_score := 15
+    credit_conditions_score
+else if credit_spread < 1000
+    credit_conditions_score := 10
+    credit_conditions_score
+else
+    credit_conditions_score := 0
+    credit_conditions_score
+
+financial_stability_score = 0
+if spy_debt_to_equity < 0.5 and spy_return_on_equity > 15
+    financial_stability_score := 20
+    financial_stability_score
+else if spy_debt_to_equity < 1.0 and spy_return_on_equity > 10
+    financial_stability_score := 15
+    financial_stability_score
+else if spy_debt_to_equity < 1.5
+    financial_stability_score := 10
+    financial_stability_score
+else
+    financial_stability_score := 5
+    financial_stability_score
+
+macro_score := yield_curve_score + credit_conditions_score + financial_stability_score
+macro_score := math.max(0, math.min(100, macro_score))
+
+// CRISIS DETECTION
+
+crisis_indicators = 0
+
+if vix > crisis_vix_threshold
+    crisis_indicators := crisis_indicators + 1
+    crisis_indicators
+if vix > 60
+    crisis_indicators := crisis_indicators + 2
+    crisis_indicators
+
+if current_drawdown > crisis_drawdown_threshold
+    crisis_indicators := crisis_indicators + 1
+    crisis_indicators
+if current_drawdown > 25
+    crisis_indicators := crisis_indicators + 1
+    crisis_indicators
+
+if credit_spread > crisis_credit_spread
+    crisis_indicators := crisis_indicators + 1
+    crisis_indicators
+
+sp500_roc_5 = ta.roc(sp500, 5)
+tlt_roc_5 = ta.roc(tlt, 5)
+if sp500_roc_5 < -10 and tlt_roc_5 < -5
+    crisis_indicators := crisis_indicators + 2
+    crisis_indicators
+
+volume_spike = sp500_volume > ta.sma(sp500_volume, 20) * 2
+sp500_roc_1 = ta.roc(sp500, 1)
+if volume_spike and sp500_roc_1 < -3
+    crisis_indicators := crisis_indicators + 1
+    crisis_indicators
+
+is_crisis = crisis_indicators >= 3
+is_severe_crisis = crisis_indicators >= 5
+
+// FINAL ALLOCATION CALCULATION
+
+// Convert regime to base allocation
+regime_allocation = market_regime == 'Strong Bull' ? 100 : market_regime == 'Bull Market' ? 80 : market_regime == 'Neutral' ? 60 : market_regime == 'Correction' ? 40 : market_regime == 'Bear Market' ? 20 : 0
+
+// Normalize weights
+total_weight = w_regime + w_risk + w_valuation + w_sentiment + w_macro
+w_regime_norm = w_regime / total_weight
+w_risk_norm = w_risk / total_weight
+w_valuation_norm = w_valuation / total_weight
+w_sentiment_norm = w_sentiment / total_weight
+w_macro_norm = w_macro / total_weight
+
+// Calculate Weighted Allocation
+weighted_allocation = regime_allocation * w_regime_norm + risk_allocation * w_risk_norm + valuation_score * w_valuation_norm + sentiment_score * w_sentiment_norm + macro_score * w_macro_norm
+
+// Apply Crisis Override
+if use_crisis_detection
+    if is_severe_crisis
+        weighted_allocation := math.min(weighted_allocation, 10)
+        weighted_allocation
+    else if is_crisis
+        weighted_allocation := math.min(weighted_allocation, 25)
+        weighted_allocation
+
+// Model Type Adjustment
+model_adjustment = 0.0
+if model_type == 'Conservative'
+    model_adjustment := -10
+    model_adjustment
+else if model_type == 'Aggressive'
+    model_adjustment := 10
+    model_adjustment
+else if model_type == 'Adaptive'
+    recent_return = (sp500 - sp500[20]) / sp500[20] * 100
+    if recent_return > 5
+        model_adjustment := 5
+        model_adjustment
+    else if recent_return < -5
+        model_adjustment := -5
+        model_adjustment
+
+// Apply adjustment and bounds
+final_allocation = weighted_allocation + model_adjustment
+final_allocation := math.max(0, math.min(100, final_allocation))
+
+// Smooth allocation
+smoothed_allocation = ta.sma(final_allocation, smoothing_period)
+
+// Calculate portfolio risk metrics (only for internal alerts)
+actual_portfolio_volatility = smoothed_allocation / 100 * market_volatility_20d
+actual_portfolio_drawdown = smoothed_allocation / 100 * current_drawdown
+
+// VISUALIZATION
+
+// Color definitions
+var color primary_color = #2196F3
+var color bullish_color = #4CAF50
+var color bearish_color = #FF5252
+var color neutral_color = #808080
+var color text_color = color.white
+var color bg_color = #000000
+var color table_bg_color = #1E1E1E
+var color header_bg_color = #2D2D2D
+
+switch color_scheme // Apply color scheme
+    'Gold' => 
+        primary_color := use_dark_mode ? #FFD700 : #DAA520
+        bullish_color := use_dark_mode ? #FFA500 : #FF8C00
+        bearish_color := use_dark_mode ? #FF5252 : #D32F2F
+        neutral_color := use_dark_mode ? #C0C0C0 : #808080
+        text_color := use_dark_mode ? color.white : color.black
+        bg_color := use_dark_mode ? #000000 : #FFFFFF
+        table_bg_color := use_dark_mode ? #1A1A00 : #FFFEF0
+        header_bg_color := use_dark_mode ? #2D2600 : #F5F5DC
+        header_bg_color
+    'EdgeTools' => 
+
+        primary_color := use_dark_mode ? #4682B4 : #1E90FF
+        bullish_color := use_dark_mode ? #4CAF50 : #388E3C
+        bearish_color := use_dark_mode ? #FF5252 : #D32F2F
+        neutral_color := use_dark_mode ? #708090 : #696969
+        text_color := use_dark_mode ? color.white : color.black
+        bg_color := use_dark_mode ? #000000 : #FFFFFF
+        table_bg_color := use_dark_mode ? #0F1419 : #F0F8FF
+        header_bg_color := use_dark_mode ? #1E2A3A : #E6F3FF
+        header_bg_color
+    'Behavioral' => 
+
+        primary_color := #808080
+        bullish_color := #00FF00
+        bearish_color := #8B0000
+        neutral_color := #FFBF00
+        text_color := use_dark_mode ? color.white : color.black
+        bg_color := use_dark_mode ? #000000 : #FFFFFF
+        table_bg_color := use_dark_mode ? #1A1A1A : #F8F8F8
+        header_bg_color := use_dark_mode ? #2D2D2D : #E8E8E8
+        header_bg_color
+    'Quant' => 
+
+        primary_color := #808080
+        bullish_color := #FFA500
+        bearish_color := #8B0000
+        neutral_color := #4682B4
+        text_color := use_dark_mode ? color.white : color.black
+        bg_color := use_dark_mode ? #000000 : #FFFFFF
+        table_bg_color := use_dark_mode ? #0D0D0D : #FAFAFA
+        header_bg_color := use_dark_mode ? #1A1A1A : #F0F0F0
+        header_bg_color
+    'Ocean' => 
+
+        primary_color := use_dark_mode ? #20B2AA : #008B8B
+        bullish_color := use_dark_mode ? #00CED1 : #4682B4
+        bearish_color := use_dark_mode ? #FF4500 : #B22222
+        neutral_color := use_dark_mode ? #87CEEB : #2F4F4F
+        text_color := use_dark_mode ? #F0F8FF : #191970
+        bg_color := use_dark_mode ? #001F3F : #F0F8FF
+        table_bg_color := use_dark_mode ? #001A2E : #E6F7FF
+        header_bg_color := use_dark_mode ? #002A47 : #CCF2FF
+        header_bg_color
+    'Fire' => 
+
+        primary_color := use_dark_mode ? #FF6347 : #DC143C
+        bullish_color := use_dark_mode ? #FFD700 : #FF8C00
+        bearish_color := use_dark_mode ? #8B0000 : #800000
+        neutral_color := use_dark_mode ? #FFA500 : #CD853F
+        text_color := use_dark_mode ? #FFFAF0 : #2F1B14
+        bg_color := use_dark_mode ? #2F1B14 : #FFFAF0
+        table_bg_color := use_dark_mode ? #261611 : #FFF8F0
+        header_bg_color := use_dark_mode ? #3D241A : #FFE4CC
+        header_bg_color
+    'Matrix' => 
+
+        primary_color := use_dark_mode ? #00FF41 : #006400
+        bullish_color := use_dark_mode ? #39FF14 : #228B22
+        bearish_color := use_dark_mode ? #FF073A : #8B0000
+        neutral_color := use_dark_mode ? #00FFFF : #008B8B
+        text_color := use_dark_mode ? #C0FF8C : #003300
+        bg_color := use_dark_mode ? #0D1B0D : #F0FFF0
+        table_bg_color := use_dark_mode ? #0A1A0A : #E8FFF0
+        header_bg_color := use_dark_mode ? #112B11 : #CCFFCC
+        header_bg_color
+    'Arctic' => 
+
+        primary_color := use_dark_mode ? #87CEFA : #4169E1
+        bullish_color := use_dark_mode ? #00BFFF : #0000CD
+        bearish_color := use_dark_mode ? #FF1493 : #8B008B
+        neutral_color := use_dark_mode ? #B0E0E6 : #483D8B
+        text_color := use_dark_mode ? #F8F8FF : #191970
+        bg_color := use_dark_mode ? #191970 : #F8F8FF
+        table_bg_color := use_dark_mode ? #141B47 : #F0F8FF
+        header_bg_color := use_dark_mode ? #1E2A5C : #E0F0FF
+        header_bg_color
+
+// Transparency settings
+bg_transparency = use_dark_mode ? 85 : 92
+zone_transparency = use_dark_mode ? 90 : 95
+band_transparency = use_dark_mode ? 70 : 85
+table_transparency = use_dark_mode ? 80 : 15
+
+// Allocation color
+alloc_color = smoothed_allocation >= 80 ? bullish_color : smoothed_allocation >= 60 ? color.new(bullish_color, 30) : smoothed_allocation >= 40 ? primary_color : smoothed_allocation >= 20 ? color.new(bearish_color, 30) : bearish_color
+
+// Dynamic background
+var color dynamic_bg_color = na
+if show_regime_background
+    if smoothed_allocation >= 70
+        dynamic_bg_color := color.new(bullish_color, background_intensity)
+        dynamic_bg_color
+    else if smoothed_allocation <= 30
+        dynamic_bg_color := color.new(bearish_color, background_intensity)
+        dynamic_bg_color
+    else if smoothed_allocation > 60 or smoothed_allocation < 40
+        dynamic_bg_color := color.new(primary_color, math.min(99, background_intensity + 2))
+        dynamic_bg_color
+
+bgcolor(dynamic_bg_color, title = 'Allocation Signal Background')
+
+// Plot main allocation line
+plot(smoothed_allocation, 'Equity Allocation %', color = alloc_color, linewidth = math.max(1, main_line_width))
+
+// Reference lines (static colors for hline)
+hline_bullish_color = color_scheme == 'Gold' ? use_dark_mode ? #FFA500 : #FF8C00 : color_scheme == 'EdgeTools' ? use_dark_mode ? #4CAF50 : #388E3C : color_scheme == 'Behavioral' ? #00FF00 : color_scheme == 'Quant' ? #FFA500 : color_scheme == 'Ocean' ? use_dark_mode ? #00CED1 : #4682B4 : color_scheme == 'Fire' ? use_dark_mode ? #FFD700 : #FF8C00 : color_scheme == 'Matrix' ? use_dark_mode ? #39FF14 : #228B22 : color_scheme == 'Arctic' ? use_dark_mode ? #00BFFF : #0000CD : #4CAF50
+
+hline_bearish_color = color_scheme == 'Gold' ? use_dark_mode ? #FF5252 : #D32F2F : color_scheme == 'EdgeTools' ? use_dark_mode ? #FF5252 : #D32F2F : color_scheme == 'Behavioral' ? #8B0000 : color_scheme == 'Quant' ? #8B0000 : color_scheme == 'Ocean' ? use_dark_mode ? #FF4500 : #B22222 : color_scheme == 'Fire' ? use_dark_mode ? #8B0000 : #800000 : color_scheme == 'Matrix' ? use_dark_mode ? #FF073A : #8B0000 : color_scheme == 'Arctic' ? use_dark_mode ? #FF1493 : #8B008B : #FF5252
+
+hline_primary_color = color_scheme == 'Gold' ? use_dark_mode ? #FFD700 : #DAA520 : color_scheme == 'EdgeTools' ? use_dark_mode ? #4682B4 : #1E90FF : color_scheme == 'Behavioral' ? #808080 : color_scheme == 'Quant' ? #808080 : color_scheme == 'Ocean' ? use_dark_mode ? #20B2AA : #008B8B : color_scheme == 'Fire' ? use_dark_mode ? #FF6347 : #DC143C : color_scheme == 'Matrix' ? use_dark_mode ? #00FF41 : #006400 : color_scheme == 'Arctic' ? use_dark_mode ? #87CEFA : #4169E1 : #2196F3
+
+hline(show_reference_lines ? 100 : na, '100% Equity', color = color.new(hline_bullish_color, 70), linestyle = hline.style_dotted, linewidth = 1)
+hline(show_reference_lines ? 80 : na, '80% Equity', color = color.new(hline_bullish_color, 40), linestyle = hline.style_dashed, linewidth = 1)
+hline(show_reference_lines ? 60 : na, '60% Equity', color = color.new(hline_bullish_color, 60), linestyle = hline.style_dotted, linewidth = 1)
+hline(50, '50% Balanced', color = color.new(hline_primary_color, 50), linestyle = hline.style_solid, linewidth = 2)
+hline(show_reference_lines ? 40 : na, '40% Equity', color = color.new(hline_bearish_color, 60), linestyle = hline.style_dotted, linewidth = 1)
+hline(show_reference_lines ? 20 : na, '20% Equity', color = color.new(hline_bearish_color, 40), linestyle = hline.style_dashed, linewidth = 1)
+hline(show_reference_lines ? 0 : na, '0% Equity', color = color.new(hline_bearish_color, 70), linestyle = hline.style_dotted, linewidth = 1)
+
+// Component plots
+plot(show_components ? regime_allocation : na, 'Regime', color = color.new(#4ECDC4, 70), linewidth = 1)
+plot(show_components ? risk_allocation : na, 'Risk', color = color.new(#FF6B6B, 70), linewidth = 1)
+plot(show_components ? valuation_score : na, 'Valuation', color = color.new(#45B7D1, 70), linewidth = 1)
+plot(show_components ? sentiment_score : na, 'Sentiment', color = color.new(#FFD93D, 70), linewidth = 1)
+plot(show_components ? macro_score : na, 'Macro', color = color.new(#6BCF7F, 70), linewidth = 1)
+
+// Confidence bands
+upper_band = plot(show_confidence_bands ? math.min(100, smoothed_allocation + ta.stdev(smoothed_allocation, 20)) : na, color = color.new(neutral_color, band_transparency), display = display.none, title = 'Upper Band')
+lower_band = plot(show_confidence_bands ? math.max(0, smoothed_allocation - ta.stdev(smoothed_allocation, 20)) : na, color = color.new(neutral_color, band_transparency), display = display.none, title = 'Lower Band')
+fill(upper_band, lower_band, color = show_confidence_bands ? color.new(neutral_color, zone_transparency) : na, title = 'Uncertainty')
+
+// DASHBOARD
+
+if show_dashboard and barstate.islast
+    var table dashboard = table.new(position.top_right, 2, 20, border_width = 1, bgcolor = color.new(table_bg_color, table_transparency))
+
+    table.clear(dashboard, 0, 0, 1, 19)
+
+    // Header
+    header_color = color.new(header_bg_color, 20)
+    dashboard_text_color = text_color
+
+    table.cell(dashboard, 0, 0, 'DEAM', text_color = dashboard_text_color, bgcolor = header_color, text_size = size.normal)
+    table.cell(dashboard, 1, 0, model_type, text_color = dashboard_text_color, bgcolor = header_color, text_size = size.normal)
+
+    // Core metrics
+    table.cell(dashboard, 0, 1, 'Equity Allocation', text_color = dashboard_text_color, text_size = size.small)
+    table.cell(dashboard, 1, 1, str.tostring(smoothed_allocation, '##.#') + '%', text_color = alloc_color, text_size = size.small)
+
+    table.cell(dashboard, 0, 2, 'Cash Allocation', text_color = dashboard_text_color, text_size = size.small)
+    cash_color = 100 - smoothed_allocation > 70 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 2, str.tostring(100 - smoothed_allocation, '##.#') + '%', text_color = cash_color, text_size = size.small)
+
+    // Signal
+    signal_text = 'NEUTRAL'
+    signal_color = primary_color
+    if smoothed_allocation >= 70
+        signal_text := 'BULLISH'
+        signal_color := bullish_color
+        signal_color
+    else if smoothed_allocation <= 30
+        signal_text := 'BEARISH'
+        signal_color := bearish_color
+        signal_color
+    table.cell(dashboard, 0, 3, 'Signal', text_color = dashboard_text_color, text_size = size.small)
+    table.cell(dashboard, 1, 3, signal_text, text_color = signal_color, text_size = size.small)
+
+    // Market Regime
+    table.cell(dashboard, 0, 4, 'Regime', text_color = dashboard_text_color, text_size = size.small)
+    regime_color_display = market_regime == 'Strong Bull' or market_regime == 'Bull Market' ? bullish_color : market_regime == 'Neutral' ? primary_color : market_regime == 'Crisis' ? bearish_color : bearish_color
+    table.cell(dashboard, 1, 4, market_regime, text_color = regime_color_display, text_size = size.small)
+
+    // VIX
+    table.cell(dashboard, 0, 5, 'VIX Level', text_color = dashboard_text_color, text_size = size.small)
+    vix_color_display = vix < 20 ? bullish_color : vix < 30 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 5, str.tostring(vix, '##.##'), text_color = vix_color_display, text_size = size.small)
+
+    // Market Drawdown
+    table.cell(dashboard, 0, 6, 'Market DD', text_color = dashboard_text_color, text_size = size.small)
+    market_dd_color = current_drawdown < 5 ? bullish_color : current_drawdown < 10 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 6, '-' + str.tostring(current_drawdown, '##.#') + '%', text_color = market_dd_color, text_size = size.small)
+
+    // Crisis Detection
+    table.cell(dashboard, 0, 7, 'Crisis Detection', text_color = dashboard_text_color, text_size = size.small)
+    crisis_text = is_severe_crisis ? 'SEVERE' : is_crisis ? 'CRISIS' : 'Normal'
+    crisis_display_color = is_severe_crisis or is_crisis ? bearish_color : bullish_color
+    table.cell(dashboard, 1, 7, crisis_text, text_color = crisis_display_color, text_size = size.small)
+
+    // Real Data Section
+    financial_bg = color.new(primary_color, 85)
+    table.cell(dashboard, 0, 8, 'REAL DATA', text_color = dashboard_text_color, bgcolor = financial_bg, text_size = size.small)
+    table.cell(dashboard, 1, 8, 'Live Metrics', text_color = dashboard_text_color, bgcolor = financial_bg, text_size = size.small)
+
+    // P/E Ratio
+    table.cell(dashboard, 0, 9, 'P/E Ratio', text_color = dashboard_text_color, text_size = size.small)
+    pe_color = actual_pe_ratio < 18 ? bullish_color : actual_pe_ratio < 25 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 9, str.tostring(actual_pe_ratio, '##.#'), text_color = pe_color, text_size = size.small)
+
+    // ERP
+    table.cell(dashboard, 0, 10, 'ERP', text_color = dashboard_text_color, text_size = size.small)
+    erp_color = equity_risk_premium > 2 ? bullish_color : equity_risk_premium > 0 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 10, str.tostring(equity_risk_premium, '##.##') + '%', text_color = erp_color, text_size = size.small)
+
+    // ROE
+    table.cell(dashboard, 0, 11, 'ROE', text_color = dashboard_text_color, text_size = size.small)
+    roe_color = spy_return_on_equity > 20 ? bullish_color : spy_return_on_equity > 10 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 11, str.tostring(spy_return_on_equity, '##.#') + '%', text_color = roe_color, text_size = size.small)
+
+    // D/E Ratio
+    table.cell(dashboard, 0, 12, 'D/E Ratio', text_color = dashboard_text_color, text_size = size.small)
+    de_color = spy_debt_to_equity < 0.5 ? bullish_color : spy_debt_to_equity < 1.0 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 12, str.tostring(spy_debt_to_equity, '##.##'), text_color = de_color, text_size = size.small)
+
+    // Shareholder Yield
+    table.cell(dashboard, 0, 13, 'Dividend+Buyback', text_color = dashboard_text_color, text_size = size.small)
+    yield_color = total_shareholder_yield > 4 ? bullish_color : total_shareholder_yield > 2 ? primary_color : bearish_color
+    table.cell(dashboard, 1, 13, str.tostring(total_shareholder_yield, '##.#') + '%', text_color = yield_color, text_size = size.small)
+
+    // Component Scores
+    component_bg = color.new(neutral_color, 80)
+    table.cell(dashboard, 0, 14, 'Components', text_color = dashboard_text_color, bgcolor = component_bg, text_size = size.small)
+    table.cell(dashboard, 1, 14, 'Scores', text_color = dashboard_text_color, bgcolor = component_bg, text_size = size.small)
+
+    table.cell(dashboard, 0, 15, 'Regime', text_color = dashboard_text_color, text_size = size.small)
+    regime_score_color = regime_allocation > 60 ? bullish_color : regime_allocation < 40 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 15, str.tostring(regime_allocation, '##'), text_color = regime_score_color, text_size = size.small)
+
+    table.cell(dashboard, 0, 16, 'Risk', text_color = dashboard_text_color, text_size = size.small)
+    risk_score_color = risk_allocation > 60 ? bullish_color : risk_allocation < 40 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 16, str.tostring(risk_allocation, '##'), text_color = risk_score_color, text_size = size.small)
+
+    table.cell(dashboard, 0, 17, 'Valuation', text_color = dashboard_text_color, text_size = size.small)
+    val_score_color = valuation_score > 60 ? bullish_color : valuation_score < 40 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 17, str.tostring(valuation_score, '##'), text_color = val_score_color, text_size = size.small)
+
+    table.cell(dashboard, 0, 18, 'Sentiment', text_color = dashboard_text_color, text_size = size.small)
+    sent_score_color = sentiment_score > 60 ? bullish_color : sentiment_score < 40 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 18, str.tostring(sentiment_score, '##'), text_color = sent_score_color, text_size = size.small)
+
+    table.cell(dashboard, 0, 19, 'Macro', text_color = dashboard_text_color, text_size = size.small)
+    macro_score_color = macro_score > 60 ? bullish_color : macro_score < 40 ? bearish_color : primary_color
+    table.cell(dashboard, 1, 19, str.tostring(macro_score, '##'), text_color = macro_score_color, text_size = size.small)
+
+// ALERTS
+
+// Major allocation changes
+alertcondition(smoothed_allocation >= 80 and smoothed_allocation[1] < 80, 'High Equity Allocation', 'Equity allocation reached 80% - Bull market conditions')
+
+alertcondition(smoothed_allocation <= 20 and smoothed_allocation[1] > 20, 'Low Equity Allocation', 'Equity allocation dropped to 20% - Defensive positioning')
+
+// Crisis alerts
+alertcondition(is_crisis and not is_crisis[1], 'CRISIS DETECTED', 'Crisis conditions detected - Reducing equity allocation')
+
+alertcondition(is_severe_crisis and not is_severe_crisis[1], 'SEVERE CRISIS', 'Severe crisis detected - Maximum defensive positioning')
+
+// Regime changes
+regime_changed = market_regime != market_regime[1]
+alertcondition(regime_changed, 'Regime Change', 'Market regime has changed')
+
+// Risk management alerts
+risk_breach = enable_portfolio_risk_scaling and (actual_portfolio_volatility > target_portfolio_volatility * 1.2 or actual_portfolio_drawdown > max_portfolio_drawdown * 1.2)
+alertcondition(risk_breach, 'Risk Breach', 'Portfolio risk exceeds target parameters')
+
+// USAGE
+
+// The indicator displays a recommended equity allocation percentage (0-100%).
+// Example: 75% allocation = 75% stocks, 25% cash/bonds.
+//
+// The model combines market regime analysis (trend, volatility, drawdowns),
+// risk management (portfolio-level targeting), valuation metrics (P/E, ERP),
+// sentiment indicators (VIX term structure), and macro factors (yield curve,
+// credit spreads) into a single allocation signal.
+//
+// Crisis detection automatically reduces exposure when multiple warning signals
+// converge. Alerts available for major allocation shifts and regime changes.
+//
+// Designed for SPY/S&P 500 portfolio allocation. Adjust component weights and
+// risk parameters in settings to match your risk tolerance.

@@ -1,0 +1,90 @@
+//@version=6
+indicator("Momentum Tide [Alpha Extract]", behind_chart = false, overlay=true, max_boxes_count=50, max_labels_count=50)
+
+// ==== Inputs ====
+lenBaseline   = input.int(50, "Baseline Length", minval=5, maxval=300, group="Trend Model")
+lenSmooth     = input.int(8, "Signal Smoothing", minval=1, maxval=50, group="Trend Model")
+atrLen        = input.int(15, "ATR Length", minval=5, maxval=100, group="Trend Model")
+neutralBand   = input.float(0.08, "Neutral Band (ATR %)", minval=0.0, maxval=0.5, step=0.01, group="Trend Model", tooltip="Wider band = fewer flips.")
+slopeScaler   = input.float(1.8, "Slope Sensitivity", minval=0.5, maxval=5.0, step=0.1, group="Trend Model", tooltip="Higher = smoother, lower = snappier.")
+
+showBaseline  = input.bool(true, "Show Baseline", group="Display")
+
+// ==== Core trend math ====
+baseline = ta.ema(close, lenBaseline)
+atrValue = ta.atr(atrLen)
+
+// Normalized deviation of price from baseline scaled by ATR, then smoothed
+rawDeviation = (close - baseline) / math.max(atrValue * slopeScaler, syminfo.mintick)
+signal       = ta.ema(rawDeviation, lenSmooth)
+tanhSafe(v) =>
+    capped = math.max(math.min(v, 20.0), -20.0)
+    e2 = math.exp(2.0 * capped)
+    (e2 - 1.0) / (e2 + 1.0)
+clamped = tanhSafe(signal)  
+
+// States: 1 bull, -1 bear, 0 neutral
+state    = clamped > neutralBand ? 1 : clamped < -neutralBand ? -1 : 0
+strength = math.abs(clamped)  
+
+// Colors 
+bullBase    = color.rgb(31, 222, 185)
+bearBase    = color.rgb(214, 24, 104)
+neutralBase = color.rgb(120, 128, 138)
+blendNeutral = color.rgb(105, 110, 120)
+fade(alphaBase, s) =>
+    alphaVal = math.round(alphaBase - s * 60)
+    math.max(math.min(alphaVal, 100), 0)
+
+bullColor    = color.new(bullBase, fade(70, strength))
+bearColor    = color.new(bearBase, fade(70, strength))
+neutralColor = color.new(neutralBase, 70)
+
+trendColor = state == 1 ? bullColor : state == -1 ? bearColor : neutralColor
+
+//Trend strength meter 
+segments = 12
+mixColor(c1, c2, frac) =>
+    r = color.r(c1) + (color.r(c2) - color.r(c1)) * frac
+    g = color.g(c1) + (color.g(c2) - color.g(c1)) * frac
+    b = color.b(c1) + (color.b(c2) - color.b(c1)) * frac
+    color.rgb(r, g, b)
+
+var table meter = table.new(position.bottom_center, segments * 2, 2, frame_color=color.new(color.black, 100), border_width=0)
+if barstate.islast
+    table.clear(meter, 0, 0)
+    negFill = clamped < 0 ? int(math.round(math.abs(clamped) * segments)) : 0
+    posFill = clamped > 0 ? int(math.round(math.abs(clamped) * segments)) : 0
+    totalCols = segments * 2
+    arrowNorm = (clamped + 1.0) / 2.0
+    arrowNorm := math.max(math.min(arrowNorm, 1.0), 0.0)
+    arrowCol = int(math.round(arrowNorm * (totalCols - 1)))
+    for i = 0 to segments - 1
+        frac = i / (segments - 1)
+        baseCol = mixColor(bearBase, blendNeutral, frac)
+        table.cell(meter, i, 1, "", bgcolor=baseCol)
+    for i = 0 to segments - 1
+        frac = i / (segments - 1)
+        baseCol = mixColor(blendNeutral, bullBase, frac)
+        table.cell(meter, segments + i, 1, "", bgcolor=baseCol)
+    for i = 0 to totalCols - 1
+        bg = color.new(color.black, 100)
+        txt = i == arrowCol ? "v" : ""
+        table.cell(meter, i, 0, txt, text_color=color.new(color.gray, 0), text_size=size.large, bgcolor=bg)
+
+// Plots 
+plot(showBaseline ? baseline : na, "Baseline", color=trendColor, linewidth=2)
+barcolor(trendColor, title="Trend Bars")
+plotcandle(open, high, low, close, title="Trend Candles", color=trendColor, wickcolor=trendColor, bordercolor=trendColor, force_overlay=true)
+
+// Transition markers 
+var int lastSignal = 0  
+isGreenFlip = state == 1 and state[1] != 1 and lastSignal <= 0  
+isRedFlip   = state == -1 and state[1] != -1 and lastSignal >= 0 
+if isGreenFlip
+    lastSignal := 1
+if isRedFlip
+    lastSignal := -1
+showTri = input.bool(true, "Show Flip Markers", group="Display")
+plotshape(showTri and isGreenFlip, title="Trend Up", location=location.belowbar, color=bullBase, style=shape.triangleup, size=size.tiny, text="")
+plotshape(showTri and isRedFlip, title="Trend Down", location=location.abovebar, color=bearBase, style=shape.triangledown, size=size.tiny, text="")

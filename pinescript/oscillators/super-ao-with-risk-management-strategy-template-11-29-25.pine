@@ -1,0 +1,669 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// @SignalLynx
+
+
+//@version=5
+// Super-AO with Risk Management Strategy Template - By SignalLynx 11-29-25 Release
+
+
+// ============================================================================================================
+//     SIGNAL LYNX - SUPER-AO STRATEGY & RISK MANAGEMENT TEMPLATE
+// ============================================================================================================
+//
+//     INTRODUCTION:
+//     This script implements "Super-AO," a robust trend-following strategy that combines the 
+//     SuperTrend indicator with the Awesome Oscillator (AO). 
+//    
+//     HOW IT WORKS:
+//     1. SuperTrend determines the macro direction (Trend).
+//     2. Awesome Oscillator (AO) determines the momentum.
+//     3. A signal is only generated when the SuperTrend is Green AND the AO is positive/rising (Buy),
+//        or SuperTrend is Red AND AO is negative/falling (Sell).
+//    
+//     USAGE:
+//     - Designed to capture large moves in High Time Frame (HTF) Swing Trades.
+//     - Excels on timeframes above 4 Hours.
+//     - Works best on "well-behaved" pairs with clear liquidity (Major Forex, BTC, ETH, etc.).
+//
+//     THE RISK MANAGEMENT (RM) ENGINE:
+//     This code is more than just a strategy; it is a Risk Management Template. 
+//     It features an advanced engine that separates the "Signal" from the "Execution."
+//    
+//     - Logic Injection: The engine expects a simple integer signal: +2 (Buy) or -2 (Sell).
+//     - Repainting Protection: It is designed to use actual candle closes for exits to minimize 
+//       repainting issues common in backtesting.
+//     - Advanced Exits: Includes Staged Take Profits (Scale out), Trailing Stops, and an 
+//       Advanced Adaptive Trailing Stop (AATS) based on volatility.
+//
+//     --------------------------------------------------------------------------------------------------------
+//     Signal Lynx
+//     Free Scripts supporting Automation for the Night-Shift Nation 🌙
+//    
+//     We are providing this code open source to support the night shift nation. This code has been 
+//     in action since 2022 and is a known performer in PineScript v5. 
+//    
+//     If you are looking to automate your strategies, please take a look at SignalLynx in your search:
+//     (www.signallynx.com)
+//
+//     If you make modifications to this code which are beneficial, please release them for the community.
+//     --------------------------------------------------------------------------------------------------------
+
+
+// ==============================================================================
+//  !!! MODE SELECTION - READ CAREFULLY !!!
+// ==============================================================================
+//  Pine Script can run as a STRATEGY (Backtesting) or an INDICATOR (Alerts).
+//  You must uncomment only ONE of the following two lines.
+//
+//  OPTION 1: STRATEGY MODE (Default) 
+//  Use this to see Buy/Sell tags on the chart and run the Strategy Tester.
+//  [INSTRUCTIONS]: Keep the line starting with 'strategy' UNCOMMENTED.
+//
+strategy('Super-AO with Risk Management Strategy Template - 11-29-25', shorttitle='SAO - RM Strat Template - 11-29-25', overlay=true, initial_capital=1000, commission_type=strategy.commission.percent, commission_value=0.26, currency=currency.USD, default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=0, slippage=5)
+//
+//  OPTION 2: INDICATOR/ALERT MODE
+//  Use this to set up Alerts for automation (Signal Lynx, 3Commas, etc).
+//  [INSTRUCTIONS]: Add "//" before the 'strategy' line above, and remove "//" from the 'indicator' line below.
+//
+//indicator('Super-AO with Risk Management Alerts Template - 11-29-25', shorttitle='SAO - RM Alerts Template - 11-29-25', overlay=true)
+// ==============================================================================
+
+
+////////////////////////////////////////////////////////////////
+//* Backtest Setting                                         *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] This section restricts the strategy execution to a specific date range.
+// This is crucial for verifying how a strategy performed during specific market cycles.
+var BackTestMod ="Back Test Inputs"
+testStartYear = input(2019, '- Start year', group=BackTestMod)
+testStartMonth = input(01, '- Start month', group=BackTestMod)
+testStartDay = input(01, '- Start day', group=BackTestMod)
+testPeriodStart =  timestamp(testStartYear, testStartMonth, testStartDay, 0, 0) 
+
+testStopYear = input(99999, '- Stop year', group=BackTestMod)
+testStopMonth = input(12, '- Stop month', group=BackTestMod)
+testStopDay = input(30, '-Stop day', group=BackTestMod)
+testPeriodStop = timestamp(testStopYear, testStopMonth, testStopDay, 0, 0)
+
+// Function to check if current bar is within the test period
+testPeriod() =>
+    time >= testPeriodStart and time <= testPeriodStop ? true : false
+
+
+/////////////////////////////////////
+// Longs and shorts Direction Control
+
+var LnS = "Strategy Options - Longs and Shorts"
+LnS_Longs = input(true, title='Longs', group=LnS)
+LnS_Shorts = input(false, title='Shorts', group=LnS)
+
+// Logic to determine direction: 1=Both, 2=Long Only, 3=Short Only
+LongAndShort =LnS_Longs==true and LnS_Shorts==true ? 1 : LnS_Longs==true and LnS_Shorts==false ? 2 : LnS_Longs==false and LnS_Shorts==true ? 3 : 1
+
+
+////////////////////////////////////////////////////////////////
+//* Super-AO Strategy Logic                                  *//
+////////////////////////////////////////////////////////////////
+// [NOTE] This is the "Brain" of the strategy. If you want to use this template for a different strategy,
+// you would replace the code in this section.
+
+// --- Awesome Oscillator (AO) ---
+AOfastLength = input(title='AO Fast Length', defval=14)
+AOslowLength = input(title='AO Slow Length', defval=420) // [NOTE] Using a very slow length to smooth out noise for swing trading
+ao = ta.sma(close, AOfastLength) - ta.sma(close, AOslowLength)
+AOSmoothInput = input(title='AO Smoother length', defval=21)
+aoSmooth = ta.ema(ao, AOSmoothInput)
+AORising = ta.rising(ao, AOSmoothInput) ? 1 : -1
+
+// --- SuperTrend (ST) ---
+STPeriods = input(title='ST ATR Period', defval=14)
+STsrc = close
+STMultiplier = input.float(title='ST ATR Multiplier', step=0.1, defval=7.0) // [NOTE] Multiplier of 7 is looser than standard
+
+STatr = ta.atr(STPeriods)
+STup = STsrc - STMultiplier * STatr
+STup1 = nz(STup[1], STup)
+STup := close[1] > STup1 ? math.max(STup, STup1) : STup
+STdn = STsrc + STMultiplier * STatr
+STdn1 = nz(STdn[1], STdn)
+STdn := close[1] < STdn1 ? math.min(STdn, STdn1) : STdn
+
+// SuperTrend Trend Calculation
+STtrend = 1
+STtrend := nz(STtrend[1], STtrend)
+STtrend := STtrend == -1 and close > STdn1 ? 1 : STtrend == 1 and close < STup1 ? -1 : STtrend
+STbuySignal = STtrend == 1 and STtrend[1] == -1
+STsellSignal = STtrend == -1 and STtrend[1] == 1
+
+// Smoothed SuperTrend for advanced exit conditions
+STdnsmooth=ta.sma(STdn, 14)
+STupsmooth=ta.sma(STup, 14)
+STUpRise= ta.rising(STupsmooth, 14) and STtrend==1 ? 1 : 0
+STDnFall = ta.falling(STdnsmooth, 14) and STtrend ==-1 ? -1 :0 
+
+// --- Super-AO Final Signal Generation ---
+// [NOTE] The magic number 2 represents a BUY, -2 represents a SELL. 0 is Neutral.
+SAO  = ao>= 0 and AORising==1 and STtrend==1 ? 2 : ao<=0 and AORising==-1 and STtrend==-1 ? -2 : 0
+
+
+// --- Weekend Filtering ---
+// Prevents entries during low liquidity weekend hours if selected
+WeekendInput = input(false, title='Do NOT Trade Weekends (Default=Trade)')
+weekend = dayofweek==1 or dayofweek==7 ? 1 : 0
+WeekendHalt = WeekendInput==true ? weekend : 0
+
+
+////////////////////////////////////////////////////////////////
+//* Final Buys for Risk Management Module                    *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] This connects the Strategy Logic (SAO) to the Risk Manager.
+RM_EngineInput = SAO
+
+// If weekend halt is on, signals are suppressed (0), otherwise they pass through
+AlertOpen= WeekendHalt == 1 ? 0 : RM_EngineInput
+
+// Exit triggers based on SuperTrend smoothing
+CloseLong = STDnFall ==-1 ? true : false
+CloseShort = STUpRise==1 ? true : false
+
+////////////////////////////////////////////////////////////////
+//* Trade State Engine (Risk Management Translation)         *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] This state machine prevents signal spamming. It ensures we only 
+// react to a *change* in signal or a confirmed trend state.
+
+// AO: Detects the initial signal change (2 or -2)
+AO = AlertOpen == 2 and AlertOpen != AlertOpen[1] ? 2 : 
+   AlertOpen == -2 and AlertOpen != AlertOpen[1] ? -2 : 0
+   
+// AT (Actual Trend): Persists the trend state
+AT=float(na)
+AT:= (AO==2)? 2: (AO==-2)? -2: AT[1]
+
+// AF (Actual Final): Confirms entry only if the trend direction has actually flipped
+AF=float(na) 
+AF:=(AT==2 and AT[1]!=2)?2: (AT==-2 and AT [1]!=-2) ? -2:0
+
+// CL/CS: Logic for closing positions
+CS = CloseShort == true ? -1 : 0
+CL = CloseLong == true ? 1 : 0
+CSX = CS == -1 and CS != CS[1] ? -1 : CL == 1 and CL != CL[1] ? 1 : 0
+
+// [NOTE] Aggressive RM allows re-entries in the same trend direction (Pyramiding Type I).
+AgressiveRM = input(true, "Utilize Agresive RM - Reset RM Values as long as Algo determines entry conditions are valide (Default- Conservative)")
+
+TradeEngineX = AlertOpen == 2 ? 1 : AlertOpen == -2 ? -1 : 0
+TradeEngineY= AF==2?1:AF==-2?-1:0
+
+TradeEngineRisk = (AgressiveRM==false)? TradeEngineY: TradeEngineX
+
+
+////////////////////////////////////////////////////////////////
+//* Risk Management Code                                     *//
+////////////////////////////////////////////////////////////////
+// [NOTE] CORE RISK MANAGEMENT BLOCK - DO NOT MODIFY
+
+open_ = open[1] 
+close_ = close[1] 
+high_X = high[1] 
+low_X = low[1] 
+
+isLong = true
+isShort = true
+
+// === RISK MANAGEMENT VALUE PREP ===
+// Determine what Bar values we should use for Risk managment (High/Low vs Close)
+BarTypeRM = input(true, "Use Bar Open/Close for RM Only (Defaul is High/Low)")
+low_=(BarTypeRM==true) ? close_ :low_X
+high_=(BarTypeRM==true) ? close_ : high_X
+
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// Generate final Risk Management Signals
+RiskOpenR = (AgressiveRM==false) ? AF: AO
+RiskCloseLR = (AgressiveRM==false) ? CSX: CL
+RiskCloseSR = (AgressiveRM==false) ? CSX: CS
+
+openLongR = RiskOpenR == 2 ? true : false
+closeLongR = RiskCloseLR == 1 ? true : false
+
+openShortR = RiskOpenR == -2 ? true : false
+closeShortR = RiskCloseSR == -1 ? true : false 
+
+buy = 0
+buy := openLongR ? nz(buy[1]) > 0 ? buy[1] + 1 : 1 : 0
+sell = 0
+sell := openShortR ? nz(sell[1]) > 0 ? sell[1] + 1 : 1 : 0
+
+
+//////////////////////////
+//* Trade State Engine *//
+//////////////////////////
+
+// [NOTE] Tracks if a position is currently forcibly closed
+longCloseX = false
+longCloseX := nz(longCloseX[1], false)
+shortCloseX = false
+shortCloseX := nz(shortCloseX[1], false)
+
+tradeState = TradeEngineRisk
+
+///////////////////////////////////////////////////////
+// Handle Entry Conditions, when state changes direction.
+
+longCondition = false
+shortCondition = false
+longCondition := ta.change(tradeState) and tradeState == 1
+shortCondition := ta.change(tradeState) and tradeState == -1
+
+// Exit on Sell signal reversal
+longExitC = CL == 1 or AlertOpen == -2 ? 1 : 0
+shortExitC = CS == -1 or AlertOpen == 2 ? 1 : 0
+
+// Exit condition for no Stop Loss defined
+longExit = ta.change(longExitC) and longExitC == 1 and tradeState == 1
+shortExit = ta.change(shortExitC) and shortExitC == 1 and tradeState == -1
+
+/////////////////////////////////////
+//======[ Deal Entry Prices ]======//
+/////////////////////////////////////
+
+// Store the price at the moment the entry condition was met
+last_open_longCondition = float(na)
+last_open_shortCondition = float(na)
+last_open_longCondition := longCondition ? close : nz(last_open_longCondition[1])
+last_open_shortCondition := shortCondition ? close : nz(last_open_shortCondition[1])
+
+//////////////////////////////////
+//======[ Position State ]======//
+//////////////////////////////////
+
+// Boolean flags for current direction
+in_longCondition=(AT==2)? true: false
+in_shortCondition = (AT==-2)? true:false
+
+/////////////////////////////////
+//======[ Trailing Stop ]======//
+/////////////////////////////////
+
+// [NOTE] Basic Percentage Trailing Stop Logic.
+isTS = input(false, "Trailing Stop")
+tsActivation = input.float(18.0, "Trailing Stop  Activation (%)", minval=0, step=0.1)/100
+ts = input.float(6.0, 'Trailing Stop (%)', minval=0, step=0.1) / 100
+
+LongTSActivate = low_ > last_open_longCondition + last_open_longCondition * tsActivation ? true : false
+ShortTSActivate=  high_ < last_open_shortCondition - last_open_shortCondition * tsActivation ? true : false
+
+// Tracking Highest High (for longs) and Lowest Low (for shorts) since entry
+last_high = float(na)
+last_low = float(na)
+last_high_short = float(na)
+last_low_long = float(na)
+
+last_high := not in_longCondition ? na : 
+   in_longCondition and (na(last_high[1]) or high_ > nz(last_high[1])) ? high_ : 
+   nz(last_high[1])
+last_high_short := not in_shortCondition ? na : 
+   in_shortCondition and (na(last_high[1]) or high_ > nz(last_high[1])) ? high_ : 
+   nz(last_high[1])
+last_low := not in_shortCondition ? na : 
+   in_shortCondition and (na(last_low[1]) or low_ < nz(last_low[1])) ? low_ : 
+   nz(last_low[1])
+last_low_long := not in_longCondition ? na : 
+   in_longCondition and (na(last_low[1]) or low_ < nz(last_low[1])) ? low_ : 
+   nz(last_low[1])
+
+long_ts = isTS and in_longCondition and not na(last_high) and (LongTSActivate==true)  and 
+   low_ <= last_high - last_high * ts
+short_ts = isTS and in_shortCondition and not na(last_low) and (ShortTSActivate==true) and 
+   high_ >= last_low + last_low * ts
+
+
+///////////////////////////////
+//======[ Take Profit ]======//
+///////////////////////////////
+
+// [NOTE] Standard Take Profit with a "Trailing Profit" feature. 
+isTP = input(false, "Take Profit")
+tp = input.float(12.0, 'Take Profit (%)', minval=0, step=0.1) / 100
+ttp = input.float(2.5, 'Trailing Profit (%)', minval=0, step=0.1) / 100
+ttp := ttp > tp ? tp : ttp
+
+long_tp = isTP and in_longCondition and 
+   last_high >= last_open_longCondition + last_open_longCondition * tp and 
+   low_ <= last_high - last_high * ttp
+short_tp = isTP and in_shortCondition and 
+   last_low <= last_open_shortCondition - last_open_shortCondition * tp and 
+   high_ >= last_low + last_low * ttp
+
+
+/////////////////////////////////////
+//======[ Staged Take Profit]======//
+/////////////////////////////////////
+
+// [NOTE] Staged Take Profits allow scaling out of a position.
+isSTP = input(false, "Use Staged Take Profit (Default = No")
+Stp1Per = input.float(10.0, "1st Level - Take Profit Activation Percent (%))", minval=0, step=0.1) // 100
+Stp1Trail = input.float(5.0, "1st Level - Trailing Profit Percent (%)", minval=0, step=0.1) // 100
+Stp1Qty = input.float(10.0, "1st Level - Close Order Quantity (%)", minval=0, step=0.1) // 100
+Stp2Per = input.float(20.0, "2nd Level - Take Profit Activation Percent (%))", minval=0, step=0.1) // 100
+Stp2Trail = input.float(10.0, "2nd Level - Trailing Profit Percent (%)", minval=0, step=0.1) // 100
+Stp2Qty = input.float(10.0, "2nd Level - Close Order Quantity (%)", minval=0, step=0.1) // 100
+Stp3Per = input.float(30.0, "3rd Level - Take Profit Activation Percent (%)", minval=0, step=0.1) // 100
+Stp3Trail = input.float(5.0, "3rd Level - Trailing Profit Percent (%)", minval=0, step=0.1) // 100
+Stp3Qty = input.float(70.0, "3rd Level - Close Order Quantity (%)", minval=0, step=0.1) // 100
+
+// Calculate activations for staged TPs
+LongTSActivate1 = last_high >= last_open_longCondition + last_open_longCondition * (Stp1Per/100) ? true : false
+ShortTSActivate1= last_low  <= last_open_shortCondition - last_open_shortCondition * (Stp1Per/100) ? true : false
+LongTSActivate2 = last_high >= last_open_longCondition + last_open_longCondition * (Stp2Per/100) ? true : false
+ShortTSActivate2= last_low <=  last_open_shortCondition - last_open_shortCondition * (Stp2Per/100) ? true : false
+LongTSActivate3 = last_high >= last_open_longCondition + last_open_longCondition * (Stp3Per/100) ? true : false
+ShortTSActivate3= last_low <=  last_open_shortCondition - last_open_shortCondition * (Stp3Per/100) ? true : false
+
+// Calculate trigger hits for staged TPs
+long_Stp1 = isSTP and in_longCondition and not na(last_high) and (LongTSActivate1==true) and
+   low_ <= last_high - last_high *  (Stp1Trail/100)
+short_Stp1 = isSTP and in_shortCondition and not na(last_low) and (ShortTSActivate1==true) and 
+   high_ >= last_low + last_low * (Stp1Trail/100)
+long_Stp2 = isSTP and in_longCondition and not na(last_high) and (LongTSActivate2==true) and
+   low_ <= last_high - last_high *  (Stp2Trail/100)
+short_Stp2 = isSTP and in_shortCondition and not na(last_low) and (ShortTSActivate2==true) and  
+   high_ >= last_low + last_low * (Stp2Trail/100)
+long_Stp3 = isSTP and in_longCondition and not na(last_high) and (LongTSActivate3==true) and
+   low_ <= last_high - last_high *  (Stp3Trail/100)
+short_Stp3 = isSTP and in_shortCondition and not na(last_low) and (ShortTSActivate3==true) and  
+   high_ >= last_low + last_low * (Stp3Trail/100)
+   
+// Define Limit Prices for strategy exits   
+longSTP1=long_Stp1==true ? last_high - last_high *  (Stp1Per/100) : Stp1Qty<=0 ? na : na
+longSTP2=long_Stp2==true ? last_high - last_high *  (Stp2Per/100) : Stp2Qty<=0 ? na : na
+longSTP3=long_Stp3==true ? last_high - last_high *  (Stp3Per/100) : Stp3Qty<=0 ? na : na
+
+shortSTP1=short_Stp1==true ? last_low + last_low * (Stp1Per/100) : Stp1Qty<=0 ? na : na
+shortSTP2=short_Stp2==true ? last_low + last_low * (Stp2Per/100) : Stp2Qty<=0 ? na : na
+shortSTP3=short_Stp3==true ? last_low + last_low * (Stp3Per/100) : Stp3Qty<=0 ? na : na
+
+Stp1QtyF=Stp1Qty<=0 ? na : Stp1Qty
+Stp2QtyF=Stp2Qty<=0 ? na : Stp2Qty
+Stp3QtyF=Stp3Qty<=0 ? na : Stp3Qty
+
+// Counters to ensure TP alerts fire only once per level per trade
+var Counter_LTP1 = 0
+Counter_LTP1 := long_Stp1 != 0 ? Counter_LTP1 + 1 : AF != 0 ? 0 : Counter_LTP1[1]
+var Counter_LTP2 = 0
+Counter_LTP2 := long_Stp2 != 0 ? Counter_LTP2 + 1 : AF != 0 ? 0 : Counter_LTP2[1]
+var Counter_LTP3 = 0
+Counter_LTP3 := long_Stp3 != 0 ? Counter_LTP3 + 1 : AF != 0 ? 0 : Counter_LTP3[1]
+var Counter_STP1 = 0
+Counter_STP1 := short_Stp1 != 0 ? Counter_STP1 + 1 : AF != 0 ? 0 : Counter_STP1[1]
+var Counter_STP2 = 0
+Counter_STP2 := short_Stp2 != 0 ? Counter_STP2 + 1 : AF != 0 ? 0 : Counter_STP2[1]
+var Counter_STP3 = 0
+Counter_STP3 := short_Stp3 != 0 ? Counter_STP3 + 1 : AF != 0 ? 0 : Counter_STP3[1]
+
+TakeProfit1Plot = long_Stp1 == true and long_Stp1 != long_Stp1[1] and Counter_LTP1 == 1 ? 1 : short_Stp1 == true and short_Stp1 != short_Stp1[1] and Counter_STP1 == 1 ? -1 : 0
+TakeProfit2Plot = long_Stp2 == true and long_Stp2 != long_Stp2[1] and Counter_LTP2 == 1 ? 2 : short_Stp2 == true and short_Stp2 != short_Stp2[1] and Counter_STP2 == 1 ? -2 : 0
+TakeProfit3Plot = long_Stp3 == true and long_Stp3 != long_Stp3[1] and Counter_LTP3 == 1 ? 3 : short_Stp3 == true and short_Stp3 != short_Stp3[1] and Counter_STP3 == 1 ? -3 : 0
+
+
+/////////////////////////////
+//======[ Stop Loss ]======//
+/////////////////////////////
+
+// [NOTE] Hard Stop Loss Logic
+isSL = input(false, "Stop Loss")
+sl = input.float(18.0, 'Stop Loss (%)', minval=0, step=0.1) / 100
+long_sl = isSL and in_longCondition and ( low_ <= last_open_longCondition - last_open_longCondition * sl)
+short_sl = isSL and in_shortCondition and  (high_ >= (last_open_shortCondition + last_open_shortCondition * sl))
+   
+LongStop = last_open_longCondition - last_open_longCondition * sl
+ShortStop=  last_open_shortCondition + last_open_shortCondition * sl
+
+
+/////////////////////////////////////////////////
+//======[Advance Adaptive Trailing Stop ]======//
+////////////////////////////////////////////////
+
+// [NOTE] AATS Logic: This is a complex module that calculates market volatility and location relative to
+// Hirashima Sugita (HSRS) Support/Resistance levels and Bollinger Bands to determine how "tight" the stop should be.
+
+lenEMA = 50  
+srcEMA = close  
+outEMA = ta.sma(srcEMA, lenEMA)
+CS_AATS = ta.ema(close, 7)
+
+// Hirashima Sugita R/S Code (HSRS)
+lengthHSRS = 1000  
+maHSRS = ta.ema(close, lengthHSRS)
+dHSRS = close - maHSRS
+
+sHSRS = ta.linreg(dHSRS, lengthHSRS, 0)
+xHSRS = maHSRS + sHSRS
+
+d_HSRS = close - xHSRS
+s_HSRS = ta.linreg(d_HSRS, lengthHSRS, 0)
+basisHSRS = maHSRS + sHSRS + ta.change(s_HSRS)
+
+// Calculate HSRS Bands
+upperHSRS = basisHSRS + ta.wma(math.abs(dHSRS), lengthHSRS)
+lowerHSRS = basisHSRS - ta.wma(math.abs(dHSRS), lengthHSRS)
+upper_HSRS = upperHSRS + ta.wma(math.abs(dHSRS), lengthHSRS)
+lower_HSRS = lowerHSRS - ta.wma(math.abs(dHSRS), lengthHSRS)
+
+// Determine where price is relative to HSRS bands ("Floors" of the building)
+HSRS_RangePenthouse = CS_AATS >= upper_HSRS ? 6 : 0
+HSRS_Range4thFloor = CS_AATS < upper_HSRS and CS_AATS >= upperHSRS ? 5 : 0
+HSRS_Range3rdFloor = CS_AATS < upperHSRS and CS_AATS >= basisHSRS ? 4 : 0
+HSRS_Range2ndFloor = CS_AATS < basisHSRS and CS_AATS >= lowerHSRS ? 3 : 0
+HSRS_Range1stFloor = CS_AATS < lowerHSRS and CS_AATS >= lower_HSRS ? 2 : 0
+HSRS_RangeDungeon = CS_AATS < lower_HSRS ? 1 : 0
+HSRS_Location = HSRS_RangeDungeon + HSRS_Range1stFloor + HSRS_Range2ndFloor + HSRS_Range3rdFloor + HSRS_Range4thFloor + HSRS_RangePenthouse
+
+// Bollinger Band Logic (MBB)
+srcMBB = close  
+lengthMBB = 34  
+multMBB = 2.0  
+
+basisMBB = ta.sma(srcMBB, lengthMBB)
+devMBB = ta.stdev(srcMBB, lengthMBB)
+dev2MBB = multMBB * devMBB
+dev3MBB = multMBB * 2 * devMBB
+
+upper1MBB = basisMBB + devMBB
+lower1MBB = basisMBB - devMBB
+upper2MBB = basisMBB + dev2MBB
+lower2MBB = basisMBB - dev2MBB
+upper3MBB = basisMBB + dev3MBB
+lower3MBB = basisMBB - dev3MBB
+
+// Calculate AATS Engagement and Factor
+// Determines if we are in a strong trend zone and adjusts the Stop sensitivity (Factor)
+AATS_Engage3 = CS_AATS > outEMA and CS_AATS > basisHSRS and CS_AATS > upper1MBB ? 1 : CS_AATS < outEMA and CS_AATS < basisHSRS and CS_AATS < lower1MBB ? -1 : 0
+AATS_Factor = AATS_Engage3 == 1 and HSRS_Location == 6 ? 0.5 : AATS_Engage3 == 1 and HSRS_Location == 5 ? 2 : AATS_Engage3 == 1 and HSRS_Location == 4 ? 3 : AATS_Engage3 == -1 and HSRS_Location == 1 ? 0.5 : AATS_Engage3 == -1 and HSRS_Location == 2 ? 2 : AATS_Engage3 == -1 and HSRS_Location == 3 ? 3 : 4
+
+var SLMod2 = "Stop Loss Qualifiers"
+
+// ATS Code implementation
+UseAATS = input(true, 'Use Advance Adaptive Trailing Stop (AATS) - (Default is On)', group = SLMod2)
+RestrictiveAATS = input(true, 'Use Restrictive AATS - Good for majors (Default is On)', group = SLMod2)
+UseRSIS = input(true, 'Use RSI Stop (RSIS) - (Default is On)', group = SLMod2)
+
+srcATS = close
+aATS = 0.0
+bATS = 0.0
+osATS = 0.0
+
+atsFacInput = input(80, 'ATS Stop Factor (0+)', group = SLMod2)
+erATS = AATS_Factor / atsFacInput  
+
+// Calculate Dynamic Stop Lines
+aATS := math.max(srcATS, nz(aATS[1], srcATS)) - math.abs(srcATS - nz(aATS[1], srcATS)) * erATS
+bATS := math.min(srcATS, nz(bATS[1], srcATS)) + math.abs(srcATS - nz(bATS[1], srcATS)) * erATS
+
+ATSCross1 = ta.cross(aATS, srcATS) ? 1 : 0
+ATSCross2 = ta.cross(bATS, srcATS) ? 0 : -1
+
+osATS := ATSCross1 == 1 ? 1 : ATSCross2 == 0 ? 0 : osATS[1]
+tsATS = osATS * bATS + (1 - osATS) * aATS
+
+ATSaX = ta.sma(close - (aATS - close), 7)
+ATSbX = ta.sma(close + close - bATS, 7)
+
+// RSI Stop Loss (RSIS) - Adds momentum verification to stops
+McGinleyRSIS(_srcRSIS, lenRSIS) =>
+    MDRSIS = 0.0
+    MDRSIS := na(_srcRSIS[1]) ? _srcRSIS : MDRSIS[1] + (_srcRSIS - MDRSIS[1]) / (0.6 * lenRSIS * math.pow(_srcRSIS / MDRSIS[1], 4))
+    MDRSIS
+
+rsi_maRSIS = McGinleyRSIS(close, 14)
+ATRRSIS = ta.atr(27)
+top_lineRSIS = rsi_maRSIS + ATRRSIS
+bottom_lineRSIS = rsi_maRSIS - ATRRSIS
+DirectionRSIS1 = ta.crossover(close, top_lineRSIS) ? 1 : 0
+DirectionRSIS2 = ta.crossunder(close, bottom_lineRSIS) ? -1 : 0
+directionRSIS = 1
+directionRSIS := DirectionRSIS1 == 1 ? 1 : DirectionRSIS2 == -1 ? -1 : directionRSIS[1]
+stop_lineRSIS = rsi_maRSIS - directionRSIS * ATRRSIS
+RSIS_Signal = directionRSIS
+
+ATS_CloseLongsX = UseRSIS == true and in_longCondition == true and AATS_Engage3 == 1  and RSIS_Signal == -1 ? true : false
+ATS_CloseShortsX = UseRSIS == true and in_shortCondition == true and AATS_Engage3 == -1 and RSIS_Signal == 1 ? true : false
+
+// Check to see if we should be using ATS Module for final close signal
+ATS_CloseLongsY = UseAATS == true and in_longCondition == true and AATS_Engage3 == 1   and low_ < bATS and low_ < ATSbX and low_ < ATSaX ? true : false  ///
+ATS_CloseShortsY = UseAATS == true and in_shortCondition == true and AATS_Engage3 == -1 and high_ > aATS and high_ > ATSaX and high_ > ATSbX ? true : false
+
+ATS_CloseLongsAgg = ATS_CloseLongsX == true or ATS_CloseLongsY == true ? true : false
+ATS_CloseShortsAgg = ATS_CloseShortsX == true or ATS_CloseShortsY == true ? true : false
+
+ATS_CloseLongsRestrictive = ATS_CloseLongsY == true ? true : false
+ATS_CloseShortsRestrictive = ATS_CloseShortsY == true ? true : false
+
+// Final ATS Flags
+ATS_CloseLongs = RestrictiveAATS == true ? ATS_CloseLongsRestrictive : ATS_CloseLongsAgg
+ATS_CloseShorts = RestrictiveAATS == true ? ATS_CloseShortsRestrictive : ATS_CloseShortsAgg
+
+
+/////////////////////////////////
+//======[ Close Signals ]======//
+/////////////////////////////////
+
+// [NOTE] Consolidate all exit reasons into a single variable.
+// This checks: Hard stops, Trailing Stops, Take Profits, and Adaptive Stops.
+longCloseX := isLong and (long_tp or long_sl or long_ts  or ATS_CloseLongs ) and not longCondition
+shortCloseX := isShort and (short_tp or short_sl or short_ts or ATS_CloseShorts ) and not shortCondition
+
+
+////////////////////////////////////////////////////////////////
+//* Final Order Signals - Buys and Sells                     *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] Final Signal processing for strategy entry.
+RMPlot = (longCloseX == true or CSX==1) ? 1 : (shortCloseX == true or CSX==-1) ? -1 : 0
+RMSig = RMPlot == 1 and RMPlot != RMPlot[1] ? 1 : 
+   RMPlot == -1 and RMPlot != RMPlot[1] ? -1 : 0
+
+ClearRM =(AT==2 and RMSig==1)? 3: (AT==-2 and RMSig==-1)?-3: 0
+
+ClearRMP=float(na) 
+ClearRMP:=(ClearRM==3)?3: (ClearRM==-3)?-3: (AO==2 or AO==-2)? 0: ClearRMP[1]
+
+CloseEmAll = float(na)
+CloseEmAll := ClearRM == 3 and ClearRM[1] != 3 and ClearRMP[1]==0 ? 1 : ClearRM == -3 and ClearRM[1] != -3 and ClearRMP[1]==0 ? -1 : 0
+
+ReOrder= (ClearRMP==0 and ClearRMP[1]==3 and ClearRMP!=ClearRMP[1])? 4: (ClearRMP==0 and ClearRMP[1]==-3 and ClearRMP!=ClearRMP[1])?-4:0
+
+Fin = (AF==2 or ReOrder==4 and AT==2)?2 : (AF==-2 or ReOrder==-4 and AT==-2)? -2:0
+
+
+////////////////////////////////////////////////////////////////
+//* Backtest Buys and Sells                                  *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] Strategy Execution Block.
+// This section triggers the actual strategy orders on the chart.
+// It maps the 'Fin' signals to Entries and the 'STP' variables to Exits.
+
+if testPeriod() and LongAndShort==1
+    strategy.entry('Long', strategy.long, when=Fin == 2, comment='Long')
+    strategy.exit('TP1 L', from_entry='Long', limit=longSTP1, qty_percent=Stp1QtyF, comment='L-TP1')
+    strategy.exit('TP2 L', from_entry='Long', limit=longSTP2, qty_percent=Stp2QtyF, comment='L-TP2')
+    strategy.exit('TP3 L', from_entry='Long', limit=longSTP3, qty_percent=Stp3QtyF, comment='L-TP3')
+    strategy.close('Long', when=CSX == 1 or longCloseX)
+
+if testPeriod() and LongAndShort==1
+    strategy.entry('Short', strategy.short, when=Fin == -2, comment='Short')
+    strategy.exit('TP1 S', from_entry='Short', limit=shortSTP1, qty_percent=Stp1QtyF, comment='S-TP1')
+    strategy.exit('TP2 S', from_entry='Short', limit=shortSTP2, qty_percent=Stp2QtyF, comment='S-TP2')
+    strategy.exit('TP3 S', from_entry='Short', limit=shortSTP3, qty_percent=Stp3QtyF, comment='S-TP3')
+    strategy.close('Short', when=CSX == -1 or shortCloseX)
+     
+if testPeriod() and LongAndShort==2
+    strategy.entry('Long', strategy.long, when=Fin == 2, comment='Long')
+    strategy.exit('TP1 L', from_entry='Long', limit=longSTP1, qty_percent=Stp1QtyF, comment='L-TP1')
+    strategy.exit('TP2 L', from_entry='Long', limit=longSTP2, qty_percent=Stp2QtyF, comment='L-TP2')
+    strategy.exit('TP3 L', from_entry='Long', limit=longSTP3, qty_percent=Stp3QtyF, comment='L-TP3')
+    strategy.close('Long', when=CSX == 1 or longCloseX or Fin==-2)
+
+if testPeriod() and LongAndShort==3
+    strategy.entry('Short', strategy.short, when=Fin == -2, comment='Short')
+    strategy.exit('TP1 S', from_entry='Short', limit=shortSTP1, qty_percent=Stp1QtyF, comment='S-TP1')
+    strategy.exit('TP2 S', from_entry='Short', limit=shortSTP2, qty_percent=Stp2QtyF, comment='S-TP2')
+    strategy.exit('TP3 S', from_entry='Short', limit=shortSTP3, qty_percent=Stp3QtyF, comment='S-TP3')
+    strategy.close('Short', when=CSX == -1 or shortCloseX or Fin==2)
+
+
+////////////////////////////////////////////////////////////////
+//* Alerts Buys and Sells (For Indicator Mode)               *//
+////////////////////////////////////////////////////////////////
+
+// [NOTE] ALERT VISUALIZERS
+// These plots are commented out by default. 
+// If you have switched to "Indicator Mode" (at the top of the script), you can uncomment these lines.
+// They will plot visual spikes on the chart (1, -1, 2, -2) which you can use to set up 
+// "Any Alert() function calls" for automation.
+
+// Buy and Sell Signals - Fin==2 Long, Fin==-2 Short
+// plot(Fin, title="Order Open",linewidth=3,color=color.blue)
+
+// RM Close Alerts = Close Long = 1, Close Short =-1
+// plot(CloseEmAll, title="RM Close", linewidth=3,color=color.yellow)
+
+// Take Profit Plot 1,2, 3 for Long TP1, 2, 3, and -1 -2 -3 for shorts
+// plot(isSTP==true ? TakeProfit1Plot : na, title="TP-1 Close", linewidth=3,color=color.lime)
+// plot(isSTP==true ? TakeProfit2Plot : na, title="TP-2 Close", linewidth=3,color=color.olive)
+// plot(isSTP==true ? TakeProfit3Plot : na, title="TP-3 Close", linewidth=3,color=color.green)
+
+
+///////////////////////////////////
+//======[ Reset Variables ]======//
+///////////////////////////////////
+
+// [NOTE] Variable Maintenance
+// This resets the tracking variables when a trade is closed to ensure clean data for the next trade.
+// Critical for the correct functioning of the TradeState engine.
+
+if longCloseX or not in_longCondition
+    last_high := na
+    last_high_short := na
+
+
+if shortCloseX or not in_shortCondition
+    last_low := na
+    last_low_long := na
+
+
+if longCloseX or shortCloseX
+    tradeState := 0
+    in_longCondition := false
+    in_shortCondition := false
+
+
+
+///////////////////////////////////
+//======[ EOF - Done Baby ]======//
+///////////////////////////////////

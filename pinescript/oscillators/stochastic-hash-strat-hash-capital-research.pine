@@ -1,0 +1,211 @@
+//@version=6
+strategy("Stochastic Hash Strat [Hash Capital Research]",
+     overlay=false,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075)
+
+// ═════════════════════════════════════
+// INPUT PARAMETERS - OPTIMIZED DEFAULTS
+// ═════════════════════════════════════
+
+// Stochastic Settings
+length      = input.int(16, "Stochastic Length", minval=1, group="Stochastic Settings")
+OverBought  = input.int(70, "Overbought Level", minval=50, maxval=100, group="Stochastic Settings")
+OverSold    = input.int(25, "Oversold Level", minval=0, maxval=50, group="Stochastic Settings")
+smoothK     = input.int(7, "Smooth K", minval=1, group="Stochastic Settings")
+smoothD     = input.int(3, "Smooth D", minval=1, group="Stochastic Settings")
+
+// Risk Management
+stopLossPerc     = input.float(2.2, "Stop Loss %", minval=0.1, maxval=10, step=0.1, group="Risk Management")
+takeProfitPerc   = input.float(7.0, "Take Profit %", minval=0.1, maxval=20, step=0.1, group="Risk Management")
+
+// Exit Settings
+exitOnOppositeExtreme = input.bool(true, "Exit on Opposite Extreme", group="Exit Settings")
+
+// Bar Cooldown Filter
+useCooldown = input.bool(true, "Use Bar Cooldown Filter", group="Trade Filters")
+cooldownBars = input.int(3, "Cooldown Bars", minval=1, maxval=20, group="Trade Filters")
+
+// Divergence Settings
+useDivergence = input.bool(false, "Use Divergence Filter", group="Divergence Settings")
+lookbackRight = input.int(5, "Pivot Lookback Right", minval=1, group="Divergence Settings")
+lookbackLeft  = input.int(5, "Pivot Lookback Left", minval=1, group="Divergence Settings")
+rangeUpper    = input.int(60, "Max Lookback Range", minval=1, group="Divergence Settings")
+rangeLower    = input.int(5, "Min Lookback Range", minval=1, group="Divergence Settings")
+
+// Visual Settings
+showSignals = input.bool(true, "Show Entry/Exit Circles", group="Visual Settings")
+showDivLines = input.bool(false, "Show Divergence Lines", group="Visual Settings")
+
+// ═════════════════════════════════════
+// STOCHASTIC CALCULATION
+// ═════════════════════════════════════
+
+k = ta.sma(ta.stoch(close, high, low, length), smoothK)
+d = ta.sma(k, smoothD)
+
+// Crossover signals
+bullishCross = ta.crossover(k, d)
+bearishCross = ta.crossunder(k, d)
+
+// ═════════════════════════════════════
+// BAR COOLDOWN FILTER
+// ═════════════════════════════════════
+
+var int lastExitBar = na
+var bool inCooldown = false
+
+// Track when position closes
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    lastExitBar := bar_index
+    inCooldown := true
+
+// Check if cooldown period has passed
+if not na(lastExitBar) and bar_index - lastExitBar >= cooldownBars
+    inCooldown := false
+
+// Apply cooldown filter
+cooldownFilter = useCooldown ? not inCooldown : true
+
+// ═════════════════════════════════════
+// DIVERGENCE DETECTION
+// ═════════════════════════════════════
+
+priceLowPivot  = ta.pivotlow(close, lookbackLeft, lookbackRight)
+priceHighPivot = ta.pivothigh(close, lookbackLeft, lookbackRight)
+stochLowPivot  = ta.pivotlow(k, lookbackLeft, lookbackRight)
+stochHighPivot = ta.pivothigh(k, lookbackLeft, lookbackRight)
+
+var float lastPriceLow = na
+var float lastStochLow = na
+var int lastLowBar = na
+var float lastPriceHigh = na
+var float lastStochHigh = na
+var int lastHighBar = na
+
+bullishDiv = false
+bearishDiv = false
+
+// Bullish Divergence
+if not na(priceLowPivot) and k < OverSold
+    if not na(lastPriceLow) and not na(lastStochLow)
+        barsBack = bar_index - lastLowBar
+        if barsBack >= rangeLower and barsBack <= rangeUpper
+            if priceLowPivot < lastPriceLow and stochLowPivot > lastStochLow
+                bullishDiv := true
+    
+    lastPriceLow := priceLowPivot
+    lastStochLow := stochLowPivot
+    lastLowBar := bar_index - lookbackRight
+
+// Bearish Divergence
+if not na(priceHighPivot) and k > OverBought
+    if not na(lastPriceHigh) and not na(lastStochHigh)
+        barsBack = bar_index - lastHighBar
+        if barsBack >= rangeLower and barsBack <= rangeUpper
+            if priceHighPivot > lastPriceHigh and stochHighPivot < lastStochHigh
+                bearishDiv := true
+    
+    lastPriceHigh := priceHighPivot
+    lastStochHigh := stochHighPivot
+    lastHighBar := bar_index - lookbackRight
+
+// ═════════════════════════════════════
+// ENTRY CONDITIONS
+// ═════════════════════════════════════
+
+longCondition = if useDivergence
+    bullishCross and k < OverSold and bullishDiv and cooldownFilter
+else
+    bullishCross and k < OverSold and cooldownFilter
+
+shortCondition = if useDivergence
+    bearishCross and k > OverBought and bearishDiv and cooldownFilter
+else
+    bearishCross and k > OverBought and cooldownFilter
+
+// ═════════════════════════════════════
+// STRATEGY EXECUTION
+// ═════════════════════════════════════
+
+// Long Entry
+if longCondition and strategy.position_size == 0
+    stopPrice = close * (1 - stopLossPerc / 100)
+    targetPrice = close * (1 + takeProfitPerc / 100)
+    
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
+
+// Short Entry
+if shortCondition and strategy.position_size == 0
+    stopPrice = close * (1 + stopLossPerc / 100)
+    targetPrice = close * (1 - takeProfitPerc / 100)
+    
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+
+// Exit on Opposite Extreme
+if exitOnOppositeExtreme
+    if strategy.position_size > 0 and k > OverBought
+        strategy.close("Long", comment="Exit OB")
+    
+    if strategy.position_size < 0 and k < OverSold
+        strategy.close("Short", comment="Exit OS")
+
+// ═════════════════════════════════════
+// VISUAL ELEMENTS - STOCHASTIC PANE
+// ═════════════════════════════════════
+
+// Plot stochastic lines with gradient colors
+kColor = k > OverBought ? color.new(#FF0055, 0) : k < OverSold ? color.new(#00FF88, 0) : color.new(#00BBFF, 0)
+dColor = color.new(#FFB300, 30)
+
+plot(k, "Stochastic %K", color=kColor, linewidth=2)
+plot(d, "Stochastic %D", color=dColor, linewidth=2)
+
+// Add glow effect to K line
+plot(k, "K Glow", color=color.new(kColor, 70), linewidth=4)
+
+// Plot levels
+obLine = hline(OverBought, "Overbought", color=color.new(#FF0055, 60), linestyle=hline.style_dashed, linewidth=1)
+osLine = hline(OverSold, "Oversold", color=color.new(#00FF88, 60), linestyle=hline.style_dashed, linewidth=1)
+midLine = hline(50, "Midline", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+
+// ═════════════════════════════════════
+// FLUORESCENT SIGNAL CIRCLES
+// ═════════════════════════════════════
+
+// Long signal - Bright green fluorescent circle
+longSignalLevel = longCondition ? k : na
+plot(longSignalLevel, "Long Signal", color=color.new(#00FF88, 0), style=plot.style_circles, linewidth=6)
+plot(longSignalLevel, "Long Glow", color=color.new(#00FF88, 60), style=plot.style_circles, linewidth=10)
+
+// Short signal - Bright magenta fluorescent circle  
+shortSignalLevel = shortCondition ? k : na
+plot(shortSignalLevel, "Short Signal", color=color.new(#FF0055, 0), style=plot.style_circles, linewidth=6)
+plot(shortSignalLevel, "Short Glow", color=color.new(#FF0055, 60), style=plot.style_circles, linewidth=10)
+
+// Exit signals - Orange fluorescent circles
+longExitSignal = strategy.position_size[1] > 0 and strategy.position_size == 0
+shortExitSignal = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+exitLevel = longExitSignal or shortExitSignal ? k : na
+plot(exitLevel, "Exit Signal", color=color.new(#FF8800, 0), style=plot.style_circles, linewidth=4)
+plot(exitLevel, "Exit Glow", color=color.new(#FF8800, 70), style=plot.style_circles, linewidth=8)
+
+// ═════════════════════════════════════
+// DIVERGENCE INDICATORS
+// ═════════════════════════════════════
+
+if showDivLines and bullishDiv
+    label.new(bar_index, 10, "🔺 Bull Div", style=label.style_none, color=na, textcolor=color.new(#00FF88, 0), size=size.tiny)
+
+if showDivLines and bearishDiv
+    label.new(bar_index, 90, "🔻 Bear Div", style=label.style_none, color=na, textcolor=color.new(#FF0055, 0), size=size.tiny)
+
+// Cooldown indicator
+if useCooldown and inCooldown
+    label.new(bar_index, k, "⏸", style=label.style_none, color=na, textcolor=color.new(color.gray, 50), size=size.tiny, tooltip="Cooldown Active")

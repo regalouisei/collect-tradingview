@@ -1,0 +1,130 @@
+//@version=6
+indicator("Macro Clock Overlap (166/186/208) — Anchored (v6)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Anchors (Pine v6 requires input.time defval to be a compile-time constant int)
+// Unix epoch milliseconds (UTC midnight):
+// 2016-07-09 00:00:00Z => 1468022400000
+// 2018-12-10 00:00:00Z => 1544400000000
+// 2021-01-04 00:00:00Z => 1609718400000
+//──────────────────────────────────────────────────────────────────────────────
+anchorHalving = input.time(1468022400000, "208w Halving Anchor (Jul 9 2016)")
+anchorTrough  = input.time(1544400000000, "186w RSI Trough Anchor (Dec 10 2018)")
+anchorPeak    = input.time(1609718400000, "166w RSI Peak Anchor (Jan 4 2021)")
+
+// Periods & windows (weeks)
+weeksHalving = input.int(208, "Halving Period (weeks)", minval=1)
+weeksTrough  = input.int(186, "Trough Period (weeks)", minval=1)
+weeksPeak    = input.int(166, "Peak Period (weeks)", minval=1)
+
+winHalvingW  = input.int(12, "Halving Window ± (weeks)", minval=0)
+winTroughW   = input.int(10, "Trough Window ± (weeks)", minval=0)
+winPeakW     = input.int(10, "Peak Window ± (weeks)", minval=0)
+
+// Display
+showBg    = input.bool(true, "Shade Background by Score")
+showLines = input.bool(true, "Draw Vertical Event Lines")
+maxEvents = input.int(60, "Max Lines per Clock", minval=5, maxval=200)
+showTable = input.bool(true, "Show Current Score Table")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+//──────────────────────────────────────────────────────────────────────────────
+msPerWeek = 7 * 24 * 60 * 60 * 1000
+
+periodMs(int weeks) =>
+    weeks * msPerWeek
+
+nearestEventTime(int anchor, int perMs) =>
+    // nearest integer index k
+    float k = math.round((time - anchor) / perMs)
+    anchor + int(k) * perMs
+
+inWindow(int anchor, int perWeeks, int winWeeks) =>
+    int perMs = periodMs(perWeeks)
+    int wMs   = periodMs(winWeeks)
+    int evt   = nearestEventTime(anchor, perMs)
+    math.abs(time - evt) <= wMs
+
+//──────────────────────────────────────────────────────────────────────────────
+// Per-bar overlaps
+//──────────────────────────────────────────────────────────────────────────────
+bool in208 = inWindow(anchorHalving, weeksHalving, winHalvingW)
+bool in186 = inWindow(anchorTrough,  weeksTrough,  winTroughW)
+bool in166 = inWindow(anchorPeak,    weeksPeak,    winPeakW)
+
+int score = (in208 ? 1 : 0) + (in186 ? 1 : 0) + (in166 ? 1 : 0)
+int signedPressure = (in166 ? 1 : 0) - (in186 ? 1 : 0)
+
+// Background shading color (single-line ternary = parser-safe)
+bgColor = score == 0 ? na : score == 1 ? color.new(color.gray, 92) : score == 2 ? color.new(color.gray, 84) : color.new(color.gray, 76)
+
+// bgcolor must be called in global scope
+bgcolor(showBg ? bgColor : na, title="Overlap Score Shading")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Vertical event lines (draw once on last bar)
+//──────────────────────────────────────────────────────────────────────────────
+var int firstTime = na
+if barstate.isfirst
+    firstTime := time
+
+var line[] lines208 = array.new_line()
+var line[] lines186 = array.new_line()
+var line[] lines166 = array.new_line()
+
+deleteLines(line[] arr) =>
+    int sz = array.size(arr)
+    if sz > 0
+        for i = 0 to sz - 1
+            line ln = array.get(arr, i)
+            line.delete(ln)
+        array.clear(arr)
+
+
+makeEventLines(line[] store, int anchor, int perWeeks, color c, int maxN) =>
+    int perMs = periodMs(perWeeks)
+
+    // index range covering loaded chart (plus small buffer)
+    int nStart = int(math.floor((firstTime - anchor) / perMs)) - 2
+    int nEnd   = int(math.ceil((time - anchor) / perMs)) + 2
+
+    int totalN = (nEnd - nStart + 1)
+    int stepN  = totalN > maxN ? int(math.ceil(totalN / maxN)) : 1
+
+    for n = nStart to nEnd by stepN
+        int evtTime = anchor + n * perMs
+        if evtTime >= firstTime - perMs and evtTime <= time + perMs
+            line ln = line.new(evtTime, low, evtTime, high,
+                               xloc=xloc.bar_time,
+                               extend=extend.both,
+                               color=color.new(c, 55),
+                               width=1)
+            array.push(store, ln)
+
+if barstate.islast
+    if showLines
+        deleteLines(lines208)
+        deleteLines(lines186)
+        deleteLines(lines166)
+
+        makeEventLines(lines208, anchorHalving, weeksHalving, color.blue,  maxEvents)
+        makeEventLines(lines186, anchorTrough,  weeksTrough,  color.red,   maxEvents)
+        makeEventLines(lines166, anchorPeak,    weeksPeak,    color.green, maxEvents)
+    else
+        deleteLines(lines208)
+        deleteLines(lines186)
+        deleteLines(lines166)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Table (current score + active clocks)
+//──────────────────────────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 1, 3)
+
+if showTable and barstate.islast
+    string active = (in166 ? "166 " : "") + (in186 ? "186 " : "") + (in208 ? "208 " : "")
+    active := active == "" ? "none" : active
+
+    table.cell(t, 0, 0, "Overlap Score: " + str.tostring(score), text_color=color.white)
+    table.cell(t, 0, 1, "Active: " + active, text_color=color.white)
+    table.cell(t, 0, 2, "Signed: " + str.tostring(signedPressure), text_color=color.white)

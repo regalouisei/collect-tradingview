@@ -1,0 +1,957 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Investment Analysis Framework Bar v2
+
+//@version=6
+indicator("Investment Analysis Bar v2", overlay=false, max_labels_count=500)
+
+// ============================================================================
+// PURPOSE: Framework-aligned stock analysis bar
+//          - Margin Stack (GM, OM, NIM, FCF) - Margin-first thinking
+//          - Returns on Capital (ROCE, ROE)
+//          - Growth Metrics (Revenue, EPS)
+//          - Valuation (PE TTM/Fwd, PEG)
+//          - Financial Health (D/E, SBC)
+//          - Zone-Based Decision Support (Accumulate/Hold/Trim/Exit)
+//          - Technical Signals (RSI + Volume Confirmation)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// INPUTS - DISPLAY SETTINGS
+// ----------------------------------------------------------------------------
+string GRP_DISPLAY = "═══ Display Settings ═══"
+barPosition = input.string("Bottom Right", "Tier 1 Bar Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=GRP_DISPLAY)
+textSize = input.string("Small", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=GRP_DISPLAY)
+showTier2Panel = input.bool(true, "Show Tier 2 Detail Panel", group=GRP_DISPLAY)
+tier2Position = input.string("Top Left", "Tier 2 Panel Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=GRP_DISPLAY)
+tier2TextSize = input.string("Tiny", "Tier 2 Text Size", options=["Tiny", "Small", "Normal"], group=GRP_DISPLAY)
+
+string GRP_TIER1 = "═══ Tier 1 Metrics ═══"
+showMargins = input.bool(true, "Show Margin Stack", group=GRP_TIER1)
+showReturns = input.bool(true, "Show Returns (ROCE/ROE)", group=GRP_TIER1)
+showGrowth = input.bool(true, "Show Growth Metrics", group=GRP_TIER1)
+showValuation = input.bool(true, "Show Valuation (PE/PEG)", group=GRP_TIER1)
+showZone = input.bool(true, "Show Zone Status", group=GRP_TIER1)
+showSignal = input.bool(true, "Show Technical Signal", group=GRP_TIER1)
+
+// ----------------------------------------------------------------------------
+// INPUTS - ZONE CONFIGURATION (Framework Section 1.12)
+// ----------------------------------------------------------------------------
+string GRP_ZONES = "═══ Zone Configuration ═══"
+zoneMethod = input.string("52W Range", "Zone Calculation Method", options=["52W Range", "Manual Levels", "ATR-Based"], group=GRP_ZONES)
+
+// Manual zone levels (if method = Manual)
+manualExit = input.float(0, "Manual: Exit Below $", group=GRP_ZONES)
+manualAccumHigh = input.float(0, "Manual: Accumulate Below $", group=GRP_ZONES)
+manualTrimLow = input.float(0, "Manual: Trim Above $", group=GRP_ZONES)
+manualExitHigh = input.float(0, "Manual: Exit Above $", group=GRP_ZONES)
+
+// ATR multipliers (if method = ATR-Based)
+atrAccumMult = input.float(2.0, "ATR: Accumulate Zone (x ATR below SMA)", minval=0.5, maxval=5, group=GRP_ZONES)
+atrTrimMult = input.float(2.0, "ATR: Trim Zone (x ATR above SMA)", minval=0.5, maxval=5, group=GRP_ZONES)
+
+// ----------------------------------------------------------------------------
+// INPUTS - QUALITY GATE THRESHOLDS (Framework Gates)
+// ----------------------------------------------------------------------------
+string GRP_GATES = "═══ Quality Gate Thresholds ═══"
+gmThreshold = input.float(40, "Gross Margin Minimum %", group=GRP_GATES)
+roceThreshold = input.float(15, "ROCE Minimum %", group=GRP_GATES)
+debtEquityMax = input.float(50, "Debt/Equity Maximum %", group=GRP_GATES)
+sbcRevenueMax = input.float(15, "SBC/Revenue Maximum %", group=GRP_GATES)
+dilutionMax = input.float(3, "Annual Dilution Maximum %", group=GRP_GATES)
+
+// ----------------------------------------------------------------------------
+// INPUTS - TECHNICAL SETTINGS
+// ----------------------------------------------------------------------------
+string GRP_TECH = "═══ Technical Settings ═══"
+strategyMode = input.string("Opportunity Enhancement", "Strategy Mode", options=["Opportunity Enhancement", "Trend Follower"], group=GRP_TECH, tooltip="Opportunity Enhancement: Quality Gates determine buy/avoid. EMA 200 is sizing enhancer - below = scale up, above = normal size. Trend Follower: Traditional momentum approach preferring entries above 200 EMA.")
+rsiLength = input.int(14, "RSI Length", minval=2, maxval=50, group=GRP_TECH)
+rsiOversold = input.int(30, "RSI Oversold Level", minval=10, maxval=40, group=GRP_TECH)
+rsiOverbought = input.int(70, "RSI Overbought Level", minval=60, maxval=90, group=GRP_TECH)
+volConfirmMult = input.float(1.2, "Volume Confirmation Multiplier", minval=1.0, maxval=3.0, group=GRP_TECH)
+emaPeriod = input.int(50, "Trend EMA Period", minval=10, maxval=200, group=GRP_TECH)
+requireQualityGates = input.bool(true, "Require Quality Gates for Strong Signal", group=GRP_TECH, tooltip="When enabled, strong buy signals require passing quality gates (GM, ROCE, D/E)")
+
+// ----------------------------------------------------------------------------
+// INPUTS - PERFORMANCE TIMEFRAMES
+// ----------------------------------------------------------------------------
+string GRP_PERF = "═══ Performance Display ═══"
+showPerformance = input.bool(true, "Show Performance Returns", group=GRP_PERF)
+
+// ----------------------------------------------------------------------------
+// FUNDAMENTAL DATA FETCHING
+// ----------------------------------------------------------------------------
+
+// Margin Stack
+grossMargin = request.financial(syminfo.tickerid, "GROSS_MARGIN", "FQ", ignore_invalid_symbol=true)
+operatingMargin = request.financial(syminfo.tickerid, "OPERATING_MARGIN", "FQ", ignore_invalid_symbol=true)
+netMargin = request.financial(syminfo.tickerid, "NET_MARGIN", "FQ", ignore_invalid_symbol=true)
+
+// For FCF Margin, we calculate from components
+freeCashFlow = request.financial(syminfo.tickerid, "FREE_CASH_FLOW", "FQ", ignore_invalid_symbol=true)
+totalRevenue = request.financial(syminfo.tickerid, "TOTAL_REVENUE", "FQ", ignore_invalid_symbol=true)
+fcfMargin = (not na(freeCashFlow) and not na(totalRevenue) and totalRevenue != 0) ? (freeCashFlow / totalRevenue) * 100 : na
+
+// Returns on Capital
+roe = request.financial(syminfo.tickerid, "RETURN_ON_EQUITY", "FQ", ignore_invalid_symbol=true)
+roic = request.financial(syminfo.tickerid, "RETURN_ON_INVESTED_CAPITAL", "FQ", ignore_invalid_symbol=true)
+// ROCE approximation (using ROIC as proxy, or calculate if we have components)
+roce = not na(roic) ? roic : roe  // Use ROIC as ROCE proxy
+
+// Growth Metrics
+revenueGrowth = request.financial(syminfo.tickerid, "REVENUE_ONE_YEAR_GROWTH", "FQ", ignore_invalid_symbol=true)
+epsGrowth = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_DILUTED_ONE_YEAR_GROWTH", "FQ", ignore_invalid_symbol=true)
+
+// Valuation
+peRatioTTM = request.financial(syminfo.tickerid, "PRICE_EARNINGS_TTMYOY", "FY", ignore_invalid_symbol=true)
+peRatioFwd = request.financial(syminfo.tickerid, "PRICE_EARNINGS_FORWARD", "FY", ignore_invalid_symbol=true)
+
+// Fallback PE calculation
+epsDiluted = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_DILUTED", "TTM", ignore_invalid_symbol=true)
+calculatedPE = (not na(epsDiluted) and epsDiluted > 0) ? close / epsDiluted : na
+displayPE_TTM = not na(peRatioTTM) ? peRatioTTM : calculatedPE
+
+// PEG Ratio calculation
+pegRatio = (not na(displayPE_TTM) and not na(epsGrowth) and epsGrowth > 0) ? displayPE_TTM / epsGrowth : na
+
+// Financial Health
+totalDebt = request.financial(syminfo.tickerid, "TOTAL_DEBT", "FQ", ignore_invalid_symbol=true)
+totalEquity = request.financial(syminfo.tickerid, "TOTAL_EQUITY", "FQ", ignore_invalid_symbol=true)
+debtToEquity = (not na(totalDebt) and not na(totalEquity) and totalEquity != 0) ? (totalDebt / totalEquity) * 100 : na
+
+// SBC Analysis
+sbcValue = request.financial(syminfo.tickerid, "STOCK_BASED_COMPENSATION", "FQ", ignore_invalid_symbol=true)
+sbcToRevenue = (not na(sbcValue) and not na(totalRevenue) and totalRevenue != 0) ? (sbcValue / totalRevenue) * 100 : na
+
+// Shares for dilution calculation
+sharesOutstanding = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ", ignore_invalid_symbol=true)
+
+// Dividend Yield
+dividendYield = request.financial(syminfo.tickerid, "DIVIDEND_YIELD_RECENT", "FY", ignore_invalid_symbol=true)
+
+// ----------------------------------------------------------------------------
+// PERFORMANCE CALCULATIONS
+// ----------------------------------------------------------------------------
+price1W = close[5]
+price1M = close[21]
+price3M = close[63]
+price6M = close[126]
+price1Y = close[252]
+
+calcReturn(currentPrice, pastPrice) =>
+    na(pastPrice) or pastPrice == 0 ? na : ((currentPrice - pastPrice) / pastPrice) * 100
+
+return1W = calcReturn(close, price1W)
+return1M = calcReturn(close, price1M)
+return3M = calcReturn(close, price3M)
+return6M = calcReturn(close, price6M)
+return1Y = calcReturn(close, price1Y)
+
+// ----------------------------------------------------------------------------
+// 52-WEEK CONTEXT
+// ----------------------------------------------------------------------------
+high52W = ta.highest(high, 252)
+low52W = ta.lowest(low, 252)
+range52W = high52W - low52W
+positionIn52W = range52W != 0 ? ((close - low52W) / range52W) * 100 : 50
+distFromHigh = ((close - high52W) / high52W) * 100
+distFromLow = ((close - low52W) / low52W) * 100
+
+// Days since 52W high/low
+var int daysSinceHigh = 0
+var int daysSinceLow = 0
+
+if high >= high52W
+    daysSinceHigh := 0
+else
+    daysSinceHigh := daysSinceHigh + 1
+
+if low <= low52W
+    daysSinceLow := 0
+else
+    daysSinceLow := daysSinceLow + 1
+
+// ----------------------------------------------------------------------------
+// ZONE CALCULATIONS (Framework Section 1.12)
+// ----------------------------------------------------------------------------
+ema50 = ta.ema(close, emaPeriod)
+atr14 = ta.atr(14)
+
+// Zone boundaries based on method
+var float zoneExitLow = na
+var float zoneAccumHigh = na
+var float zoneTrimLow = na
+var float zoneExitHigh = na
+
+if zoneMethod == "52W Range"
+    // Zones based on 52W range percentiles
+    zoneExitLow := low52W * 0.95  // 5% below 52W low = broken
+    zoneAccumHigh := low52W + (range52W * 0.25)  // Bottom 25% = accumulate
+    zoneTrimLow := low52W + (range52W * 0.75)   // Top 25% = trim consideration
+    zoneExitHigh := high52W * 1.05  // 5% above 52W high = exit target
+else if zoneMethod == "Manual Levels"
+    zoneExitLow := manualExit
+    zoneAccumHigh := manualAccumHigh
+    zoneTrimLow := manualTrimLow
+    zoneExitHigh := manualExitHigh
+else if zoneMethod == "ATR-Based"
+    zoneExitLow := ema50 - (atr14 * atrAccumMult * 1.5)
+    zoneAccumHigh := ema50 - (atr14 * atrAccumMult)
+    zoneTrimLow := ema50 + (atr14 * atrTrimMult)
+    zoneExitHigh := ema50 + (atr14 * atrTrimMult * 1.5)
+
+// Current zone determination
+getZone() =>
+    if close < zoneExitLow
+        "EXIT ⛔"
+    else if close <= zoneAccumHigh
+        "ACCUM 🟢"
+    else if close < zoneTrimLow
+        "HOLD 🔵"
+    else if close < zoneExitHigh
+        "TRIM 🟡"
+    else
+        "EXIT 🔴"
+
+currentZone = getZone()
+
+// Zone color
+getZoneColor() =>
+    if close < zoneExitLow
+        color.rgb(180, 0, 0)
+    else if close <= zoneAccumHigh
+        color.rgb(0, 150, 0)
+    else if close < zoneTrimLow
+        color.rgb(50, 100, 180)
+    else if close < zoneExitHigh
+        color.rgb(200, 180, 0)
+    else
+        color.rgb(200, 50, 50)
+
+zoneColor = getZoneColor()
+
+// Distance to next zone boundary
+getZoneDistance() =>
+    if close < zoneExitLow
+        str.tostring(((zoneExitLow - close) / close) * -100, "#.#") + "% below exit"
+    else if close <= zoneAccumHigh
+        str.tostring(((zoneAccumHigh - close) / close) * 100, "#.#") + "% to hold"
+    else if close < zoneTrimLow
+        str.tostring(((zoneTrimLow - close) / close) * 100, "#.#") + "% to trim"
+    else if close < zoneExitHigh
+        str.tostring(((zoneExitHigh - close) / close) * 100, "#.#") + "% to exit"
+    else
+        str.tostring(((close - zoneExitHigh) / zoneExitHigh) * 100, "#.#") + "% above exit"
+
+zoneDistanceText = getZoneDistance()
+
+// ----------------------------------------------------------------------------
+// TECHNICAL SIGNALS
+// ----------------------------------------------------------------------------
+rsiValue = ta.rsi(close, rsiLength)
+volSMA = ta.sma(volume, 20)
+relativeVol = volume / volSMA
+ema200 = ta.ema(close, 200)
+
+// MACD Calculation for Entry Quality
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+macdHistPrev = macdHist[1]
+
+// Signal logic: RSI oversold bounce with volume confirmation
+rsiOversoldBounce = rsiValue > rsiOversold and rsiValue[1] <= rsiOversold
+rsiOverboughtDrop = rsiValue < rsiOverbought and rsiValue[1] >= rsiOverbought
+volumeConfirmed = relativeVol >= volConfirmMult
+aboveTrendEMA = close > ema50
+aboveLongEMA = close > ema200
+belowLongEMA = close < ema200
+
+// ----------------------------------------------------------------------------
+// ENTRY QUALITY SCORE (Framework v7.5)
+// Quality Gates = IF you buy, Entry Quality = WHEN and HOW MUCH
+// ----------------------------------------------------------------------------
+
+// Component 1: EMA Pullback Position (30%)
+// Price at 50 EMA in uptrend = 10, within 5% = 8-9, 5-10% above = 7, >10% = 5, >20% = 3
+emaDistance = ((close - ema50) / ema50) * 100
+ema50Score = emaDistance <= 0 ? 10.0 : emaDistance <= 2 ? 9.0 : emaDistance <= 5 ? 8.0 : emaDistance <= 10 ? 7.0 : emaDistance <= 15 ? 5.0 : emaDistance <= 20 ? 4.0 : 3.0
+
+// Component 2: RSI 14-day (25%)
+// <30 = 10, 30-40 = 8-9, 40-50 = 7, 50-60 = 5, 60-70 = 4, >70 = 2, >80 = 1
+rsiScore = rsiValue < 30 ? 10.0 : rsiValue < 35 ? 9.0 : rsiValue < 40 ? 8.0 : rsiValue < 45 ? 7.5 : rsiValue < 50 ? 7.0 : rsiValue < 55 ? 6.0 : rsiValue < 60 ? 5.0 : rsiValue < 65 ? 4.0 : rsiValue < 70 ? 3.0 : rsiValue < 80 ? 2.0 : 1.0
+
+// Component 3: MACD Histogram (20%)
+// Bullish cross = 10, positive growing = 8, negative shrinking = 7, positive shrinking = 5, negative growing = 2, bearish cross = 1
+macdBullishCross = macdHist > 0 and macdHistPrev <= 0
+macdBearishCross = macdHist < 0 and macdHistPrev >= 0
+macdPositiveGrowing = macdHist > 0 and macdHist > macdHistPrev
+macdPositiveShrinking = macdHist > 0 and macdHist <= macdHistPrev
+macdNegativeShrinking = macdHist < 0 and macdHist > macdHistPrev
+macdNegativeGrowing = macdHist < 0 and macdHist <= macdHistPrev
+
+macdScore = macdBullishCross ? 10.0 : macdPositiveGrowing ? 8.0 : macdNegativeShrinking ? 7.0 : macdPositiveShrinking ? 5.0 : macdNegativeGrowing ? 2.0 : macdBearishCross ? 1.0 : 5.0
+
+// Component 4: % From Recent High (15%)
+// 20-25% below = 10, 15-20% = 9, 10-15% = 7, 5-10% = 5, 0-5% = 3, >30% = 6
+distFromHighScore = distFromHigh >= 25 ? 9.0 : distFromHigh >= 20 ? 10.0 : distFromHigh >= 15 ? 9.0 : distFromHigh >= 10 ? 7.0 : distFromHigh >= 5 ? 5.0 : distFromHigh >= 0 ? 3.0 : distFromHigh >= -5 ? 2.0 : 5.0
+
+// Component 5: Volume Confirmation (10%)
+// Low volume pullback = 8-10, average = 5, high volume pullback = 3
+priceDown = close < close[1]
+volScore = priceDown and relativeVol < 0.8 ? 10.0 : priceDown and relativeVol < 1.0 ? 8.0 : not priceDown and relativeVol > 1.5 ? 9.0 : relativeVol < 0.8 ? 6.0 : relativeVol < 1.2 ? 5.0 : priceDown and relativeVol > 1.5 ? 3.0 : 5.0
+
+// Calculate weighted Entry Quality Score
+entryQualityScore = (ema50Score * 0.30) + (rsiScore * 0.25) + (macdScore * 0.20) + (distFromHighScore * 0.15) + (volScore * 0.10)
+
+// Entry Quality Rating
+entryExcellent = entryQualityScore >= 8.0
+entryGood = entryQualityScore >= 6.5 and entryQualityScore < 8.0
+entryFair = entryQualityScore >= 5.0 and entryQualityScore < 6.5
+entryPoor = entryQualityScore >= 3.5 and entryQualityScore < 5.0
+entryAvoid = entryQualityScore < 3.5
+
+// Zone checks for signal logic
+inAccumulateZone = close <= zoneAccumHigh and close >= zoneExitLow
+inHoldZone = close > zoneAccumHigh and close < zoneTrimLow
+inTrimZone = close >= zoneTrimLow and close < zoneExitHigh
+inExitZone = close >= zoneExitHigh or close < zoneExitLow
+
+// Opportunity Enhancement mode: Gates = Direction, EMA = Sizing
+isOpportunityMode = strategyMode == "Opportunity Enhancement"
+isTrendMode = strategyMode == "Trend Follower"
+
+// ----------------------------------------------------------------------------
+// QUALITY GATE STATUS (moved before signal logic)
+// ----------------------------------------------------------------------------
+gateGM = na(grossMargin) ? "?" : grossMargin >= gmThreshold ? "✓" : "✗"
+gateROCE = na(roce) ? "?" : roce >= roceThreshold ? "✓" : "✗"
+gateDE = na(debtToEquity) ? "?" : debtToEquity <= debtEquityMax ? "✓" : "✗"
+gateSBC = na(sbcToRevenue) ? "?" : sbcToRevenue <= sbcRevenueMax ? "✓" : "✗"
+
+gatesPassedCount = 0
+gatesTotalCount = 0
+
+if not na(grossMargin)
+    gatesTotalCount := gatesTotalCount + 1
+    if grossMargin >= gmThreshold
+        gatesPassedCount := gatesPassedCount + 1
+
+if not na(roce)
+    gatesTotalCount := gatesTotalCount + 1
+    if roce >= roceThreshold
+        gatesPassedCount := gatesPassedCount + 1
+
+if not na(debtToEquity)
+    gatesTotalCount := gatesTotalCount + 1
+    if debtToEquity <= debtEquityMax
+        gatesPassedCount := gatesPassedCount + 1
+
+if not na(sbcToRevenue)
+    gatesTotalCount := gatesTotalCount + 1
+    if sbcToRevenue <= sbcRevenueMax
+        gatesPassedCount := gatesPassedCount + 1
+
+gatesSummary = str.tostring(gatesPassedCount) + "/" + str.tostring(gatesTotalCount)
+
+// Quality check: majority of gates pass (or no data available)
+qualityConfirmed = gatesTotalCount == 0 or gatesPassedCount >= math.ceil(gatesTotalCount * 0.5)
+allGatesPass = gatesTotalCount > 0 and gatesPassedCount == gatesTotalCount
+mostGatesPass = gatesTotalCount > 0 and gatesPassedCount >= math.ceil(gatesTotalCount * 0.75)
+gatesFailing = gatesTotalCount > 0 and gatesPassedCount < math.ceil(gatesTotalCount * 0.5)
+
+// Combined quality + zone check for framework-aligned signals
+qualityInAccumZone = inAccumulateZone and qualityConfirmed
+
+// NEW LOGIC: Gates = Direction, EMA = Sizing Enhancement
+// Below 200 EMA = Enhanced opportunity (scale up sizing)
+// Above 200 EMA = Normal opportunity (standard sizing)
+enhancedOpportunity = belowLongEMA and qualityConfirmed  // Below EMA + Quality = Scale UP
+normalOpportunity = aboveLongEMA and qualityConfirmed     // Above EMA + Quality = Normal size
+primeSetup = inAccumulateZone and allGatesPass and belowLongEMA  // Best possible setup
+
+// ----------------------------------------------------------------------------
+// SIGNAL DETERMINATION (Framework v7.5 - Entry Quality Based)
+// ----------------------------------------------------------------------------
+
+// Combined Decision Matrix (v7.5):
+// Gates Pass + Entry 8-10 → STRONG BUY (100% position)
+// Gates Pass + Entry 6.5-8 → BUY (75% position)
+// Gates Pass + Entry 5-6.5 → BUY PARTIAL (50% position)
+// Gates Pass + Entry <5 → WAIT (good stock, poor timing)
+// Gates Fail → AVOID
+
+getSignal() =>
+    if isOpportunityMode
+        // OPPORTUNITY ENHANCEMENT MODE (v7.5)
+        // Quality Gates = IF you buy, Entry Quality = WHEN and HOW MUCH
+        
+        if gatesFailing
+            "AVOID ⛔"  // Gates failing = Don't buy, Entry Quality irrelevant
+        else if allGatesPass and entryExcellent and inAccumulateZone
+            "PRIME 💎"  // Best possible: All gates + Excellent entry + Accum Zone
+        else if allGatesPass and entryExcellent
+            "STR BUY 🟢" // Strong buy - 100% position
+        else if qualityConfirmed and entryGood
+            "BUY 🔼"     // Buy - 75% position
+        else if qualityConfirmed and entryFair
+            "BUY 50% 🔸" // Buy partial - 50% position
+        else if qualityConfirmed and entryPoor
+            "WAIT ⏳"    // Good stock, poor timing - wait for better entry
+        else if qualityConfirmed and entryAvoid
+            "WAIT ⚪"    // Quality OK but entry timing bad
+        else if rsiOverboughtDrop and volumeConfirmed and (inTrimZone or inExitZone)
+            "TRIM 📤"    // Take profits
+        else if rsiOverboughtDrop and volumeConfirmed
+            "SELL ↘"     // Exit signal
+        else if rsiValue > rsiOverbought
+            "OVRB ⚠"     // Overbought warning
+        else if qualityConfirmed and inAccumulateZone
+            "ZONE 🎯"    // In accumulation zone, quality OK
+        else
+            "NEUT —"
+    else
+        // TREND FOLLOWER MODE (original logic)
+        if rsiOversoldBounce and volumeConfirmed and aboveLongEMA
+            "BUY 🔼"
+        else if rsiOversoldBounce and volumeConfirmed
+            "BUY? ↗"
+        else if rsiOverboughtDrop and volumeConfirmed
+            "SELL ↘"
+        else if rsiValue < rsiOversold
+            "WAIT ⏳"
+        else if rsiValue > rsiOverbought
+            "OVRB ⚠"
+        else
+            "NEUT —"
+
+currentSignal = getSignal()
+
+getSignalColor() =>
+    if isOpportunityMode
+        // OPPORTUNITY ENHANCEMENT MODE COLORS (v7.5)
+        if gatesFailing
+            color.rgb(180, 50, 50)      // Red - AVOID
+        else if allGatesPass and entryExcellent and inAccumulateZone
+            color.rgb(0, 255, 100)      // Bright green - PRIME
+        else if allGatesPass and entryExcellent
+            color.rgb(0, 220, 50)       // Green - STRONG BUY
+        else if qualityConfirmed and entryGood
+            color.rgb(0, 200, 0)        // Green - BUY 75%
+        else if qualityConfirmed and entryFair
+            color.rgb(255, 200, 50)     // Yellow/Gold - BUY 50%
+        else if qualityConfirmed and entryPoor
+            color.rgb(150, 150, 150)    // Gray - WAIT
+        else if qualityConfirmed and entryAvoid
+            color.rgb(120, 120, 120)    // Dark gray - WAIT (bad timing)
+        else if rsiOverboughtDrop and volumeConfirmed and (inTrimZone or inExitZone)
+            color.rgb(255, 180, 50)     // Orange - Trim
+        else if rsiOverboughtDrop and volumeConfirmed
+            color.rgb(200, 100, 100)    // Red - Sell
+        else if rsiValue > rsiOverbought
+            color.rgb(255, 180, 50)     // Orange - Overbought
+        else if qualityConfirmed and inAccumulateZone
+            color.rgb(80, 180, 120)     // Teal - In zone
+        else
+            color.rgb(150, 150, 150)    // Gray - Neutral
+    else
+        // TREND FOLLOWER MODE COLORS (original)
+        if rsiOversoldBounce and volumeConfirmed and aboveLongEMA
+            color.rgb(0, 200, 0)
+        else if rsiOversoldBounce and volumeConfirmed
+            color.rgb(100, 200, 100)
+        else if rsiOverboughtDrop and volumeConfirmed
+            color.rgb(200, 100, 100)
+        else if rsiValue < rsiOversold
+            color.rgb(100, 150, 200)
+        else if rsiValue > rsiOverbought
+            color.rgb(255, 180, 50)
+        else
+            color.rgb(150, 150, 150)
+
+signalColor = getSignalColor()
+
+// ----------------------------------------------------------------------------
+// COLOR FUNCTIONS
+// ----------------------------------------------------------------------------
+
+// Margin colors (green = good, red = concerning)
+getMarginColor(m, threshold) =>
+    if na(m)
+        color.gray
+    else if m >= threshold
+        color.rgb(0, 180, 80)
+    else if m >= threshold * 0.75
+        color.rgb(180, 200, 80)
+    else if m >= threshold * 0.5
+        color.rgb(255, 180, 50)
+    else if m >= 0
+        color.rgb(255, 120, 80)
+    else
+        color.rgb(200, 50, 50)
+
+// Returns color
+getReturnMetricColor(r, threshold) =>
+    if na(r)
+        color.gray
+    else if r >= threshold * 1.5
+        color.rgb(0, 200, 50)
+    else if r >= threshold
+        color.rgb(100, 200, 100)
+    else if r >= threshold * 0.5
+        color.rgb(200, 200, 100)
+    else if r >= 0
+        color.rgb(255, 180, 100)
+    else
+        color.rgb(255, 100, 100)
+
+// Growth color
+getGrowthColor(g) =>
+    if na(g)
+        color.gray
+    else if g >= 30
+        color.rgb(0, 200, 50)
+    else if g >= 15
+        color.rgb(100, 200, 100)
+    else if g >= 5
+        color.rgb(180, 200, 100)
+    else if g >= 0
+        color.rgb(200, 200, 150)
+    else
+        color.rgb(255, 120, 100)
+
+// PE color (context-dependent)
+getPEColor(pe) =>
+    if na(pe)
+        color.gray
+    else if pe < 0
+        color.rgb(200, 50, 50)
+    else if pe <= 15
+        color.rgb(0, 180, 80)
+    else if pe <= 25
+        color.rgb(150, 200, 100)
+    else if pe <= 40
+        color.rgb(255, 200, 100)
+    else
+        color.rgb(255, 120, 80)
+
+// PEG color
+getPEGColor(peg) =>
+    if na(peg)
+        color.gray
+    else if peg <= 1.0
+        color.rgb(0, 200, 50)
+    else if peg <= 1.5
+        color.rgb(100, 200, 100)
+    else if peg <= 2.0
+        color.rgb(200, 200, 100)
+    else if peg <= 3.0
+        color.rgb(255, 180, 100)
+    else
+        color.rgb(255, 120, 80)
+
+// Performance return colors
+getReturnColor(ret) =>
+    if na(ret)
+        color.gray
+    else if ret >= 50
+        color.rgb(0, 200, 0)
+    else if ret >= 20
+        color.rgb(0, 180, 80)
+    else if ret >= 10
+        color.rgb(100, 200, 100)
+    else if ret >= 0
+        color.rgb(180, 220, 180)
+    else if ret >= -10
+        color.rgb(255, 200, 200)
+    else if ret >= -20
+        color.rgb(255, 150, 150)
+    else
+        color.rgb(255, 80, 80)
+
+// Financial health color (inverted - lower is better for D/E)
+getDebtColor(de) =>
+    if na(de)
+        color.gray
+    else if de <= 20
+        color.rgb(0, 200, 50)
+    else if de <= 50
+        color.rgb(100, 200, 100)
+    else if de <= 100
+        color.rgb(255, 200, 100)
+    else
+        color.rgb(255, 100, 100)
+
+// ----------------------------------------------------------------------------
+// TABLE POSITION HELPER
+// ----------------------------------------------------------------------------
+getTablePosition(pos) =>
+    if pos == "Top Left"
+        position.top_left
+    else if pos == "Top Center"
+        position.top_center
+    else if pos == "Top Right"
+        position.top_right
+    else if pos == "Middle Left"
+        position.middle_left
+    else if pos == "Middle Center"
+        position.middle_center
+    else if pos == "Middle Right"
+        position.middle_right
+    else if pos == "Bottom Left"
+        position.bottom_left
+    else if pos == "Bottom Center"
+        position.bottom_center
+    else
+        position.bottom_right
+
+// Text size helper
+getTextSize() =>
+    if textSize == "Tiny"
+        size.tiny
+    else if textSize == "Small"
+        size.small
+    else if textSize == "Normal"
+        size.normal
+    else
+        size.large
+
+barTextSize = getTextSize()
+
+// ----------------------------------------------------------------------------
+// TIER 1 BAR - ESSENTIAL METRICS
+// ----------------------------------------------------------------------------
+
+// Calculate columns needed
+numCols = 0
+numCols := showMargins ? numCols + 4 : numCols      // GM, OM, NIM, FCF
+numCols := showReturns ? numCols + 2 : numCols      // ROCE, ROE
+numCols := showGrowth ? numCols + 2 : numCols       // Rev, EPS
+numCols := showValuation ? numCols + 3 : numCols    // PE, FwdPE, PEG
+numCols := showZone ? numCols + 1 : numCols         // Zone
+numCols := showSignal ? numCols + 1 : numCols       // Signal
+numCols := showPerformance ? numCols + 5 : numCols  // 1W,1M,3M,6M,1Y
+
+var table tier1Bar = table.new(getTablePosition(barPosition), numCols, 1, 
+     bgcolor=color.new(color.black, 90), 
+     border_width=0)
+
+if barstate.islast
+    int col = 0
+    
+    // MARGIN STACK
+    if showMargins
+        // Gross Margin
+        gmText = na(grossMargin) ? "GM —" : "GM " + str.tostring(grossMargin, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, gmText, bgcolor=getMarginColor(grossMargin, 40), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // Operating Margin
+        omText = na(operatingMargin) ? "OM —" : "OM " + str.tostring(operatingMargin, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, omText, bgcolor=getMarginColor(operatingMargin, 15), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // Net Income Margin
+        nimText = na(netMargin) ? "NIM —" : "NIM " + str.tostring(netMargin, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, nimText, bgcolor=getMarginColor(netMargin, 10), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // FCF Margin
+        fcfText = na(fcfMargin) ? "FCF —" : "FCF " + str.tostring(fcfMargin, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, fcfText, bgcolor=getMarginColor(fcfMargin, 10), text_color=color.black, text_size=barTextSize)
+        col += 1
+    
+    // RETURNS ON CAPITAL
+    if showReturns
+        // ROCE (using ROIC as proxy)
+        roceText = na(roce) ? "ROCE —" : "ROCE " + str.tostring(roce, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, roceText, bgcolor=getReturnMetricColor(roce, 15), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // ROE
+        roeText = na(roe) ? "ROE —" : "ROE " + str.tostring(roe, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, roeText, bgcolor=getReturnMetricColor(roe, 15), text_color=color.black, text_size=barTextSize)
+        col += 1
+    
+    // GROWTH METRICS
+    if showGrowth
+        // Revenue Growth
+        revText = na(revenueGrowth) ? "Rev —" : "Rev " + str.tostring(revenueGrowth, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, revText, bgcolor=getGrowthColor(revenueGrowth), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // EPS Growth
+        epsGText = na(epsGrowth) ? "EPS —" : "EPS " + str.tostring(epsGrowth, "#.#") + "%"
+        table.cell(tier1Bar, col, 0, epsGText, bgcolor=getGrowthColor(epsGrowth), text_color=color.black, text_size=barTextSize)
+        col += 1
+    
+    // VALUATION
+    if showValuation
+        // PE TTM
+        peText = na(displayPE_TTM) ? "PE —" : "PE " + str.tostring(displayPE_TTM, "#.#")
+        table.cell(tier1Bar, col, 0, peText, bgcolor=getPEColor(displayPE_TTM), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // Forward PE
+        fwdPEText = na(peRatioFwd) ? "FwdPE —" : "FwdPE " + str.tostring(peRatioFwd, "#.#")
+        table.cell(tier1Bar, col, 0, fwdPEText, bgcolor=getPEColor(peRatioFwd), text_color=color.black, text_size=barTextSize)
+        col += 1
+        
+        // PEG
+        pegText = na(pegRatio) ? "PEG —" : "PEG " + str.tostring(pegRatio, "#.##")
+        table.cell(tier1Bar, col, 0, pegText, bgcolor=getPEGColor(pegRatio), text_color=color.black, text_size=barTextSize)
+        col += 1
+    
+    // ZONE STATUS
+    if showZone
+        table.cell(tier1Bar, col, 0, currentZone, bgcolor=zoneColor, text_color=color.white, text_size=barTextSize)
+        col += 1
+    
+    // TECHNICAL SIGNAL
+    if showSignal
+        table.cell(tier1Bar, col, 0, currentSignal, bgcolor=signalColor, text_color=color.black, text_size=barTextSize)
+        col += 1
+    
+    // PERFORMANCE RETURNS
+    if showPerformance
+        table.cell(tier1Bar, col, 0, "1W " + str.tostring(return1W, "#.#") + "%", bgcolor=getReturnColor(return1W), text_color=color.black, text_size=barTextSize)
+        col += 1
+        table.cell(tier1Bar, col, 0, "1M " + str.tostring(return1M, "#.#") + "%", bgcolor=getReturnColor(return1M), text_color=color.black, text_size=barTextSize)
+        col += 1
+        table.cell(tier1Bar, col, 0, "3M " + str.tostring(return3M, "#") + "%", bgcolor=getReturnColor(return3M), text_color=color.black, text_size=barTextSize)
+        col += 1
+        table.cell(tier1Bar, col, 0, "6M " + str.tostring(return6M, "#") + "%", bgcolor=getReturnColor(return6M), text_color=color.black, text_size=barTextSize)
+        col += 1
+        table.cell(tier1Bar, col, 0, "1Y " + str.tostring(return1Y, "#") + "%", bgcolor=getReturnColor(return1Y), text_color=color.black, text_size=barTextSize)
+        col += 1
+
+// ----------------------------------------------------------------------------
+// TIER 2 PANEL - UNIQUE DETAILED INFO (not duplicating bar)
+// ----------------------------------------------------------------------------
+
+// Determine panel position
+tier2Pos = tier2Position == "Top Left" ? position.top_left : 
+           tier2Position == "Top Right" ? position.top_right :
+           tier2Position == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+// Determine text size
+tier2Size = tier2TextSize == "Tiny" ? size.tiny : tier2TextSize == "Small" ? size.small : size.normal
+
+// Focused layout: Only show what's NOT in the bar
+var table tier2Panel = table.new(tier2Pos, 5, 6, 
+     bgcolor=color.rgb(25, 25, 30),
+     border_width=1,
+     border_color=color.rgb(60, 60, 70))
+
+if barstate.islast and showTier2Panel
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 0: DECISION OUTPUT (the key actionable info)
+    // ═══════════════════════════════════════════════════════════════
+    decisionText = gatesFailing ? "⛔ AVOID - Gates Fail" : (allGatesPass and entryExcellent ? "🟢 BUY 100%" : (qualityConfirmed and entryGood ? "🟢 BUY 75%" : (qualityConfirmed and entryFair ? "🟡 BUY 50%" : (qualityConfirmed ? "⏳ WAIT - Poor Entry" : "⚪ HOLD"))))
+    decisionColor = gatesFailing ? color.rgb(220, 50, 50) : (entryExcellent and allGatesPass ? color.rgb(0, 255, 100) : (entryGood and qualityConfirmed ? color.rgb(0, 220, 0) : (entryFair and qualityConfirmed ? color.rgb(255, 200, 50) : color.rgb(150, 150, 150))))
+    table.cell(tier2Panel, 0, 0, decisionText, text_color=decisionColor, text_size=tier2Size, bgcolor=color.rgb(40, 40, 50), text_halign=text.align_center)
+    table.merge_cells(tier2Panel, 0, 0, 4, 0)
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 1: ENTRY QUALITY SCORE BREAKDOWN - Labels
+    // ═══════════════════════════════════════════════════════════════
+    entryColor = entryExcellent ? color.rgb(0, 255, 100) : entryGood ? color.rgb(0, 220, 0) : entryFair ? color.rgb(255, 200, 50) : color.rgb(220, 100, 100)
+    entryRatingText = entryExcellent ? "EXCELLENT" : entryGood ? "GOOD" : entryFair ? "FAIR" : entryPoor ? "POOR" : "AVOID"
+    table.cell(tier2Panel, 0, 1, "Entry: " + str.tostring(entryQualityScore, "#.#") + " " + entryRatingText, text_color=entryColor, text_size=tier2Size, bgcolor=color.rgb(35, 35, 45), text_halign=text.align_center)
+    table.merge_cells(tier2Panel, 0, 1, 4, 1)
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 2: ENTRY COMPONENTS - Labels
+    // ═══════════════════════════════════════════════════════════════
+    table.cell(tier2Panel, 0, 2, "EMA50 30%", text_color=color.rgb(140, 140, 150), text_size=tier2Size, bgcolor=color.rgb(32, 32, 40), text_halign=text.align_center)
+    table.cell(tier2Panel, 1, 2, "RSI 25%", text_color=color.rgb(140, 140, 150), text_size=tier2Size, bgcolor=color.rgb(32, 32, 40), text_halign=text.align_center)
+    table.cell(tier2Panel, 2, 2, "MACD 20%", text_color=color.rgb(140, 140, 150), text_size=tier2Size, bgcolor=color.rgb(32, 32, 40), text_halign=text.align_center)
+    table.cell(tier2Panel, 3, 2, "FromHi 15%", text_color=color.rgb(140, 140, 150), text_size=tier2Size, bgcolor=color.rgb(32, 32, 40), text_halign=text.align_center)
+    table.cell(tier2Panel, 4, 2, "Vol 10%", text_color=color.rgb(140, 140, 150), text_size=tier2Size, bgcolor=color.rgb(32, 32, 40), text_halign=text.align_center)
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 3: ENTRY COMPONENTS - Values
+    // ═══════════════════════════════════════════════════════════════
+    emaScoreColor = ema50Score >= 8 ? color.rgb(0, 220, 0) : ema50Score >= 6 ? color.rgb(220, 220, 0) : color.rgb(220, 120, 80)
+    table.cell(tier2Panel, 0, 3, str.tostring(ema50Score, "#") + " (" + str.tostring(emaDistance, "#") + "%)", text_color=emaScoreColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    rsiScoreColor = rsiScore >= 8 ? color.rgb(0, 220, 0) : rsiScore >= 6 ? color.rgb(220, 220, 0) : color.rgb(220, 120, 80)
+    table.cell(tier2Panel, 1, 3, str.tostring(rsiScore, "#") + " (" + str.tostring(rsiValue, "#") + ")", text_color=rsiScoreColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    macdScoreColor = macdScore >= 8 ? color.rgb(0, 220, 0) : macdScore >= 6 ? color.rgb(220, 220, 0) : color.rgb(220, 120, 80)
+    macdShort = macdBullishCross ? "Cross+" : macdPositiveGrowing ? "↑" : macdNegativeShrinking ? "Rev" : macdPositiveShrinking ? "↓" : macdNegativeGrowing ? "Weak" : "—"
+    table.cell(tier2Panel, 2, 3, str.tostring(macdScore, "#") + " " + macdShort, text_color=macdScoreColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    highScoreColor = distFromHighScore >= 8 ? color.rgb(0, 220, 0) : distFromHighScore >= 6 ? color.rgb(220, 220, 0) : color.rgb(220, 120, 80)
+    table.cell(tier2Panel, 3, 3, str.tostring(distFromHighScore, "#") + " (-" + str.tostring(distFromHigh, "#") + "%)", text_color=highScoreColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    volScoreColor = volScore >= 8 ? color.rgb(0, 220, 0) : volScore >= 6 ? color.rgb(220, 220, 0) : color.rgb(220, 120, 80)
+    table.cell(tier2Panel, 4, 3, str.tostring(volScore, "#") + " (" + str.tostring(relativeVol * 100, "#") + "%)", text_color=volScoreColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 4: ZONE PRICE LEVELS (actionable prices to watch)
+    // ═══════════════════════════════════════════════════════════════
+    table.cell(tier2Panel, 0, 4, "Accum < $" + str.tostring(zoneAccumHigh, "#.##"), text_color=color.rgb(0, 180, 0), text_size=tier2Size, text_halign=text.align_center)
+    table.cell(tier2Panel, 1, 4, "Trim > $" + str.tostring(zoneTrimLow, "#.##"), text_color=color.rgb(220, 180, 0), text_size=tier2Size, text_halign=text.align_center)
+    table.cell(tier2Panel, 2, 4, "Exit > $" + str.tostring(zoneExitHigh, "#.##"), text_color=color.rgb(220, 80, 80), text_size=tier2Size, text_halign=text.align_center)
+    
+    // 52W context
+    posColor = positionIn52W > 75 ? color.rgb(255, 150, 100) : positionIn52W < 25 ? color.rgb(100, 220, 100) : color.rgb(160, 160, 160)
+    table.cell(tier2Panel, 3, 4, "52W: " + str.tostring(positionIn52W, "#") + "%", text_color=posColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    // EMA context
+    emaContextColor = close > ema200 ? color.rgb(0, 180, 0) : color.rgb(220, 150, 50)
+    emaContextText = close > ema200 ? "EMA ↑" : "EMA ↓"
+    table.cell(tier2Panel, 4, 4, emaContextText, text_color=emaContextColor, text_size=tier2Size, text_halign=text.align_center)
+    
+    // ═══════════════════════════════════════════════════════════════
+    // ROW 5: TIMING CONTEXT
+    // ═══════════════════════════════════════════════════════════════
+    table.cell(tier2Panel, 0, 5, "High: " + str.tostring(daysSinceHigh) + "d ago", text_color=color.rgb(140, 140, 150), text_size=tier2Size, text_halign=text.align_center)
+    table.cell(tier2Panel, 1, 5, "Low: " + str.tostring(daysSinceLow) + "d ago", text_color=color.rgb(140, 140, 150), text_size=tier2Size, text_halign=text.align_center)
+    
+    // Gates summary (compact)
+    gatesColor = allGatesPass ? color.rgb(0, 220, 0) : qualityConfirmed ? color.rgb(220, 220, 0) : color.rgb(220, 80, 80)
+    gateDetails = "GM" + gateGM + " ROCE" + gateROCE + " D/E" + gateDE + " SBC" + gateSBC
+    table.cell(tier2Panel, 2, 5, "Gates: " + gatesSummary, text_color=gatesColor, text_size=tier2Size, text_halign=text.align_center)
+    table.merge_cells(tier2Panel, 2, 5, 4, 5)
+
+// ----------------------------------------------------------------------------
+// ZONE VISUALIZATION (Note: Disabled in separate pane mode - bgcolor doesn't support force_overlay)
+// ----------------------------------------------------------------------------
+// showZoneBG = input.bool(false, "Show Zone Background Colors", group=GRP_ZONES)
+// Zone backgrounds only work when indicator is overlay=true
+
+// ----------------------------------------------------------------------------
+// ENTRY QUALITY SCORE PLOT (in separate pane)
+// ----------------------------------------------------------------------------
+plot(entryQualityScore, "Entry Quality Score", color=entryExcellent ? color.rgb(0, 255, 100) : entryGood ? color.rgb(0, 200, 0) : entryFair ? color.rgb(255, 200, 50) : entryPoor ? color.rgb(200, 150, 100) : color.rgb(200, 100, 100), linewidth=2)
+
+// Reference lines for Entry Quality thresholds
+hline(8.0, "Excellent (8+)", color=color.rgb(0, 200, 0, 70), linestyle=hline.style_dashed)
+hline(6.5, "Good (6.5+)", color=color.rgb(100, 200, 100, 70), linestyle=hline.style_dotted)
+hline(5.0, "Fair (5+)", color=color.rgb(200, 200, 100, 70), linestyle=hline.style_dotted)
+hline(3.5, "Poor (3.5)", color=color.rgb(200, 100, 100, 70), linestyle=hline.style_dotted)
+
+// Fill zones
+p1 = plot(10, color=na, display=display.none)
+p2 = plot(8, color=na, display=display.none)
+p3 = plot(6.5, color=na, display=display.none)
+p4 = plot(5, color=na, display=display.none)
+p5 = plot(3.5, color=na, display=display.none)
+p6 = plot(0, color=na, display=display.none)
+
+fill(p1, p2, color=color.new(color.green, 90), title="Excellent Zone")
+fill(p2, p3, color=color.new(color.lime, 93), title="Good Zone")
+fill(p3, p4, color=color.new(color.yellow, 93), title="Fair Zone")
+fill(p4, p5, color=color.new(color.orange, 93), title="Poor Zone")
+fill(p5, p6, color=color.new(color.red, 93), title="Avoid Zone")
+
+// ----------------------------------------------------------------------------
+// SIGNAL MARKERS (on main chart using labels with force_overlay)
+// ----------------------------------------------------------------------------
+showSignalMarkers = input.bool(false, "Show Signal Markers on Chart", group=GRP_TECH)
+
+// Only show markers on TRIGGER events (RSI bounce)
+// PRIME signal
+if showSignalMarkers and isOpportunityMode and rsiOversoldBounce and volumeConfirmed and allGatesPass and entryExcellent and inAccumulateZone
+    label.new(bar_index, low, "💎", style=label.style_none, textcolor=color.rgb(0, 255, 100), size=size.normal, force_overlay=true)
+
+// STRONG BUY signal
+if showSignalMarkers and isOpportunityMode and rsiOversoldBounce and volumeConfirmed and allGatesPass and entryExcellent and not inAccumulateZone
+    label.new(bar_index, low, "▲", style=label.style_none, textcolor=color.rgb(0, 220, 50), size=size.small, force_overlay=true)
+
+// BUY signal (75%)
+if showSignalMarkers and isOpportunityMode and rsiOversoldBounce and volumeConfirmed and qualityConfirmed and entryGood
+    label.new(bar_index, low, "▲", style=label.style_none, textcolor=color.rgb(0, 200, 0), size=size.small, force_overlay=true)
+
+// BUY signal Trend mode
+if showSignalMarkers and isTrendMode and rsiOversoldBounce and volumeConfirmed and aboveLongEMA
+    label.new(bar_index, low, "▲", style=label.style_none, textcolor=color.rgb(0, 200, 0), size=size.small, force_overlay=true)
+
+// BUY PARTIAL signal (50%)
+if showSignalMarkers and isOpportunityMode and rsiOversoldBounce and volumeConfirmed and qualityConfirmed and entryFair
+    label.new(bar_index, low, "△", style=label.style_none, textcolor=color.rgb(255, 200, 50), size=size.tiny, force_overlay=true)
+
+// Trim signal
+if showSignalMarkers and isOpportunityMode and rsiOverboughtDrop and volumeConfirmed and (inTrimZone or inExitZone)
+    label.new(bar_index, high, "■", style=label.style_none, textcolor=color.rgb(255, 180, 50), size=size.small, force_overlay=true)
+
+// Sell signal
+if showSignalMarkers and rsiOverboughtDrop and volumeConfirmed and not (inTrimZone or inExitZone)
+    label.new(bar_index, high, "▼", style=label.style_none, textcolor=color.rgb(255, 100, 100), size=size.small, force_overlay=true)
+
+// ----------------------------------------------------------------------------
+// ALERTS
+// ----------------------------------------------------------------------------
+
+// Zone change alerts
+alertcondition(close <= zoneAccumHigh and close[1] > zoneAccumHigh, 
+     title="Entered Accumulate Zone", 
+     message="{{ticker}} entered ACCUMULATE zone at {{close}}")
+
+alertcondition(close >= zoneTrimLow and close[1] < zoneTrimLow, 
+     title="Entered Trim Zone", 
+     message="{{ticker}} entered TRIM zone at {{close}}")
+
+alertcondition(close >= zoneExitHigh and close[1] < zoneExitHigh, 
+     title="Entered Exit Zone (High)", 
+     message="{{ticker}} entered EXIT zone (target achieved) at {{close}}")
+
+alertcondition(close < zoneExitLow and close[1] >= zoneExitLow, 
+     title="Entered Exit Zone (Low)", 
+     message="{{ticker}} BROKE DOWN into EXIT zone at {{close}}")
+
+// Signal alerts - Opportunity Enhancement Mode (v7.5 Entry Quality)
+alertcondition(isOpportunityMode and allGatesPass and entryExcellent and inAccumulateZone, 
+     title="PRIME Entry Signal", 
+     message="{{ticker}} PRIME: All Gates Pass + Entry Quality EXCELLENT + Accumulate Zone - 100% position")
+
+alertcondition(isOpportunityMode and allGatesPass and entryExcellent, 
+     title="Strong Buy Signal", 
+     message="{{ticker}} STRONG BUY: All Gates Pass + Entry Quality EXCELLENT - 100% position")
+
+alertcondition(isOpportunityMode and qualityConfirmed and entryGood, 
+     title="Buy Signal (75%)", 
+     message="{{ticker}} BUY: Quality Confirmed + Entry Quality GOOD - 75% position")
+
+alertcondition(isOpportunityMode and qualityConfirmed and entryFair, 
+     title="Buy Partial Signal (50%)", 
+     message="{{ticker}} BUY PARTIAL: Quality Confirmed + Entry Quality FAIR - 50% position")
+
+alertcondition(isOpportunityMode and qualityConfirmed and (entryPoor or entryAvoid), 
+     title="Wait Signal", 
+     message="{{ticker}} WAIT: Quality OK but Entry Quality POOR - wait for better entry")
+
+alertcondition(isOpportunityMode and gatesFailing, 
+     title="AVOID - Gates Failing", 
+     message="{{ticker}} AVOID: Quality Gates failing - do not buy regardless of entry quality")
+
+alertcondition(isOpportunityMode and rsiOverboughtDrop and volumeConfirmed and (inTrimZone or inExitZone), 
+     title="Trim Signal", 
+     message="{{ticker}} TRIM: Overbought in Trim/Exit zone - consider taking profits")
+
+// Signal alerts - Trend Follower Mode
+alertcondition(isTrendMode and rsiOversoldBounce and volumeConfirmed and aboveLongEMA, 
+     title="Strong Buy (Trend Mode)", 
+     message="{{ticker}} STRONG BUY: RSI oversold bounce with volume confirmation, above 200 EMA")
+
+alertcondition(rsiOversoldBounce and volumeConfirmed, 
+     title="Buy Signal", 
+     message="{{ticker}} BUY signal: RSI oversold bounce with volume confirmation")
+
+alertcondition(rsiOverboughtDrop and volumeConfirmed, 
+     title="Sell Signal", 
+     message="{{ticker}} SELL signal: RSI overbought drop with volume confirmation")
+
+// Entry Quality improvement alert
+alertcondition(entryQualityScore >= 6.5 and entryQualityScore[1] < 6.5 and qualityConfirmed, 
+     title="Entry Quality Improved to GOOD", 
+     message="{{ticker}} Entry Quality improved to GOOD (6.5+) - consider buying if Gates pass")
+
+// Quality gate alerts
+alertcondition(not na(grossMargin) and grossMargin < gmThreshold and grossMargin[1] >= gmThreshold, 
+     title="Gross Margin Gate Failed", 
+     message="{{ticker}} Gross Margin dropped below threshold - check Quality Gate settings")
+
+alertcondition(not na(debtToEquity) and debtToEquity > debtEquityMax and debtToEquity[1] <= debtEquityMax, 
+     title="Debt/Equity Gate Failed", 
+     message="{{ticker}} Debt/Equity exceeded threshold - check Quality Gate settings")

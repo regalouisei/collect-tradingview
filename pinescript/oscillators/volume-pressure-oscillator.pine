@@ -1,0 +1,181 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © VEGAlgo
+
+//@version=6
+indicator("Volume Pressure Oscillator", "VPO", overlay=false)
+
+// Inputs
+
+i_lookback = input.int(14, "Momentum Period", minval=5, maxval=50)
+
+i_upColor = input.color(#00ff7b, "Rising Pressure", inline="c1")
+i_dnColor = input.color(color.rgb(254, 50, 115), "Falling Pressure", inline="c1")
+i_midColor = input.color(#888888, "Neutral", inline="c2")
+
+// Hardcoded parameters
+i_normPeriod = 60
+i_smooth = 3
+i_extremePersistence = 0.7
+i_showZones = true
+i_showMid = true
+
+// LTF Selection
+
+getLowerTimeframe() =>
+    chartTfSeconds = timeframe.in_seconds()
+    divisor = 12
+    ltfSeconds = math.max(60, math.floor(chartTfSeconds / divisor))
+    
+    if ltfSeconds <= 60
+        "1"
+    else if ltfSeconds <= 180
+        "3"
+    else if ltfSeconds <= 300
+        "5"
+    else if ltfSeconds <= 900
+        "15"
+    else if ltfSeconds < 3600
+        str.tostring(math.round(ltfSeconds / 60))
+    else if ltfSeconds < 86400
+        str.tostring(math.round(ltfSeconds / 3600)) + "H"
+    else
+        "D"
+
+//  Intrabar Volume Analysis
+
+calcIntrabarDelta() =>
+    buyVol = 0.0
+    sellVol = 0.0
+    
+    if close > open
+        buyVol := volume
+    else if close < open
+        sellVol := volume
+    else
+        if close > nz(close[1])
+            buyVol := volume
+        else if close < nz(close[1])
+            sellVol := volume
+        else
+            prevMid = (nz(high[1]) + nz(low[1])) / 2
+            if close > prevMid
+                buyVol := volume
+            else if close < prevMid
+                sellVol := volume
+            else
+                buyVol := volume * 0.5
+                sellVol := volume * 0.5
+    
+    [buyVol, sellVol]
+
+// CVD
+
+ltf = getLowerTimeframe()
+[buyVolArray, sellVolArray] = request.security_lower_tf(syminfo.tickerid, ltf, calcIntrabarDelta())
+
+buyVolTotal = array.size(buyVolArray) > 0 ? array.sum(buyVolArray) : volume
+sellVolTotal = array.size(sellVolArray) > 0 ? array.sum(sellVolArray) : 0.0
+
+barDelta = buyVolTotal - sellVolTotal
+var cvd = 0.0
+cvd += barDelta
+
+// Volume Pressure
+
+// Short-term CVD momentum
+cvdMomentumShort = ta.change(cvd, i_lookback)
+
+// Longer-term CVD momentum
+cvdMomentumLong = ta.change(cvd, i_lookback * 2)
+
+// Normalize using percentile rank
+cvdPercentileShort = ta.percentrank(cvdMomentumShort, i_normPeriod * 2)
+cvdPercentileLong = ta.percentrank(cvdMomentumLong, i_normPeriod * 4)
+
+// Convert to -50 to +50 range
+shortSignal = cvdPercentileShort - 50
+longSignal = cvdPercentileLong - 50
+
+// Slow EMA of long signal for trend bias
+trendBias = ta.ema(longSignal, 20)
+
+// Price context
+priceRoc = ta.roc(close, i_lookback)
+pricePercentile = ta.percentrank(priceRoc, i_normPeriod * 2)
+priceSignal = (pricePercentile - 50) * 0.3
+
+// Combine signals
+combinedSignal = (shortSignal * 0.5) + (trendBias * 0.3) + (longSignal * 0.2) + priceSignal
+
+// Apply scaling
+scaledValue = 50 + (combinedSignal * 0.95)
+
+// Progressive compression at far extremes
+compressedValue = scaledValue
+
+if scaledValue > 80
+    excess = scaledValue - 80
+    compressionFactor = 0.75
+    compressedValue := 80 + (excess * compressionFactor)
+    
+if scaledValue < 20
+    deficit = 20 - scaledValue
+    compressionFactor = 0.75
+    compressedValue := 20 - (deficit * compressionFactor)
+
+// Soft clamp
+vpoRaw = math.max(0, math.min(100, compressedValue))
+
+// Smoothing
+vpoSmooth = ta.ema(vpoRaw, i_smooth)
+
+// Extreme Zone Behavior
+
+// Check if CVD is still moving in the dominant direction
+cvdChange1 = ta.change(cvd, 1)
+recentCvdDirection = ta.ema(cvdChange1, 5)
+
+var float vpoWithPersistence = 50.0
+
+// Get previous VPO value
+prevVpo = nz(vpoWithPersistence[1], 50)
+
+// In upper extreme 
+if prevVpo >= 80
+    if recentCvdDirection > 0
+        vpoWithPersistence := (prevVpo * i_extremePersistence) + (vpoSmooth * (1 - i_extremePersistence))
+        vpoWithPersistence := math.max(75, vpoWithPersistence)
+    else
+        vpoWithPersistence := vpoSmooth
+
+else if prevVpo <= 20
+    if recentCvdDirection < 0
+        vpoWithPersistence := (prevVpo * i_extremePersistence) + (vpoSmooth * (1 - i_extremePersistence))
+        vpoWithPersistence := math.min(25, vpoWithPersistence)
+    else
+        vpoWithPersistence := vpoSmooth
+
+// In neutral zones
+else
+    vpoWithPersistence := vpoSmooth
+
+vpoFinal = vpoWithPersistence
+
+// Plotting
+
+vpoColor = vpoFinal > 50 ? i_upColor : vpoFinal < 50 ? i_dnColor : i_midColor
+plot(vpoFinal, "VPO", color=vpoColor, linewidth=2)
+
+hline(50, "Midline", color=i_showMid ? i_midColor : na, linestyle=hline.style_solid)
+
+band80 = hline(80, color=na)
+band100 = hline(100, color=na)
+band60 = hline(60, color=na)
+band40 = hline(40, color=na)
+band20 = hline(20, color=na)
+band0 = hline(0, color=na)
+
+fill(band80, band100, color=i_showZones ? color.new(i_upColor, 90) : na, title="Strong Buying")
+fill(band0, band20, color=i_showZones ? color.new(i_dnColor, 90) : na, title="Strong Selling")
+fill(band60, band80, color=i_showZones ? color.new(i_upColor, 95) : na, title="Moderate Buying")
+fill(band20, band40, color=i_showZones ? color.new(i_dnColor, 95) : na, title="Moderate Selling")

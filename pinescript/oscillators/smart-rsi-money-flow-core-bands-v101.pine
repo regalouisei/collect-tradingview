@@ -1,0 +1,173 @@
+//@version=6
+indicator(title="Smart RSI Money Flow — Core Bands V1.01", shorttitle="RSI MF", overlay=true)
+
+//══════════════
+// Inputs
+//══════════════
+src_input          = input.source(close, "Source", tooltip="Primary price source used for RSI and price-range mapping.")
+rsi_len_input      = input.int(14, "RSI / Angle Length", minval=2, tooltip="Lookback length for RSI and angle calculations.")
+map_len_input      = input.int(14, "Mapping Length", minval=1, tooltip="Price-range window for RSI-to-price mapping.")
+rsi_upper_lvl      = input.float(70.0, "RSI Upper Level", minval=0, maxval=100, tooltip="RSI level mapped to upper price band.")
+rsi_lower_lvl      = input.float(30.0, "RSI Lower Level", minval=0, maxval=100, tooltip="RSI level mapped to lower price band.")
+
+ltf_tf_input       = input.timeframe("15S", "Volume lower TF", tooltip="Lower timeframe used to decompose volume into buy/sell (e.g., 15S).")
+vol_len_input      = input.int(11, "Volume Length", minval=1, tooltip="Lookback length for volume averages and cumulative flow.")
+
+//══════════════
+// Utils
+//══════════════
+mapRsiToPrice_core(rsi_value, low_price, high_price) =>
+    price_range = high_price - low_price
+    price_range <= 0 ? na : low_price + (rsi_value / 100.0) * price_range
+
+//══════════════
+// Core RSI → Price Bands
+//══════════════
+rsi_core        = ta.rsi(src_input, rsi_len_input)
+price_low_map   = ta.lowest(src_input, map_len_input)
+price_high_map  = ta.highest(src_input, map_len_input)
+
+upper_band_core     = mapRsiToPrice_core(rsi_upper_lvl, price_low_map, price_high_map) 
+lower_band_core     = mapRsiToPrice_core(rsi_lower_lvl, price_low_map, price_high_map) 
+rsi_price_line_core = mapRsiToPrice_core(rsi_core,      price_low_map, price_high_map)
+
+//══════════════
+// 15s Volume Decomposition (single security_lower_tf call)
+//══════════════
+// 15s candle: close > open → +volume (buy), close < open → -volume (sell), else 0
+array<float> volSignedArr = request.security_lower_tf(
+     syminfo.tickerid,
+     ltf_tf_input,
+     close > open ? volume : close < open ? -volume : 0.0,
+     ignore_invalid_timeframe = true)
+
+float buyVol_15s  = na
+float sellVol_15s = na
+
+int arrSize = array.size(volSignedArr)
+if arrSize > 0
+    float buyTmp  = 0.0
+    float sellTmp = 0.0
+    for i = 0 to arrSize - 1
+        float v = array.get(volSignedArr, i)
+        if v > 0
+            buyTmp += v       // green 15s candles → buy volume
+        else if v < 0
+            sellTmp += -v     // red 15s candles → sell volume
+    buyVol_15s  := buyTmp
+    sellVol_15s := sellTmp
+
+
+
+//══════════════
+// Angle Metrics (Price, Buy Volume, Sell Volume)
+//══════════════
+angle_len_core = rsi_len_input
+
+// Price angle (in degrees)
+float reg_price_now  = ta.linreg(src_input, angle_len_core, 0)
+float reg_price_prev = ta.linreg(src_input, angle_len_core, 1)
+float slope_price    = reg_price_now - reg_price_prev
+float angle_price    = math.atan(slope_price) * 180.0 / math.pi
+
+// Buy volume angle (in degrees)
+float reg_buy_now  = ta.linreg(buyVol_15s, angle_len_core, 0)
+float reg_buy_prev = ta.linreg(buyVol_15s, angle_len_core, 1)
+float slope_buy    = reg_buy_now - reg_buy_prev
+float angle_buy    = math.atan(slope_buy) * 180.0 / math.pi
+
+// Sell volume angle (in degrees)
+float reg_sell_now  = ta.linreg(sellVol_15s, angle_len_core, 0)
+float reg_sell_prev = ta.linreg(sellVol_15s, angle_len_core, 1)
+float slope_sell    = reg_sell_now - reg_sell_prev
+float angle_sell    = math.atan(slope_sell) * 180.0 / math.pi
+
+
+//══════════════
+// Angle + Volume Conditions (Signals)
+//══════════════
+
+// Volume-based averages (independent volume length)
+float buyVol_avg  = ta.sma(buyVol_15s,  vol_len_input)
+float sellVol_avg = ta.sma(sellVol_15s, vol_len_input)
+
+// Cumulative buy/sell volume over the last volume length bars
+float buyVol_cum  = math.sum(buyVol_15s,  vol_len_input)
+float sellVol_cum = math.sum(sellVol_15s, vol_len_input)
+
+bool bull_flow_cum_cond = not na(buyVol_cum)  and not na(sellVol_cum) and buyVol_cum  > sellVol_cum
+bool bear_flow_cum_cond = not na(buyVol_cum)  and not na(sellVol_cum) and sellVol_cum > buyVol_cum
+
+bool bull_angle_cond = not na(angle_price) and not na(angle_buy) and not na(buyVol_15s) and not na(sellVol_15s) and
+     angle_price < 0 and angle_buy > 0 and
+     buyVol_15s > sellVol_15s and
+     buyVol_15s > buyVol_avg and
+     bull_flow_cum_cond
+
+bool bear_angle_cond = not na(angle_price) and not na(angle_sell) and not na(buyVol_15s) and not na(sellVol_15s) and
+     angle_price > 0 and angle_sell > 0 and
+     sellVol_15s > buyVol_15s and
+     sellVol_15s > sellVol_avg and
+     bear_flow_cum_cond
+
+
+// Plot shapes on chart
+plotshape(
+     bull_angle_cond  ,
+     title     = "Bullish Angle-Volume Signal",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = color.new(color.aqua, 0),
+     text      = "↑\nO\nV\nE\nR\n.\nB",
+     textcolor = color.new(color.aqua , 0),
+     size      = size.small)
+
+plotshape(
+     bear_angle_cond ,
+     title     = "Bearish Angle-Volume Signal",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = color.new(color.red, 0),
+     text      = "O\nV\nE\nR\n.\nS\n↓",
+     textcolor = color.new(color.red, 0),
+     size      = size.small)
+
+//══════════════
+// Plot RSI price bands
+//══════════════
+
+upper_plot = plot(
+      upper_band_core,
+      "RSI 70 Band",
+      color     = color.new(color.orange, 0),
+      linewidth = 1)
+
+lower_plot = plot(
+      lower_band_core,
+      "RSI 30 Band",
+      color     = color.new(color.aqua, 0),
+      linewidth = 1)
+
+rsi_plot = plot(
+      rsi_price_line_core,
+      "RSI Price Line",
+      color     = color.new(color.gray, 0),
+      linewidth = 2)
+
+fill(
+      upper_plot,
+      lower_plot,
+      color = color.new(color.gray, 90),
+      title = "RSI Zone Fill")
+
+fill(
+      rsi_plot,
+      upper_plot,
+      color = rsi_price_line_core > upper_band_core ? color.new(color.orange, 60) : na,
+      title = "Over Upper - Orange")
+
+fill(
+      rsi_plot,
+      lower_plot,
+      color = rsi_price_line_core < lower_band_core ? color.new(color.aqua, 60) : na,
+      title = "Under Lower - Aqua")

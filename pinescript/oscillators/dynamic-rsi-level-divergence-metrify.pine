@@ -1,0 +1,173 @@
+//@Metrify
+//https://creativecommons.org/licenses/by-nc-sa/4.0/
+//@version=6
+indicator("Dynamic RSI Level + Divergence [Metrify]", shorttitle="Metrify - Dynamic RSI/div", overlay=false, precision=2, max_lines_count=500, max_labels_count=500)
+
+grp_calc    = "Calculation Engine"
+grp_misc    = "Visual Extras"
+grp_div     = "Divergence"
+
+// inputs
+int rsi_len       = input.int(14, "RSI Period", minval=2, group=grp_calc)
+string src_type   = input.string("Close", "Source", options=["Close", "HL2", "OHLC4"], group=grp_calc)
+string smooth_type = input.string("HMA", "Smoothing Type", options=["HMA", "RMA", "SMA", "EMA"], group=grp_calc)
+int sig_smooth_len = input.int(5, "Smoothing Length", minval=1, group=grp_calc)
+
+int basis_len     = input.int(100, "Trend Baseline Length", minval=5, group=grp_calc)
+float band_mult   = input.float(1.618, "Volatility Multiplier", step=0.1, group=grp_calc, tooltip="Determines the width of the dynamic bands.\nHigher: less signals, high conviction.\nLower: more signals, scalping.")
+
+bool show_div     = input.bool(true, "Show Divergence", group=grp_div) 
+int div_left      = input.int(25, "Pivot Length", minval=1, group=grp_div)
+float div_rsi_min = input.float(2.0, "Min RSI Diff (Steepness)", minval=0.0, step=0.5,group=grp_div, tooltip="Minimum RSI point difference between peaks to consider it a valid divergence. Filters out flat/weak signals.")
+float div_atr_min = input.float(0.2, "Min Price Diff (ATR Multiplier)", minval=0.0, step=0.1,group=grp_div, tooltip="Minimum price difference between peaks relative to ATR. Ensures price actually moved significantly.")
+
+bool show_hist    = input.bool(false, "Show Histogram", group=grp_misc)
+bool show_ema     = input.bool(false, "Show EMA", group=grp_misc)
+int  ema_len      = input.int(50, "EMA Length", minval=1, group=grp_misc)
+bool show_price_bg = input.bool(false, "Mark OB/OS Area on Chart", group=grp_misc)
+
+color col_ob      = #ff2020 
+color col_os      = #00ff2f 
+color col_neu     = color.new(#5d606b, 50)
+color col_ema     = color.rgb(59, 226, 255) 
+
+color col_h_grow_bull = color.new(#00ff2f, 40)
+color col_h_weak_bull = color.new(#005a10, 40)
+color col_h_grow_bear = color.new(#ff2020, 40)
+color col_h_weak_bear = color.new(#7a0b0b, 40)
+
+// calculations
+float src = switch src_type
+    "Close" => close
+    "HL2"   => hl2
+    "OHLC4" => ohlc4
+    => close
+
+float raw_rsi = ta.rsi(src, rsi_len)
+
+float signal_rsi = switch smooth_type
+    "SMA" => ta.sma(raw_rsi, sig_smooth_len)
+    "EMA" => ta.ema(raw_rsi, sig_smooth_len)
+    "RMA" => ta.rma(raw_rsi, sig_smooth_len)
+    "HMA" => ta.hma(raw_rsi, sig_smooth_len) 
+    => raw_rsi
+
+float rsi_basis = ta.hma(raw_rsi, basis_len)
+float rsi_stdev = ta.stdev(raw_rsi, basis_len)
+float upper_band = rsi_basis + (rsi_stdev * band_mult)
+float lower_band = rsi_basis - (rsi_stdev * band_mult)
+
+// clamp to valid rsi range
+upper_band := math.min(upper_band, 100)
+lower_band := math.max(lower_band, 0)
+
+float rsi_ema = ta.ema(signal_rsi, ema_len)
+
+// divergence
+float atr = ta.atr(14)
+
+var float last_ph_rsi = na
+var float last_ph_price = na
+var int   last_ph_bar = na
+
+var float last_pl_rsi = na
+var float last_pl_price = na
+var int   last_pl_bar = na
+
+float ph_rsi = ta.pivothigh(signal_rsi, div_left, 1)
+float pl_rsi = ta.pivotlow(signal_rsi, div_left, 1)
+
+if not na(ph_rsi) and show_div
+    float ph_price = high[1] 
+    
+    if not na(last_ph_rsi)
+        bool price_hh = ph_price > last_ph_price
+        bool rsi_lh   = ph_rsi < last_ph_rsi
+        
+        // filters: steepness & atr distance
+        bool steep_rsi = (last_ph_rsi - ph_rsi) > div_rsi_min
+        bool sig_price = (ph_price - last_ph_price) > (atr * div_atr_min)
+
+        bool collision = false
+        int dist = (bar_index - 1) - last_ph_bar
+        
+        if dist > 0 and dist < 300 and price_hh and rsi_lh
+            float slope = (ph_rsi - last_ph_rsi) / dist
+            for i = 1 to dist - 1
+                if signal_rsi[1 + (dist - i)] > (last_ph_rsi + (slope * i))
+                    collision := true
+                    break
+        
+        if price_hh and rsi_lh and not collision and steep_rsi and sig_price
+            int curr_bar = bar_index - 1
+            line.new(last_ph_bar, last_ph_rsi, curr_bar, ph_rsi, color=col_ob, style=line.style_dashed, width=1)
+            label.new(bar_index, ph_rsi + 2, "Bear Div", color=color.new(col_ob, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+            line.new(last_ph_bar, last_ph_price, curr_bar, ph_price, color=col_ob, style=line.style_dashed, width=1, force_overlay=true)
+            label.new(bar_index, ph_price + (atr * 0.15), "Bear Div", color=color.new(col_ob, 0), textcolor=color.white, style=label.style_label_down, size=size.tiny, force_overlay=true)
+            
+    last_ph_rsi   := ph_rsi
+    last_ph_price := ph_price
+    last_ph_bar   := bar_index - 1
+
+if not na(pl_rsi) and show_div
+    float pl_price = low[1]
+    
+    if not na(last_pl_rsi)
+        bool price_ll = pl_price < last_pl_price
+        bool rsi_hl   = pl_rsi > last_pl_rsi
+        
+        bool steep_rsi = (pl_rsi - last_pl_rsi) > div_rsi_min
+        bool sig_price = (last_pl_price - pl_price) > (atr * div_atr_min)
+
+        bool collision = false
+        int dist = (bar_index - 1) - last_pl_bar
+        
+        if dist > 0 and dist < 300 and price_ll and rsi_hl
+            float slope = (pl_rsi - last_pl_rsi) / dist
+            for i = 1 to dist - 1
+                if signal_rsi[1 + (dist - i)] < (last_pl_rsi + (slope * i))
+                    collision := true
+                    break
+        
+        if price_ll and rsi_hl and not collision and steep_rsi and sig_price
+            int curr_bar = bar_index - 1
+            line.new(last_pl_bar, last_pl_rsi, curr_bar, pl_rsi, color=col_os, style=line.style_dashed, width=1)
+            label.new(bar_index, pl_rsi - 2, "Bull Div", color=color.new(col_os, 0), textcolor=color.black, style=label.style_label_up, size=size.tiny)
+            line.new(last_pl_bar, last_pl_price, curr_bar, pl_price, color=col_os, style=line.style_dashed, width=1, force_overlay=true)
+            label.new(bar_index, pl_price - (atr * 0.15), "Bull Div", color=color.new(col_os, 0), textcolor=color.black, style=label.style_label_up, size=size.tiny, force_overlay=true)
+
+    last_pl_rsi   := pl_rsi
+    last_pl_price := pl_price
+    last_pl_bar   := bar_index - 1
+
+// visualization
+float mom_delta = signal_rsi - rsi_basis
+bool is_growing = math.abs(mom_delta) > math.abs(mom_delta[1])
+color hist_col = mom_delta > 0 ? (is_growing ? col_h_grow_bull : col_h_weak_bull) : (is_growing ? col_h_grow_bear : col_h_weak_bear)
+
+plot(show_hist ? 50 + mom_delta : na, "Momentum Velocity", color=hist_col, style=plot.style_columns, histbase=50)
+plot(show_ema ? rsi_ema : na, "RSI EMA", color=col_ema, linewidth=1, style=plot.style_line)
+
+p_upper = plot(upper_band, "Dynamic OB Band", color=color.new(col_ob, 60), style=plot.style_line)
+p_lower = plot(lower_band, "Dynamic OS Band", color=color.new(col_os, 60), style=plot.style_line)
+p_basis = plot(rsi_basis, "Center of Gravity", color=color.new(col_neu, 80), display=display.none)
+fill(p_upper, p_lower, top_value=100, bottom_value=0, top_color=color.new(col_ob, 95), bottom_color=color.new(col_os, 95), title="Regime Cloud")
+
+color rsi_col = signal_rsi > upper_band ? col_ob : signal_rsi < lower_band ? col_os : color.from_gradient(signal_rsi, lower_band, upper_band, color.new(col_os, 20), color.new(col_ob, 20))
+p_rsi = plot(signal_rsi, "V-RSI Signal", color=rsi_col, linewidth=2, style=plot.style_line)
+
+color price_bg_col = signal_rsi > upper_band ? color.new(col_ob, 90) : signal_rsi < lower_band ? color.new(col_os, 90) : na
+bgcolor(show_price_bg ? price_bg_col : na, title="OB/OS Main Chart BG", force_overlay=true)
+
+// excursion gradients
+p_ob_sig = plot(signal_rsi > upper_band ? signal_rsi : na, "OB Excursion Signal", display=display.none)
+p_ob_bnd = plot(signal_rsi > upper_band ? upper_band : na, "OB Excursion Band",   display=display.none)
+p_os_sig = plot(signal_rsi < lower_band ? signal_rsi : na, "OS Excursion Signal", display=display.none)
+p_os_bnd = plot(signal_rsi < lower_band ? lower_band : na, "OS Excursion Band",   display=display.none)
+
+fill(p_ob_sig, p_ob_bnd, top_color=color.new(col_ob, 20), bottom_color=color.new(col_ob, 90), title="Bearish Gradient Fill")
+fill(p_os_bnd, p_os_sig, top_color=color.new(col_os, 90), bottom_color=color.new(col_os, 20), title="Bullish Gradient Fill")
+
+hline(50, "Static Mid", color=color.new(color.gray, 30), linestyle=hline.style_dotted)
+hline(70, "Static Mid", color=color.new(color.gray, 30), linestyle=hline.style_dotted)
+hline(30, "Static Mid", color=color.new(color.gray, 30), linestyle=hline.style_dotted)

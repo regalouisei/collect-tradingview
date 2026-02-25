@@ -1,0 +1,253 @@
+//@version=6
+// NP : Supertrend Optimizer — v2025.08.31-rc2
+// - Uses multi-factor Supertrend scoring (unchanged core logic)
+// - Removes all fundamentals data/UI
+// - Adds rich, user-controlled table formatting (position, text size, colors, borders, zebra rows)
+
+indicator("NP : Supertrend Optimizer", overlay=true)
+
+// ── INPUTS: SUPER-TREND CORE ─────────────────────────────────────────────
+atrLen     = input.int(10, "ATR Length", minval=1)
+showPerf   = input.bool(true, "Show Performance Table")
+
+// ── INPUTS: TABLE FORMATTING (learned from NP:Earnings) ──────────────
+groupTbl   = "Table Formatting"
+txtSizeStr = input.string("small", "Text Size", options=["auto","tiny","small","normal","large","huge"], group=groupTbl)
+posStr     = input.string("bottom_right", "Table Position", options=["top_left","top_center","top_right","middle_left","middle_center","middle_right","bottom_left","bottom_center","bottom_right"], group=groupTbl)
+tblBg      = input.color(color.new(color.white, 0), "Table Background", group=groupTbl)
+hdrBg      = input.color(color.new(color.rgb(248,236,0), 26), "Header Background", group=groupTbl)
+bodyBg     = input.color(color.new(color.rgb(0,122,252), 73), "Body Background", group=groupTbl)
+textCol    = input.color(color.black, "Text Color", group=groupTbl)
+borderCol  = input.color(color.gray, "Border Color", group=groupTbl)
+borderW    = input.int(1, "Border Width", minval=0, maxval=5, group=groupTbl)
+bestBg     = input.color(color.teal, "Best Column Highlight", group=groupTbl)
+bestTxt    = input.color(color.white, "Best Column Text", group=groupTbl)
+zebra      = input.bool(true, "Zebra Rows (Body)", group=groupTbl)
+zebraBg    = input.color(color.new(color.gray, 90), "Zebra Alt Background", group=groupTbl)
+
+// map string → size enum (keeps inputs clean & robust)
+toSize(_s) =>
+    switch _s
+        "auto"   => size.auto
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        "huge"   => size.huge
+        => size.small
+
+// map string → position enum
+toPos(_p) =>
+    switch _p
+        "top_left"       => position.top_left
+        "top_center"     => position.top_center
+        "top_right"      => position.top_right
+        "middle_left"    => position.middle_left
+        "middle_center"  => position.middle_center
+        "middle_right"   => position.middle_right
+        "bottom_left"    => position.bottom_left
+        "bottom_center"  => position.bottom_center
+        => position.bottom_right
+
+txtSize = toSize(txtSizeStr)
+tPos    = toPos(posStr)
+
+// ── MULTI-FACTOR SUPER-TREND SETUP ───────────────────────────────────────
+factors    = array.from(1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0)
+factorCnt  = array.size(factors)
+
+// persistent state arrays
+var entryArr    = array.new_float(factorCnt, na)
+var posArr      = array.new_int(  factorCnt, 0)
+var winsArr     = array.new_int(  factorCnt, 0)
+var tradesArr   = array.new_int(  factorCnt, 0)
+var gWinArr     = array.new_float(factorCnt, 0.0)
+var gLossArr    = array.new_float(factorCnt, 0.0)
+var worstArr    = array.new_float(factorCnt, 0.0)
+var scoreArr    = array.new_float(factorCnt, na)
+var winPctArr   = array.new_float(factorCnt, na)
+var wlArr       = array.new_float(factorCnt, na)
+var lossArr     = array.new_float(factorCnt, na)
+var avgWinArr   = array.new_float(factorCnt, na)
+var avgLossArr  = array.new_float(factorCnt, na)
+
+// buffers for plotting
+var stBuf       = array.new_float(factorCnt, na)
+var dirBuf      = array.new_float(factorCnt, na)
+
+// track first bar time for table header
+var int firstT  = na
+if barstate.isfirst
+    firstT := time
+
+// month abbreviation helper (kept simple & safe)
+abbr(m) =>
+    switch m
+        1  => "Jan"
+        2  => "Feb"
+        3  => "Mar"
+        4  => "Apr"
+        5  => "May"
+        6  => "Jun"
+        7  => "Jul"
+        8  => "Aug"
+        9  => "Sep"
+        10 => "Oct"
+        11 => "Nov"
+        =>   "Dec"
+
+// process one factor
+process(_i, _st, _dir) =>
+    array.set(stBuf,  _i, _st)
+    array.set(dirBuf, _i, _dir)
+    en = array.get(entryArr, _i)
+    ps = array.get(posArr,   _i)
+    wn = array.get(winsArr,  _i)
+    tr = array.get(tradesArr,_i)
+    gw = array.get(gWinArr,  _i)
+    gl = array.get(gLossArr, _i)
+    wt = array.get(worstArr, _i)
+
+    enter = ta.change(_dir) < 0
+    exit  = ta.change(_dir) > 0
+
+    if (exit and ps == 1) or (barstate.islast and ps == 1)
+        pnl = (close - en) / en
+        tr  += 1
+        wt  := math.min(wt, pnl)
+        if pnl >= 0
+            wn += 1
+            gw += pnl
+        else
+            gl += -pnl
+        ps := 0
+        en := na
+
+    if enter and ps == 0
+        ps := 1
+        en := close
+
+    array.set(entryArr,  _i, en)
+    array.set(posArr,    _i, ps)
+    array.set(winsArr,   _i, wn)
+    array.set(tradesArr, _i, tr)
+    array.set(gWinArr,   _i, gw)
+    array.set(gLossArr,  _i, gl)
+    array.set(worstArr,  _i, wt)
+
+    if barstate.islast
+        winPct = tr > 0 ? wn / tr * 100 : na
+        avW    = wn > 0 ? gw / wn        : na
+        avL    = (tr - wn) > 0 ? gl / (tr - wn) : na
+        wl     = not na(avW) and not na(avL) and avL > 0 ? avW / avL : na
+        sc     = not na(winPct) and not na(wl) ? winPct * wl : na
+        ml     = -wt * 100
+
+        array.set(winPctArr,  _i, winPct)
+        array.set(avgWinArr,  _i, avW)
+        array.set(avgLossArr, _i, avL)
+        array.set(wlArr,      _i, wl)
+        array.set(lossArr,    _i, ml)
+        array.set(scoreArr,   _i, sc)
+
+// ── RUN SUPER-TREND FOR EACH FACTOR (unrolled for Pine) ──────────────────
+[st0, dir0] = ta.supertrend(array.get(factors,0), atrLen)
+process(0, st0, dir0)
+[st1, dir1] = ta.supertrend(array.get(factors,1), atrLen)
+process(1, st1, dir1)
+[st2, dir2] = ta.supertrend(array.get(factors,2), atrLen)
+process(2, st2, dir2)
+[st3, dir3] = ta.supertrend(array.get(factors,3), atrLen)
+process(3, st3, dir3)
+[st4, dir4] = ta.supertrend(array.get(factors,4), atrLen)
+process(4, st4, dir4)
+[st5, dir5] = ta.supertrend(array.get(factors,5), atrLen)
+process(5, st5, dir5)
+[st6, dir6] = ta.supertrend(array.get(factors,6), atrLen)
+process(6, st6, dir6)
+[st7, dir7] = ta.supertrend(array.get(factors,7), atrLen)
+process(7, st7, dir7)
+[st8, dir8] = ta.supertrend(array.get(factors,8), atrLen)
+process(8, st8, dir8)
+
+var int bestIdx = 0
+if barstate.islast
+    bestScore = array.get(scoreArr, 0)
+    for i = 1 to factorCnt - 1
+        sc = array.get(scoreArr, i)
+        if sc > bestScore
+            bestScore := sc
+            bestIdx    := i
+
+winner = request.security(syminfo.tickerid, timeframe.period, bestIdx, lookahead=barmerge.lookahead_on)
+selSt  = array.get(stBuf,  winner)
+selDir = array.get(dirBuf, winner)
+
+// ── PLOTS ────────────────────────────────────────────────────────────────
+upPlot   = plot(selDir < 0 ? selSt : na, "Up-trend",     color=color.green, style=plot.style_linebr)
+downPlot = plot(selDir < 0 ? na     : selSt, "Down-trend", color=color.red,   style=plot.style_linebr)
+basis    = plot(barstate.isfirst ? na : (open + close)/2, display=display.none)
+fill(basis, upPlot,   color.new(color.green, 90))
+fill(basis, downPlot, color.new(color.red,   90))
+
+// ── TABLE HELPERS ────────────────────────────────────────────────────────
+ftHead(_t, _c, _r, _txt) =>
+    table.cell(_t, _c, _r, _txt, bgcolor=hdrBg, text_color=textCol, text_size=txtSize)
+
+ftBody(_t, _c, _r, _txt, _alt) =>
+    table.cell(_t, _c, _r, _txt, bgcolor=_alt ? zebraBg : bodyBg, text_color=textCol, text_size=txtSize)
+
+// ── SUPER-TREND PERFORMANCE TABLE (formatting upgrades) ──────────────────
+if barstate.islast and showPerf
+    // rows: 0=Period header, 1=Factor header, then metrics rows
+    labels = array.from("Trades","Win %","Avg Win %","Avg Loss %","Avg W/L","Max Loss %","Score")
+    rowsNeeded = 2 + array.size(labels)  // 9
+    colsNeeded = factorCnt + 1
+
+    var table perf = table.new(tPos, colsNeeded, rowsNeeded, bgcolor=tblBg, frame_color=borderCol, frame_width=borderW, border_color=borderCol, border_width=borderW)
+    // Clear the full area explicitly (fix for start_column/start_row params)
+    table.clear(perf, 0, 0, colsNeeded - 1, rowsNeeded - 1)
+
+    // Period header
+    fromLbl = abbr(month(firstT)) + "-" + str.tostring(year(firstT) % 100)
+    toLbl   = abbr(month(time))   + "-" + str.tostring(year(time)  % 100)
+    ftHead(perf, 0, 0, "Period")
+    for c = 0 to factorCnt - 1
+        ftHead(perf, c+1, 0, fromLbl + "–" + toLbl)
+
+    // Factor header (highlight best)
+    ftHead(perf, 0, 1, "Metric")
+    for c = 0 to factorCnt - 1
+        hdr = "F=" + str.tostring(array.get(factors, c))
+        isBest = c == winner
+        table.cell(perf, c+1, 1, hdr,
+          bgcolor    = isBest ? bestBg : hdrBg,
+          text_color = isBest ? bestTxt: textCol,
+          text_size  = txtSize)
+
+    // Left metric labels
+    for r = 0 to array.size(labels)-1
+        ftHead(perf, 0, r+2, array.get(labels, r))
+
+    // Body values (zebra rows option)
+    for c = 0 to factorCnt - 1
+        // Trades
+        ftBody(perf, c+1, 2, str.tostring(array.get(tradesArr, c)), zebra and (2 % 2 == 0))
+        // Win %
+        wp = array.get(winPctArr, c)
+        ftBody(perf, c+1, 3, na(wp) ? "—" : (str.tostring(wp, "#.##") + "%"), zebra and (3 % 2 == 0))
+        // Avg Win %
+        aw = array.get(avgWinArr, c)
+        ftBody(perf, c+1, 4, na(aw) ? "—" : (str.tostring(aw*100, "#.##") + "%"), zebra and (4 % 2 == 0))
+        // Avg Loss %
+        al = array.get(avgLossArr, c)
+        ftBody(perf, c+1, 5, na(al) ? "—" : (str.tostring(al*100, "#.##") + "%"), zebra and (5 % 2 == 0))
+        // Avg W/L
+        wl = array.get(wlArr, c)
+        ftBody(perf, c+1, 6, na(wl) ? "—" : str.tostring(wl, "#.##"), zebra and (6 % 2 == 0))
+        // Max Loss %
+        ml = array.get(lossArr, c)
+        ftBody(perf, c+1, 7, na(ml) ? "—" : (str.tostring(ml, "#.##") + "%"), zebra and (7 % 2 == 0))
+        // Score
+        sc = array.get(scoreArr, c)
+        ftBody(perf, c+1, 8, na(sc) ? "—" : str.tostring(sc, "#.##"), zebra and (8 % 2 == 0))

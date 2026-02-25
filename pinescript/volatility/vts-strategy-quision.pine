@@ -1,0 +1,262 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant (original indicator: Volatility Trend Score)
+// © Quision (Strategy wrapper with SL/TP/Session management)
+//@version=6
+strategy("VTS Strategy [Quision]",
+     overlay=true,
+     pyramiding=0,
+     process_orders_on_close=false,
+     calc_on_every_tick=false,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     max_bars_back=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Constants
+const string calc   = "Core Calculation Settings"
+const string thres  = "Signals Settings"
+const string exitg  = "Exit Management"
+const string timeg  = "Session Filter"
+const string ui     = "Plotting and Coloring"
+const color  GREEN  = #00ff00
+const color  RED    = #ff0000
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs - Core (from BackQuant indicator)
+int   calc_p        = input.int(35, "Average True Range Period", group=calc)
+float atr_factor    = input.float(1.2, "Factor", step=0.1, group=calc)
+int   start         = input.int(1, "For Loop Start", inline="FL", group=calc)
+int   end           = input.int(45, "End", maxval=50, inline="FL", group=calc)
+
+// Inputs - Signals
+bool  show_refs     = input.bool(true, "Show Reference Lines", group=thres)
+bool  showls        = input.bool(true, "Show Long and Short Signals On Chart?", group=thres)
+int   thresL        = input.int(40, "Long Threshold", group=thres, inline=thres)
+int   thresS        = input.int(-10, "Short Threshold", group=thres, inline=thres)
+bool  enableLong    = input.bool(true, "Enable LONG trades", group=thres)
+bool  enableShort   = input.bool(true, "Enable SHORT trades", group=thres)
+
+// Inputs - Exit Management
+string exit_mode    = input.string("SL/TP Only", "Exit Mode", options=["Signal Flip Only", "SL/TP Only", "Signal Flip + SL/TP"], group=exitg, tooltip="Signal Flip Only: exit only on opposite signal, no SL/TP.\nSL/TP Only: exit only when SL or TP is hit, ignore signal flips.\nSignal Flip + SL/TP: both active, whichever triggers first.")
+int   sl_atr_period = input.int(14, "SL ATR Period", minval=1, group=exitg)
+float sl_atr_mult   = input.float(3.5, "SL ATR Multiplier", minval=0.1, step=0.1, group=exitg)
+float tp_rr         = input.float(6.0, "TP Risk:Reward Ratio", minval=0.1, step=0.1, group=exitg, tooltip="TP = SL distance × this ratio")
+bool  use_trailing  = input.bool(true, "Use Trailing Stop", group=exitg)
+float trail_atr_mult = input.float(2.5, "Trailing ATR Multiplier", minval=0.1, step=0.1, group=exitg)
+
+// Inputs - Session Filter
+bool  use_session   = input.bool(false, "Enable Session Filter", group=timeg)
+string session_time = input.session("0900-2200", "Trading Session", group=timeg)
+string session_tz   = input.string("Exchange", "Timezone", options=["Exchange", "UTC", "Europe/Rome", "America/New_York", "Europe/London", "Asia/Tokyo"], group=timeg)
+
+// Inputs - Visuals
+color longcol       = input.color(GREEN, "Long Color", group=ui)
+color shortcol      = input.color(RED, "Short Color", group=ui)
+int   lineW         = input.int(5, "Line Width", group=ui)
+bool  onchart       = input.bool(true, "Show ATR Trail On Chart?", group=ui)
+bool  paintCandles  = input.bool(false, "Paint Candles to Trend?", group=ui)
+bool  bgCol         = input.bool(false, "Background Color?", group=ui)
+bool  show_sl_tp    = input.bool(true, "Show SL/TP Lines", group=ui)
+
+
+method transp(color x, int t) =>
+    color.new(x, t)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Core calcs (from BackQuant indicator)
+float atr  = ta.atr(calc_p)
+float band = atr * atr_factor
+
+var float trailS = na
+trailS := close
+trailS := nz(trailS[1], trailS)
+
+float up = close + band
+float dn = close - band
+
+if dn > trailS
+    trailS := dn
+if up < trailS
+    trailS := up
+
+// Score
+float scoreS = 0.0
+for i = start to end by 1
+    scoreS += (trailS > trailS[i] ? 1 : -1)
+
+// Conditions
+bool longCond  = scoreS > thresL
+bool shortCond = ta.crossunder(scoreS, thresS)
+
+// State signal
+var int signal = 1
+var color coloring = na
+
+if longCond and not shortCond
+    signal := 1
+    coloring := longcol
+else if shortCond
+    signal := -1
+    coloring := shortcol
+else
+    coloring := nz(coloring[1], chart.fg_color)
+
+// Flip signals
+bool longSignal  = (signal == 1 and signal[1] == -1)
+bool shortSignal = (signal == -1 and signal[1] == 1)
+
+bool canTrade = bar_index > end
+
+//──────────────────────────────────────────────────────────────────────────────
+// Session Filter
+tz_str = session_tz == "Exchange" ? syminfo.timezone : session_tz
+bool in_session = not use_session or (not na(time(timeframe.period, session_time, tz_str)))
+
+//──────────────────────────────────────────────────────────────────────────────
+// Exit ATR
+float exit_atr = ta.atr(sl_atr_period)
+
+// Track position state for SL/TP management
+var float pos_sl = na
+var float pos_tp = na
+var float pos_entry = na
+var int   pos_dir = 0  // 1=long, -1=short, 0=flat
+
+// Determine if SL/TP exits are active
+bool use_sl_tp = (exit_mode == "SL/TP Only" or exit_mode == "Signal Flip + SL/TP")
+bool use_signal_exit = (exit_mode == "Signal Flip Only" or exit_mode == "Signal Flip + SL/TP")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Trading Logic
+//──────────────────────────────────────────────────────────────────────────────
+
+// --- ENTRIES ---
+if canTrade and in_session and longSignal
+    // Close short if open
+    if strategy.position_size < 0 and use_signal_exit
+        strategy.close("S", comment="Flip→L")
+        pos_dir := 0
+    
+    // Enter long
+    if enableLong
+        float sl_dist = exit_atr * sl_atr_mult
+        float entry_price = close
+        pos_entry := entry_price
+        pos_sl := entry_price - sl_dist
+        pos_tp := entry_price + sl_dist * tp_rr
+        pos_dir := 1
+        
+        if use_sl_tp
+            strategy.entry("L", strategy.long)
+            strategy.exit("Exit L", "L", stop=pos_sl, limit=pos_tp)
+        else
+            strategy.entry("L", strategy.long)
+
+if canTrade and in_session and shortSignal
+    // Close long if open
+    if strategy.position_size > 0 and use_signal_exit
+        strategy.close("L", comment="Flip→S")
+        pos_dir := 0
+    
+    // Enter short
+    if enableShort
+        float sl_dist = exit_atr * sl_atr_mult
+        float entry_price = close
+        pos_entry := entry_price
+        pos_sl := entry_price + sl_dist
+        pos_tp := entry_price - sl_dist * tp_rr
+        pos_dir := -1
+        
+        if use_sl_tp
+            strategy.entry("S", strategy.short)
+            strategy.exit("Exit S", "S", stop=pos_sl, limit=pos_tp)
+        else
+            strategy.entry("S", strategy.short)
+
+// --- SIGNAL ONLY EXITS ---
+if exit_mode == "Signal Flip Only"
+    if shortSignal and strategy.position_size > 0
+        strategy.close("L", comment="Signal Exit")
+        pos_dir := 0
+    if longSignal and strategy.position_size < 0
+        strategy.close("S", comment="Signal Exit")
+        pos_dir := 0
+
+// --- TRAILING STOP ---
+if use_trailing and use_sl_tp and strategy.position_size != 0
+    float trail_dist = exit_atr * trail_atr_mult
+    if strategy.position_size > 0
+        float new_sl = close - trail_dist
+        if new_sl > pos_sl and new_sl > pos_entry
+            pos_sl := new_sl
+            strategy.exit("Exit L", "L", stop=pos_sl, limit=pos_tp)
+    if strategy.position_size < 0
+        float new_sl = close + trail_dist
+        if new_sl < pos_sl and new_sl < pos_entry
+            pos_sl := new_sl
+            strategy.exit("Exit S", "S", stop=pos_sl, limit=pos_tp)
+
+// --- RESET on flat ---
+if strategy.position_size == 0
+    pos_dir := 0
+    pos_sl := na
+    pos_tp := na
+    pos_entry := na
+
+//──────────────────────────────────────────────────────────────────────────────
+// Plots
+//──────────────────────────────────────────────────────────────────────────────
+plot(scoreS, "Score", coloring, lineW, display=display.pane)
+
+plot(trailS, "ATR Trail",
+     coloring, lineW, plot.style_line,
+     display = onchart ? display.all : display.none)
+
+if barstate.islast and show_refs
+    line.new(x1=last_bar_index, x2=bar_index - 1, y1=thresL, y2=thresL,
+         color=chart.fg_color.transp(50), style=line.style_dashed, extend=extend.right)
+    line.new(x1=last_bar_index, x2=bar_index - 1, y1=thresS, y2=thresS,
+         color=chart.fg_color.transp(50), style=line.style_dashed, extend=extend.right)
+
+// Candle painting
+plotcandle(open, high, low, close, "Trend Candles",
+     coloring, coloring,
+     bordercolor=coloring,
+     display=paintCandles ? display.all : display.none)
+
+bgcolor(bgCol ? coloring.transp(80) : na)
+
+// Signal markers
+plotshape(longSignal,  "Long Signal",  shape.triangleup,   location.belowbar, longcol,  0, "𝕃",
+     textcolor=longcol, size=size.small,
+     display=showls ? display.all : display.none)
+
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.abovebar, shortcol, 0, "𝕊",
+     textcolor=shortcol, size=size.small,
+     display=showls ? display.all : display.none)
+
+// SL/TP lines on chart
+var line sl_line = na
+var line tp_line = na
+var label sl_label = na
+var label tp_label = na
+
+if show_sl_tp and use_sl_tp and strategy.position_size != 0
+    if barstate.islast
+        if not na(sl_line)
+            line.delete(sl_line)
+        if not na(tp_line)
+            line.delete(tp_line)
+        if not na(sl_label)
+            label.delete(sl_label)
+        if not na(tp_label)
+            label.delete(tp_label)
+        
+        sl_line := line.new(bar_index - 20, pos_sl, bar_index + 5, pos_sl, 
+             color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        tp_line := line.new(bar_index - 20, pos_tp, bar_index + 5, pos_tp, 
+             color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        sl_label := label.new(bar_index + 6, pos_sl, "SL " + str.tostring(pos_sl, format.mintick), 
+             color=color.new(color.red, 80), textcolor=color.red, style=label.style_label_left, size=size.tiny)
+        tp_label := label.new(bar_index + 6, pos_tp, "TP " + str.tostring(pos_tp, format.mintick), 
+             color=color.new(color.green, 80), textcolor=color.green, style=label.style_label_left, size=size.tiny)

@@ -1,0 +1,125 @@
+//@version=6
+strategy("Structural Volatility Expansion Strategy",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 2,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04,
+     slippage = 2,
+     pyramiding = 0)
+
+// ─────────────────────────────
+// INPUTS
+// ─────────────────────────────
+
+pivotLen        = input.int(5,  "Pivot Strength", minval=2)
+atrLength       = input.int(14, "ATR Length")
+volLookback     = input.int(50, "Volatility Baseline Length")
+compressionMult = input.float(0.8, "Compression Threshold", step=0.05)
+htfTF           = input.timeframe("60", "Higher Timeframe")
+htfLen          = input.int(50, "HTF Moving Average Length")
+atrStopMult     = input.float(1.5, "ATR Stop Multiplier")
+rrTarget        = input.float(2.0, "Risk Reward Ratio")
+
+// ─────────────────────────────
+// VOLATILITY REGIME FILTER
+// ─────────────────────────────
+
+atrValue = ta.atr(atrLength)
+atrMean  = ta.sma(atrValue, volLookback)
+
+// Detect compression regime
+isCompression = atrValue < atrMean * compressionMult
+
+// Detect expansion phase
+isExpansion = atrValue > atrMean
+
+// ─────────────────────────────
+// CONFIRMED STRUCTURE (Non-Repainting)
+// ─────────────────────────────
+
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastHigh = na
+var float lastLow  = na
+
+if not na(pivotHigh)
+    lastHigh := pivotHigh
+
+if not na(pivotLow)
+    lastLow := pivotLow
+
+bosUp   = not na(lastHigh) and close > lastHigh
+bosDown = not na(lastLow)  and close < lastLow
+
+// ─────────────────────────────
+// LIQUIDITY SWEEP FILTER
+// ─────────────────────────────
+
+liquiditySweepHigh = not na(lastHigh) and high > lastHigh and close < lastHigh
+liquiditySweepLow  = not na(lastLow)  and low  < lastLow  and close > lastLow
+
+// ─────────────────────────────
+// HIGHER TIMEFRAME BIAS (Non-Repainting)
+// ─────────────────────────────
+
+htfClose = request.security(syminfo.tickerid, htfTF, close, lookahead=barmerge.lookahead_off)
+htfMA    = request.security(syminfo.tickerid, htfTF, ta.sma(close, htfLen), lookahead=barmerge.lookahead_off)
+
+htfBull = htfClose > htfMA
+htfBear = htfClose < htfMA
+
+// ─────────────────────────────
+// ENTRY CONDITIONS
+// ─────────────────────────────
+
+longCondition =
+     isExpansion and
+     bosUp and
+     not liquiditySweepHigh and
+     htfBull
+
+shortCondition =
+     isExpansion and
+     bosDown and
+     not liquiditySweepLow and
+     htfBear
+
+// ─────────────────────────────
+// EXECUTION (2% Equity Risk Model)
+// ─────────────────────────────
+
+if longCondition and strategy.position_size == 0
+    stopPrice   = close - atrValue * atrStopMult
+    riskPoints  = close - stopPrice
+    targetPrice = close + riskPoints * rrTarget
+
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit",
+         from_entry = "Long",
+         stop = stopPrice,
+         limit = targetPrice)
+
+if shortCondition and strategy.position_size == 0
+    stopPrice   = close + atrValue * atrStopMult
+    riskPoints  = stopPrice - close
+    targetPrice = close - riskPoints * rrTarget
+
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit",
+         from_entry = "Short",
+         stop = stopPrice,
+         limit = targetPrice)
+
+// ─────────────────────────────
+// VISUALS
+// ─────────────────────────────
+
+plot(htfMA, title="Higher Timeframe Bias MA", color=color.orange, linewidth=2)
+
+plotshape(bosUp,   title="Bullish Structure Break",  location=location.belowbar, color=color.green, style=shape.triangleup, size=size.tiny)
+plotshape(bosDown, title="Bearish Structure Break", location=location.abovebar, color=color.red,   style=shape.triangledown, size=size.tiny)
+
+bgcolor(isCompression ? color.new(color.blue, 85) : na)

@@ -1,0 +1,134 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//  _______           _______  _______           _______  _       _________ _        _______ 
+// (  ____ \|\     /|(  ____ \(  ____ )|\     /|(  ___  )( \      \__   __/( (    /|(  ___  )
+// | (    \/| )   ( || (    \/| (    )|| )   ( || (   ) || (         ) (   |  \  ( || (   ) |
+// | |      | (___) || (__    | (____)|| |   | || |   | || |         | |   |   \ | || |   | |
+// | |      |  ___  ||  __)   |     __)( (   ) )| |   | || |         | |   | (\ \) || |   | |
+// | |      | (   ) || (      | (\ (    \ \_/ / | |   | || |         | |   | | \   || |   | |
+// | (____/\| )   ( || (____/\| ) \ \__  \   /  | (___) || (____/\___) (___| )  \  || (___) |
+// (_______/|/     \|(_______/|/   \__/   \_/   (_______)(_______/\_______/|/    )_)(_______)
+// © chervolino
+//@version=6
+indicator(title="Relative Strength Index Remastered [CHE]", shorttitle="RSI RM", overlay=false, format=format.price, precision=2, max_bars_back=500, max_lines_count=200, max_labels_count=200)
+
+// ——— SECTION: Constants & Enums
+BULL_REG_COLOR   = color.new(color.lime, 0)
+BEAR_REG_COLOR   = color.new(color.red, 0)
+BULL_HID_COLOR   = color.new(color.teal, 0)
+BEAR_HID_COLOR   = color.new(color.orange, 0)
+RSI_COLOR        = #7E57C2
+BAND_COLOR       = #787B86
+MA_COLOR         = color.yellow
+BB_COLOR         = color.green
+RSI_GROUP        = "RSI Settings"
+SMOOTHING_GROUP  = "Smoothing"
+DIV_GROUP        = "Divergence (robust)"
+BB_TOOLTIP       = "Only applies when 'SMA + Bollinger Bands' is selected. Determines the distance between the SMA and the bands."
+
+// ——— SECTION: Inputs (grouped; tooltips; one-row via inline)
+rsi_length_input      = input.int(14, "Length", minval=1, group=RSI_GROUP, inline="rsi1", tooltip="Period for RSI calculation.")
+rsi_source_input      = input.source(close, "Source", group=RSI_GROUP, inline="rsi1", tooltip="Price source for RSI.")
+calc_div_input        = input.bool(true, "Calculate Divergence", group=RSI_GROUP, tooltip="Robust detection: Price pivots + RSI line-of-sight. Signals on confirmed pivot.", display=display.data_window)
+ma_type_input         = input.string("SMA", "Type", options=["None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group=SMOOTHING_GROUP, tooltip="Moving average type for smoothing RSI.", display=display.data_window)
+ma_length_input       = input.int(14, "Length", minval=1, group=SMOOTHING_GROUP, inline="ma1", tooltip="Length for smoothing MA.", display=display.data_window, active=ma_type_input != "None")
+bb_mult_input         = input.float(2.0, "BB StdDev", minval=0.001, maxval=50.0, step=0.1, group=SMOOTHING_GROUP, tooltip=BB_TOOLTIP, display=display.data_window, active=ma_type_input == "SMA + Bollinger Bands")
+pivot_left_input      = input.int(5, "Pivot Left", minval=1, maxval=50, group=DIV_GROUP, inline="pivot", tooltip="Bars left of pivot for confirmation.")
+pivot_right_input     = input.int(5, "Pivot Right", minval=1, maxval=50, group=DIV_GROUP, inline="pivot", tooltip="Bars right of pivot for confirmation.")
+max_bars_input        = input.int(60, "Max Bars Between Pivots", minval=6, maxval=300, group=DIV_GROUP, inline="range", tooltip="Maximum bars between pivot points.")
+min_bars_input        = input.int(5, "Min Bars Between Pivots", minval=1, maxval=100, group=DIV_GROUP, inline="range", tooltip="Minimum bars between pivot points.")
+show_hidden_input     = input.bool(true, "Detect Hidden", group=DIV_GROUP, inline="opts", tooltip="Enable hidden divergence detection.")
+show_lines_input      = input.bool(true, "Draw Lines", group=DIV_GROUP, inline="opts", tooltip="Draw lines connecting divergence points.")
+
+// ——— SECTION: Types (if any)
+
+// ——— SECTION: Persistent Vars → Runtime Vars
+is_bb_enabled         = ma_type_input == "SMA + Bollinger Bands"
+is_ma_enabled         = ma_type_input != "None"
+
+// ——— SECTION: Helpers (pure)
+moving_average(source, length, ma_type) =>
+    switch ma_type
+        "SMA"                   => ta.sma(source, length)
+        "SMA + Bollinger Bands" => ta.sma(source, length)
+        "EMA"                   => ta.ema(source, length)
+        "SMMA (RMA)"            => ta.rma(source, length)
+        "WMA"                   => ta.wma(source, length)
+        "VWMA"                  => ta.vwma(source, length)
+        => na
+
+pivots_in_range(idx_a, idx_b, min_bars, max_bars) =>
+    bar_count = idx_a - idx_b
+    min_bars <= bar_count and bar_count <= max_bars
+
+line_clear_check(src, idx_a, val_a, idx_b, val_b, require_above) =>
+    is_clear = true
+    segment_len = idx_a - idx_b
+    if segment_len > 1
+        slope_val = (val_a - val_b) / segment_len
+        for offset_i = 1 to segment_len - 1
+            bar_offset = bar_index - (idx_b + offset_i)
+            src_val = src[bar_offset]
+            line_val = val_b + slope_val * offset_i
+            if require_above and src_val < line_val
+                is_clear := false
+                break
+            if not require_above and src_val > line_val
+                is_clear := false
+                break
+    is_clear
+
+// ——— SECTION: Core Calculations
+price_change = ta.change(rsi_source_input)
+up_move = ta.rma(math.max(price_change, 0), rsi_length_input)
+down_move = ta.rma(-math.min(price_change, 0), rsi_length_input)
+rsi_value = down_move == 0 ? 100 : up_move == 0 ? 0 : 100 - (100 / (1 + up_move / down_move))
+smoothed_rsi = is_ma_enabled ? moving_average(rsi_value, ma_length_input, ma_type_input) : na
+bb_deviation = is_bb_enabled ? ta.stdev(rsi_value, ma_length_input) * bb_mult_input : na
+is_low_pivot = not na(ta.pivotlow(low, pivot_left_input, pivot_right_input))
+is_high_pivot = not na(ta.pivothigh(high, pivot_left_input, pivot_right_input))
+last_low_index = ta.valuewhen(is_low_pivot, bar_index - pivot_right_input, 0)
+prev_low_index = ta.valuewhen(is_low_pivot, bar_index - pivot_right_input, 1)
+last_low_price = ta.valuewhen(is_low_pivot, low[pivot_right_input], 0)
+prev_low_price = ta.valuewhen(is_low_pivot, low[pivot_right_input], 1)
+last_low_rsi = ta.valuewhen(is_low_pivot, rsi_value[pivot_right_input], 0)
+prev_low_rsi = ta.valuewhen(is_low_pivot, rsi_value[pivot_right_input], 1)
+last_high_index = ta.valuewhen(is_high_pivot, bar_index - pivot_right_input, 0)
+prev_high_index = ta.valuewhen(is_high_pivot, bar_index - pivot_right_input, 1)
+last_high_price = ta.valuewhen(is_high_pivot, high[pivot_right_input], 0)
+prev_high_price = ta.valuewhen(is_high_pivot, high[pivot_right_input], 1)
+last_high_rsi = ta.valuewhen(is_high_pivot, rsi_value[pivot_right_input], 0)
+prev_high_rsi = ta.valuewhen(is_high_pivot, rsi_value[pivot_right_input], 1)
+is_reg_bull_div = calc_div_input and is_low_pivot and pivots_in_range(last_low_index, prev_low_index, min_bars_input, max_bars_input) and (last_low_price < prev_low_price) and (last_low_rsi > prev_low_rsi) and line_clear_check(rsi_value, last_low_index, last_low_rsi, prev_low_index, prev_low_rsi, true)
+is_reg_bear_div = calc_div_input and is_high_pivot and pivots_in_range(last_high_index, prev_high_index, min_bars_input, max_bars_input) and (last_high_price > prev_high_price) and (last_high_rsi < prev_high_rsi) and line_clear_check(rsi_value, last_high_index, last_high_rsi, prev_high_index, prev_high_rsi, false)
+is_hid_bull_div = calc_div_input and show_hidden_input and is_low_pivot and pivots_in_range(last_low_index, prev_low_index, min_bars_input, max_bars_input) and (last_low_price > prev_low_price) and (last_low_rsi < prev_low_rsi) and line_clear_check(rsi_value, last_low_index, last_low_rsi, prev_low_index, prev_low_rsi, false)
+is_hid_bear_div = calc_div_input and show_hidden_input and is_high_pivot and pivots_in_range(last_high_index, prev_high_index, min_bars_input, max_bars_input) and (last_high_price < prev_high_price) and (last_high_rsi > prev_high_rsi) and line_clear_check(rsi_value, last_high_index, last_high_rsi, prev_high_index, prev_high_rsi, true)
+
+// ——— SECTION: Rendering/UI (GLOBAL ONLY; single-line calls)
+rsi_line_plot = plot(rsi_value, title="RSI", color=RSI_COLOR)
+upper_rsi_band = hline(70, title="Upper Band", color=BAND_COLOR)
+mid_rsi_line = hline(50, title="Mid Band", color=color.new(BAND_COLOR, 50))
+lower_rsi_band = hline(30, title="Lower Band", color=BAND_COLOR)
+fill(upper_rsi_band, lower_rsi_band, color=color.rgb(126, 87, 194, 90), title="Background Fill")
+mid_fill_line = plot(50, color=na, editable=false, display=display.none)
+fill(rsi_line_plot, mid_fill_line, top_value=100, bottom_value=70, top_color=color.new(color.green, 0), bottom_color=color.new(color.green, 100), title="Overbought Fill")
+fill(rsi_line_plot, mid_fill_line, top_value=30, bottom_value=0, top_color=color.new(color.red, 100), bottom_color=color.new(color.red, 0), title="Oversold Fill")
+plot(smoothed_rsi, title="Smoothed RSI", color=MA_COLOR, display=is_ma_enabled ? display.all : display.none, editable=is_ma_enabled)
+bb_upper_plot = plot(smoothed_rsi + bb_deviation, title="BB Upper", color=BB_COLOR, display=is_bb_enabled ? display.all : display.none, editable=is_bb_enabled)
+bb_lower_plot = plot(smoothed_rsi - bb_deviation, title="BB Lower", color=BB_COLOR, display=is_bb_enabled ? display.all : display.none, editable=is_bb_enabled)
+fill(bb_upper_plot, bb_lower_plot, color=is_bb_enabled ? color.new(BB_COLOR, 90) : na, title="BB Fill", display=is_bb_enabled ? display.all : display.none, editable=is_bb_enabled)
+if show_lines_input and is_reg_bull_div
+    line.new(x1=prev_low_index, y1=prev_low_rsi, x2=last_low_index, y2=last_low_rsi, color=BULL_REG_COLOR, width=2, extend=extend.none)
+if show_lines_input and is_reg_bear_div
+    line.new(x1=prev_high_index, y1=prev_high_rsi, x2=last_high_index, y2=last_high_rsi, color=BEAR_REG_COLOR, width=2, extend=extend.none)
+if show_lines_input and is_hid_bull_div
+    line.new(x1=prev_low_index, y1=prev_low_rsi, x2=last_low_index, y2=last_low_rsi, color=BULL_HID_COLOR, width=1, extend=extend.none, style=line.style_dashed)
+if show_lines_input and is_hid_bear_div
+    line.new(x1=prev_high_index, y1=prev_high_rsi, x2=last_high_index, y2=last_high_rsi, color=BEAR_HID_COLOR, width=1, extend=extend.none, style=line.style_dashed)
+plotshape(is_reg_bull_div ? rsi_value[pivot_right_input] : na, title="Reg Bull", offset=-pivot_right_input, style=shape.labelup, text=" Bull", color=BULL_REG_COLOR, textcolor=color.white, display=calc_div_input ? display.pane : display.none, location=location.absolute)
+plotshape(is_reg_bear_div ? rsi_value[pivot_right_input] : na, title="Reg Bear", offset=-pivot_right_input, style=shape.labeldown, text=" Bear", color=BEAR_REG_COLOR, textcolor=color.white, display=calc_div_input ? display.pane : display.none, location=location.absolute)
+plotshape(is_hid_bull_div ? rsi_value[pivot_right_input] : na, title="Hid Bull", offset=-pivot_right_input, style=shape.labelup, text=" HBull", color=BULL_HID_COLOR, textcolor=color.white, display=calc_div_input and show_hidden_input ? display.pane : display.none, location=location.absolute)
+plotshape(is_hid_bear_div ? rsi_value[pivot_right_input] : na, title="Hid Bear", offset=-pivot_right_input, style=shape.labeldown, text=" HBear", color=BEAR_HID_COLOR, textcolor=color.white, display=calc_div_input and show_hidden_input ? display.pane : display.none, location=location.absolute)
+alertcondition(is_reg_bull_div, title="Regular Bullish Divergence", message="Regular Bullish Divergence at latest pivot low.")
+alertcondition(is_reg_bear_div, title="Regular Bearish Divergence", message="Regular Bearish Divergence at latest pivot high.")
+alertcondition(is_hid_bull_div, title="Hidden Bullish Divergence", message="Hidden Bullish Divergence at latest pivot low.")
+alertcondition(is_hid_bear_div, title="Hidden Bearish Divergence", message="Hidden Bearish Divergence at latest pivot high.")

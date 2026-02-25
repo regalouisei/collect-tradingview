@@ -1,0 +1,466 @@
+//@version=6
+indicator("Adaptive MACD PRO", shorttitle="MACD PRO", overlay=false, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+//
+//Adaptive MACD PRO (Open Version)
+
+//This script combines:
+//- Adaptive MACD Core (structural momentum)
+//- Phase Momentum Core (directional confirmation)
+//- ATR-based volatility weighting
+//- Higher-timeframe alignment
+//- Auto-calibration of MACD_z thresholds
+
+//The full source code is visible and may be modified or extended.
+//
+
+//────────────────────────── Inputs
+res            = input.timeframe("", "Indicator timeframe (blank = chart)")
+fastLen        = input.int(12, "Fast length", minval=1)
+slowLen        = input.int(26, "Slow length", minval=1)
+sigLen         = input.int(9,  "Signal length", minval=1)
+src            = input.source(close, "Source")
+
+maOscType      = input.string("EMA", "Oscillator MA", options=["SMA","EMA","KAMA"])
+maSigType      = input.string("EMA", "Signal MA",     options=["SMA","EMA","KAMA"])
+
+showMACD       = input.bool(true,  "Show MACD/Signal", group="Display")
+showHist       = input.bool(true,  "Show Histogram",   group="Display")
+showDots       = input.bool(true,  "Show signal dots", group="Display")
+trendColors    = input.bool(true,  "Trend coloring",   group="Display")
+
+// Adaptive layer
+lenNorm        = input.int(50, "Normalization window", minval=10, group="Adaptive")
+stdevEps       = 1e-10
+
+// Volatility gate
+useVolGate     = input.bool(true,  "Enable volatility weighting", group="Volatility Gate")
+atrLen         = input.int(14, "ATR length", group="Volatility Gate")
+volMaLen       = input.int(50, "ATR average window", group="Volatility Gate")
+volGateMult    = input.float(0.8, "Gate multiplier", group="Volatility Gate", minval=0.1, step=0.1)
+
+// HTF confirmation
+useHTF         = input.bool(true, "Enable higher timeframe align", group="HTF confirm")
+htfTf = input.timeframe("", "Higher timeframe (HTF)")
+requireAlign   = input.bool(true, "Require alignment for signals", group="HTF confirm")
+
+// Signals
+confirmOnClose = input.bool(true,  "Confirm on bar close", group="Signals")
+cooldownBars   = input.int(4,      "Cooldown bars after signal", group="Signals", minval=0)
+
+// Auto Calibration Inputs (default tuned)
+useAutoCalib   = input.bool(true,  "Enable Auto Calibration", group="Signals")
+autoCalibLen   = input.int(280, "Calibration window", minval=50, group="Signals")
+autoSmooth     = input.float(0.12, "Adaptation smooth factor (0–1)", step=0.01, group="Signals")
+autoMode       = input.string("SAFE", "AutoCalib Mode", options=["SAFE","AGGRESSIVE"], group="Signals")
+autoBlend      = input.bool(true, "Auto Mode Blending", group="Signals")
+
+//────────────────────────── Color Inputs
+colMACD        = input.color(#FF6D00, "MACD line", group="Colors")
+colSignal      = input.color(#2962FF, "Signal line", group="Colors")
+colUp          = input.color(#4BAF4F, "Trend up", group="Colors")
+colDn          = input.color(#B71D1C, "Trend down", group="Colors")
+
+colHistUpGrow  = input.color(#26A69A, "Hist up grow", group="Histogram Colors")
+colHistUpFall  = input.color(#B2DFDB, "Hist up fall", group="Histogram Colors")
+colHistDnGrow  = input.color(#FF5252, "Hist down grow", group="Histogram Colors")
+colHistDnFall  = input.color(#FFCDD2, "Hist down fall", group="Histogram Colors")
+
+phase_buy_color = input.color(color.new(color.orange, 0), "Phase Sell", group="Bar Colors")
+phase_sell_color = input.color(color.new(color.teal, 0), "Phase Buy", group="Bar Colors")
+
+//────────────────────────── Bar Colors per Signal Type
+dot_buy_color        = input.color(color.new(color.lime, 0), "MACD Dot Buy", group="Bar Colors")
+dot_sell_color       = input.color(color.new(color.red, 0), "MACD Dot Sell", group="Bar Colors")
+auto_buy_color_bar   = input.color(color.new(color.aqua, 0), "AutoCalib Buy", group="Bar Colors")
+auto_sell_color_bar  = input.color(color.new(color.fuchsia, 0), "AutoCalib Sell", group="Bar Colors")
+
+//────────────────────────── Phase Core Inputs
+inputSource = input.source(close, "Phase Source", group="Phase Core")
+inputStrategy = input.string("PLUS MODE", title="Phase Strategy", options=["STANDARD","PLUS MODE"], group="Phase Core")
+inputStrategyLongShort = input.string("ADX", title="Boost", options=["DISABLED","ADX"], group="Phase Core")
+
+//────────────────────────── Helpers
+clamp(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_kama(src_, length) =>
+    delta = math.abs(src_ - src_[length - 1])
+    ac = math.abs(ta.change(src_))
+    cum = ta.cum(ac)
+    volatility = nz(cum - cum[length - 1], 0)
+    er = delta / (volatility + 1e-10)
+    fastSC = 2.0 / (2 + 1)
+    slowSC = 2.0 / (length + 1)
+    sc = math.pow(er * (fastSC - slowSC) + slowSC, 2)
+    kama = 0.0
+    kama := na(kama[1]) ? src_ : kama[1] + sc * (src_ - kama[1])
+    kama
+
+f_ma(v, len, type) =>
+    switch type
+        "SMA"  => ta.sma(v, len)
+        "EMA"  => ta.ema(v, len)
+        "KAMA" => f_kama(v, len)
+        => ta.ema(v, len)
+
+f_macd_sig(tf) =>
+    // Αν δεν έχει οριστεί διαφορετικό timeframe, υπολογίζει τοπικά
+    if str.length(tf) == 0 or tf == timeframe.period
+        fast = f_ma(src, fastLen, maOscType)
+        slow = f_ma(src, slowLen, maOscType)
+        mac  = fast - slow
+        sig  = f_ma(mac, sigLen, maSigType)
+        [mac, sig]
+    else
+        // Υπολογίζει MACD και Signal στο ίδιο security call (χωρίς lookahead)
+        [mac_htf, sig_htf] = request.security(syminfo.tickerid, tf, [f_ma(src, fastLen, maOscType) - f_ma(src, slowLen, maOscType),  f_ma(f_ma(src, fastLen, maOscType) - f_ma(src, slowLen, maOscType), sigLen, maSigType)],gaps = barmerge.gaps_off,lookahead = barmerge.lookahead_off)
+        [mac_htf, sig_htf]
+
+
+nz_sd(x, len) =>
+    lenSafe = math.max(1, math.min(nz(len, 1), bar_index + 1))
+    sd = ta.stdev(x, lenSafe)
+    na(sd) or sd == 0 ? stdevEps : sd
+
+//────────────────────────── MACD Core
+tfUse   = str.length(res) == 0 ? timeframe.period : res
+[macd, signal] = f_macd_sig(tfUse)
+hist    = macd - signal
+
+macdSt       = nz(ta.stdev(macd, lenNorm), stdevEps)
+histSt       = nz(ta.stdev(hist, lenNorm), stdevEps)
+macdEnergy   = math.max(0.0, histSt / macdSt)
+energySmooth = ta.ema(macdEnergy, 8)
+adaptFactor  = 1.0 / (1.0 + math.exp(-4.5 * (energySmooth - 1.0)))
+lenMult      = 0.6 + adaptFactor * 0.8
+dynLen  = bar_index < 1 ? 1 :
+          bar_index < lenNorm ? lenNorm :
+          clamp(math.round(lenNorm * lenMult), 20, 300)
+
+safeLen = dynLen < 1 or na(dynLen) ? 1 : dynLen
+
+lenEff = math.min(safeLen, bar_index + 1)
+macd_z   = (macd   - ta.sma(macd,   lenEff)) / nz_sd(macd,   lenEff)
+signal_z = (signal - ta.sma(signal, lenEff)) / nz_sd(signal, lenEff)
+hist_z   = macd_z - signal_z
+
+// MACD direction-change events (slope flips)
+macd_slope    = macd - macd[1]
+macd_upturn   = macd_slope > 0 and macd_slope[1] <= 0      // γυρνά ανοδικά
+macd_downturn = macd_slope < 0 and macd_slope[1] >= 0      // γυρνά καθοδικά
+
+// Volatility weighting
+atrNow    = ta.atr(atrLen)
+volRatio  = atrNow / close
+volMean   = ta.sma(volRatio, volMaLen)
+x         = na(volMean) or volMean == 0 ? 0.0 : math.log(volRatio / (volMean * volGateMult))
+logi      = 1.0 / (1.0 + math.exp(-(x * 5.0)))
+atrGate   = 0.5 + logi
+volWeight = useVolGate ? atrGate : 1.0
+
+// HTF alignment
+[macd_htf, signal_htf] = f_macd_sig(htfTf)
+htf_confirmed = request.security(syminfo.tickerid, htfTf, barstate.isconfirmed,
+                                 gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+trendAlignUp = macd_htf > signal_htf and htf_confirmed
+trendAlignDn = macd_htf < signal_htf and htf_confirmed
+
+//────────────────────────── MACD Signals
+upCrossRaw = ta.crossover(macd, signal)
+dnCrossRaw = ta.crossunder(macd, signal)
+okBar      = confirmOnClose ? barstate.isconfirmed : true
+alignOkUp  = not requireAlign or trendAlignUp
+alignOkDn  = not requireAlign or trendAlignDn
+
+//────────────────────────── Phase Momentum Core
+funcEmaSma(_src, _period, _strategy) =>
+    tresholdPositive = 88
+    tresholdNegative = -88
+    maLengthBuy_1_Default  = 14
+    maLengthBuy_2_Default  = 3
+    maLengthSell_1_Default = 10
+    maLengthSell_2_Default = 1
+
+    maLengthBuy_1  = _period == "1"  ? 5  : _period == "3"  ? 5  : _period == "5"  ? 8  : _period == "15" ? 34 : _period == "30" ? 34 : _period == "45" ? 16 : _period == "60" ? 20 : timeframe.isdaily ? 21 : timeframe.isweekly ? 9 : timeframe.ismonthly ? 5 : 14
+    maLengthBuy_2  = _period == "1"  ? 2  : _period == "3"  ? 2  : _period == "5"  ? 3  : _period == "15" ? 3  : _period == "30" ? 3  : _period == "45" ? 3  : _period == "60" ? 5  : timeframe.isdaily ? 5  : timeframe.isweekly ? 3 : timeframe.ismonthly ? 2 : 3
+    maLengthSell_1 = _period == "1"  ? 8  : _period == "3"  ? 8  : _period == "5"  ? 10 : _period == "15" ? 12 : _period == "30" ? 12 : _period == "45" ? 20 : _period == "60" ? 30 : timeframe.isdaily ? 21 : timeframe.isweekly ? 12 : timeframe.ismonthly ? 8 : 12
+    maLengthSell_2 = _period == "1"  ? 3  : _period == "3"  ? 3  : _period == "5"  ? 4  : _period == "15" ? 4  : _period == "30" ? 4  : _period == "45" ? 4  : _period == "60" ? 5  : timeframe.isdaily ? 5  : timeframe.isweekly ? 4  : timeframe.ismonthly ? 3 : 3
+
+    isPlus = _strategy == "PLUS MODE"
+    lenB1  = isPlus ? maLengthBuy_1  : maLengthBuy_1_Default
+    lenB2  = isPlus ? maLengthBuy_2  : maLengthBuy_2_Default
+    lenS1  = isPlus ? maLengthSell_1 : maLengthSell_1_Default
+    lenS2  = isPlus ? maLengthSell_2 : maLengthSell_2_Default
+
+    esaBuy        = ta.ema(_src, lenB1)
+    sourceEmaBuy  = ta.ema(math.abs(_src - esaBuy), lenB1)
+    ciBuy         = (_src - esaBuy) / (0.015 * sourceEmaBuy)
+    trendEmaBuy   = ta.ema(ciBuy, lenB2)
+    trendSmaBuy   = ta.sma(trendEmaBuy, 4)
+
+    esaSell       = ta.ema(_src, lenS1)
+    sourceEmaSell = ta.ema(math.abs(_src - esaSell), lenS1)
+    ciSell        = (_src - esaSell) / (0.015 * sourceEmaSell)
+    trendEmaSell  = ta.ema(ciSell, lenS2)
+    trendSmaSell  = ta.sma(trendEmaSell, 4)
+
+    buyEmaSma  = ta.crossover(trendEmaBuy,  trendSmaBuy)  and trendEmaBuy  <= tresholdNegative
+    sellEmaSma = ta.crossunder(trendEmaSell, trendSmaSell) and trendEmaSell >= tresholdPositive
+    [buyEmaSma, sellEmaSma]
+
+//────────────────────────── ADX subsystem
+funcDirectionalMovement(_len) =>
+    _up = ta.change(high)
+    _down = -ta.change(low)
+    _plusDM  = na(_up)   ? na : _up  > _down and _up  > 0 ? _up  : 0
+    _minusDM = na(_down) ? na : _down > _up   and _down > 0 ? _down : 0
+    _trueRange = ta.rma(ta.tr, _len)
+    _plus  = nz(100 * ta.rma(_plusDM,  _len) / _trueRange)
+    _minus = nz(100 * ta.rma(_minusDM, _len) / _trueRange)
+    [_plus, _minus]
+
+funcAdx(_dirLen, _len) =>
+    [_plus, _minus] = funcDirectionalMovement(_dirLen)
+    sum = _plus + _minus
+    100 * ta.rma(math.abs(_plus - _minus) / (sum == 0 ? 1 : sum), _len)
+
+funcAdxLowHigh(_len, _type) =>
+    [_plus, _minus] = funcDirectionalMovement(_len)
+    _type == "high" ? _plus : _minus
+
+funcAdxFinal(_dirLen, _len, _atrAvg, _hiLowTrend) =>
+    dHigh = funcAdxLowHigh(_dirLen, "high")
+    dLow  = funcAdxLowHigh(_dirLen, "low")
+    dirUp    = dHigh >= dLow
+    dirDown  = dLow  >  dHigh
+    dirUpStrong   = dHigh >= _hiLowTrend
+    dirDownStrong = dLow  >  _hiLowTrend
+    adxUp = funcAdx(_dirLen, _len) >= _atrAvg
+    cross = ta.cross(dHigh, dLow)
+    adxCounter = 0
+    adxCounter := (cross and dirUp[1])  ? 0 :
+                  (cross and dirDown[1])? 0 :
+                  (adxUp and dirUp and dirUpStrong)     ? 1  :
+                  (adxUp and dirDown and dirDownStrong) ? -1 :
+                  nz(adxCounter[1])
+    longAdx  = adxCounter == 1  and adxCounter[1] == 0
+    shortAdx = adxCounter == -1 and adxCounter[1] == 0
+    [longAdx, shortAdx]
+
+//────────────────────────── Phase signals
+tfPhase = timeframe.period
+[phaseBuy_raw, phaseSell_raw] = funcEmaSma(inputSource, tfPhase, inputStrategy)
+
+valAdxLength                 = 13
+valAdxDirectionalIndexLength = 14
+valAdxAverageTrueRange       = 20
+valAdxHigherLowTrend         = 40
+
+[longAdx, shortAdx] = funcAdxFinal(valAdxDirectionalIndexLength, valAdxLength, valAdxAverageTrueRange, valAdxHigherLowTrend)
+
+phase_buy  = (inputStrategyLongShort == "ADX") ? longAdx  : phaseBuy_raw
+phase_sell = (inputStrategyLongShort == "ADX") ? shortAdx : phaseSell_raw
+
+//────────────────────────── Visual Background
+strength = math.abs(hist_z) * volWeight
+bgCol = hist_z > 0 ? color.new(color.red, 90 - math.min(strength * 22, 90)) : color.new(color.lime, 90 - math.min(strength * 22, 90))
+bgcolor(bgCol)
+
+// Histogram phase color
+histGrowUp = hist_z > hist_z[1] and hist_z > 0
+histFallUp = hist_z <= hist_z[1] and hist_z > 0
+histGrowDn = hist_z < hist_z[1] and hist_z <= 0
+histFallDn = hist_z >= hist_z[1] and hist_z <= 0
+histCol = histGrowUp ? colHistUpGrow :
+          histFallUp ? colHistUpFall :
+          histGrowDn ? colHistDnGrow :
+          histFallDn ? colHistDnFall : color.silver
+
+hline(0, "Zero Line", color=color.new(color.gray, 70))
+plot(showHist ? nz(hist_z * volWeight, 0) : na, "Histogram", style=plot.style_columns, color=histCol, linewidth=3)
+
+// Dynamic line colors
+trendUp = macd > signal
+macdCol   = trendUp ? color.new(colUp, 0) : color.new(colDn, 0)
+signalCol = trendUp ? color.new(colSignal, 15) : color.new(colSignal, 65)
+plot(showMACD ? nz(macd_z, 0)   : na, "MACD (z)",   color=macdCol, linewidth=3)
+plot(showMACD ? nz(signal_z, 0) : na, "Signal (z)", color=signalCol, linewidth=2)
+
+// Simplified cooldown logic
+var int cd = 0
+cd := math.max(0, cd - 1)
+
+macdBuy  = ta.crossover(macd, signal)  and (confirmOnClose ? barstate.isconfirmed : true) and alignOkUp  and cd == 0 
+macdSell = ta.crossunder(macd, signal) and (confirmOnClose ? barstate.isconfirmed : true) and alignOkDn  and cd == 0
+
+cd := (macdBuy or macdSell) ? cooldownBars : cd
+
+
+//────────────────────────── MACD trigger-level crosses (custom Buy/Sell thresholds)
+
+macd_z_sell_level = input.float(2.6,  "Sell Trigger Level (+)", step=0.1)
+macd_z_buy_level  = input.float(-2.6, "Buy Trigger Level (-)",  step=0.1)
+
+//────────────────────────── Mode-based tuning with auto blend
+float volMetric = ta.atr(atrLen) / ta.sma(ta.atr(atrLen), volMaLen)  // ratio >1 = high volatility
+float modeBlend = clamp(volMetric - 1.0, 0.0, 1.0)  // scale 0–1 based on volatility
+
+bool isAggressive = (autoBlend and modeBlend > 0.5) or (not autoBlend and autoMode == "AGGRESSIVE")
+bool isSafe       = not isAggressive
+
+int   calibLen = isSafe ? autoCalibLen : int(math.round(autoCalibLen * 0.5))
+float smoothF  = isSafe ? autoSmooth   : autoSmooth * 0.5
+
+//────────────────────────── Adaptive Threshold Calculation (Fixed Version)
+var float macd_z_sell_auto = na
+var float macd_z_buy_auto  = na
+
+float rangeHigh = ta.highest(macd_z, calibLen)
+float rangeLow  = ta.lowest(macd_z,  calibLen)
+
+// Exponential smoothing
+macd_z_sell_auto := na(macd_z_sell_auto[1]) ? rangeHigh : macd_z_sell_auto[1] * (1 - smoothF) + rangeHigh * smoothF
+macd_z_buy_auto  := na(macd_z_buy_auto[1])  ? rangeLow  : macd_z_buy_auto[1]  * (1 - smoothF) + rangeLow  * smoothF
+
+plot(useAutoCalib ? macd_z_sell_auto : na, "Auto Sell Level", color=color.new(color.red, 60), linewidth=1)
+plot(useAutoCalib ? macd_z_buy_auto  : na, "Auto Buy Level",  color=color.new(color.lime, 60), linewidth=1)
+
+//────────────────────────── Threshold Selector
+sellLevel = useAutoCalib ? macd_z_sell_auto : macd_z_sell_level
+buyLevel  = useAutoCalib ? macd_z_buy_auto  : macd_z_buy_level
+
+// MACD_z slope
+macd_z_slope = macd_z - macd_z[1]
+
+sell_cond = macd_z[1] > sellLevel and macd_z_slope < 0 and macd_z_slope[1] > 0
+buy_cond  = macd_z[1] < buyLevel  and macd_z_slope > 0 and macd_z_slope[1] < 0
+
+//────────────────────────── Fixed-position MACD_z Dots (Straight Line Layout)
+
+// Προκαθορισμένες σταθερές θέσεις
+sell_y_level = 3.0
+buy_y_level  = -3.0
+
+// Κουκίδες σε ευθεία γραμμή
+plot(showDots and sell_cond ? sell_y_level : na, 
+     title="Sell Dot (fixed line)", 
+     style=plot.style_circles, 
+     linewidth=3, 
+     color=color.new(color.red, 0))
+
+plot(showDots and buy_cond ? buy_y_level : na, 
+     title="Buy Dot (fixed line)", 
+     style=plot.style_circles, 
+     linewidth=3, 
+     color=color.new(color.lime, 0))
+
+
+//────────────────────────── Phase Momentum arrows (fixed colors)
+phase_buy_y  = -3   
+phase_sell_y =  3  
+
+plotshape(showDots and phase_buy,  title="Phase Sell",  style=shape.triangledown,   size=size.tiny, color=phase_buy_color, location=location.top)
+plotshape(showDots and phase_sell, title="Phase Buy", style=shape.triangleup, size=size.tiny, color=phase_sell_color,  location=location.bottom)
+
+
+//────────────────────────── AutoCalib Cross Dots (Adaptive Transparency + Distinct Color)
+showAutoCalibDots = input.bool(true, "Show AutoCalib Cross Dots", group="Display")
+
+// Cross conditions
+auto_buy_cross  = ta.crossover(macd_z, macd_z_buy_auto)
+auto_sell_cross = ta.crossunder(macd_z, macd_z_sell_auto)
+
+// Υπολογισμός έντασης cross (όσο πιο απότομη η κίνηση, τόσο πιο έντονο το dot)
+cross_strength_buy  = math.abs(macd_z - macd_z_buy_auto)
+cross_strength_sell = math.abs(macd_z - macd_z_sell_auto)
+
+buy_alpha  = clamp(100 - (cross_strength_buy  * 50), 10, 100)
+sell_alpha = clamp(100 - (cross_strength_sell * 50), 10, 100)
+
+// Dynamic χρώματα με adaptive transparency
+auto_buy_color  = color.new(color.aqua, 100 - buy_alpha)
+auto_sell_color = color.new(color.fuchsia, 100 - sell_alpha)
+
+// Ελαφρώς διαφορετικά επίπεδα για καθαρή διάκριση από τα static dots
+auto_buy_y  = -3.3
+auto_sell_y = 3.3
+
+// Εμφάνιση
+plot(showAutoCalibDots and auto_buy_cross ? auto_buy_y : na,
+     title="AutoCalib Buy Dot",
+     style=plot.style_circles,
+     color=auto_buy_color,
+     linewidth=3)
+
+plot(showAutoCalibDots and auto_sell_cross ? auto_sell_y : na,
+     title="AutoCalib Sell Dot",
+     style=plot.style_circles,
+     color=auto_sell_color,
+     linewidth=3)
+
+//────────────────────────── Barcolor Logic (for Arrows & Dots)
+bar_transparent = color.new(color.white, 90)
+
+// Σημαίες
+isBuyPhase  = phase_buy
+isSellPhase = phase_sell
+isBuyDot    = buy_cond
+isSellDot   = sell_cond
+isBuyAuto   = auto_buy_cross
+isSellAuto  = auto_sell_cross
+
+barColorFinal = isBuyAuto  ? auto_buy_color_bar  :
+                 isSellAuto ? auto_sell_color_bar : 
+                 isBuyDot   ? dot_buy_color      :
+                 isSellDot  ? dot_sell_color     :
+                 isBuyPhase ? phase_buy_color    :
+                 isSellPhase ? phase_sell_color  :
+                 bar_transparent
+
+barcolor(barColorFinal)
+
+//────────────────────────── Alerts
+alertcondition(macdBuy,     title="MACD Buy",     message="MACD Fusion - Long signal confirmed")
+alertcondition(macdSell,    title="MACD Sell",    message="MACD Fusion - Short signal confirmed")
+alertcondition(phase_buy,   title="Phase Buy",    message="Phase Momentum - Long signal confirmed")
+alertcondition(phase_sell,  title="Phase Sell",   message="Phase Momentum - Short signal confirmed") 
+alertcondition(auto_buy_cross,  title="AutoCalib Buy",  message="AutoCalib Cross - Long signal triggered")
+alertcondition(auto_sell_cross, title="AutoCalib Sell", message="AutoCalib Cross - Short signal triggered")
+
+//────────────────────────── Debug HUD (Full Control: Visibility + Position + Anchor)
+showHud      = input.bool(true, "Show Debug HUD", group="Display")
+hudPosMode   = input.string("Relative", "HUD Position Mode", options=["Top", "Bottom", "Relative"], group="Display")
+hudAnchor    = input.string("Right", "HUD Anchor", options=["Left","Right"], group="Display")
+hudOffsetY   = input.float(2.0, "HUD Vertical Offset", step=0.1, group="Display")
+hudOffsetX   = input.int(3, "HUD Horizontal Offset (bars)", minval=0, group="Display")
+
+if useAutoCalib and showHud
+    var label dbg_label = na
+    label.delete(dbg_label)
+
+    dbg_text = "AutoCalib ON\n" +
+               "Sell Level: " + str.tostring(macd_z_sell_auto, format.mintick) + "\n" +
+               "Buy Level: " + str.tostring(macd_z_buy_auto, format.mintick) + "\n" +
+               "Current MACD_z: " + str.tostring(macd_z, format.mintick)
+
+    // Θέση Y
+    float dbg_y = switch hudPosMode
+        "Top" => ta.highest(macd_z, 50) + hudOffsetY
+        "Bottom" => ta.lowest(macd_z, 50) - hudOffsetY 
+        => macd_z + hudOffsetY
+
+    // Θέση X
+    int dbg_x = hudAnchor == "Right" ? bar_index + hudOffsetX : bar_index - hudOffsetX
+
+    dbg_label := label.new(
+         dbg_x, dbg_y, dbg_text,
+         style=label.style_label_left,
+         textcolor=color.white,
+         color=color.new(color.silver, 70),
+         size=size.small,
+         textalign=hudAnchor == "Right" ? text.align_left : text.align_right)
+
+alertcondition(buy_cond or auto_buy_cross,  title="Unified Buy",  message="Adaptive MACD PRO - Long trigger")
+alertcondition(sell_cond or auto_sell_cross, title="Unified Sell", message="Adaptive MACD PRO - Short trigger")

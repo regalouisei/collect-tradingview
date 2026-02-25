@@ -1,0 +1,287 @@
+//@version=6
+indicator("GCM Apex Predator Algo", shorttitle="GCM APA", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// 1. INPUTS
+// ==========================================
+group_mode  = "Strategy Selector"
+trade_mode  = input.string("Scalper Mode (Fast)", "Trading Mode", options=["Trend Mode (Swing)", "Scalper Mode (Fast)", "Hybrid (Both)"], group=group_mode)
+
+group_trend = "Trend Engine (Main)"
+len_trend   = input.int(10, "Trend Period", group=group_trend)
+mult_trend  = input.float(1.5, "Trend Factor", group=group_trend)
+
+group_scalp = "Scalper Engine (Hidden Logic)"
+len_scalp   = input.int(7, "Scalper Length (HMA)", group=group_scalp)
+
+group_struc = "Market Structure (Signal Flow)"
+show_struc  = input.bool(true, "Show Seamless Trend Projector", group=group_struc)
+
+group_apex  = "Apex Score (Loop Engine)"
+per_score   = input.int(35, "Score ATR Period", group=group_apex)
+fac_score   = input.float(1.2, "Score ATR Factor", step=0.1, group=group_apex)
+loop_start  = input.int(1, "Loop Start", group=group_apex)
+loop_end    = input.int(45, "Loop End (Max 50)", maxval=50, group=group_apex)
+thres_l     = input.int(40, "Score Long Threshold", group=group_apex)
+thres_s     = input.int(-10, "Score Short Threshold", group=group_apex)
+
+group_filt  = "Filters"
+use_vol     = input.bool(true, "Filter: Volume > Average", group=group_filt)
+len_vol     = input.int(20, "Volume Length", group=group_filt)
+use_adx     = input.bool(true, "Filter: ADX (Remove Chop)", group=group_filt)
+th_adx      = input.int(20, "ADX Threshold", minval=1, group=group_filt)
+
+group_risk  = "Risk Management (TP/SL)"
+show_risk   = input.bool(true, "Show TP/SL Lines & Labels", group=group_risk)
+mult_sl     = input.float(1.5, "Stop Loss ATR Multiplier", group=group_risk)
+mult_tp     = input.float(3.0, "Take Profit ATR Multiplier", group=group_risk)
+
+group_style = "Visuals"
+show_vwap   = input.bool(true, "Show VWAP Line", group=group_style)
+tr_cloud    = input.int(75, "Trend Cloud Transparency", minval=0, maxval=100, group=group_style)
+tr_ribbon   = input.int(90, "Fusion-VWAP Ribbon Transparency", minval=0, maxval=100, group=group_style)
+tr_zone     = input.int(85, "TP/SL Zone Transparency", minval=0, maxval=100, group=group_style)
+
+group_dash  = "Dashboard Design"
+show_table  = input.bool(true, "Show Corporate Dashboard", group=group_dash)
+dash_loc    = input.string("Bottom Right", "Location", options=["Top Right", "Top Center", "Top Left", "Bottom Right", "Bottom Center", "Bottom Left", "Middle Right", "Middle Left"], group=group_dash)
+dash_size   = input.string("Small", "Size", options=["Tiny", "Small", "Normal", "Large"], group=group_dash)
+c_dash_bg   = input.color(color.rgb(46, 46, 46), "Body Background", group=group_dash)
+c_dash_head = input.color(color.black, "Header Background", group=group_dash) 
+c_dash_txt  = input.color(color.silver, "Text Color", group=group_dash)
+
+// ==========================================
+// 2. CONSTANTS & VARIABLES
+// ==========================================
+c_bull = #00ffbb 
+c_bear = #ff0040 
+c_gold = #FFD700 
+c_lbl_buy  = #1b5e20 
+c_lbl_sell = #801922 
+
+bool is_scalp_mode = (trade_mode == "Scalper Mode (Fast)")
+bool is_trend_mode = (trade_mode == "Trend Mode (Swing)")
+bool is_hybrid     = (trade_mode == "Hybrid (Both)")
+
+// ==========================================
+// 3. LOGIC: TREND & APEX
+// ==========================================
+atr_val = ta.atr(len_trend)
+src     = hlc3
+up      = src - (mult_trend * atr_val)
+up     := close[1] > nz(up[1]) ? math.max(up, nz(up[1])) : up
+dn      = src + (mult_trend * atr_val)
+dn     := close[1] < nz(dn[1]) ? math.min(dn, nz(dn[1])) : dn
+
+var int trend = 1
+trend := nz(trend[1], 1)
+trend := trend == -1 and close > nz(dn[1]) ? 1 : trend == 1 and close < nz(up[1]) ? -1 : trend
+
+float active_line = trend == 1 ? up : dn
+color active_col  = trend == 1 ? c_bull : c_bear
+
+scalp_val = ta.hma(close, len_scalp)
+bool scalp_turn_up = ta.crossover(scalp_val, scalp_val[1])
+bool scalp_turn_dn = ta.crossunder(scalp_val, scalp_val[1])
+
+vwap_val = ta.vwap(hlc3)
+s_atr    = ta.atr(per_score)
+s_band   = s_atr * fac_score
+var float trail_s = na
+trail_s := nz(trail_s[1], close)
+if not na(s_band)
+    if (close - s_band) > trail_s
+        trail_s := close - s_band
+    if (close + s_band) < trail_s
+        trail_s := close + s_band
+
+float apex_score = 0.0
+if not na(trail_s[loop_end]) 
+    for i = loop_start to loop_end
+        apex_score += (trail_s > trail_s[i] ? 1 : -1)
+
+vol_avg   = ta.sma(volume, len_vol)
+is_vol_ok = use_vol ? (volume > vol_avg) : true
+[_, _, adx_val] = ta.dmi(14, 14)
+is_adx_ok = use_adx ? (adx_val > th_adx) : true
+rsi_val   = ta.rsi(close, 14)
+
+// ==========================================
+// 4. MARKET STRUCTURE (FREEZE & REPLACE)
+// ==========================================
+var line struct_line = na 
+var int active_state = 0 // 0=Init, 1=Buy, -1=Sell
+
+// A. Handle Trend Switching (On Confirmed Close)
+if barstate.isconfirmed
+    if scalp_turn_up
+        active_state := 1
+    if scalp_turn_dn
+        active_state := -1
+
+// B. Spawn New Line (Triggered by State Change)
+// FIX: Added '!= 0' because ta.change returns float/int, not bool
+if ta.change(active_state) != 0
+    line.delete(struct_line) // Erase history immediately
+    
+    // Start new line from the Signal Candle (index-1)
+    if active_state == 1
+        struct_line := line.new(bar_index-1, low[1], bar_index, low, width=1, style=line.style_dashed, color=#2dff00)
+    if active_state == -1
+        struct_line := line.new(bar_index-1, high[1], bar_index, high, width=1, style=line.style_dashed, color=#ff0040)
+    
+    line.set_extend(struct_line, extend.right)
+
+// C. Live Updates & Freeze Logic
+if show_struc and not na(struct_line)
+    // Detect OPPOSITE signal on current live candle
+    bool freeze_condition = (active_state == 1 and scalp_turn_dn) or (active_state == -1 and scalp_turn_up)
+    
+    if freeze_condition
+        // FREEZE: Force line to snap back to previous candle. 
+        // This prevents it from tracking the reversal candle.
+        float freeze_y = (active_state == 1) ? low[1] : high[1]
+        line.set_xy2(struct_line, bar_index - 1, freeze_y)
+    else
+        // NORMAL: Extend line to current candle's wick
+        float target_y = (active_state == 1) ? low : high
+        line.set_xy2(struct_line, bar_index, target_y)
+
+// ==========================================
+// 5. SIGNALS & ALERTS
+// ==========================================
+cross_up = ta.crossover(close, nz(dn[1]))
+cross_dn = ta.crossunder(close, nz(up[1]))
+
+sig_sniper_buy  = cross_up and apex_score > thres_s and is_vol_ok and is_adx_ok and rsi_val > 45
+sig_sniper_sell = cross_dn and apex_score < thres_l and is_vol_ok and is_adx_ok and rsi_val < 55
+sig_simp_buy    = trend == 1 and trend[1] == -1
+sig_simp_sell   = trend == -1 and trend[1] == 1
+
+bool is_buy = false
+bool is_sell = false
+string alert_msg = ""
+
+if sig_sniper_buy
+    is_buy := true
+    alert_msg := "🎯 SNIPER LONG: " + syminfo.ticker + " @ " + str.tostring(close)
+else if (is_trend_mode or is_hybrid) and sig_simp_buy
+    is_buy := true
+    alert_msg := "📈 TREND BUY: " + syminfo.ticker + " @ " + str.tostring(close)
+else if (is_scalp_mode or is_hybrid) and scalp_turn_up
+    is_buy := true
+    alert_msg := "⚡ SCALP BUY: " + syminfo.ticker + " @ " + str.tostring(close)
+
+if sig_sniper_sell
+    is_sell := true
+    alert_msg := "🎯 SNIPER SHORT: " + syminfo.ticker + " @ " + str.tostring(close)
+else if (is_trend_mode or is_hybrid) and sig_simp_sell
+    is_sell := true
+    alert_msg := "📉 TREND SELL: " + syminfo.ticker + " @ " + str.tostring(close)
+else if (is_scalp_mode or is_hybrid) and scalp_turn_dn
+    is_sell := true
+    alert_msg := "⚡ SCALP SELL: " + syminfo.ticker + " @ " + str.tostring(close)
+
+if (is_buy or is_sell)
+    alert(alert_msg, alert.freq_once_per_bar_close)
+
+var float entry_price = na, var float sl_price = na, var float tp_price = na, var int entry_idx = na
+var line l_entry = line.new(na, na, na, na, color=color.blue, width=2)
+var line l_sl    = line.new(na, na, na, na, color=color.red, width=2)
+var line l_tp    = line.new(na, na, na, na, color=color.green, width=2)
+var linefill f_tp = linefill.new(l_entry, l_tp, color.new(color.green, tr_zone))
+var linefill f_sl = linefill.new(l_entry, l_sl, color.new(color.red, tr_zone))
+var label lb_entry = label.new(na, na, style=label.style_label_left, textcolor=color.white, size=size.small, color=color.blue)
+var label lb_sl    = label.new(na, na, style=label.style_label_left, textcolor=color.white, size=size.small, color=color.red)
+var label lb_tp    = label.new(na, na, style=label.style_label_left, textcolor=color.white, size=size.small, color=color.green)
+
+if is_buy or is_sell
+    entry_price := close, entry_idx := bar_index
+    sl_price := is_buy ? close - (atr_val * mult_sl) : close + (atr_val * mult_sl)
+    tp_price := is_buy ? close + (atr_val * mult_tp) : close - (atr_val * mult_tp)
+
+if ta.change(trend) != 0 and not (is_buy or is_sell)
+    entry_price := na, sl_price := na, tp_price := na, entry_idx := na
+
+if show_risk and not na(entry_price)
+    lx = bar_index + 3
+    line.set_xy1(l_entry, entry_idx, entry_price), line.set_xy2(l_entry, lx, entry_price)
+    line.set_xy1(l_sl, entry_idx, sl_price), line.set_xy2(l_sl, lx, sl_price)
+    line.set_xy1(l_tp, entry_idx, tp_price), line.set_xy2(l_tp, lx, tp_price)
+    pre = (is_buy) ? "LONG " : "SHORT "
+    label.set_xy(lb_entry, lx, entry_price), label.set_text(lb_entry, pre + "ENTRY: " + str.tostring(entry_price, format.mintick))
+    label.set_xy(lb_sl, lx, sl_price), label.set_text(lb_sl, pre + "SL: " + str.tostring(sl_price, format.mintick))
+    label.set_xy(lb_tp, lx, tp_price), label.set_text(lb_tp, pre + "TP: " + str.tostring(tp_price, format.mintick))
+    linefill.set_color(f_tp, color.new(color.green, tr_zone)), linefill.set_color(f_sl, color.new(color.red, tr_zone))
+else
+    line.set_xy1(l_entry, na, na), line.set_xy2(l_entry, na, na)
+    line.set_xy1(l_sl, na, na), line.set_xy2(l_sl, na, na)
+    line.set_xy1(l_tp, na, na), line.set_xy2(l_tp, na, na)
+    label.set_xy(lb_entry, na, na), label.set_xy(lb_sl, na, na), label.set_xy(lb_tp, na, na)
+    linefill.set_color(f_tp, color.new(color.green, 100)), linefill.set_color(f_sl, color.new(color.red, 100))
+
+// ==========================================
+// 6. VISUAL OUTPUTS
+// ==========================================
+p_trail = plot(active_line, "Trend Line", color = active_col, linewidth=2)
+p_vwap  = plot(show_vwap ? vwap_val : na, "VWAP", color = vwap_val > vwap_val[1] ? c_bull : c_bear, linewidth=2)
+fill(p_trail, plot(close, display=display.none), color = active_col == c_bull ? color.new(c_bull, tr_cloud) : color.new(c_bear, tr_cloud))
+fill(p_trail, p_vwap, color = show_vwap ? (active_line > vwap_val ? color.new(c_bull, tr_ribbon) : color.new(c_bear, tr_ribbon)) : na)
+
+plotshape(sig_sniper_buy, "Sniper Surge", shape.circle, location.belowbar, c_gold, size=size.tiny)
+plotshape(sig_sniper_sell, "Sniper Dump", shape.circle, location.abovebar, c_gold, size=size.tiny)
+plotshape((is_trend_mode or is_hybrid) and sig_simp_buy ? low - (atr_val * 0.5) : na, "Trend Buy", shape.labelup, location.absolute, c_lbl_buy, 0, "B", color.white, size=size.tiny)
+plotshape((is_trend_mode or is_hybrid) and sig_simp_sell ? high + (atr_val * 0.5) : na, "Trend Sell", shape.labeldown, location.absolute, c_lbl_sell, 0, "S", color.white, size=size.tiny)
+plotshape((is_scalp_mode or is_hybrid) and scalp_turn_up ? low - (atr_val * 0.2) : na, "Scalper Buy", shape.labelup, location.absolute, c_lbl_buy, 0, "B", color.white, size=size.tiny)
+plotshape((is_scalp_mode or is_hybrid) and scalp_turn_dn ? high + (atr_val * 0.2) : na, "Scalper Sell", shape.labeldown, location.absolute, c_lbl_sell, 0, "S", color.white, size=size.tiny)
+barcolor(active_col)
+
+// ==========================================
+// 7. DASHBOARD
+// ==========================================
+if show_table and barstate.islast
+    txt_tr = trend == 1 ? "𝐁𝐔𝐋𝐋𝐈𝐒𝐇" : "𝐁𝐄𝐀𝐑𝐈𝐒𝐇"
+    col_tr = trend == 1 ? c_bull : c_bear
+    txt_adx = adx_val > 25 ? "𝐏𝐎𝐖𝐄𝐑" : (adx_val < 20 ? "𝐂𝐇𝐎𝐏" : "𝐁𝐔𝐈𝐋𝐃𝐈𝐍𝐆")
+    col_adx = adx_val > 25 ? c_bull : (adx_val < 20 ? c_bear : color.orange)
+    txt_apex = apex_score > thres_l ? "𝐒𝐔𝐑𝐆𝐄 (𝐋)" : (apex_score < thres_s ? "𝐃𝐔𝐌𝐏 (𝐒)" : "𝐍𝐄𝐔𝐓𝐑𝐀𝐋")
+    col_apex = apex_score > thres_l ? c_bull : (apex_score < thres_s ? c_bear : color.gray)
+    txt_scalp = scalp_val > scalp_val[1] ? "𝐔𝐏𝐅𝐋𝐎𝐖" : "𝐃𝐎𝐖𝐍 𝐅𝐋𝐎𝐖"
+    col_scalp = scalp_val > scalp_val[1] ? c_bull : c_bear
+    txt_vol = volume > vol_avg ? "𝐇𝐈𝐆𝐇" : "𝐋𝐎𝐖"
+    col_vol = volume > vol_avg ? c_bull : color.gray
+    txt_vwap = close > vwap_val ? "𝐏𝐑𝐄𝐌𝐈𝐔𝐌" : "𝐃𝐈𝐒𝐂𝐎𝐔𝐍𝐓"
+    col_vwap = close > vwap_val ? c_bull : c_bear
+
+    pos_tbl = switch dash_loc
+        "Top Right"     => position.top_right
+        "Top Center"    => position.top_center
+        "Top Left"      => position.top_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Left"   => position.bottom_left
+        "Middle Right"  => position.middle_right
+        "Middle Left"   => position.middle_left
+        => position.bottom_right
+    sz_tbl = switch dash_size
+        "Tiny" => size.tiny
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+    var tbl = table.new(pos_tbl, 2, 8, bgcolor=c_dash_bg, frame_color=c_dash_txt)
+    table.cell(tbl, 0, 0, "GCM APEX PREDATOR", bgcolor=c_dash_head, text_color=color.white, text_size=sz_tbl, text_halign=text.align_center)
+    table.merge_cells(tbl, 0, 0, 1, 0)
+    table.cell(tbl, 0, 1, "MODE", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, is_scalp_mode ? "𝐒𝐂𝐀𝐋𝐏𝐄𝐑" : (is_trend_mode ? "𝐒𝐖𝐈𝐍𝐆" : "𝐇𝐘𝐁𝐑𝐈𝐃"), bgcolor=c_dash_bg, text_color=c_gold, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 2, "TREND BIAS", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, txt_tr, bgcolor=color.new(col_tr, 85), text_color=col_tr, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 3, "SCALPER", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, txt_scalp, bgcolor=color.new(col_scalp, 85), text_color=col_scalp, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 4, "TREND PWR", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, txt_adx, bgcolor=color.new(col_adx, 85), text_color=col_adx, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 5, "APEX MOMENTUM", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, txt_apex, bgcolor=color.new(col_apex, 85), text_color=col_apex, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 6, "VOLUME", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, txt_vol, bgcolor=color.new(col_vol, 85), text_color=col_vol, text_size=sz_tbl, text_halign=text.align_center)
+    table.cell(tbl, 0, 7, "VWAP ZONE", text_color=c_dash_txt, text_size=sz_tbl, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, txt_vwap, bgcolor=color.new(col_vwap, 85), text_color=col_vwap, text_size=sz_tbl, text_halign=text.align_center)

@@ -1,0 +1,115 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=5
+indicator("McDonald's Pattern [LuxAlgo]",overlay=true,max_lines_count=500,max_bars_back=500)
+length = input(30)
+from_start = input(true,'Use First Bar As Vertex')
+
+css = input(#FFC72C,'Shape Color',group='Style')
+min_width = input(2,'Width',inline='b',group='Style')
+max_width = input(30,'',inline='b',group='Style')
+
+colored_area = input(true,'Area',inline='c',group='Style')
+css_dn = input(#DA291C,'',inline='c',group='Style')
+css_up = input(#0cb51a,'',inline='c',group='Style')
+show_score = input(true,"McDonald's Score")
+//----
+os = 0
+src = close
+n = bar_index
+var float valtop = na
+var float valbtm = na
+var tb = table.new(position.top_right,1,2)
+//------------------------------------------------------------------------------
+var Y = array.new_float(0)
+var X = array.new_int(0)
+
+a = math.max(close,open)
+b = math.min(close,open)
+
+upper = ta.highest(a,length)
+lower = ta.lowest(b,length)
+
+os := a[length] > upper ? 0 : b[length] < lower ? 1 : os[1]
+
+btm = os == 1 and os[1] != 1
+top = os == 0 and os[1] != 0
+
+if top
+    array.unshift(Y,a[length])
+    array.unshift(X,n-length)
+if btm
+    array.unshift(Y,b[length])
+    array.unshift(X,n-length)
+//----
+plotchar(top ? high[length] : na,"Top",'🍟',location.abovebar,offset=-length,size=size.tiny)
+plotchar(btm ? low[length] : na,"Bottom",'🍔',location.belowbar,offset=-length,size=size.tiny)
+//----
+a_y = 0.,b_y = 0.
+c_y = 0.,d_y = 0.
+if barstate.islast
+    dist_a = 0.
+    dist_b = 0.
+    
+    for l in line.all
+        line.delete(l)
+    if from_start
+        array.unshift(Y,close)
+        array.unshift(X,n)
+    
+    max = array.max(array.slice(Y,0,5))
+    min = array.min(array.slice(Y,0,5))
+    val = array.get(Y,0) < array.get(Y,1) ? min : max
+    //----
+    dist1 = array.get(X,0) - array.get(X,2)
+    
+    a_y := array.get(Y,2),b_y := array.get(Y,1)
+    c_y := array.get(Y,1),d_y := array.get(Y,0)
+    
+    float y1 = na
+    for i = 0 to dist1
+        k = i/dist1
+        y2 = a_y*math.pow(1 - k,3) + 3*b_y*math.pow(1 - k,2)*k + 3*c_y*(1 - k)*math.pow(k,2) + d_y*math.pow(k,3)
+        dist_a += math.abs(y2 - val)
+        
+        r = (array.get(X,0) - array.get(X,1))/dist1
+        w = min_width + math.abs(i/dist1 - r)*(max_width-min_width)
+        line.new(array.get(X,2)+i,y2,array.get(X,2)+i-1,y1,color=css,width=w)
+        y1 := y2
+    //----
+    dist2 = array.get(X,2) - array.get(X,4)
+    
+    a_y := array.get(Y,4),b_y := array.get(Y,3)
+    c_y := array.get(Y,3),d_y := array.get(Y,2)
+    
+    y1 := na
+    for i = 0 to dist2
+        k = i/dist2
+        y2 = a_y*math.pow(1 - k,3) + 3*b_y*math.pow(1 - k,2)*k + 3*c_y*(1 - k)*math.pow(k,2) + d_y*math.pow(k,3)
+        dist_b += math.abs(y2 - val)
+        
+        r = (array.get(X,3) - array.get(X,4))/dist2
+        w = min_width + math.abs(i/dist2 - r)*(max_width-min_width)
+        line.new(array.get(X,4)+i,y2,array.get(X,4)+i-1,y1,color=css,width=w)
+        y1 := y2
+        
+    if colored_area
+        area_css = array.get(Y,0) < array.get(Y,1) ? css_dn : css_up
+        box.delete(box.new(array.get(X,4),max,
+          array.get(X,0),min,
+          border_color=na,
+          bgcolor=color.new(area_css,80))[1])
+
+    if from_start
+        array.shift(Y)
+        array.shift(X)
+    //----
+    a = dist_a/dist1
+    b = dist_b/dist2
+    score = (1 - math.abs(a/(a+b) - .5)*2)*100
+    
+    if show_score
+        table.cell(tb,0,0,"McDonald's Score",text_color=color.gray)
+        table.cell(tb,0,1,str.tostring(score,'#.##')+'%',text_color=color.gray)
+// I'm lovin' it

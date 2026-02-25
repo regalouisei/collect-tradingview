@@ -1,0 +1,200 @@
+//@version=5
+// V11.1 — Raw MACD + Adaptive Volatility Zones + Histogram + Banners + Frames + Dots
+indicator("Smooth Fear/Greed Waves — MACD Core V11 Adaptive", shorttitle="FG MACD V11", overlay=false, max_labels_count=500, max_lines_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// MACD Core Inputs
+//──────────────────────────────────────────────────────────────────────────────
+macdGrp = "MACD Core"
+fastLen   = input.int(12, "MACD Fast Length", group=macdGrp, minval=1)
+slowLen   = input.int(26, "MACD Slow Length", group=macdGrp, minval=1)
+signalLen = input.int(9,  "MACD Signal Length (SMA)", group=macdGrp, minval=1)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Adaptive Zone Inputs
+//──────────────────────────────────────────────────────────────────────────────
+zoneGrp = "Adaptive Zones"
+zoneLookback = input.int(300, "Zone Lookback Length", group=zoneGrp, minval=20)
+zoneMult     = input.float(1.3, "Greed/Fear Multiplier", step=0.1, group=zoneGrp) // <-- lowered to 1.3
+extMult      = input.float(2.5, "Extreme Multiplier", step=0.1, group=zoneGrp)
+
+// NEW: Extreme offset in standard-deviation units (smaller = stricter, larger = more hits)
+extOffsetDev = input.float(0.15, "Extreme Offset (σ)", step=0.05, group=zoneGrp, minval=0.0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Frames / Fill Controls
+//──────────────────────────────────────────────────────────────────────────────
+fillGrp = "Blue/Orange Frames"
+fillLb  = input.int(100, "Fill Sensitivity Lookback", group=fillGrp, minval=20)
+fillMax = input.int(88,  "Max Fill Strength", group=fillGrp, minval=10, maxval=95)
+fillMin = input.int(10,  "Min Fill Strength", group=fillGrp, minval=0,  maxval=50)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Signals & Banners
+//──────────────────────────────────────────────────────────────────────────────
+sigGrp = "Signals"
+showBanners  = input.bool(true, "Show BUY/SELL Banners", group=sigGrp)
+cooldownBars = input.int(8, "Signal Cooldown Bars", group=sigGrp, minval=0)
+
+// Pivot settings (used to print banners at actual bottom/top after entering extremes)
+pivotL = input.int(2, "Pivot Left Bars (bottom/top)", group=sigGrp, minval=1)
+pivotR = input.int(2, "Pivot Right Bars (confirm)", group=sigGrp, minval=1)
+
+//──────────────────────────────────────────────────────────────────────────────
+// MACD Core (RAW)
+//──────────────────────────────────────────────────────────────────────────────
+fast = math.min(fastLen, slowLen)
+slow = math.max(fastLen, slowLen)
+
+macd_raw   = ta.ema(close, fast) - ta.ema(close, slow)
+signal_raw = ta.sma(macd_raw, signalLen)
+hist_raw   = macd_raw - signal_raw
+
+crossUp   = ta.crossover(macd_raw, signal_raw)
+crossDown = ta.crossunder(macd_raw, signal_raw)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Adaptive Zones (mean ± stdev bands)
+//──────────────────────────────────────────────────────────────────────────────
+macdBasis = ta.sma(macd_raw, zoneLookback)
+macdDev   = ta.stdev(macd_raw, zoneLookback)
+
+zoneGreed = macdBasis + zoneMult * macdDev
+zoneFear  = macdBasis - zoneMult * macdDev
+
+// NEW: relaxed extremes via σ offset (brings bands closer → more hits)
+extK      = math.max(0.1, extMult - extOffsetDev)
+extGreed  = macdBasis + extK * macdDev
+extFear   = macdBasis - extK * macdDev
+
+//──────────────────────────────────────────────────────────────────────────────
+// Histogram
+//──────────────────────────────────────────────────────────────────────────────
+histColor =
+     hist_raw > hist_raw[1] and hist_raw > 0 ? color.aqua :
+     hist_raw < hist_raw[1] and hist_raw > 0 ? color.blue :
+     hist_raw < hist_raw[1] and hist_raw <= 0 ? color.red :
+     hist_raw > hist_raw[1] and hist_raw <= 0 ? color.maroon :
+     color.gray
+
+plot(hist_raw, title="Histogram", color=histColor, style=plot.style_histogram, linewidth=4)
+hline(0, "Zero Line", color=color.gray)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Blue/Orange Frames (Dynamic Fill Band)
+// We fill the area between Fear and Greed zones, tinting blue when MACD>Signal,
+// orange when MACD<Signal, and intensity driven by histogram strength.
+//──────────────────────────────────────────────────────────────────────────────
+absHist    = math.abs(hist_raw)
+histPeak   = ta.highest(absHist, fillLb)
+strength01 = histPeak == 0.0 ? 0.0 : absHist / histPeak
+intensity  = math.round(fillMin + (fillMax - fillMin) * strength01)
+
+frameColor = macd_raw > signal_raw ? color.new(color.blue, 100 - intensity) :
+             macd_raw < signal_raw ? color.new(color.orange, 100 - intensity) : na
+
+bandLow  = plot(zoneFear,  title="Frame Bottom (Fear)",  display=display.none)
+bandHigh = plot(zoneGreed, title="Frame Top (Greed)", display=display.none)
+fill(bandLow, bandHigh, color=frameColor, title="Blue/Orange Frames")
+
+//──────────────────────────────────────────────────────────────────────────────
+// Zone Lines + Background Highlights
+//──────────────────────────────────────────────────────────────────────────────
+plot(zoneGreed, "Greed Zone", color=color.new(color.red, 60))
+plot(zoneFear,  "Fear Zone",  color=color.new(color.green, 60))
+plot(extGreed,  "Extreme Greed", color=color.new(color.red, 30))
+plot(extFear,   "Extreme Fear",  color=color.new(color.green, 30))
+
+bgcolor(macd_raw >= zoneGreed ? color.new(color.red, 90) : na)
+bgcolor(macd_raw <= zoneFear  ? color.new(color.green, 90) : na)
+
+//──────────────────────────────────────────────────────────────────────────────
+// MACD Lines
+//──────────────────────────────────────────────────────────────────────────────
+mainCol =
+     macd_raw >= extGreed ? color.red :
+     macd_raw <= extFear  ? color.lime :
+     color.new(#04cae4, 0)
+
+plot(macd_raw,   "MACD",   color=mainCol, linewidth=3)
+plot(signal_raw, "Signal", color=color.orange, linewidth=2)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Crossover Dots (Option A — plot.style_circles)
+//──────────────────────────────────────────────────────────────────────────────
+plot(crossUp ? macd_raw : na,
+     title="Cross Up Dot",
+     style=plot.style_circles,
+     linewidth=4,
+     color=color.lime)
+
+plot(crossDown ? macd_raw : na,
+     title="Cross Down Dot",
+     style=plot.style_circles,
+     linewidth=4,
+     color=color.red)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BUY / SELL LOGIC (Extreme lines + print at bottom/top)
+// One signal per "event": enter extreme → find pivot beyond extreme → print once
+// New event allowed only after exiting the extreme zone.
+//──────────────────────────────────────────────────────────────────────────────
+enterExtFear  = ta.crossunder(macd_raw, extFear)
+enterExtGreed = ta.crossover(macd_raw, extGreed)
+
+exitExtFear   = ta.crossover(macd_raw, extFear)
+exitExtGreed  = ta.crossunder(macd_raw, extGreed)
+
+var bool fearArmed  = false
+var bool greedArmed = false
+var bool fearDone   = false
+var bool greedDone  = false
+
+// Arm only when we enter an extreme AND haven't already fired during this excursion
+if enterExtFear and not fearDone
+    fearArmed := true
+
+if enterExtGreed and not greedDone
+    greedArmed := true
+
+// Pivot detection (confirmed pivot appears pivotR bars after the actual pivot bar)
+pivLow  = ta.pivotlow(macd_raw, pivotL, pivotR)
+pivHigh = ta.pivothigh(macd_raw, pivotL, pivotR)
+
+// Ensure the pivot itself occurred beyond the extreme line at that pivot bar
+pivLowIsExtreme  = not na(pivLow)  and pivLow  <= extFear[pivotR]
+pivHighIsExtreme = not na(pivHigh) and pivHigh >= extGreed[pivotR]
+
+// Cooldown (reuse original cooldownBars)
+var int lastSigBar = na
+canFire() =>
+    na(lastSigBar) or (bar_index - lastSigBar >= cooldownBars)
+
+// Final signals
+buy  = fearArmed  and pivLowIsExtreme  and canFire()
+sell = greedArmed and pivHighIsExtreme and canFire()
+
+if buy or sell
+    lastSigBar := bar_index
+
+// After firing once, mark done for this excursion and disarm
+if buy
+    fearArmed := false
+    fearDone  := true
+
+if sell
+    greedArmed := false
+    greedDone  := true
+
+// Reset the "done" flag only after we EXIT the extreme zone (defines a new event)
+if exitExtFear
+    fearDone := false
+if exitExtGreed
+    greedDone := false
+
+// Place labels on the actual pivot bar (bar_index - pivotR)
+if showBanners and buy
+    label.new(bar_index - pivotR, pivLow, "BUY", style=label.style_label_up, textcolor=color.black, color=color.lime, size=size.large)
+
+if showBanners and sell
+    label.new(bar_index - pivotR, pivHigh, "SELL", style=label.style_label_down, textcolor=color.white, color=color.red, size=size.large)

@@ -1,0 +1,152 @@
+//@version=6
+indicator("Cointegration Heatmap & Spread Table [EdgeTerminal]", overlay = false)
+
+import TradingView/ta/9 as TVta
+import TradingView/ValueAtTime/1 as TVvt
+
+// Inputs
+string symbolListInput = input.text_area("XLC, FDIS, XRT, FXD, RXI, RSPD, CSCO, STE", "Symbol list")
+string tfInput         = input.timeframe("1M", "Returns timeframe", ["1W", "1M"])
+bool limitInput        = input.bool(false, "Max periods")
+int  maxPeriodsInput   = input.int(60, "", minval = 2)
+
+// Parse symbols
+var array<string> symbolsArray = TVvt.getArrayFromString(str.upper(symbolListInput))
+var int numSymbols = symbolsArray.size()
+
+// Utility: Aligned returns
+getAlignedReturns(series string symbol, series string timeframe) =>
+    string chartTicker = ticker.new(syminfo.prefix, syminfo.tickerid)
+    string standard1   = ticker.standard(chartTicker)
+    string standard2   = ticker.standard(symbol)
+    string sumSpread = ticker.modify(ticker.inherit(chartTicker, standard1 + "+" + standard2), session.extended, adjustment.dividends)
+    string diffSpread = ticker.modify(ticker.inherit(chartTicker, standard1 + "-" + standard2), session.extended, adjustment.dividends)
+    float currPrice   = close[1]
+    float prevPrice   = nz(close[2], open[1])
+    [currSum, prevSum] = request.security(sumSpread, timeframe, [currPrice, prevPrice], barmerge.gaps_on, barmerge.lookahead_on)
+    [currDiff, prevDiff] = request.security(diffSpread, timeframe, [currPrice, prevPrice], barmerge.gaps_on, barmerge.lookahead_on)
+    TVta.changePercent(0.5 * (currSum - currDiff), 0.5 * (prevSum - prevDiff))
+
+// Collect returns into matrix
+collectReturns(array<string> symbols, simple string timeframe, simple int maxPeriods = na) =>
+    var int num = symbols.size()
+    var array<float> row = array.new<float>(num)
+    var matrix<float> result = matrix.new<float>(num, 0)
+    bool exclude = false
+    for [i, sym] in symbols
+        float ret = getAlignedReturns(sym, timeframe)
+        if na(ret)
+            exclude := true
+            break
+        row.set(i, ret)
+    int cols = result.columns()
+    if not exclude
+        result.add_col(cols, row)
+        cols += 1
+    if cols > maxPeriods
+        result.remove_col(0)
+    result
+
+// Get residual std deviation as cointegration strength proxy
+getResidualStd(array<float> x, array<float> y) =>
+    int len = math.min(x.size(), y.size())
+    if len < 2
+        na
+    else
+        float meanX = x.avg(), meanY = y.avg()
+        float covXY = 0.0, varX = 0.0
+        for i = 0 to len - 1
+            float dx = x.get(i) - meanX
+            float dy = y.get(i) - meanY
+            covXY += dx * dy
+            varX  += dx * dx
+        float beta = covXY / varX
+        float alpha = meanY - beta * meanX
+        array<float> residuals = array.new<float>()
+        int maxResiduals = 100
+        int start = math.max(0, len - maxResiduals)
+        for i = start to len - 1
+            float resid = y.get(i) - (alpha + beta * x.get(i))
+            array.push(residuals, resid)
+        residuals.stdev()
+
+// Build matrix
+matrix<float> returnsMatrix = collectReturns(symbolsArray, tfInput, limitInput ? maxPeriodsInput : na)
+var table heatmap = table.new(position.middle_center, numSymbols + 1, numSymbols + 1, border_width = 1)
+
+// Draw headers
+for i = 0 to numSymbols - 1
+    string sym = symbolsArray.get(i)
+    table.cell(heatmap, i + 1, 0, sym, text_color=color.white, bgcolor=color.gray)
+    table.cell(heatmap, 0, i + 1, sym, text_color=color.white, bgcolor=color.gray)
+
+// Fill heatmap table
+for i = 0 to numSymbols - 1
+    for j = 0 to numSymbols - 1
+        string label = i == j ? "—" : ""
+        color bg = color.new(color.black, 0)
+        if i < j and returnsMatrix.columns() > 1
+            array<float> x = returnsMatrix.row(i)
+            array<float> y = returnsMatrix.row(j)
+            float std = getResidualStd(x, y)
+            float score = 1 / std  // Lower residual std = stronger cointegration
+            label := str.tostring(score, format.percent)
+            float scale = math.min(score * 1000, 100)
+            bg := color.from_gradient(scale, 0, 100, color.rgb(30,30,30), color.rgb(0, 200, 0))
+        table.cell(heatmap, j + 1, i + 1, label, text_color=color.white, bgcolor=bg)
+
+// Cointegration spread summary table for all pairs
+int maxPairs = numSymbols * (numSymbols - 1) / 2
+var table spreadStatsTable = table.new(position.middle_right, 5, maxPairs + 1, border_width = 1)
+
+// Header row
+color headerColor = color.rgb(90, 90, 100)
+color rowColor    = color.rgb(20, 20, 20)
+color textColor   = color.white
+
+table.cell(spreadStatsTable, 0, 0, "Pair",    text_color=textColor, bgcolor=headerColor)
+table.cell(spreadStatsTable, 1, 0, "Spread",  text_color=textColor, bgcolor=headerColor)
+table.cell(spreadStatsTable, 2, 0, "Mean",    text_color=textColor, bgcolor=headerColor)
+table.cell(spreadStatsTable, 3, 0, "Z-score", text_color=textColor, bgcolor=headerColor)
+table.cell(spreadStatsTable, 4, 0, "Signal",  text_color=textColor, bgcolor=headerColor)
+
+// Fill rows with stats per unique pair
+int row = 1
+for i = 0 to numSymbols - 2
+    for j = i + 1 to numSymbols - 1
+        if returnsMatrix.columns() > 1
+            array<float> x = returnsMatrix.row(i)
+            array<float> y = returnsMatrix.row(j)
+            int len = math.min(x.size(), y.size())
+            float meanX = x.avg(), meanY = y.avg()
+            float covXY = 0.0, varX = 0.0
+            for k = 0 to len - 1
+                float dx = x.get(k) - meanX
+                float dy = y.get(k) - meanY
+                covXY += dx * dy
+                varX  += dx * dx
+            float beta  = covXY / varX
+            float alpha = meanY - beta * meanX
+            float latestSpread = y.get(len - 1) - (alpha + beta * x.get(len - 1))
+            float spreadSum = 0.0
+            float spreadSq  = 0.0
+            int maxPoints = 100
+            int start = math.max(0, len - maxPoints)
+            for k = start to len - 1
+                float s = y.get(k) - (alpha + beta * x.get(k))
+                spreadSum += s
+                spreadSq  += s * s
+            float meanSpread = spreadSum / (len - start)
+            float variance = (spreadSq / (len - start)) - math.pow(meanSpread, 2)
+            float stdevSpread = math.sqrt(variance)
+            float zScore = (latestSpread - meanSpread) / stdevSpread
+            string signal = zScore > 2 ? "Short" : zScore < -2 ? "Long" : "Neutral"
+            string pairName = symbolsArray.get(i) + " vs " + symbolsArray.get(j)
+            table.cell(spreadStatsTable, 0, row, pairName, text_color=textColor, bgcolor=rowColor)
+            table.cell(spreadStatsTable, 1, row, str.tostring(latestSpread, format.mintick), text_color=textColor, bgcolor=rowColor)
+            table.cell(spreadStatsTable, 2, row, str.tostring(meanSpread, format.mintick), text_color=textColor, bgcolor=rowColor)
+            
+            table.cell(spreadStatsTable,3, row,str.tostring(zScore, format.mintick),text_color = textColor,bgcolor = rowColor,tooltip = "Z > 2: Short quote, Long base\nZ < -2: Long quote, Short base\nZ ~ 0: Exit / No trade")
+
+            table.cell(spreadStatsTable, 4, row, signal, text_color=textColor, bgcolor=rowColor)
+            row += 1

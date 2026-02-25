@@ -1,0 +1,542 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Rejection Blocks [UAlgo]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// -----------------------------------------------------------------------------
+// Settings
+// -----------------------------------------------------------------------------
+type Settings
+    int swingLeft
+    int swingRight
+    int confirmWindow
+    string sweepType
+    int minSweepTicks
+    bool useShapeFilter
+    float minWickToBody
+    float minDomWickPct
+    float maxOppWickPct
+    float maxBodyPct
+    string closeFilter
+    string rbZoneMode
+    string strengthModel
+    float innerMaxPctOfOuter
+    int innerMinBars
+    int rightOffsetBars
+    int maxBlocks
+    int maxPending
+    string mitigationMode
+    bool stopOnMitigation
+    bool deleteOnMitigation
+    string invalidationMode
+    bool deleteOnInvalid
+    int maxAgeBars
+    bool showBull
+    bool showBear
+    bool showStructure
+    int structLineLenBars
+    int maxStructLines
+    color colOuterFill
+    color colOuterBorder
+    color colOuterMitFill
+    color colOuterMitBorder
+    color colOuterInvFill
+    color colOuterInvBorder
+    color colBuyFill
+    color colBuyBorder
+    color colSellFill
+    color colSellBorder
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+type CandleParts
+    float rng
+    float body
+    float upperWick
+    float lowerWick
+    float bodyTop
+    float bodyBot
+
+method rngAdj(CandleParts self) =>
+    math.max(self.rng, syminfo.mintick)
+
+method bodyAdj(CandleParts self) =>
+    math.max(self.body, syminfo.mintick)
+
+type Candidate
+    int leftT
+    float top
+    float bottom
+    int dir
+    float buyStrength
+    float sellStrength
+    float confirmLevel
+
+type BlockVisuals
+    box outer
+    box buyBox
+    box sellBox
+    line capLine
+
+type Block
+    int leftT
+    int rightT
+    float top
+    float bottom
+    int dir
+    bool mitigated
+    bool invalidated
+    int stopRightT
+    float buyStrength
+    float sellStrength
+    BlockVisuals vis
+
+type StructLine
+    line id
+    label lbl
+
+// -----------------------------------------------------------------------------
+// Methods & Helpers
+// -----------------------------------------------------------------------------
+f_clamp(float v, float lo, float hi) =>
+    math.min(math.max(v, lo), hi)
+
+f_clampInt(int v, int lo, int hi) =>
+    v < lo ? lo : v > hi ? hi : v
+
+f_hidden(color c) =>
+    color.new(c, 100)
+
+method delete(BlockVisuals self) =>
+    if not na(self.outer)
+        box.delete(self.outer)
+    if not na(self.buyBox)
+        box.delete(self.buyBox)
+    if not na(self.sellBox)
+        box.delete(self.sellBox)
+    if not na(self.capLine)
+        line.delete(self.capLine)
+
+method delete(Block self) =>
+    self.vis.delete()
+
+method delete(StructLine self) =>
+    if not na(self.id)
+        line.delete(self.id)
+    if not na(self.lbl)
+        label.delete(self.lbl)
+
+type RBManager
+    Settings cfg
+    array<Candidate> pending
+    array<Block> blocks
+    array<StructLine> structLines
+    float lastSwingHigh
+    int lastSwingHighT
+    float lastSwingLow
+    int lastSwingLowT
+    int lastBrokenHighT
+    int lastBrokenLowT
+    int trendDir
+
+f_getParts() =>
+    float bTop = math.max(open, close)
+    float bBot = math.min(open, close)
+    float uW = high - bTop
+    float lW = bBot - low
+    float rng = high - low
+    float body = bTop - bBot
+    CandleParts.new(rng, body, uW, lW, bTop, bBot)
+
+method isRBCandle(RBManager self, int dir, float level) =>
+    if na(level)
+        false
+    else
+        CandleParts p = f_getParts()
+        float rngAdj = p.rngAdj()
+        float bodyAdj = p.bodyAdj()
+
+        float domW = dir == 1 ? p.lowerWick : p.upperWick
+        float oppW = dir == 1 ? p.upperWick : p.lowerWick
+        float domPct = domW / rngAdj
+        float oppPct = oppW / rngAdj
+        float bodyPct = p.body / rngAdj
+
+        bool shapeOk = not self.cfg.useShapeFilter ? true :
+             rngAdj > syminfo.mintick and
+             domW >= bodyAdj * self.cfg.minWickToBody and
+             domPct >= self.cfg.minDomWickPct and
+             oppPct <= self.cfg.maxOppWickPct and
+             bodyPct <= self.cfg.maxBodyPct
+
+        float sweepMargin = self.cfg.minSweepTicks * syminfo.mintick
+        bool sweepOk = dir == 1 ?
+             (low < level - sweepMargin and close > level) :
+             (high > level + sweepMargin and close < level)
+
+        bool wickSweepOk = self.cfg.sweepType == "Wick sweep (open+close inside)" ? (dir == 1 ? open > level : open < level) : true
+
+        float mid = (high + low) * 0.5
+        bool closeOk = switch self.cfg.closeFilter
+            "None" => true
+            "Close in favorable half" => dir == 1 ? close >= mid : close <= mid
+            "Close beyond open" => dir == 1 ? close > open : close < open
+            => true
+
+        sweepOk and wickSweepOk and shapeOk and closeOk
+
+method getZone(RBManager self, int dir) =>
+    float bodyTop = math.max(open, close)
+    float bodyBot = math.min(open, close)
+    float top = na
+    float bottom = na
+    switch self.cfg.rbZoneMode
+        "Wick-to-Body" =>
+            if dir == 1
+                top := bodyBot
+                bottom := low
+            else
+                top := high
+                bottom := bodyTop
+        "Open-to-Extreme" =>
+            if dir == 1
+                top := open
+                bottom := low
+            else
+                top := high
+                bottom := open
+        "Full Candle" =>
+            top := high
+            bottom := low
+        "Body" =>
+            top := bodyTop
+            bottom := bodyBot
+        =>
+            top := high
+            bottom := low
+    [top, bottom]
+
+method getStrength(RBManager self, int dir) =>
+    CandleParts p = f_getParts()
+    float rngAdj = p.rngAdj()
+    float closeLoc = f_clamp((close - low) / rngAdj, 0.0, 1.0)
+    float buy = closeLoc
+    if self.cfg.strengthModel == "Close + Wick"
+        float domWickPct = (dir == 1 ? p.lowerWick : p.upperWick) / rngAdj
+        float wickSignal = dir == 1 ? domWickPct : (1.0 - domWickPct)
+        buy := f_clamp(closeLoc * 0.7 + wickSignal * 0.3, 0.0, 1.0)
+    float sell = 1.0 - buy
+    [buy, sell]
+
+method createBlock(RBManager self, Candidate c, int rightNowT, int barMs) =>
+    float mid = (c.top + c.bottom) * 0.5
+    int minRightT = c.leftT + barMs
+    int r = math.max(rightNowT, minRightT)
+
+    box outer = box.new(left=c.leftT, top=c.top, right=r, bottom=c.bottom, xloc=xloc.bar_time, extend=extend.none)
+    box buyBox = box.new(left=c.leftT, top=mid, right=r, bottom=c.bottom, xloc=xloc.bar_time, extend=extend.none, bgcolor=color.new(color.lime, 90), border_color=color.new(color.lime, 80))
+    box sellBox = box.new(left=c.leftT, top=c.top, right=r, bottom=mid, xloc=xloc.bar_time, extend=extend.none, bgcolor=color.new(color.red, 90), border_color=color.new(color.red, 80))
+
+    int width = math.max(1, r - c.leftT)
+    int capX = c.leftT + int(math.round(width * self.cfg.innerMaxPctOfOuter))
+    capX := math.min(r, capX)
+    line capLine = line.new(x1=capX, y1=c.bottom, x2=capX, y2=c.top, xloc=xloc.bar_time, extend=extend.none, color=self.cfg.colOuterBorder, style=line.style_dashed, width=1)
+    
+    BlockVisuals vis = BlockVisuals.new(outer, buyBox, sellBox, capLine)
+    Block b = Block.new(c.leftT, r, c.top, c.bottom, c.dir, false, false, na, c.buyStrength, c.sellStrength, vis)
+    b
+
+method setVisuals(RBManager self, Block b, bool visible) =>
+    color fill = b.invalidated ? self.cfg.colOuterInvFill : b.mitigated ? self.cfg.colOuterMitFill : self.cfg.colOuterFill
+    color border = b.invalidated ? self.cfg.colOuterInvBorder : b.mitigated ? self.cfg.colOuterMitBorder : self.cfg.colOuterBorder
+    
+    box.set_bgcolor(b.vis.outer, visible ? fill : f_hidden(fill))
+    box.set_border_width(b.vis.outer, 0)
+    box.set_border_color(b.vis.outer, f_hidden(border))
+
+    box.set_bgcolor(b.vis.buyBox, visible ? self.cfg.colBuyFill : f_hidden(self.cfg.colBuyFill))
+    box.set_border_color(b.vis.buyBox, visible ? self.cfg.colBuyBorder : f_hidden(self.cfg.colBuyBorder))
+    box.set_bgcolor(b.vis.sellBox, visible ? self.cfg.colSellFill : f_hidden(self.cfg.colSellFill))
+    box.set_border_color(b.vis.sellBox, visible ? self.cfg.colSellBorder : f_hidden(self.cfg.colSellBorder))
+    
+    color capCol = b.invalidated ? self.cfg.colOuterInvBorder : b.mitigated ? self.cfg.colOuterMitBorder : self.cfg.colOuterBorder
+    if not na(b.vis.capLine)
+        line.set_color(b.vis.capLine, visible ? capCol : f_hidden(capCol))
+
+method updateBoxCoords(RBManager self, Block b, int rightNowT, int barMs) =>
+    int r = rightNowT
+    box.set_right(b.vis.outer, r)
+
+    int width = math.max(1, r - b.leftT)
+    float buyPct = self.cfg.innerMaxPctOfOuter * f_clamp(b.buyStrength, 0.0, 1.0)
+    float sellPct = self.cfg.innerMaxPctOfOuter * f_clamp(b.sellStrength, 0.0, 1.0)
+
+    int minW = self.cfg.innerMinBars * barMs
+    int buyW = f_clampInt(int(math.round(width * buyPct)), minW, width)
+    int sellW = f_clampInt(int(math.round(width * sellPct)), minW, width)
+
+    box.set_right(b.vis.buyBox, math.min(r, b.leftT + buyW))
+    box.set_right(b.vis.sellBox, math.min(r, b.leftT + sellW))
+
+    int capX = b.leftT + int(math.round(width * self.cfg.innerMaxPctOfOuter))
+    capX := math.min(r, capX)
+    if not na(b.vis.capLine)
+        line.set_xy1(b.vis.capLine, capX, b.bottom)
+        line.set_xy2(b.vis.capLine, capX, b.top)
+
+method pushLine(RBManager self, int x1, int x2, float y, color col, string sty, int limit, string txt, color txtCol) =>
+    if array.size(self.structLines) >= limit
+        StructLine old = array.shift(self.structLines)
+        old.delete()
+    
+    line l = line.new(x1=x1, y1=y, x2=x2, y2=y, xloc=xloc.bar_time, extend=extend.none, color=col, style=sty, width=1)
+    
+    int midT = int((x1 + x2) / 2)
+    label lbl = label.new(x=midT, y=y, text=txt, xloc=xloc.bar_time, yloc=yloc.price, color=color.new(color.white, 100), textcolor=txtCol, style=label.style_label_center, size=size.tiny)
+    
+    array.push(self.structLines, StructLine.new(l, lbl))
+
+method addBlock(RBManager self, Candidate c, int rightOffsetMs, int barMs) =>
+    while array.size(self.blocks) >= self.cfg.maxBlocks
+        Block old = array.shift(self.blocks)
+        old.delete()
+    int rightNowT = time_close + rightOffsetMs
+    Block b = self.createBlock(c, rightNowT, barMs)
+    self.setVisuals(b, true)
+    self.updateBoxCoords(b, rightNowT, barMs)
+    array.push(self.blocks, b)
+
+method process(RBManager self) =>
+    int barMs = int(time_close - time)
+    barMs := barMs <= 0 ? 1 : barMs
+    int rightOffsetMs = self.cfg.rightOffsetBars * barMs
+
+    float ph = ta.pivothigh(high, self.cfg.swingLeft, self.cfg.swingRight)
+    float pl = ta.pivotlow(low, self.cfg.swingLeft, self.cfg.swingRight)
+
+    float srcUp = close
+    float srcDn = close
+    
+    bool canBullBreak = not na(self.lastSwingHigh) and not na(self.lastSwingHighT) and time_close > self.lastSwingHighT and self.lastSwingHighT != self.lastBrokenHighT
+    bool canBearBreak = not na(self.lastSwingLow) and not na(self.lastSwingLowT) and time_close > self.lastSwingLowT and self.lastSwingLowT != self.lastBrokenLowT
+    
+    bool bullBreak = canBullBreak and srcUp > self.lastSwingHigh and srcUp[1] <= self.lastSwingHigh
+    bool bearBreak = canBearBreak and srcDn < self.lastSwingLow and srcDn[1] >= self.lastSwingLow
+
+    if not na(ph)
+        self.lastSwingHigh := ph
+        self.lastSwingHighT := time[self.cfg.swingRight]
+    if not na(pl)
+        self.lastSwingLow := pl
+        self.lastSwingLowT := time[self.cfg.swingRight]
+
+    int prevTrendDir = self.trendDir
+    
+    bool bearRBCandle = self.cfg.showBear and self.isRBCandle(-1, self.lastSwingHigh)
+    bool bullRBCandle = self.cfg.showBull and self.isRBCandle(1, self.lastSwingLow)
+
+    bool bullBOS = bullBreak and prevTrendDir != -1
+    bool bullCHOCH = bullBreak and prevTrendDir == -1
+    bool bearBOS = bearBreak and prevTrendDir != 1
+    bool bearCHOCH = bearBreak and prevTrendDir == 1
+
+    if barstate.isconfirmed
+        if bullBreak or bearBreak
+            self.trendDir := bullBreak ? 1 : -1
+            if bullBreak
+                self.lastBrokenHighT := self.lastSwingHighT
+            if bearBreak
+                self.lastBrokenLowT := self.lastSwingLowT
+
+    if barstate.isconfirmed and self.cfg.showStructure
+        int budget = 500 - self.cfg.maxBlocks
+        budget := budget < 0 ? 0 : budget
+        int limit = self.cfg.maxStructLines < budget ? self.cfg.maxStructLines : budget
+        
+        if limit > 0
+            int x1 = time
+            int x2 = time + self.cfg.structLineLenBars * barMs
+            
+            if bullRBCandle
+                self.pushLine(self.lastSwingHighT, time, self.lastSwingLow, color.new(color.gray, 25), line.style_dotted, limit, "SW", color.gray)
+            if bearRBCandle
+                self.pushLine(self.lastSwingLowT, time, self.lastSwingHigh, color.new(color.gray, 25), line.style_dotted, limit, "SW", color.gray)
+            
+            if bullBOS
+                self.pushLine(self.lastSwingHighT, time, self.lastSwingHigh, color.new(color.lime, 0), line.style_dashed, limit, "BOS", color.lime)
+            if bullCHOCH
+                self.pushLine(self.lastSwingHighT, time, self.lastSwingHigh, color.new(color.teal, 0), line.style_dashed, limit, "CH", color.teal)
+            if bearBOS
+                self.pushLine(self.lastSwingLowT, time, self.lastSwingLow, color.new(color.red, 0), line.style_dashed, limit, "BOS", color.red)
+            if bearCHOCH
+                self.pushLine(self.lastSwingLowT, time, self.lastSwingLow, color.new(color.orange, 0), line.style_dashed, limit, "CH", color.orange)
+
+    if barstate.isconfirmed
+        if bearRBCandle
+            float confirmLvl = self.lastSwingLow
+            if not na(confirmLvl)
+                [top, bottom] = self.getZone(-1)
+                if not na(top) and not na(bottom) and top > bottom + syminfo.mintick
+                    [buyStr, sellStr] = self.getStrength(-1)
+                    Candidate c = Candidate.new(time, top, bottom, -1, buyStr, sellStr, confirmLvl)
+                    array.push(self.pending, c)
+
+        if bullRBCandle
+            float confirmLvl = self.lastSwingHigh
+            if not na(confirmLvl)
+                [top, bottom] = self.getZone(1)
+                if not na(top) and not na(bottom) and top > bottom + syminfo.mintick
+                    [buyStr, sellStr] = self.getStrength(1)
+                    Candidate c = Candidate.new(time, top, bottom, 1, buyStr, sellStr, confirmLvl)
+                    array.push(self.pending, c)
+
+        while array.size(self.pending) > self.cfg.maxPending
+            array.shift(self.pending)
+        
+        int pn = array.size(self.pending)
+        if pn > 0
+            for i = pn - 1 to 0
+                Candidate c = array.get(self.pending, i)
+                bool expired = self.cfg.confirmWindow > 0 and (time_close - c.leftT) >= (self.cfg.confirmWindow * barMs)
+                bool confirmed = false
+                
+                if not expired and not na(c.confirmLevel) and time > c.leftT
+                    bool broke = c.dir == 1 ?
+                         (srcUp > c.confirmLevel and srcUp[1] <= c.confirmLevel) :
+                         (srcDn < c.confirmLevel and srcDn[1] >= c.confirmLevel)
+                    confirmed := broke
+                
+                if expired
+                    array.remove(self.pending, i)
+                else if confirmed
+                    self.addBlock(c, rightOffsetMs, barMs)
+                    array.remove(self.pending, i)
+
+        while array.size(self.blocks) > self.cfg.maxBlocks
+            Block old = array.shift(self.blocks)
+            old.delete()
+        
+        int bn = array.size(self.blocks)
+        if bn > 0
+            for i = bn - 1 to 0
+                Block b = array.get(self.blocks, i)
+                bool visible = b.dir == 1 ? self.cfg.showBull : self.cfg.showBear
+                bool doDelete = false
+                
+                if not doDelete and self.cfg.maxAgeBars > 0 and (time_close - b.leftT) >= (self.cfg.maxAgeBars * barMs)
+                    doDelete := true
+                    true
+                else
+                    false
+                
+                if not doDelete and not b.invalidated and self.cfg.invalidationMode != "None"
+                    bool inv = switch b.dir
+                        1 => self.cfg.invalidationMode == "Close" ? close < b.bottom : low < b.bottom
+                        -1 => self.cfg.invalidationMode == "Close" ? close > b.top : high > b.top
+                        => false
+                    
+                    if inv
+                        b.invalidated := true
+                        self.setVisuals(b, visible) 
+                        if self.cfg.deleteOnInvalid
+                            doDelete := true
+                        true
+                    else
+                        false
+                
+                if not doDelete and not b.mitigated
+                    bool closeInside = close <= b.top and close >= b.bottom
+                    bool intersect = high >= b.bottom and low <= b.top
+                    bool hit = self.cfg.mitigationMode == "Close Inside" ? closeInside : intersect
+                    if hit and time_close > b.leftT
+                        b.mitigated := true
+                        b.stopRightT := time_close + rightOffsetMs
+                        if self.cfg.deleteOnMitigation
+                            doDelete := true
+                        true
+                    else
+                        false
+                
+                self.setVisuals(b, visible)
+                
+                int rightNowT = time_close + rightOffsetMs
+                if self.cfg.stopOnMitigation and b.mitigated and not na(b.stopRightT)
+                    rightNowT := b.stopRightT
+                
+                int minRightT = b.leftT + barMs
+                rightNowT := math.max(rightNowT, minRightT)
+                b.rightT := rightNowT
+                
+                self.updateBoxCoords(b, rightNowT, barMs)
+                
+                if doDelete
+                    b.delete()
+                    array.remove(self.blocks, i)
+                    true
+                else
+                    array.set(self.blocks, i, b)
+                    false
+
+// -----------------------------------------------------------------------------
+// Initialization & Main Execution
+// -----------------------------------------------------------------------------
+groupStructure = "Market Structure"
+swingLeft      = input.int(5, "Swing left bars", minval=5, group=groupStructure)
+swingRight     = input.int(5, "Swing right bars", minval=5, group=groupStructure)
+
+groupRB = "Rejection Block (RB) Detection"
+sweepType         = input.string("Any sweep (close inside)", "Sweep type", options=["Wick sweep (open+close inside)","Any sweep (close inside)"], group=groupRB)
+minSweepTicks     = input.int(0, "Min sweep distance (ticks)", minval=0, maxval=5000, group=groupRB)
+useShapeFilter    = input.bool(true, "Use rejection candle shape filter", group=groupRB)
+minWickToBody     = input.float(2.0, "Min wick/body ratio", minval=0.5, step=0.1, group=groupRB)
+minDomWickPct     = input.float(55.0, "Min dominant wick (% of range)", minval=5.0, maxval=100.0, step=1.0, group=groupRB) / 100.0
+maxOppWickPct     = input.float(30.0, "Max opposite wick (% of range)", minval=0.0, maxval=100.0, step=1.0, group=groupRB) / 100.0
+maxBodyPct        = input.float(60.0, "Max body (% of range)", minval=0.0, maxval=100.0, step=1.0, group=groupRB) / 100.0
+closeFilter       = input.string("Close in favorable half", "Close filter", options=["None","Close in favorable half","Close beyond open"], group=groupRB)
+rbZoneMode        = input.string("Wick-to-Body", "RB zone model", options=["Wick-to-Body","Open-to-Extreme","Full Candle","Body"], group=groupRB)
+
+groupStrength = "Inner Buy/Sell Strength"
+strengthModel      = input.string("Close location", "Strength model", options=["Close location","Close + Wick"], group=groupStrength, tooltip="Approximation only. Strength is fixed at RB formation.")
+innerMaxPctOfOuter = input.float(50.0, "Max inner width (% of outer, <= 50)", minval=1.0, maxval=50.0, step=1.0, group=groupStrength) / 100.0
+innerMinBars       = input.int(1, "Min inner width (bars)", minval=1, maxval=50, group=groupStrength)
+rightOffsetBars    = input.int(0, "Right offset (bars)", minval=0, maxval=200, group=groupStrength)
+
+groupLifecycle = "Lifecycle"
+maxBlocks          = input.int(25, "Max blocks", minval=1, maxval=150, group=groupLifecycle)
+mitigationMode     = input.string("Touch", "Mitigation mode", options=["Touch","Close Inside"], group=groupLifecycle)
+stopOnMitigation   = input.bool(false, "Stop extending on mitigation", group=groupLifecycle)
+deleteOnMitigation = input.bool(false, "Delete on mitigation", group=groupLifecycle)
+invalidationMode   = input.string("Close", "Invalidation mode", options=["None","Wick","Close"], group=groupLifecycle)
+deleteOnInvalid    = input.bool(true, "Delete on invalidation", group=groupLifecycle)
+maxAgeBars         = input.int(0, "Max age (bars, 0=off)", minval=0, maxval=20000, group=groupLifecycle)
+
+groupDisplay = "Display"
+showBull   = input.bool(true, "Show bullish blocks", group=groupDisplay)
+showBear   = input.bool(true, "Show bearish blocks", group=groupDisplay)
+showStructure    = input.bool(true, "Show sweep/BOS/CHOCH", group=groupDisplay)
+structLineLenBars = input.int(40, "Structure line length (bars, 0=off)", minval=0, maxval=2000, group=groupDisplay)
+maxStructLines    = input.int(120, "Max structure lines", minval=0, maxval=500, group=groupDisplay)
+
+colOuterFill      = input.color(color.new(color.gray, 82), "Outer fill", group=groupDisplay)
+colOuterBorder    = input.color(color.new(color.gray, 35), "Outer border", group=groupDisplay)
+colOuterMitFill   = input.color(color.new(color.teal, 85), "Mitigated fill", group=groupDisplay)
+colOuterMitBorder = input.color(color.new(color.teal, 35), "Mitigated border", group=groupDisplay)
+colOuterInvFill   = input.color(color.new(color.maroon, 85), "Invalidated fill", group=groupDisplay)
+colOuterInvBorder = input.color(color.new(color.maroon, 35), "Invalidated border", group=groupDisplay)
+
+colBuyFill    = input.color(color.new(color.lime, 55), "Buy fill", group=groupDisplay)
+colBuyBorder  = input.color(color.new(color.lime, 0), "Buy border", group=groupDisplay)
+colSellFill   = input.color(color.new(color.red, 55), "Sell fill", group=groupDisplay)
+colSellBorder = input.color(color.new(color.red, 0), "Sell border", group=groupDisplay)
+
+// Init Settings
+Settings cfg = Settings.new(swingLeft, swingRight, 50, sweepType, minSweepTicks, useShapeFilter, minWickToBody, minDomWickPct, maxOppWickPct, maxBodyPct, closeFilter, rbZoneMode, strengthModel, innerMaxPctOfOuter, innerMinBars, rightOffsetBars, maxBlocks, 50, mitigationMode, stopOnMitigation, deleteOnMitigation, invalidationMode, deleteOnInvalid, maxAgeBars, showBull, showBear, showStructure, structLineLenBars, maxStructLines, colOuterFill, colOuterBorder, colOuterMitFill, colOuterMitBorder, colOuterInvFill, colOuterInvBorder, colBuyFill, colBuyBorder, colSellFill, colSellBorder)
+
+// Init Manager
+var RBManager mgr = RBManager.new(cfg, array.new<Candidate>(), array.new<Block>(), array.new<StructLine>(), na, na, na, na, 0, 0, 0)
+
+// Execute
+mgr.process()

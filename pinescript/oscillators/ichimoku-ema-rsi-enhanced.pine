@@ -1,0 +1,228 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © D4V3YZ
+
+//@version=5
+strategy("Ichimoku + EMA + RSI [Enhanced]", overlay = true, 
+         default_qty_type = strategy.percent_of_equity, 
+         default_qty_value = 100, 
+         initial_capital = 10000, 
+         commission_type = strategy.commission.percent, 
+         commission_value = 0.075,
+         slippage = 2)
+
+// ══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════
+// Trend Filter
+emaLength = input.int(200, "EMA Length", minval=50, group="Trend Filter")
+
+// RSI
+rsiLength     = input.int(14, "RSI Length", group="RSI")
+rsiLongLevel  = input.int(55, "RSI Long Minimum", minval=50, group="RSI")
+rsiShortLevel = input.int(45, "RSI Short Maximum", maxval=50, group="RSI")
+
+// Ichimoku
+tenkanPeriod  = input.int(9,  "Tenkan Period", group="Ichimoku")
+kijunPeriod   = input.int(26, "Kijun Period", group="Ichimoku")
+senkouBPeriod = input.int(52, "Senkou B Period", group="Ichimoku")
+displacement  = input.int(26, "Displacement", group="Ichimoku")
+
+useChikou      = input.bool(true, "Require Chikou Confirmation", group="Ichimoku")
+useCloudFilter = input.bool(true, "Require Cloud Position", group="Ichimoku")
+
+// Risk Management
+atrLength     = input.int(14, "ATR Length", group="Risk Management")
+atrMultSL     = input.float(2.0, "ATR Stop Loss Multiplier", step=0.1, group="Risk Management")
+atrMultTP     = input.float(3.0, "ATR Take Profit Multiplier", step=0.1, group="Risk Management")
+minBarsBetween = input.int(3, "Min Bars Between Trades", minval=0, group="Risk Management")
+
+// Display
+showDashboard = input.bool(true, "Show Dashboard", group="Display")
+showSignals   = input.bool(true, "Show Entry Signals", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════
+ema200 = ta.ema(close, emaLength)
+rsi    = ta.rsi(close, rsiLength)
+atr    = ta.atr(atrLength)
+
+// Ichimoku
+donchian(len) => math.avg(ta.lowest(len), ta.highest(len))
+
+tenkan  = donchian(tenkanPeriod)
+kijun   = donchian(kijunPeriod)
+senkouA = math.avg(tenkan, kijun)
+senkouB = donchian(senkouBPeriod)
+
+cloudTop    = math.max(senkouA, senkouB)
+cloudBottom = math.min(senkouA, senkouB)
+
+// Calculate crossovers in global scope (CRITICAL FIX)
+tkBullCross = ta.crossover(tenkan, kijun)
+tkBearCross = ta.crossunder(tenkan, kijun)
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONDITIONS
+// ══════════════════════════════════════════════════════════════════════════
+bullTrend = close > ema200
+bearTrend = close < ema200
+
+aboveCloud = close > cloudTop
+belowCloud = close < cloudBottom
+
+tkBull = tenkan > kijun
+tkBear = tenkan < kijun
+
+// Corrected Chikou confirmation
+chikouBull = not useChikou or close > high[displacement]
+chikouBear = not useChikou or close < low[displacement]
+
+rsiBull = rsi > rsiLongLevel
+rsiBear = rsi < rsiShortLevel
+
+// Cooldown logic
+var int lastExitBar = 0
+if (strategy.position_size == 0 and strategy.position_size[1] != 0)
+    lastExitBar := bar_index
+
+canTrade = bar_index - lastExitBar >= minBarsBetween
+
+// Entry conditions
+longCondition  = canTrade and bullTrend and (not useCloudFilter or aboveCloud) and 
+                 tkBullCross and rsiBull and chikouBull
+                 
+shortCondition = canTrade and bearTrend and (not useCloudFilter or belowCloud) and 
+                 tkBearCross and rsiBear and chikouBear
+
+// ══════════════════════════════════════════════════════════════════════════
+// SIGNAL STRENGTH
+// ══════════════════════════════════════════════════════════════════════════
+int bullScore = 0
+bullScore += bullTrend ? 1 : 0
+bullScore += aboveCloud ? 1 : 0
+bullScore += tkBullCross ? 3 : (tkBull ? 2 : 0)
+bullScore += rsiBull ? 1 : 0
+bullScore += chikouBull ? 1 : 0
+
+int bearScore = 0
+bearScore += bearTrend ? 1 : 0
+bearScore += belowCloud ? 1 : 0
+bearScore += tkBearCross ? 3 : (tkBear ? 2 : 0)
+bearScore += rsiBear ? 1 : 0
+bearScore += chikouBear ? 1 : 0
+
+var string signalText = "NEUTRAL"
+var color signalColor = color.gray
+
+if bullScore >= 7
+    signalText := "STRONG LONG"
+    signalColor := color.new(color.green, 0)
+else if bullScore >= 4
+    signalText := "LONG"
+    signalColor := color.new(color.green, 30)
+else if bearScore >= 7
+    signalText := "STRONG SHORT"
+    signalColor := color.new(color.red, 0)
+else if bearScore >= 4
+    signalText := "SHORT"
+    signalColor := color.new(color.red, 30)
+else
+    signalText := "NEUTRAL"
+    signalColor := color.gray
+
+// ══════════════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ══════════════════════════════════════════════════════════════════════════
+atrTicksSL = (atr * atrMultSL) / syminfo.mintick
+atrTicksTP = (atr * atrMultTP) / syminfo.mintick
+
+if (longCondition)
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", "Long", 
+                  trail_points = atrTicksSL, 
+                  trail_offset = 0,
+                  loss = atrTicksSL,
+                  profit = atrTicksTP)
+
+if (shortCondition)
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", "Short", 
+                  trail_points = atrTicksSL, 
+                  trail_offset = 0,
+                  loss = atrTicksSL,
+                  profit = atrTicksTP)
+
+// Additional exit conditions - FIXED: use pre-calculated cross variables
+if (strategy.position_size > 0)
+    if (close < cloudBottom)
+        strategy.close("Long", comment="Cloud Breach")
+    else if (tkBearCross)
+        strategy.close("Long", comment="TK Bear Cross")
+
+if (strategy.position_size < 0)
+    if (close > cloudTop)
+        strategy.close("Short", comment="Cloud Breach")
+    else if (tkBullCross)
+        strategy.close("Short", comment="TK Bull Cross")
+
+// ══════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════════════════════════════════
+plot(ema200, "EMA 200", color.orange, 2)
+plot(tenkan, "Tenkan", color.blue)
+plot(kijun, "Kijun", color.red)
+
+p1 = plot(senkouA, "Senkou A", color.green, offset=displacement)
+p2 = plot(senkouB, "Senkou B", color.red, offset=displacement)
+fill(p1, p2, senkouA > senkouB ? color.new(color.green, 90) : color.new(color.red, 90))
+
+// FIXED: plotshape in global scope with conditional display
+plotshape(showSignals ? longCondition : na, "Long", 
+          shape.triangleup, location.belowbar, 
+          color.green, size=size.small)
+          
+plotshape(showSignals ? shortCondition : na, "Short", 
+          shape.triangledown, location.abovebar, 
+          color.red, size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 7, 
+                               bgcolor = color.new(color.black, 85), 
+                               border_width = 1)
+    
+    table.cell(dash, 0, 0, "Component", text_color=color.white, bgcolor=color.new(color.blue, 60))
+    table.cell(dash, 1, 0, "Status", text_color=color.white, bgcolor=color.new(color.blue, 60))
+    
+    table.cell(dash, 0, 1, "EMA Trend")
+    table.cell(dash, 1, 1, bullTrend ? "BULL" : "BEAR", 
+               text_color = bullTrend ? color.green : color.red)
+    
+    table.cell(dash, 0, 2, "Cloud")
+    table.cell(dash, 1, 2, aboveCloud ? "ABOVE" : belowCloud ? "BELOW" : "INSIDE", 
+               text_color = aboveCloud ? color.green : belowCloud ? color.red : color.yellow)
+    
+    table.cell(dash, 0, 3, "TK Cross")
+    table.cell(dash, 1, 3, tkBull ? "BULL" : "BEAR", 
+               text_color = tkBull ? color.green : color.red)
+    
+    table.cell(dash, 0, 4, "RSI")
+    table.cell(dash, 1, 4, str.tostring(rsi, "#.#"), 
+               text_color = rsiBull ? color.green : rsiBear ? color.red : color.gray)
+    
+    table.cell(dash, 0, 5, "Chikou")
+    table.cell(dash, 1, 5, chikouBull ? "BULL" : chikouBear ? "BEAR" : "—", 
+               text_color = chikouBull ? color.green : chikouBear ? color.red : color.gray)
+    
+    table.cell(dash, 0, 6, "Signal", text_halign=text.align_center)
+    table.cell(dash, 1, 6, signalText, text_color=color.white, 
+               bgcolor=signalColor, text_halign=text.align_center)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════
+alertcondition(longCondition, "Long Entry", "LONG SIGNAL")
+alertcondition(shortCondition, "Short Entry", "SHORT SIGNAL")

@@ -1,0 +1,229 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © OhRayOhRay
+
+//@version=6
+strategy("Tristan's Tri-band Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// RSI Settings
+rsi_length = input.int(14, "RSI Length", minval=1)
+rsi_oversold = input.int(30, "RSI Oversold Level", minval=0, maxval=50)
+rsi_overbought = input.int(70, "RSI Overbought Level", minval=50, maxval=100)
+
+// Bollinger Bands Settings
+bb_length = input.int(20, "BB Length", minval=1)
+bb_mult = input.float(2.0, "BB Standard Deviation", minval=0.1, step=0.1)
+
+// Williams %R Settings
+willr_length = input.int(14, "Williams %R Length", minval=1)
+
+// Visual Settings
+gradient_strength = input.int(70, "Gradient Strength (lower = more visible)", minval=0, maxval=95)
+gradient_height = input.float(0.5, "Gradient Height %", minval=0.1, maxval=2.0, step=0.1)
+show_bb = input.bool(true, "Show Bollinger Bands")
+show_rsi_gradients = input.bool(true, "Show RSI Gradients")
+show_willr_gradients = input.bool(true, "Show Williams %R Gradients")
+
+// Strategy Settings
+use_strategy_signals = input.bool(true, "Enable Strategy Entries/Exits")
+wait_for_close = input.bool(true, "Wait for Candle Close (No Repainting)", tooltip="Signals confirmed only after candle closes")
+
+// Session Settings
+trade_ny_session = input.bool(true, "Trade NY Session", group="Trading Sessions")
+trade_london_session = input.bool(true, "Trade London Session", group="Trading Sessions")
+trade_asia_session = input.bool(true, "Trade Asia Session", group="Trading Sessions")
+
+// Session Time Definitions (ALL IN EST/EDT)
+// NY: 9:30 AM - 4:00 PM EST
+ny_session_start = input.int(9, "NY Session Start Hour (EST)", minval=0, maxval=23, group="Trading Sessions", tooltip="NY: 9:30 AM - 4:00 PM EST")
+ny_session_start_min = input.int(30, "NY Session Start Minute", minval=0, maxval=59, group="Trading Sessions")
+ny_session_end = input.int(16, "NY Session End Hour (EST)", minval=0, maxval=23, group="Trading Sessions")
+ny_session_end_min = input.int(0, "NY Session End Minute", minval=0, maxval=59, group="Trading Sessions")
+
+// London: 3:00 AM - 11:30 AM EST (8:00 AM - 4:30 PM GMT)
+london_session_start = input.int(3, "London Session Start Hour (EST)", minval=0, maxval=23, group="Trading Sessions", tooltip="London: 3:00 AM - 11:30 AM EST")
+london_session_start_min = input.int(0, "London Session Start Minute", minval=0, maxval=59, group="Trading Sessions")
+london_session_end = input.int(11, "London Session End Hour (EST)", minval=0, maxval=23, group="Trading Sessions")
+london_session_end_min = input.int(30, "London Session End Minute", minval=0, maxval=59, group="Trading Sessions")
+
+// Asia/Tokyo: 7:00 PM - 1:00 AM EST (9:00 AM - 3:00 PM JST, next day)
+asia_session_start = input.int(19, "Asia Session Start Hour (EST)", minval=0, maxval=23, group="Trading Sessions", tooltip="Tokyo: 7:00 PM - 1:00 AM EST (crosses midnight)")
+asia_session_start_min = input.int(0, "Asia Session Start Minute", minval=0, maxval=59, group="Trading Sessions")
+asia_session_end = input.int(1, "Asia Session End Hour (EST)", minval=0, maxval=23, group="Trading Sessions")
+asia_session_end_min = input.int(0, "Asia Session End Minute", minval=0, maxval=59, group="Trading Sessions")
+
+// ============================================================================
+// SESSION DETECTION
+// ============================================================================
+
+// Get current hour and minute
+current_hour = hour(time, "America/New_York")
+current_minute = minute(time, "America/New_York")
+
+// Convert times to minutes for easier comparison
+current_time_minutes = current_hour * 60 + current_minute
+
+ny_start_minutes = ny_session_start * 60 + ny_session_start_min
+ny_end_minutes = ny_session_end * 60 + ny_session_end_min
+
+london_start_minutes = london_session_start * 60 + london_session_start_min
+london_end_minutes = london_session_end * 60 + london_session_end_min
+
+asia_start_minutes = asia_session_start * 60 + asia_session_start_min
+asia_end_minutes = asia_session_end * 60 + asia_session_end_min
+
+// Check if current bar is in each session (handles sessions that cross midnight)
+in_ny_session = ny_start_minutes < ny_end_minutes ? (current_time_minutes >= ny_start_minutes and current_time_minutes < ny_end_minutes) : (current_time_minutes >= ny_start_minutes or current_time_minutes < ny_end_minutes)
+
+in_london_session = london_start_minutes < london_end_minutes ? (current_time_minutes >= london_start_minutes and current_time_minutes < london_end_minutes) : (current_time_minutes >= london_start_minutes or current_time_minutes < london_end_minutes)
+
+in_asia_session = asia_start_minutes < asia_end_minutes ? (current_time_minutes >= asia_start_minutes and current_time_minutes < asia_end_minutes) : (current_time_minutes >= asia_start_minutes or current_time_minutes < asia_end_minutes)
+
+// Determine if we should trade based on session settings
+can_trade = (trade_ny_session and in_ny_session) or (trade_london_session and in_london_session) or (trade_asia_session and in_asia_session)
+
+// Visual session indicators
+show_session_bg = input.bool(false, "Show Session Background Colors", group="Trading Sessions")
+session_bg_transparency = input.int(95, "Session Background Transparency", minval=90, maxval=99, group="Trading Sessions")
+
+bgcolor(show_session_bg and in_ny_session ? color.new(color.blue, session_bg_transparency) : na, title="NY Session BG")
+bgcolor(show_session_bg and in_london_session ? color.new(color.yellow, session_bg_transparency) : na, title="London Session BG")
+bgcolor(show_session_bg and in_asia_session ? color.new(color.purple, session_bg_transparency) : na, title="Asia Session BG")
+
+// ============================================================================
+// INDICATOR CALCULATIONS
+// ============================================================================
+
+// RSI Calculation
+rsi = ta.rsi(close, rsi_length)
+rsi_is_oversold = rsi <= rsi_oversold
+rsi_is_overbought = rsi >= rsi_overbought
+
+// Bollinger Bands Calculation
+bb_basis = ta.sma(close, bb_length)
+bb_dev = bb_mult * ta.stdev(close, bb_length)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+
+// Williams %R Calculation
+willr = ta.wpr(willr_length)
+willr_is_overbought = willr >= -20 and willr <= 0
+willr_is_oversold = willr >= -100 and willr <= -80
+
+// ============================================================================
+// VISUAL OVERLAYS
+// ============================================================================
+
+// Bollinger Bands
+bb_upper_plot = plot(show_bb ? bb_upper : na, "BB Upper", color=color.new(color.blue, 50), linewidth=2)
+bb_lower_plot = plot(show_bb ? bb_lower : na, "BB Lower", color=color.new(color.blue, 50), linewidth=2)
+bb_basis_plot = plot(show_bb ? bb_basis : na, "BB Basis", color=color.new(color.gray, 50), linewidth=1)
+
+// BB band fill
+fill(bb_upper_plot, bb_lower_plot, color=color.new(color.blue, 95), title="BB Fill")
+
+// Calculate price range for gradient sizing
+price_range = high - low
+gradient_offset = price_range * gradient_height / 100
+
+// RSI OVERSOLD - Green gradient BELOW candles (bullish)
+rsi_oversold_top = show_rsi_gradients and rsi_is_oversold ? low : na
+rsi_oversold_bottom = show_rsi_gradients and rsi_is_oversold ? low - gradient_offset : na
+
+rsi_oversold_plot_top = plot(rsi_oversold_top, display=display.none, editable=false)
+rsi_oversold_plot_bottom = plot(rsi_oversold_bottom, display=display.none, editable=false)
+fill(rsi_oversold_plot_top, rsi_oversold_plot_bottom, color=show_rsi_gradients and rsi_is_oversold ? color.new(color.green, gradient_strength) : na, title="RSI Oversold (Bullish)")
+
+// RSI OVERBOUGHT - Red gradient ABOVE candles (bearish)
+rsi_overbought_bottom = show_rsi_gradients and rsi_is_overbought ? high : na
+rsi_overbought_top = show_rsi_gradients and rsi_is_overbought ? high + gradient_offset : na
+
+rsi_overbought_plot_bottom = plot(rsi_overbought_bottom, display=display.none, editable=false)
+rsi_overbought_plot_top = plot(rsi_overbought_top, display=display.none, editable=false)
+fill(rsi_overbought_plot_bottom, rsi_overbought_plot_top, color=show_rsi_gradients and rsi_is_overbought ? color.new(color.red, gradient_strength) : na, title="RSI Overbought (Bearish)")
+
+// WILLIAMS %R OVERSOLD - Green gradient BELOW candles (bullish, -80 to -100)
+willr_oversold_top = show_willr_gradients and willr_is_oversold ? low : na
+willr_oversold_bottom = show_willr_gradients and willr_is_oversold ? low - gradient_offset : na
+
+willr_oversold_plot_top = plot(willr_oversold_top, display=display.none, editable=false)
+willr_oversold_plot_bottom = plot(willr_oversold_bottom, display=display.none, editable=false)
+fill(willr_oversold_plot_top, willr_oversold_plot_bottom, color=show_willr_gradients and willr_is_oversold ? color.new(color.lime, gradient_strength) : na, title="WillR Oversold (Bullish)")
+
+// WILLIAMS %R OVERBOUGHT - Red gradient ABOVE candles (bearish, 0 to -20)
+willr_overbought_bottom = show_willr_gradients and willr_is_overbought ? high : na
+willr_overbought_top = show_willr_gradients and willr_is_overbought ? high + gradient_offset : na
+
+willr_overbought_plot_bottom = plot(willr_overbought_bottom, display=display.none, editable=false)
+willr_overbought_plot_top = plot(willr_overbought_top, display=display.none, editable=false)
+fill(willr_overbought_plot_bottom, willr_overbought_plot_top, color=show_willr_gradients and willr_is_overbought ? color.new(color.orange, gradient_strength) : na, title="WillR Overbought (Bearish)")
+
+// Background coloring for additional visual emphasis
+bgcolor(show_rsi_gradients and rsi_is_oversold ? color.new(color.green, 95) : na, title="RSI Oversold BG")
+bgcolor(show_rsi_gradients and rsi_is_overbought ? color.new(color.red, 95) : na, title="RSI Overbought BG")
+bgcolor(show_willr_gradients and willr_is_oversold ? color.new(color.lime, 97) : na, title="WillR Oversold BG")
+bgcolor(show_willr_gradients and willr_is_overbought ? color.new(color.orange, 97) : na, title="WillR Overbought BG")
+
+// ============================================================================
+// STRATEGY LOGIC WITH CONFIRMED SIGNALS
+// ============================================================================
+
+// Entry Conditions - evaluated on PREVIOUS candle close
+long_condition_raw = rsi_is_oversold and willr_is_oversold and close < bb_lower and can_trade
+short_condition_raw = rsi_is_overbought and willr_is_overbought and close > bb_upper and can_trade
+
+// Confirmed conditions (only trigger after candle close)
+var bool long_signal_confirmed = false
+var bool short_signal_confirmed = false
+
+if wait_for_close
+    // Check conditions on the CLOSED candle (previous bar)
+    if barstate.isconfirmed
+        long_signal_confirmed := long_condition_raw
+        short_signal_confirmed := short_condition_raw
+    else
+        long_signal_confirmed := false
+        short_signal_confirmed := false
+else
+    // Real-time signals (can repaint)
+    long_signal_confirmed := long_condition_raw
+    short_signal_confirmed := short_condition_raw
+
+// Exit Conditions
+long_exit = close >= bb_upper or rsi >= rsi_overbought
+short_exit = close <= bb_lower or rsi <= rsi_oversold
+
+// Execute Strategy - enters on the NEXT bar after signal confirmation
+if use_strategy_signals
+    // Enter on next bar open after confirmed signal
+    if long_signal_confirmed[1]
+        strategy.entry("Long", strategy.long)
+    
+    if short_signal_confirmed[1]
+        strategy.entry("Short", strategy.short)
+    
+    if long_exit
+        strategy.close("Long", comment="Long Exit")
+    
+    if short_exit
+        strategy.close("Short", comment="Short Exit")
+
+// ============================================================================
+// SIGNAL LABELS (Shows on the bar AFTER confirmation)
+// ============================================================================
+
+// Plot buy/sell signals on chart - appears on the bar AFTER the signal is confirmed
+plotshape(use_strategy_signals and long_signal_confirmed[1], "Buy Signal", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.small)
+plotshape(use_strategy_signals and short_signal_confirmed[1], "Sell Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(long_signal_confirmed[1], "Long Entry Signal", "RSI + WillR Oversold + Below BB Lower - CONFIRMED")
+alertcondition(short_signal_confirmed[1], "Short Entry Signal", "RSI + WillR Overbought + Above BB Upper - CONFIRMED")
+alertcondition(long_exit, "Long Exit Signal", "Price at BB Upper or RSI Overbought")
+alertcondition(short_exit, "Short Exit Signal", "Price at BB Lower or RSI Oversold")

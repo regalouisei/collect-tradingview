@@ -1,0 +1,159 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © [MarkitTick]
+
+//@version=6
+indicator(title="Accumulative Swing Cloud [MarkitTick]", overlay=false, format=format.price, precision=2)
+
+// -----------------------------------------------------------------------------
+// 1. Types & Structure Definitions
+// -----------------------------------------------------------------------------
+
+type ASIState
+    float cumulativeValue
+
+// -----------------------------------------------------------------------------
+// 2. Methods & Functions
+// -----------------------------------------------------------------------------
+
+get_ma(float src, int len, string type) =>
+    float smaVal = ta.sma(src, len)
+    float emaVal = ta.ema(src, len)
+    float rmaVal = ta.rma(src, len)
+    float wmaVal = ta.wma(src, len)
+    
+    float result = switch type
+        "SMA" => smaVal
+        "EMA" => emaVal
+        "RMA" => rmaVal
+        "WMA" => wmaVal
+        => emaVal
+    result
+
+method update(ASIState self, float limit, float k_mult, float h, float l, float c, float o, float c_prev, float o_prev, bool useVol, float vol, float volAvg) =>
+    float absHighClose = math.abs(h - c_prev)
+    float absLowClose  = math.abs(l - c_prev)
+    float absCloseOpen = math.abs(c_prev - o_prev)
+    float rangeHighLow = h - l
+    
+    float k = absHighClose >= absLowClose ? absHighClose : absLowClose
+    
+    float r = 0.0
+    if absHighClose >= absLowClose
+        if absHighClose >= rangeHighLow
+            r := absHighClose - 0.5 * absLowClose + 0.25 * absCloseOpen
+        else
+            r := rangeHighLow + 0.25 * absCloseOpen
+    else
+        if absLowClose >= rangeHighLow
+            r := absLowClose - 0.5 * absHighClose + 0.25 * absCloseOpen
+        else
+            r := rangeHighLow + 0.25 * absCloseOpen
+
+    if r != 0 and limit > 0
+        float num = (c - c_prev) + 0.50 * (c - o) + 0.25 * (c_prev - o_prev)
+        float si  = 50 * (num / r) * (k / limit)
+        
+        float volFactor = 1.0
+        if useVol and not na(vol) and not na(volAvg) and volAvg > 0
+            volFactor := vol / volAvg
+            volFactor := math.min(volFactor, 3.0) 
+            
+        self.cumulativeValue := self.cumulativeValue + (si * volFactor)
+    
+    self.cumulativeValue * k_mult
+
+// -----------------------------------------------------------------------------
+// 3. Inputs
+// -----------------------------------------------------------------------------
+
+grp_core = "ASI Core Engine"
+float in_dailyLimit = input.float(10000.0, "Daily Limit (T)", minval=1.0, group=grp_core)
+float in_multiplier = input.float(100.0, "Multiplier", minval=1.0, group=grp_core)
+int   in_asiLength  = input.int(20, "Signal Period", minval=1, group=grp_core)
+
+grp_vol = "Volume Integration"
+bool  in_useVol     = input.bool(false, "Weight ASI by Volume?", group=grp_vol)
+int   in_volLen     = input.int(20, "Volume Avg Length", minval=1, group=grp_vol)
+
+grp_cld = "Cloud Dynamics"
+string in_maType    = input.string("EMA", "Cloud MA Type", options=["EMA", "SMA", "RMA", "WMA"], group=grp_cld)
+int    in_emaFast   = input.int(5, "Fast Length", minval=1, group=grp_cld)
+int    in_emaMid    = input.int(10, "Mid Length", minval=1, group=grp_cld)
+int    in_emaSlow   = input.int(20, "Slow Length", minval=1, group=grp_cld)
+
+grp_vis = "Visual Enhancements"
+bool   in_cloudOnly = input.bool(false, "Show Cloud Only (Hide Lines)", group=grp_vis)
+bool   in_colBar    = input.bool(true, "Color Candles by Cloud Width", group=grp_vis)
+color  col_bull     = input.color(color.new(#00E676, 0), "Bullish Color", group=grp_vis)
+color  col_bear     = input.color(color.new(#FF5252, 0), "Bearish Color", group=grp_vis)
+
+// -----------------------------------------------------------------------------
+// 4. Execution Logic
+// -----------------------------------------------------------------------------
+
+var ASIState asiEngine = ASIState.new(0.0)
+float vAvg = ta.sma(volume, in_volLen)
+
+float currentASI = asiEngine.update(in_dailyLimit, in_multiplier, high, low, close, open, nz(close[1]), nz(open[1]), in_useVol, volume, vAvg)
+
+float signalLine = ta.sma(currentASI, in_asiLength)
+float maFast = get_ma(currentASI, in_emaFast, in_maType)
+float maMid  = get_ma(currentASI, in_emaMid, in_maType)
+float maSlow = get_ma(currentASI, in_emaSlow, in_maType)
+
+bool isBullishCloud = maFast > maSlow
+bool isBullishSignal = currentASI > signalLine
+
+// -----------------------------------------------------------------------------
+// 5. Dynamic Gradient Logic 
+// -----------------------------------------------------------------------------
+
+float cloudWidth = math.abs(maFast - maSlow)
+
+float maxWidth = ta.highest(cloudWidth, 100)
+maxWidth := maxWidth == 0 ? 1 : maxWidth
+
+color c_bull_weak = color.new(col_bull, 90)
+color c_bull_str  = color.new(col_bull, 10)
+color c_bear_weak = color.new(col_bear, 90)
+color c_bear_str  = color.new(col_bear, 10)
+
+color dynamicBull = color.from_gradient(cloudWidth, 0, maxWidth, c_bull_weak, c_bull_str)
+color dynamicBear = color.from_gradient(cloudWidth, 0, maxWidth, c_bear_weak, c_bear_str)
+
+color finalDynamicColor = isBullishCloud ? dynamicBull : dynamicBear
+
+// -----------------------------------------------------------------------------
+// 6. Visualization
+// -----------------------------------------------------------------------------
+
+pFast = plot(maFast, "Cloud Fast", color=color.new(col_bull, 100))
+pSlow = plot(maSlow, "Cloud Slow", color=color.new(col_bear, 100))
+
+fill(pFast, pSlow, color=finalDynamicColor, title="Cloud Fill")
+
+color asiLineColor = isBullishSignal ? col_bull : col_bear
+plot(in_cloudOnly ? na : currentASI, "ASI Line", color=asiLineColor, linewidth=2)
+
+plot(in_cloudOnly ? na : signalLine, "Signal Line", color=color.new(color.gray, 0), linewidth=2)
+
+barcolor(in_colBar ? finalDynamicColor : na)
+
+// -----------------------------------------------------------------------------
+// 7. Alerts
+// -----------------------------------------------------------------------------
+
+bool alertBull = ta.crossover(currentASI, signalLine)
+bool alertBear = ta.crossunder(currentASI, signalLine)
+
+if alertBull
+    string json = '{"action": "buy", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "asi_value": ' + str.tostring(currentASI) + '}'
+    alert(json, alert.freq_once_per_bar_close)
+
+if alertBear
+    string json = '{"action": "sell", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "asi_value": ' + str.tostring(currentASI) + '}'
+    alert(json, alert.freq_once_per_bar_close)
+
+alertcondition(alertBull, "ASI Buy Signal", "Green Cloud / Crossover Detected")
+alertcondition(alertBear, "ASI Sell Signal", "Red Cloud / Crossunder Detected")

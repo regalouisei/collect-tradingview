@@ -1,0 +1,280 @@
+//@version=6
+strategy("Simple RSI-RS Strategy", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, pyramiding=5, process_orders_on_close=true)
+// ============================================================================
+// INPUTS
+// ============================================================================
+// RSI
+rsiLen = input.int(30, "RSI Length")
+rsiSrc = input(close, "Source")
+// RS
+indexSymbol = input.symbol("NSE:NIFTY", "Index Symbol")
+rsLen = input.int(30, "RS Length")
+rsiSafeMargin = input.int(5, "RSI support Buffer", minval=0, maxval=10, tooltip="If Weakness (RSI < 60) happens but RSI is within this buffer of 50 (e.g. 50-55), we WAIT. We assume it might bounce off 50.")
+confirmationWindow = input.int(2, "Confirmation Window (Bars)", minval=1, tooltip="Bars valid to break Alert High")
+useIndexFilter = input.bool(true, "Filter: Only Entry if Index > EMA?", tooltip="If checked, we only buy when Nifty is above its 200 EMA (Bull Market).")
+indexEmaLen = input.int(200, "Index EMA Length")
+// --- Risk Management ---
+maxInitialSlPct = input.float(10.0, "Max Initial SL %", minval=1.0, maxval=20.0, step=0.5, tooltip="Skip entry if initial stop loss is more than this % from entry price. Prevents high-risk trades.")
+slCrashPct = input.float(3.0, "Crash Buffer % (Wick Protection)", minval=0.0, step=0.1, tooltip="Price must drop this much BELOW the SL line to trigger immediate exit. Otherwise waits for Close.")
+profitRsiWLevel = input.int(80, "Profit: Weekly RSI Limit")
+profitLookback = input.int(3, "Profit: Break Low of X Days")
+// --- Visuals ---
+showSetupLabels = input.bool(false, "Show Setup Labels (Gray Triangles)")
+showSLUpdateLabels = input.bool(true, "Show SL Update Labels (Orange Diamonds)")
+showDebug = input.bool(false, "Show Debug Labels (Why entry missed?)")
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+// --- RSI ---
+calc_rsi(src) => ta.rsi(src, rsiLen)
+// Request MTF RSI
+// "0" = Current candle on that timeframe
+// "1" = Previous candle
+rsiD = request.security(syminfo.tickerid, "1D", calc_rsi(rsiSrc), lookahead=barmerge.lookahead_on)
+rsiW = request.security(syminfo.tickerid, "1W", calc_rsi(rsiSrc), lookahead=barmerge.lookahead_on)
+rsiM = request.security(syminfo.tickerid, "1M", calc_rsi(rsiSrc), lookahead=barmerge.lookahead_on)
+// Note: For strategy execution on "Close", we look at the values AS they close.
+// On Daily chart, rsiD is the current closing RSI.
+// --- Relative Strength (Mansfield-style ratio) ---
+calc_rs(sym, bench, len) =>
+    s = request.security(sym, "1D", close)
+    b = request.security(bench, "1D", close)
+    // Simple relative ratio change over period
+    s_ret = s / s[len]
+    b_ret = b / b[len]
+    (s_ret / b_ret) - 1
+    (s_ret / b_ret) - 1
+rsD = calc_rs(syminfo.tickerid, indexSymbol, rsLen)
+// --- Market Filter (Index > 200 EMA) ---
+getIndexFilterState() =>
+    if useIndexFilter
+        idxClose = request.security(indexSymbol, "1D", close)
+        idxEma = request.security(indexSymbol, "1D", ta.ema(close, indexEmaLen))
+        idxClose > idxEma
+    else
+        true
+isMarketBullish = getIndexFilterState()
+// ============================================================================
+// STRATEGY LOGIC
+// ============================================================================
+// --- ENTRY LOGIC ---
+// Condition 1: Daily Breakout (Daily Crosses 60, Week > 60)
+triggerDaily = ta.crossover(rsiD, 60) and rsiW > 60
+// Condition 2: Weekly Catch-up (Weekly Crosses 60, Daily > 60)
+triggerWeekly = ta.crossover(rsiW, 60) and rsiD > 60
+// Combined Trigger: Either happens while (M>60 or NA) and RS>0 ... AND Market is Bullish
+// If Monthly RSI is na (new listing), we skip the check
+entrySetupCondition = isMarketBullish and (na(rsiM) or rsiM > 60) and (triggerDaily or triggerWeekly) and rsD > 0
+// State Machine for Entry
+var bool isAlertCandle = false
+var float alertHigh = na
+var float alertLow = na  // Store initial SL
+var int barsSinceAlert = 0
+// Strategy State Variables (must be declared before use)
+var float stopLossPrice = na
+var bool isPartialExitTaken = false
+var bool isPyramidTaken = false
+// 1. Identify Alert Candle
+if entrySetupCondition
+    isAlertCandle := true
+    alertHigh := high
+    alertLow := low
+    barsSinceAlert := 0
+// 2. Count Bars & Check Breakout
+entryTrigger = false
+if isAlertCandle and not entrySetupCondition // If new setup coincides, it resets logic above
+    barsSinceAlert += 1
+    // "following 2 candle if break alert candle"
+    // "following 2 candle if break alert candle"
+    if barsSinceAlert <= confirmationWindow
+        // Entry allowed if:
+        // 1. We are Flat (New Trade) -- OR --
+        // 2. We have Taken Partial Profit AND haven't Pyramided yet (Scale In)
+        canEntry = strategy.position_size == 0 or (isPartialExitTaken and not isPyramidTaken)
+        
+        // Risk Filter: Check if initial SL is within acceptable range
+        // Initial SL will be alertLow, entry is at current high
+        // Calculate risk percentage: (Entry - SL) / Entry * 100
+        initialSlPct = ((high - alertLow) / high) * 100
+        riskAcceptable = initialSlPct <= maxInitialSlPct
+        
+        if high > alertHigh and canEntry and riskAcceptable
+            entryTrigger := true
+            isAlertCandle := false // Consumed
+            barsSinceAlert := 0
+        else if high > alertHigh and canEntry and not riskAcceptable
+            // Breakout happened but risk too high - cancel alert
+            isAlertCandle := false
+            barsSinceAlert := 0
+    else
+        // Expired
+        isAlertCandle := false
+        barsSinceAlert := 0
+// --- EXIT LOGIC (Trailing Stop) ---
+// 1. Hard Breakdown: RSI < 50 (Always exits regardless of RS)
+// 2. Weakness: RSI < 60 AND RS < 0
+//    
+// OPTION 3 PROTECTION: When "Near Support" (RSI between 50 and 50+buffer),
+// we COMPLETELY IGNORE the RS check. Only exit on hard breakdown (RSI < 50).
+// This allows the stock to consolidate at support even if underperforming the index.
+isNearSupport = (rsiD >= 50) and (rsiD <= 50 + rsiSafeMargin)
+// Weakness exits ONLY trigger when NOT near support
+// When near support (50-55 default), RS is completely ignored
+triggerWeakness = not isNearSupport and (rsiD < 60 and rsD < 0)
+// Exit Setup: Hard breakdown OR weakness (but weakness disabled near support)
+exitSetupCondition = (rsiD < 50) or triggerWeakness
+// If this happens, the LOW of this candle becomes the new Stop Loss.
+// Update SL on Weakness (Only move up)
+bool slUpdated = false
+if strategy.position_size > 0 and exitSetupCondition
+    // If we have an existing SL, we raise it. If it's the first weakness, we set it.
+    newSL = low
+    // Determine if we should update:
+    if na(stopLossPrice) or newSL > stopLossPrice
+        stopLossPrice := newSL
+        slUpdated := true
+// ============================================================================
+// EXECUTION
+// ============================================================================
+// Entry Execution
+if entryTrigger
+    bool isPyramidEntry = strategy.position_size > 0
+    strategy.entry("Long", strategy.long, comment=isPyramidEntry ? "Pyramid" : "Breakout")
+    
+    // Manage Flags
+    if isPyramidEntry
+        isPyramidTaken := true
+        isPartialExitTaken := false // Reset this so we can potentially book profit again on the larger position
+    else
+        isPyramidTaken := false
+        isPartialExitTaken := false
+    
+    // Initialize SL to the Entry Candle's Low (or Alert Candle Low?)
+    // If flat, set straight. If pyramiding, ensure we don't LOWER the SL.
+    if strategy.position_size == 0 or na(stopLossPrice)
+        stopLossPrice := alertLow
+    else
+        stopLossPrice := math.max(stopLossPrice, alertLow) 
+// Exit Execution (Hybrid Stop Loss)
+if strategy.position_size > 0 and not na(stopLossPrice)
+    // 1. Crash Protection (Intraday Limit)
+    // If trade drops massive amount (e.g. 3%) below our line, get out immediately.
+    crashLevel = stopLossPrice * (1 - slCrashPct / 100)
+    strategy.exit("Crash Exit", "Long", stop=crashLevel, comment="Crash SL")
+    
+    // 1.5 Partial Profit Taking (Weekly Overbought + Momentum Break)
+    // "If Weekly RSI near 80 and break 3 day low"
+    
+    // Logic: Trend is Hot (W>80) + Short Term Support Broken (Close < 3 Day Low)
+    low3Day = ta.lowest(low[1], profitLookback)
+    isOverbought = rsiW >= profitRsiWLevel
+    breakdown = close < low3Day
+    
+    if isOverbought and breakdown and not isPartialExitTaken
+        strategy.close("Long", qty_percent=50, comment="Book 50%")
+        isPartialExitTaken := true
+        
+    // 2. Standard SL (Confirmation Basis)
+    // If closes below SL, we DON'T exit immediately. We set a STOP at the Low of that candle.
+    // If next candle breaks that Low, THEN we exit. "Swing Failure" logic.
+    var float confirmLow = na
+    
+    // Recovery: If we were pending exit but price closed back above SL, Cancel!
+    if not na(confirmLow) and close > stopLossPrice
+        confirmLow := na
+        strategy.cancel("SL Confirm")
+    // Breakdown: If we close below SL (and not already confirmed), mark the Low
+    if close < stopLossPrice and na(confirmLow)
+        confirmLow := low
+    
+    // Execution: If pending, maintain the STOP order at the Breakdown Low
+    if not na(confirmLow)
+        strategy.exit("SL Confirm", "Long", stop=confirmLow, comment="Confirmed SL")
+    // Reset on flat (just in case)
+    if strategy.position_size == 0
+        confirmLow := na
+        isPyramidTaken := false
+        isPartialExitTaken := false
+// ============================================================================
+// VISUALS
+// ============================================================================
+// Entry Setup Signal
+// Entry Setup Signal
+if showSetupLabels and entrySetupCondition
+    tripPrice = str.tostring(high)
+    slPrice = str.tostring(low)
+    label.new(bar_index, low, "Watch\n>" + tripPrice + "\nSL " + slPrice, 
+              style=label.style_label_up, 
+              color=color.new(color.white, 100), 
+              textcolor=color.gray, 
+              size=size.small)
+var float entryPrice = na
+// Entry Trigger Signal
+if entryTrigger
+    entryPrice := close
+    stopLossPct = str.tostring(math.round(((close - stopLossPrice)/close)*100, 1))
+    label.new(bar_index, low, "🚀 ENTRY\nSL -" + stopLossPct + "%", 
+              style=label.style_label_up, 
+              color=color.new(color.white, 100), 
+              textcolor=color.green, 
+              size=size.small)
+// Exit Trigger (Happens automatically via strategy.exit when Price hits SL)
+// We need to detect if strategy.exit triggered?
+// Actually simpler: we just plot the label if we WENT FLAT this bar from being long.
+// Or we can verify if low < stopLossPrice
+exitTrigger = strategy.position_size[1] > 0 and strategy.position_size == 0
+if exitTrigger
+    // Calculate P/L
+    // Actual exit price is stopLossPrice (unless gap down)
+    realExit = open < stopLossPrice ? open : stopLossPrice
+    // Verify if it was a crash exit or close exit?
+    // Simplified P/L logic for labels
+    if close < stopLossPrice 
+        realExit := close // It was a closing exit
+    else
+        // likely a crash exit or manual exit
+        realExit := low // conservative estimate
+        
+    profitLoss = ((realExit - entryPrice) / entryPrice) * 100
+    profitLossText = (profitLoss >= 0 ? "+" : "") + str.tostring(math.round(profitLoss, 2)) + "%"
+    
+    label.new(bar_index, high, "🚨 EXIT\nP/L: " + profitLossText, 
+              style=label.style_label_down, 
+              color=color.new(color.white, 100), 
+              textcolor=profitLoss >= 0 ? color.green : color.red, 
+              size=size.small)
+    entryPrice := na // Reset
+// Exit Setup Signal (New SL)
+// Only show if NOT triggering exit on same bar
+// Exit Setup Signal (New SL)
+// Only show if SL was ACTUALLY updated this bar
+// Exit Setup Signal (New SL)
+// Only show if SL was ACTUALLY updated this bar
+if showSLUpdateLabels and slUpdated
+    // Show RSI value to prove why it updated
+    label.new(bar_index, low, "SL↑\n" + str.tostring(math.round(rsiD, 0)), 
+              style=label.style_label_up, 
+              color=color.new(color.white, 100), 
+              textcolor=color.orange, 
+              size=size.small)
+// ============================================================================
+// DEBUG PLOTS
+// ============================================================================
+// Helps user see WHY an entry didn't happen
+plotshape(showDebug and rsiM>60, title="Debug M", style=shape.circle, location=location.bottom, color=color.green, size=size.tiny)
+plotshape(showDebug and (rsiW>60 or ta.crossover(rsiW, 60)), title="Debug W", style=shape.circle, location=location.bottom, color=color.lime, size=size.tiny)
+plotshape(showDebug and rsD>0, title="Debug RS", style=shape.circle, location=location.bottom, color=color.blue, size=size.tiny)
+plotshape(showDebug and (ta.crossover(rsiD, 60) or ta.crossover(rsiW, 60)), title="Debug Cross", style=shape.cross, location=location.bottom, color=color.white, size=size.small)
+// Plot Stop Loss
+plot(strategy.position_size > 0 ? stopLossPrice : na, "Stop Loss", color=color.red, style=plot.style_linebr)
+// Plot Crash Limit
+crashLevelGlobal = strategy.position_size > 0 and not na(stopLossPrice) ? stopLossPrice * (1 - slCrashPct / 100) : na
+plot(crashLevelGlobal, "Crash Limit", color=color.new(color.maroon, 30), style=plot.style_circles)
+// Highlight Alert Candle Range
+// We draw a line for the High of the Alert Candle while it's valid
+var line alertLine = na
+if entrySetupCondition
+    line.delete(alertLine)
+    alertLine := line.new(bar_index, high, bar_index+2, high, color=color.new(color.blue, 50), style=line.style_dashed)
+// Highlight Position
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 80) : na)

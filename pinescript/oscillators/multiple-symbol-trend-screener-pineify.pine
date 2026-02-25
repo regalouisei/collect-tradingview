@@ -1,0 +1,1193 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Pineify
+
+//======================================================================//
+//                    ____  _            _  __                          //
+//                   |  _ \(_)_ __   ___(_)/ _|_   _                    //
+//                   | |_) | | '_ \ / _ \ | |_| | | |                   //
+//                   |  __/| | | | |  __/ |  _| |_| |                   //
+//                   |_|   |_|_| |_|\___|_|_|  \__, |                   //
+//                                             |___/                    //
+//======================================================================//
+
+//@version=6
+indicator(title="Multiple Symbol Trend Screener [Pineify]", overlay=true)
+
+//#region —————————————————————————————————————————————————— Custom Code
+
+//#endregion ————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Common Dependence
+
+p_ta_Var_Func(src, length) =>
+    valpha = 2 / (length + 1)
+    vud1 = src > src[1] ? src - src[1] : 0
+    vdd1 = src < src[1] ? src[1] - src : 0
+    vUD = math.sum(vud1, 9)
+    vDD = math.sum(vdd1, 9)
+    vCMO = nz((vUD - vDD) / (vUD + vDD))
+    VAR = 0.0
+    VAR := nz(valpha * math.abs(vCMO) * src) + (1 - valpha * math.abs(vCMO)) * nz(VAR[1])
+    VAR
+p_ta_Wwma_Func(src, length) =>
+    wwalpha = 1 / length
+    WWMA = 0.0
+    WWMA := wwalpha * src + (1 - wwalpha) * nz(WWMA[1])
+    WWMA
+p_ta_Zlema_Func(src, length) =>
+    zxLag = length / 2 == math.round(length / 2) ? length / 2 : (length - 1) / 2
+    zxEMAData = src + src - src[zxLag]
+    ZLEMA = ta.ema(zxEMAData, length)
+    ZLEMA
+p_ta_Tsf_Func(src, length) =>
+    lrc = ta.linreg(src, length, 0)
+    lrc1 = ta.linreg(src, length, 1)
+    lrs = lrc - lrc1
+    TSF = ta.linreg(src, length, 0) + lrs
+    TSF
+p_ta_ma(series float source, simple int length, simple string ma_type) =>
+    switch ma_type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "RMA" => ta.rma(source, length)
+        "HMA" => ta.hma(source, length)
+        "WMA" => ta.wma(source, length)
+        "TMA" => ta.sma(ta.sma(source, math.ceil(length / 2)), math.floor(length / 2) + 1)
+        "VAR" => p_ta_Var_Func(source, length)
+        "WWMA" => p_ta_Wwma_Func(source, length)
+        "ZLEMA" => p_ta_Zlema_Func(source, length)
+        "TSF" => p_ta_Tsf_Func(source, length)
+        "VWMA" => ta.vwma(source, length)
+
+
+p_comm_get_display_symbol(string symbol, bool show_prefix) =>
+    string result = symbol == "" ? (syminfo.prefix + ":" + syminfo.ticker) : symbol
+    has_separator = str.contains(result, ':')
+    if not show_prefix and has_separator
+        symbol_values = str.split(result, ':')
+        result := symbol_values.get(1)
+    result
+
+
+p_comm_get_display_tf(string tf) =>
+    // Normalize input
+    s  = str.trim(tf)
+    su = str.upper(s)
+
+    // Explicit token sets (seconds & D/W/M)
+    isSecondToken = su == "1S"  or su == "5S"  or su == "10S" or su == "15S" or su == "20S" or su == "30S" or su == "45S"
+    isDWMToken    = su == "1D"  or su == "1W"  or su == "1M"  or su == "3M"  or su == "6M"  or su == "12M"
+
+    // Numeric (minutes) detection
+    numRaw = str.tonumber(su)
+    isNum  = not na(numRaw)
+    n      = isNum ? int(numRaw) : 0
+
+    // Compose result
+    result = su == "" ? "" : isSecondToken ? str.lower(su) : isDWMToken ? su : isNum ? ((n >= 60 and n % 60 == 0 and n <= 24*60) ? (str.tostring(int(n / 60)) + "h") : (str.tostring(n) + "m")) : s
+
+    ' · ' + result
+
+p_comm_get_price_format(float price) =>
+    price_str = str.tostring(price)
+    str_array = str.split(price_str, '.')
+    str_size = str_array.size()
+    if str_size == 1
+        '#'
+    else
+        format_str = array.get(str_array, 1)
+        format_str_size = str.length(format_str)
+        switch format_str_size
+            1 => '#.#'
+            2 => '#.##'
+            3 => '#.###'
+            4 => '#.####'
+            5 => '#.#####'
+            6 => '#.######'
+            7 => '#.#######'
+            8 => '#.########'
+            9 => '#.#########'
+            10 => '#.##########'
+            => '#.###############'
+
+p_comm_get_is_enabled_value(bool is_enabled) =>
+    if is_enabled
+        1
+    else
+        0
+
+// Common ta (Only Screener)
+p_ta_atr(simple int length, simple string ma_type) =>
+    p_ta_ma(ta.tr(true), length, ma_type)
+
+p_ta_bb_standard(simple int length, simple string ma_type, series float source, series float mult) =>
+    basis = p_ta_ma(source, length, ma_type)
+    dev = mult * ta.stdev(source, length)
+    upper = basis + dev
+    lower = basis - dev
+    bbr = (source - lower)/(upper - lower)
+    bbw = (upper-lower)/basis
+    [basis, upper, lower]
+
+p_ta_stoch(simple int k_length, simple int k_smoothing, simple int d_smoothing) =>
+    k = ta.sma(ta.stoch(close, high, low, k_length), k_smoothing)
+    d = ta.sma(k, d_smoothing)
+    [k, d]
+
+p_ta_smaroc(roclen, smalen) => ta.sma(ta.roc(close, roclen), smalen)
+
+p_ta_get2PoleSSF(series float src, simple int length) =>
+    PI = 2 * math.asin(1)
+    arg = math.sqrt(2) * PI / length
+    a1 = math.exp(-arg)
+    b1 = 2 * a1 * math.cos(arg)
+    c2 = b1
+    c3 = -math.pow(a1, 2)
+    c1 = 1 - c2 - c3
+    ssf = 0.0
+    ssf := c1 * src + c2 * nz(ssf[1]) + c3 * nz(ssf[2])
+    ssf
+
+p_ta_ehlers_super_smoother(series float source, simple int lower) =>
+    PI=3.14159265359
+    a1 = math.exp(-PI * math.sqrt(2) / lower)
+    coeff2 = 2 * a1 * math.cos(math.sqrt(2) * PI / lower)
+    coeff3 = -math.pow(a1, 2)
+    coeff1 = (1 - coeff2 - coeff3) / 2
+    filt = 0.0
+    filt := nz(coeff1 * (source + nz(source[1], source)) + coeff2 * filt[1] + coeff3 * nz(filt[2], filt[1]), source)
+
+p_ta_xema(series float source, simple int length) =>
+    mult = 2.0 / (length + 1.0)
+    res = float(na)
+    res := mult * source + (1.0 - mult) * nz(res[1], source)
+
+p_ta_ehlers_ema_smoother(series float source, simple int smoothK = 3, simple int smoothP = 3) =>
+    p_ta_ehlers_super_smoother(p_ta_xema(source, smoothK), smoothP)
+
+
+//#endregion —————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Ta Dependence
+
+
+//#endregion —————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Constants
+
+// Input Groups
+string P_GP_1      =      "Symbol & Timeframe"
+string P_GP_2      =      "MA Dist%"
+string P_GP_3      =      "Supertrend"
+string P_GP_4      =      "PSAR"
+string P_GP_5      =      "ADX"
+string P_GP_6      =      "keltner channel"
+string P_GP_7      =      "Aroon"
+string P_GP_8      =      "BBTrend"
+
+//#endregion —————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Inputs
+
+// Symbol & Timeframe
+string p_inp_1      =      input.symbol(defval="QQQ", title="Symbol 1", group=P_GP_1)
+string p_inp_2      =      input.symbol(defval="SPY", title="Symbol 2", group=P_GP_1)
+string p_inp_3      =      input.symbol(defval="NVDA", title="Symbol 3", group=P_GP_1)
+string p_inp_4      =      input.symbol(defval="MSFT", title="Symbol 4", group=P_GP_1)
+string p_inp_5      =      input.symbol(defval="AAPL", title="Symbol 5", group=P_GP_1)
+string p_inp_6      =      input.symbol(defval="GOOG", title="Symbol 6", group=P_GP_1)
+string p_inp_7      =      input.symbol(defval="AMZN", title="Symbol 7", group=P_GP_1)
+string p_inp_8      =      input.symbol(defval="META", title="Symbol 8", group=P_GP_1)
+string p_inp_9      =      input.symbol(defval="AVGO", title="Symbol 9", group=P_GP_1)
+string p_inp_a      =      input.symbol(defval="TSLA", title="Symbol 10", group=P_GP_1)
+string p_inp_b      =      input.symbol(defval="BRK.A", title="Symbol 11", group=P_GP_1)
+string p_inp_c      =      input.symbol(defval="ORCL", title="Symbol 12", group=P_GP_1)
+string p_inp_d      =      input.symbol(defval="JPM", title="Symbol 13", group=P_GP_1)
+string p_inp_e      =      input.symbol(defval="WMT", title="Symbol 14", group=P_GP_1)
+string p_inp_f      =      input.symbol(defval="LLY", title="Symbol 15", group=P_GP_1)
+
+
+// MA Dist%
+float p_inp_g       =      input.source(defval=close, title="Source", group=P_GP_2)
+string p_inp_h      =      input.string(defval="EMA", title="MA Type", options=["SMA", "EMA", "RMA", "HMA", "WMA", "VWMA", "TMA", "VAR", "WWMA", "ZLEMA", "TSF"], group=P_GP_2)
+int p_inp_i         =      input.int(defval=14, title="MA Length", group=P_GP_2)
+float p_inp_j       =      input.source(defval=close, title="MA Price", group=P_GP_2)
+
+
+// Supertrend
+float p_inp_k      =      input.float(defval=3, title="Factor", group=P_GP_3, step=0.01)
+int p_inp_l        =      input.int(defval=10, title="ATR Period", group=P_GP_3)
+
+
+// PSAR
+float p_inp_m      =      input.float(defval=0.02, title="Start", group=P_GP_4, step=0.01)
+float p_inp_n      =      input.float(defval=0.02, title="Increment", group=P_GP_4, step=0.01)
+float p_inp_o      =      input.float(defval=0.2, title="Max", group=P_GP_4, step=0.01)
+
+
+// ADX
+int p_inp_p         =      input.int(defval=8, title="ADX Smoothing", group=P_GP_5)
+int p_inp_q         =      input.int(defval=8, title="DI Length", group=P_GP_5)
+float p_inp_r       =      input.float(defval=32, title="Trend Level", group=P_GP_5, step=0.01)
+string p_inp_s      =      input.string(defval="RMA", title="DI MA Type", options=["SMA", "EMA", "RMA", "HMA", "WMA", "VWMA", "TMA", "VAR", "WWMA", "ZLEMA", "TSF"], group=P_GP_5)
+string p_inp_t      =      input.string(defval="WMA", title="ADX MA Type", options=["SMA", "EMA", "RMA", "HMA", "WMA", "VWMA", "TMA", "VAR", "WWMA", "ZLEMA", "TSF"], group=P_GP_5)
+
+
+// keltner channel
+float p_inp_u      =      input.source(defval=close, title="Source", group=P_GP_6)
+int p_inp_v        =      input.int(defval=20, title="Length", group=P_GP_6)
+float p_inp_w      =      input.float(defval=2, title="Multiplier", group=P_GP_6, step=0.01)
+bool p_inp_x       =      input.bool(defval=true, title="Use True Range", group=P_GP_6)
+
+
+// Aroon
+int p_inp_y      =      input.int(defval=14, title="Length", group=P_GP_7)
+
+
+// BBTrend
+int p_inp_z         =      input.int(defval=20, title="Short BB Length", group=P_GP_8)
+int p_inp_10        =      input.int(defval=50, title="Long BB Length", group=P_GP_8)
+float p_inp_11      =      input.float(defval=2, title="Multiplier", group=P_GP_8, step=0.01)
+
+
+//#endregion ———————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Define
+
+var p_screener      =      table.new(position=position.top_right, frame_color=color.rgb(54, 58, 69, 0), frame_width=0, border_color=color.rgb(255, 255, 255, 100), border_width=2, rows=41, columns=31)
+
+//#endregion ————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Indicator Function Define
+
+
+var p_screener_symbol_row_number = (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1) + (1 * 1)
+var p_screener_indicator_column_number = 1 + 1 + 1 + 1 + 1 + 1 + 1
+var p_screener_page_size = 40
+var p_screener_symbol_index = 0
+var p_screener_indicator_cursor = 0
+
+p_scr_ma_distance(series float source, simple int length, simple string ma_type, series float price) =>
+    value = p_ta_ma(source, length, ma_type)
+    distance_percent = ((price - value) / price)* 100
+    [distance_percent]
+
+p_scr_ma_distance_display(series float value, simple color overbought_text_color, simple color overbought_background_color, simple color oversold_text_color, simple color oversold_background_color) =>
+    text_color = value > 0 ? overbought_text_color : oversold_text_color
+    background_color = value > 0 ? overbought_background_color : oversold_background_color
+    [str.tostring(value, "#.##") + '%', text_color, background_color]
+p_scr_aroon(simple int length) =>
+    upper = 100 * (ta.highestbars(high, length + 1) + length)/length
+    lower = 100 * (ta.lowestbars(low, length + 1) + length)/length
+    [upper, lower]
+
+p_scr_aroon_display(series float up, series float down, simple color bullish_text_color, simple color bullish_background_color, simple color bearish_text_color, simple color bearish_background_color, simple color neutral_text_color, simple color neutral_background_color) =>
+    is_bullish = up > down
+    is_bearish = down > up
+    text_value = str.tostring(up, "#.##") + "/" + str.tostring(down, "#.##")
+    text_color = is_bullish ? bullish_text_color : is_bearish ? bearish_text_color : neutral_text_color
+    background_color = is_bullish ? bullish_background_color : is_bearish ? bearish_background_color : neutral_background_color
+    [text_value, text_color, background_color]
+p_scr_psar(simple float start, simple float increment, simple float max) =>
+    psar_value = ta.sar(start, increment, max)
+    long_signal = ta.crossover(close, psar_value)
+    short_signal = ta.crossunder(close, psar_value)
+    var int psar_state = 0
+    psar_state := long_signal ? 1 : short_signal ? -1 : nz(psar_state[1], 0)
+    psar_state := psar_state == 0 ? (close > psar_value ? 1 : close < psar_value ? -1 : 0) : psar_state
+    bars_since_signal = nz(ta.barssince(long_signal or short_signal), 100000)
+    [psar_state, bars_since_signal]
+
+p_scr_psar_display(series int trend_state, series int bars_since_signal, simple string long_symbol, simple string short_symbol, simple string neutral_symbol, simple color long_text_color, simple color long_background_color, simple color short_text_color, simple color short_background_color, simple color neutral_text_color, simple color neutral_background_color) =>
+    has_signal = not na(bars_since_signal) and bars_since_signal < 100000
+    suffix = has_signal ? str.tostring(bars_since_signal) : "--"
+    symbol = trend_state > 0 ? long_symbol : trend_state < 0 ? short_symbol : neutral_symbol
+    text_value = symbol + suffix
+    text_color = trend_state > 0 ? long_text_color : trend_state < 0 ? short_text_color : neutral_text_color
+    background_color = trend_state > 0 ? long_background_color : trend_state < 0 ? short_background_color : neutral_background_color
+    [text_value, text_color, background_color]
+p_scr_adx_trend(simple int smoothing, simple int di_length, simple float level, simple string di_ma_type, simple string adx_ma_type) =>
+    up = ta.change(high)
+    down = -ta.change(low)
+    plus_dm = na(up) ? na : (up > down and up > 0 ? up : 0)
+    minus_dm = na(down) ? na : (down > up and down > 0 ? down : 0)
+    tr = p_ta_ma(ta.tr(true), di_length, di_ma_type)
+    tr_safe = tr == 0 ? 1 : tr
+    plus_di = fixnan(100 * p_ta_ma(plus_dm, di_length, di_ma_type) / tr_safe)
+    minus_di = fixnan(100 * p_ta_ma(minus_dm, di_length, di_ma_type) / tr_safe)
+    di_sum = plus_di + minus_di
+    dx = di_sum == 0 ? 0 : 100 * math.abs(plus_di - minus_di) / di_sum
+    sig = p_ta_ma(dx, smoothing, adx_ma_type)
+    sig_prev = sig[1]
+    sig_prev2 = sig[2]
+    adx_trend_up = plus_di > minus_di and sig >= sig_prev and sig < level and sig > minus_di
+    adx_trend_up_strong = plus_di > minus_di and sig >= sig_prev and sig >= level
+    adx_trend_up_falling = plus_di > minus_di and sig < sig_prev and sig >= level
+    adx_trend_down = minus_di > plus_di and sig > sig_prev and sig < level and sig > plus_di
+    adx_trend_down_strong = minus_di > plus_di and sig > sig_prev and sig >= level
+    adx_trend_down_falling = minus_di > plus_di and sig <= sig_prev and sig >= level
+    adx_kick = sig <= sig_prev and sig_prev >= sig_prev2 and sig >= level
+    state = adx_trend_up ? 2 : adx_trend_up_strong ? 3 : adx_trend_up_falling ? 4 : adx_trend_down ? 5 : adx_trend_down_strong ? 6 : adx_trend_down_falling ? 7 : adx_kick ? 1 : 0
+    [state]
+
+p_scr_adx_trend_display(series int state, simple string no_signal_text, simple color no_signal_text_color, simple color no_signal_background_color, simple string kick_text, simple color kick_text_color, simple color kick_background_color, simple string uptrend_text, simple color uptrend_text_color, simple color uptrend_background_color, simple string uptrend_strong_text, simple color uptrend_strong_text_color, simple color uptrend_strong_background_color, simple string uptrend_falling_text, simple color uptrend_falling_text_color, simple color uptrend_falling_background_color, simple string downtrend_text, simple color downtrend_text_color, simple color downtrend_background_color, simple string downtrend_strong_text, simple color downtrend_strong_text_color, simple color downtrend_strong_background_color, simple string downtrend_falling_text, simple color downtrend_falling_text_color, simple color downtrend_falling_background_color) =>
+    text_value = state == 1 ? kick_text : state == 2 ? uptrend_text : state == 3 ? uptrend_strong_text : state == 4 ? uptrend_falling_text : state == 5 ? downtrend_text : state == 6 ? downtrend_strong_text : state == 7 ? downtrend_falling_text : no_signal_text
+    text_color = state == 1 ? kick_text_color : state == 2 ? uptrend_text_color : state == 3 ? uptrend_strong_text_color : state == 4 ? uptrend_falling_text_color : state == 5 ? downtrend_text_color : state == 6 ? downtrend_strong_text_color : state == 7 ? downtrend_falling_text_color : no_signal_text_color
+    background_color = state == 1 ? kick_background_color : state == 2 ? uptrend_background_color : state == 3 ? uptrend_strong_background_color : state == 4 ? uptrend_falling_background_color : state == 5 ? downtrend_background_color : state == 6 ? downtrend_strong_background_color : state == 7 ? downtrend_falling_background_color : no_signal_background_color
+    [text_value, text_color, background_color]
+p_scr_supertrend(series float factor, simple int atrPeriod) =>
+    [supertrend_value, direction] = ta.supertrend(factor, atrPeriod)
+    [supertrend_value, direction]
+
+p_scr_supertrend_display(series float supertrend_value, series float direction, simple string up_text, simple string down_text, simple color up_text_color, simple color up_background_color, simple color down_text_color, simple color down_background_color) =>
+    is_uptrend = direction < 0
+    text_value = is_uptrend ? up_text : down_text
+    text_color = is_uptrend ? up_text_color : down_text_color
+    background_color = is_uptrend ? up_background_color : down_background_color
+    [text_value, text_color, background_color]
+p_scr_kc(series float source, simple int length, simple float mult, simple bool useTrueRange) =>
+    [upper, middle, lower] = ta.kc(source, length, mult, useTrueRange)
+    [upper, middle, lower]
+
+p_scr_kc_display(series float source, series float upper, series float middle, series float lower, simple color above_text_color, simple color above_background_color, simple color below_text_color, simple color below_background_color, simple color neutral_text_color, simple color neutral_background_color) =>
+    is_na_values = na(upper) or na(middle) or na(lower)
+    
+    if is_na_values
+        ["--", neutral_text_color, neutral_background_color]
+    else
+        position_relative = source > upper ? "Above" : source < lower ? "Below" : "Inside"
+        text_color = source > upper ? above_text_color : source < lower ? below_text_color : neutral_text_color
+        background_color = source > upper ? above_background_color : source < lower ? below_background_color : neutral_background_color
+        [position_relative, text_color, background_color]
+p_scr_bbtrend(simple int short_bb_length, simple int long_bb_length, simple float mult) =>
+    [short_middle, short_upper, short_lower] = ta.bb(close, short_bb_length, mult)
+    [long_middle,  long_upper,  long_lower]  = ta.bb(close, long_bb_length,  mult)
+    bbtrend = (math.abs(short_lower - long_lower) - math.abs(short_upper - long_upper)) / short_middle * 100
+    [bbtrend]
+
+p_scr_bbtrend_display(series float bbtrend_value, simple color bullish_text_color, simple color bullish_background_color, simple color bearish_text_color, simple color bearish_background_color) =>
+    text_value = str.tostring(bbtrend_value, "#.##")
+    text_color = bbtrend_value > 0 ? bullish_text_color : bearish_text_color
+    background_color = bbtrend_value > 0 ? bullish_background_color : bearish_background_color
+    [text_value, text_color, background_color]
+
+p_screener_indicator(series float p_scr_ind_1_source, simple int p_scr_ind_1_length, simple string p_scr_ind_1_maType, series float p_scr_ind_1_price, simple int p_scr_ind_2_length, simple float p_scr_ind_3_start, simple float p_scr_ind_3_increment, simple float p_scr_ind_3_max, simple int p_scr_ind_4_smoothing, simple int p_scr_ind_4_di_length, simple float p_scr_ind_4_level, simple string p_scr_ind_4_di_ma_type, simple string p_scr_ind_4_adx_ma_type, series float p_scr_ind_5_factor, simple int p_scr_ind_5_atrPeriod, series float p_scr_ind_6_source, simple int p_scr_ind_6_length, simple float p_scr_ind_6_mult, simple bool p_scr_ind_6_useTrueRange, simple int p_scr_ind_7_shortLength, simple int p_scr_ind_7_longLength, simple float p_scr_ind_7_multiplier) =>
+    [p_scr_ind_1_value] = p_scr_ma_distance(p_scr_ind_1_source, p_scr_ind_1_length, p_scr_ind_1_maType, p_scr_ind_1_price)
+    [p_scr_ind_2_up, p_scr_ind_2_down] = p_scr_aroon(p_scr_ind_2_length)
+    [p_scr_ind_3_trend_state, p_scr_ind_3_bars_since_signal] = p_scr_psar(p_scr_ind_3_start, p_scr_ind_3_increment, p_scr_ind_3_max)
+    [p_scr_ind_4_state] = p_scr_adx_trend(p_scr_ind_4_smoothing, p_scr_ind_4_di_length, p_scr_ind_4_level, p_scr_ind_4_di_ma_type, p_scr_ind_4_adx_ma_type)
+    [p_scr_ind_5_supertrend, p_scr_ind_5_direction] = p_scr_supertrend(p_scr_ind_5_factor, p_scr_ind_5_atrPeriod)
+    [p_scr_ind_6_upper, p_scr_ind_6_middle, p_scr_ind_6_lower] = p_scr_kc(p_scr_ind_6_source, p_scr_ind_6_length, p_scr_ind_6_mult, p_scr_ind_6_useTrueRange)
+    p_scr_ind_6_close = close
+    [p_scr_ind_7_bbtrend] = p_scr_bbtrend(p_scr_ind_7_shortLength, p_scr_ind_7_longLength, p_scr_ind_7_multiplier)
+    [p_scr_ind_1_value, p_scr_ind_2_up, p_scr_ind_2_down, p_scr_ind_3_trend_state, p_scr_ind_3_bars_since_signal, p_scr_ind_4_state, p_scr_ind_5_supertrend, p_scr_ind_5_direction, p_scr_ind_6_close, p_scr_ind_6_upper, p_scr_ind_6_middle, p_scr_ind_6_lower, p_scr_ind_7_bbtrend]
+
+
+//#endregion ——————————————————————————————————————————————————————————————————————————————————
+
+
+//#region —————————————————————————————————————————————————— Screener Table Code
+need_calculate = (last_bar_index - bar_index <= 500)
+if need_calculate
+    p_scr_sym_1_0_enabled = true
+    p_scr_sym_1_0_symbol = p_inp_1
+    p_scr_sym_1_0_timeframe = timeframe.period
+    p_scr_sym_1_0_is_chart_tf = true
+    [p_scr_sym_1_0_0_p_scr_ma_distance_value, p_scr_sym_1_0_1_p_scr_aroon_up, p_scr_sym_1_0_1_p_scr_aroon_down, p_scr_sym_1_0_2_p_scr_psar_trend_state, p_scr_sym_1_0_2_p_scr_psar_bars_since_signal, p_scr_sym_1_0_3_p_scr_adx_trend_state, p_scr_sym_1_0_4_p_scr_supertrend_supertrend, p_scr_sym_1_0_4_p_scr_supertrend_direction, p_scr_sym_1_0_5_close, p_scr_sym_1_0_5_p_scr_kc_upper, p_scr_sym_1_0_5_p_scr_kc_middle, p_scr_sym_1_0_5_p_scr_kc_lower, p_scr_sym_1_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_1, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_2_0_enabled = true
+    p_scr_sym_2_0_symbol = p_inp_2
+    p_scr_sym_2_0_timeframe = timeframe.period
+    p_scr_sym_2_0_is_chart_tf = true
+    [p_scr_sym_2_0_0_p_scr_ma_distance_value, p_scr_sym_2_0_1_p_scr_aroon_up, p_scr_sym_2_0_1_p_scr_aroon_down, p_scr_sym_2_0_2_p_scr_psar_trend_state, p_scr_sym_2_0_2_p_scr_psar_bars_since_signal, p_scr_sym_2_0_3_p_scr_adx_trend_state, p_scr_sym_2_0_4_p_scr_supertrend_supertrend, p_scr_sym_2_0_4_p_scr_supertrend_direction, p_scr_sym_2_0_5_close, p_scr_sym_2_0_5_p_scr_kc_upper, p_scr_sym_2_0_5_p_scr_kc_middle, p_scr_sym_2_0_5_p_scr_kc_lower, p_scr_sym_2_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_2, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_3_0_enabled = true
+    p_scr_sym_3_0_symbol = p_inp_3
+    p_scr_sym_3_0_timeframe = timeframe.period
+    p_scr_sym_3_0_is_chart_tf = true
+    [p_scr_sym_3_0_0_p_scr_ma_distance_value, p_scr_sym_3_0_1_p_scr_aroon_up, p_scr_sym_3_0_1_p_scr_aroon_down, p_scr_sym_3_0_2_p_scr_psar_trend_state, p_scr_sym_3_0_2_p_scr_psar_bars_since_signal, p_scr_sym_3_0_3_p_scr_adx_trend_state, p_scr_sym_3_0_4_p_scr_supertrend_supertrend, p_scr_sym_3_0_4_p_scr_supertrend_direction, p_scr_sym_3_0_5_close, p_scr_sym_3_0_5_p_scr_kc_upper, p_scr_sym_3_0_5_p_scr_kc_middle, p_scr_sym_3_0_5_p_scr_kc_lower, p_scr_sym_3_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_3, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_4_0_enabled = true
+    p_scr_sym_4_0_symbol = p_inp_4
+    p_scr_sym_4_0_timeframe = timeframe.period
+    p_scr_sym_4_0_is_chart_tf = true
+    [p_scr_sym_4_0_0_p_scr_ma_distance_value, p_scr_sym_4_0_1_p_scr_aroon_up, p_scr_sym_4_0_1_p_scr_aroon_down, p_scr_sym_4_0_2_p_scr_psar_trend_state, p_scr_sym_4_0_2_p_scr_psar_bars_since_signal, p_scr_sym_4_0_3_p_scr_adx_trend_state, p_scr_sym_4_0_4_p_scr_supertrend_supertrend, p_scr_sym_4_0_4_p_scr_supertrend_direction, p_scr_sym_4_0_5_close, p_scr_sym_4_0_5_p_scr_kc_upper, p_scr_sym_4_0_5_p_scr_kc_middle, p_scr_sym_4_0_5_p_scr_kc_lower, p_scr_sym_4_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_4, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_5_0_enabled = true
+    p_scr_sym_5_0_symbol = p_inp_5
+    p_scr_sym_5_0_timeframe = timeframe.period
+    p_scr_sym_5_0_is_chart_tf = true
+    [p_scr_sym_5_0_0_p_scr_ma_distance_value, p_scr_sym_5_0_1_p_scr_aroon_up, p_scr_sym_5_0_1_p_scr_aroon_down, p_scr_sym_5_0_2_p_scr_psar_trend_state, p_scr_sym_5_0_2_p_scr_psar_bars_since_signal, p_scr_sym_5_0_3_p_scr_adx_trend_state, p_scr_sym_5_0_4_p_scr_supertrend_supertrend, p_scr_sym_5_0_4_p_scr_supertrend_direction, p_scr_sym_5_0_5_close, p_scr_sym_5_0_5_p_scr_kc_upper, p_scr_sym_5_0_5_p_scr_kc_middle, p_scr_sym_5_0_5_p_scr_kc_lower, p_scr_sym_5_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_5, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_6_0_enabled = true
+    p_scr_sym_6_0_symbol = p_inp_6
+    p_scr_sym_6_0_timeframe = timeframe.period
+    p_scr_sym_6_0_is_chart_tf = true
+    [p_scr_sym_6_0_0_p_scr_ma_distance_value, p_scr_sym_6_0_1_p_scr_aroon_up, p_scr_sym_6_0_1_p_scr_aroon_down, p_scr_sym_6_0_2_p_scr_psar_trend_state, p_scr_sym_6_0_2_p_scr_psar_bars_since_signal, p_scr_sym_6_0_3_p_scr_adx_trend_state, p_scr_sym_6_0_4_p_scr_supertrend_supertrend, p_scr_sym_6_0_4_p_scr_supertrend_direction, p_scr_sym_6_0_5_close, p_scr_sym_6_0_5_p_scr_kc_upper, p_scr_sym_6_0_5_p_scr_kc_middle, p_scr_sym_6_0_5_p_scr_kc_lower, p_scr_sym_6_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_6, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_7_0_enabled = true
+    p_scr_sym_7_0_symbol = p_inp_7
+    p_scr_sym_7_0_timeframe = timeframe.period
+    p_scr_sym_7_0_is_chart_tf = true
+    [p_scr_sym_7_0_0_p_scr_ma_distance_value, p_scr_sym_7_0_1_p_scr_aroon_up, p_scr_sym_7_0_1_p_scr_aroon_down, p_scr_sym_7_0_2_p_scr_psar_trend_state, p_scr_sym_7_0_2_p_scr_psar_bars_since_signal, p_scr_sym_7_0_3_p_scr_adx_trend_state, p_scr_sym_7_0_4_p_scr_supertrend_supertrend, p_scr_sym_7_0_4_p_scr_supertrend_direction, p_scr_sym_7_0_5_close, p_scr_sym_7_0_5_p_scr_kc_upper, p_scr_sym_7_0_5_p_scr_kc_middle, p_scr_sym_7_0_5_p_scr_kc_lower, p_scr_sym_7_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_7, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_8_0_enabled = true
+    p_scr_sym_8_0_symbol = p_inp_8
+    p_scr_sym_8_0_timeframe = timeframe.period
+    p_scr_sym_8_0_is_chart_tf = true
+    [p_scr_sym_8_0_0_p_scr_ma_distance_value, p_scr_sym_8_0_1_p_scr_aroon_up, p_scr_sym_8_0_1_p_scr_aroon_down, p_scr_sym_8_0_2_p_scr_psar_trend_state, p_scr_sym_8_0_2_p_scr_psar_bars_since_signal, p_scr_sym_8_0_3_p_scr_adx_trend_state, p_scr_sym_8_0_4_p_scr_supertrend_supertrend, p_scr_sym_8_0_4_p_scr_supertrend_direction, p_scr_sym_8_0_5_close, p_scr_sym_8_0_5_p_scr_kc_upper, p_scr_sym_8_0_5_p_scr_kc_middle, p_scr_sym_8_0_5_p_scr_kc_lower, p_scr_sym_8_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_8, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_9_0_enabled = true
+    p_scr_sym_9_0_symbol = p_inp_9
+    p_scr_sym_9_0_timeframe = timeframe.period
+    p_scr_sym_9_0_is_chart_tf = true
+    [p_scr_sym_9_0_0_p_scr_ma_distance_value, p_scr_sym_9_0_1_p_scr_aroon_up, p_scr_sym_9_0_1_p_scr_aroon_down, p_scr_sym_9_0_2_p_scr_psar_trend_state, p_scr_sym_9_0_2_p_scr_psar_bars_since_signal, p_scr_sym_9_0_3_p_scr_adx_trend_state, p_scr_sym_9_0_4_p_scr_supertrend_supertrend, p_scr_sym_9_0_4_p_scr_supertrend_direction, p_scr_sym_9_0_5_close, p_scr_sym_9_0_5_p_scr_kc_upper, p_scr_sym_9_0_5_p_scr_kc_middle, p_scr_sym_9_0_5_p_scr_kc_lower, p_scr_sym_9_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_9, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_a_0_enabled = true
+    p_scr_sym_a_0_symbol = p_inp_a
+    p_scr_sym_a_0_timeframe = timeframe.period
+    p_scr_sym_a_0_is_chart_tf = true
+    [p_scr_sym_a_0_0_p_scr_ma_distance_value, p_scr_sym_a_0_1_p_scr_aroon_up, p_scr_sym_a_0_1_p_scr_aroon_down, p_scr_sym_a_0_2_p_scr_psar_trend_state, p_scr_sym_a_0_2_p_scr_psar_bars_since_signal, p_scr_sym_a_0_3_p_scr_adx_trend_state, p_scr_sym_a_0_4_p_scr_supertrend_supertrend, p_scr_sym_a_0_4_p_scr_supertrend_direction, p_scr_sym_a_0_5_close, p_scr_sym_a_0_5_p_scr_kc_upper, p_scr_sym_a_0_5_p_scr_kc_middle, p_scr_sym_a_0_5_p_scr_kc_lower, p_scr_sym_a_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_a, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_b_0_enabled = true
+    p_scr_sym_b_0_symbol = p_inp_b
+    p_scr_sym_b_0_timeframe = timeframe.period
+    p_scr_sym_b_0_is_chart_tf = true
+    [p_scr_sym_b_0_0_p_scr_ma_distance_value, p_scr_sym_b_0_1_p_scr_aroon_up, p_scr_sym_b_0_1_p_scr_aroon_down, p_scr_sym_b_0_2_p_scr_psar_trend_state, p_scr_sym_b_0_2_p_scr_psar_bars_since_signal, p_scr_sym_b_0_3_p_scr_adx_trend_state, p_scr_sym_b_0_4_p_scr_supertrend_supertrend, p_scr_sym_b_0_4_p_scr_supertrend_direction, p_scr_sym_b_0_5_close, p_scr_sym_b_0_5_p_scr_kc_upper, p_scr_sym_b_0_5_p_scr_kc_middle, p_scr_sym_b_0_5_p_scr_kc_lower, p_scr_sym_b_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_b, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_c_0_enabled = true
+    p_scr_sym_c_0_symbol = p_inp_c
+    p_scr_sym_c_0_timeframe = timeframe.period
+    p_scr_sym_c_0_is_chart_tf = true
+    [p_scr_sym_c_0_0_p_scr_ma_distance_value, p_scr_sym_c_0_1_p_scr_aroon_up, p_scr_sym_c_0_1_p_scr_aroon_down, p_scr_sym_c_0_2_p_scr_psar_trend_state, p_scr_sym_c_0_2_p_scr_psar_bars_since_signal, p_scr_sym_c_0_3_p_scr_adx_trend_state, p_scr_sym_c_0_4_p_scr_supertrend_supertrend, p_scr_sym_c_0_4_p_scr_supertrend_direction, p_scr_sym_c_0_5_close, p_scr_sym_c_0_5_p_scr_kc_upper, p_scr_sym_c_0_5_p_scr_kc_middle, p_scr_sym_c_0_5_p_scr_kc_lower, p_scr_sym_c_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_c, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_d_0_enabled = true
+    p_scr_sym_d_0_symbol = p_inp_d
+    p_scr_sym_d_0_timeframe = timeframe.period
+    p_scr_sym_d_0_is_chart_tf = true
+    [p_scr_sym_d_0_0_p_scr_ma_distance_value, p_scr_sym_d_0_1_p_scr_aroon_up, p_scr_sym_d_0_1_p_scr_aroon_down, p_scr_sym_d_0_2_p_scr_psar_trend_state, p_scr_sym_d_0_2_p_scr_psar_bars_since_signal, p_scr_sym_d_0_3_p_scr_adx_trend_state, p_scr_sym_d_0_4_p_scr_supertrend_supertrend, p_scr_sym_d_0_4_p_scr_supertrend_direction, p_scr_sym_d_0_5_close, p_scr_sym_d_0_5_p_scr_kc_upper, p_scr_sym_d_0_5_p_scr_kc_middle, p_scr_sym_d_0_5_p_scr_kc_lower, p_scr_sym_d_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_d, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    p_scr_sym_e_0_enabled = true
+    p_scr_sym_e_0_symbol = p_inp_e
+    p_scr_sym_e_0_timeframe = timeframe.period
+    p_scr_sym_e_0_is_chart_tf = true
+    [p_scr_sym_e_0_0_p_scr_ma_distance_value, p_scr_sym_e_0_1_p_scr_aroon_up, p_scr_sym_e_0_1_p_scr_aroon_down, p_scr_sym_e_0_2_p_scr_psar_trend_state, p_scr_sym_e_0_2_p_scr_psar_bars_since_signal, p_scr_sym_e_0_3_p_scr_adx_trend_state, p_scr_sym_e_0_4_p_scr_supertrend_supertrend, p_scr_sym_e_0_4_p_scr_supertrend_direction, p_scr_sym_e_0_5_close, p_scr_sym_e_0_5_p_scr_kc_upper, p_scr_sym_e_0_5_p_scr_kc_middle, p_scr_sym_e_0_5_p_scr_kc_lower, p_scr_sym_e_0_6_p_scr_bbtrend_bbtrend] = request.security(symbol=p_inp_e, timeframe=timeframe.period, expression=p_screener_indicator(p_inp_g, p_inp_i, p_inp_h, p_inp_j, p_inp_y, p_inp_m, p_inp_n, p_inp_o, p_inp_p, p_inp_q, p_inp_r, p_inp_s, p_inp_t, p_inp_k, p_inp_l, p_inp_u, p_inp_v, p_inp_w, p_inp_x, p_inp_z, p_inp_10, p_inp_11))
+    
+    if barstate.islast
+        p_tmp_1 = 'ignore_me'
+        p_screener_symbol_index := 0
+        p_tmp_3 = int(p_screener_symbol_row_number / p_screener_page_size)
+        p_screener_page_number = p_screener_symbol_row_number > (p_tmp_3 * p_screener_page_size) ? p_tmp_3 + 1 : p_tmp_3
+        for p_tmp_2 = 0 to p_screener_page_number - 1
+            table.cell(table_id=p_screener,column=(1 + p_screener_indicator_column_number) * p_tmp_2,row=0,text="Symbol",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+        if p_scr_sym_1_0_enabled
+            p_tmp_4 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_5,row=p_tmp_4,text=p_comm_get_display_symbol(p_scr_sym_1_0_symbol, false) + (p_scr_sym_1_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_1_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled
+            p_tmp_6 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_7,row=p_tmp_6,text=p_comm_get_display_symbol(p_scr_sym_2_0_symbol, false) + (p_scr_sym_2_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_2_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled
+            p_tmp_8 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_9 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_9,row=p_tmp_8,text=p_comm_get_display_symbol(p_scr_sym_3_0_symbol, false) + (p_scr_sym_3_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_3_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled
+            p_tmp_a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_b,row=p_tmp_a,text=p_comm_get_display_symbol(p_scr_sym_4_0_symbol, false) + (p_scr_sym_4_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_4_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled
+            p_tmp_c = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_d = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_d,row=p_tmp_c,text=p_comm_get_display_symbol(p_scr_sym_5_0_symbol, false) + (p_scr_sym_5_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_5_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled
+            p_tmp_e = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_f = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_f,row=p_tmp_e,text=p_comm_get_display_symbol(p_scr_sym_6_0_symbol, false) + (p_scr_sym_6_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_6_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled
+            p_tmp_g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_h,row=p_tmp_g,text=p_comm_get_display_symbol(p_scr_sym_7_0_symbol, false) + (p_scr_sym_7_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_7_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled
+            p_tmp_i = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_j = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_j,row=p_tmp_i,text=p_comm_get_display_symbol(p_scr_sym_8_0_symbol, false) + (p_scr_sym_8_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_8_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled
+            p_tmp_k = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_l = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_l,row=p_tmp_k,text=p_comm_get_display_symbol(p_scr_sym_9_0_symbol, false) + (p_scr_sym_9_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_9_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled
+            p_tmp_m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_n,row=p_tmp_m,text=p_comm_get_display_symbol(p_scr_sym_a_0_symbol, false) + (p_scr_sym_a_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_a_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled
+            p_tmp_o = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_p = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_p,row=p_tmp_o,text=p_comm_get_display_symbol(p_scr_sym_b_0_symbol, false) + (p_scr_sym_b_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_b_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled
+            p_tmp_q = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_r = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_r,row=p_tmp_q,text=p_comm_get_display_symbol(p_scr_sym_c_0_symbol, false) + (p_scr_sym_c_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_c_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled
+            p_tmp_s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_t,row=p_tmp_s,text=p_comm_get_display_symbol(p_scr_sym_d_0_symbol, false) + (p_scr_sym_d_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_d_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled
+            p_tmp_u = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_v = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number)
+            table.cell(table_id=p_screener,column=p_tmp_v,row=p_tmp_u,text=p_comm_get_display_symbol(p_scr_sym_e_0_symbol, false) + (p_scr_sym_e_0_is_chart_tf ? '' : p_comm_get_display_tf(p_scr_sym_e_0_timeframe)),text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        for p_tmp_w = 0 to p_screener_page_number - 1
+            p_screener_indicator_cursor := 0
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="MA Dist%",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="Aroon",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="PSAR",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="ADX",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="Supertrend",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="KC",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+            if true
+                p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+                table.cell(table_id=p_screener,column=p_tmp_w * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor,row=0,text="BBTrend",text_color=color.rgb(255, 255, 255, 0),text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=color.rgb(120, 123, 134, 0),text_font_family=font.family_default,text_formatting=text.format_none)
+        p_screener_indicator_cursor := 0
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_x_text, p_tmp_x_textColor, p_tmp_x_bgColor] = p_scr_ma_distance_display(p_scr_sym_1_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_z,row=p_tmp_y,text=p_tmp_x_text,text_color=p_tmp_x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_11 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_12 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_10_text, p_tmp_10_textColor, p_tmp_10_bgColor] = p_scr_ma_distance_display(p_scr_sym_2_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_12,row=p_tmp_11,text=p_tmp_10_text,text_color=p_tmp_10_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_10_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_14 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_15 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_13_text, p_tmp_13_textColor, p_tmp_13_bgColor] = p_scr_ma_distance_display(p_scr_sym_3_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_15,row=p_tmp_14,text=p_tmp_13_text,text_color=p_tmp_13_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_13_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_17 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_18 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_16_text, p_tmp_16_textColor, p_tmp_16_bgColor] = p_scr_ma_distance_display(p_scr_sym_4_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_18,row=p_tmp_17,text=p_tmp_16_text,text_color=p_tmp_16_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_16_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_1a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_19_text, p_tmp_19_textColor, p_tmp_19_bgColor] = p_scr_ma_distance_display(p_scr_sym_5_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1b,row=p_tmp_1a,text=p_tmp_19_text,text_color=p_tmp_19_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_19_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_1d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1c_text, p_tmp_1c_textColor, p_tmp_1c_bgColor] = p_scr_ma_distance_display(p_scr_sym_6_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1e,row=p_tmp_1d,text=p_tmp_1c_text,text_color=p_tmp_1c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_1g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1f_text, p_tmp_1f_textColor, p_tmp_1f_bgColor] = p_scr_ma_distance_display(p_scr_sym_7_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1h,row=p_tmp_1g,text=p_tmp_1f_text,text_color=p_tmp_1f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_1j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1i_text, p_tmp_1i_textColor, p_tmp_1i_bgColor] = p_scr_ma_distance_display(p_scr_sym_8_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1k,row=p_tmp_1j,text=p_tmp_1i_text,text_color=p_tmp_1i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_1m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1l_text, p_tmp_1l_textColor, p_tmp_1l_bgColor] = p_scr_ma_distance_display(p_scr_sym_9_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1n,row=p_tmp_1m,text=p_tmp_1l_text,text_color=p_tmp_1l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_1p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1o_text, p_tmp_1o_textColor, p_tmp_1o_bgColor] = p_scr_ma_distance_display(p_scr_sym_a_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1q,row=p_tmp_1p,text=p_tmp_1o_text,text_color=p_tmp_1o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_1s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1r_text, p_tmp_1r_textColor, p_tmp_1r_bgColor] = p_scr_ma_distance_display(p_scr_sym_b_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1t,row=p_tmp_1s,text=p_tmp_1r_text,text_color=p_tmp_1r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_1v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1u_text, p_tmp_1u_textColor, p_tmp_1u_bgColor] = p_scr_ma_distance_display(p_scr_sym_c_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1w,row=p_tmp_1v,text=p_tmp_1u_text,text_color=p_tmp_1u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_1y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_1z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_1x_text, p_tmp_1x_textColor, p_tmp_1x_bgColor] = p_scr_ma_distance_display(p_scr_sym_d_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_1z,row=p_tmp_1y,text=p_tmp_1x_text,text_color=p_tmp_1x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_1x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_21 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_22 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_20_text, p_tmp_20_textColor, p_tmp_20_bgColor] = p_scr_ma_distance_display(p_scr_sym_e_0_0_p_scr_ma_distance_value, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_22,row=p_tmp_21,text=p_tmp_20_text,text_color=p_tmp_20_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_20_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_24 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_25 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_23_text, p_tmp_23_textColor, p_tmp_23_bgColor] = p_scr_aroon_display(p_scr_sym_1_0_1_p_scr_aroon_up, p_scr_sym_1_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_25,row=p_tmp_24,text=p_tmp_23_text,text_color=p_tmp_23_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_23_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_27 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_28 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_26_text, p_tmp_26_textColor, p_tmp_26_bgColor] = p_scr_aroon_display(p_scr_sym_2_0_1_p_scr_aroon_up, p_scr_sym_2_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_28,row=p_tmp_27,text=p_tmp_26_text,text_color=p_tmp_26_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_26_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_2a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_29_text, p_tmp_29_textColor, p_tmp_29_bgColor] = p_scr_aroon_display(p_scr_sym_3_0_1_p_scr_aroon_up, p_scr_sym_3_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2b,row=p_tmp_2a,text=p_tmp_29_text,text_color=p_tmp_29_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_29_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_2d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2c_text, p_tmp_2c_textColor, p_tmp_2c_bgColor] = p_scr_aroon_display(p_scr_sym_4_0_1_p_scr_aroon_up, p_scr_sym_4_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2e,row=p_tmp_2d,text=p_tmp_2c_text,text_color=p_tmp_2c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_2g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2f_text, p_tmp_2f_textColor, p_tmp_2f_bgColor] = p_scr_aroon_display(p_scr_sym_5_0_1_p_scr_aroon_up, p_scr_sym_5_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2h,row=p_tmp_2g,text=p_tmp_2f_text,text_color=p_tmp_2f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_2j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2i_text, p_tmp_2i_textColor, p_tmp_2i_bgColor] = p_scr_aroon_display(p_scr_sym_6_0_1_p_scr_aroon_up, p_scr_sym_6_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2k,row=p_tmp_2j,text=p_tmp_2i_text,text_color=p_tmp_2i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_2m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2l_text, p_tmp_2l_textColor, p_tmp_2l_bgColor] = p_scr_aroon_display(p_scr_sym_7_0_1_p_scr_aroon_up, p_scr_sym_7_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2n,row=p_tmp_2m,text=p_tmp_2l_text,text_color=p_tmp_2l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_2p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2o_text, p_tmp_2o_textColor, p_tmp_2o_bgColor] = p_scr_aroon_display(p_scr_sym_8_0_1_p_scr_aroon_up, p_scr_sym_8_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2q,row=p_tmp_2p,text=p_tmp_2o_text,text_color=p_tmp_2o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_2s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2r_text, p_tmp_2r_textColor, p_tmp_2r_bgColor] = p_scr_aroon_display(p_scr_sym_9_0_1_p_scr_aroon_up, p_scr_sym_9_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2t,row=p_tmp_2s,text=p_tmp_2r_text,text_color=p_tmp_2r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_2v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2u_text, p_tmp_2u_textColor, p_tmp_2u_bgColor] = p_scr_aroon_display(p_scr_sym_a_0_1_p_scr_aroon_up, p_scr_sym_a_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2w,row=p_tmp_2v,text=p_tmp_2u_text,text_color=p_tmp_2u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_2y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_2z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_2x_text, p_tmp_2x_textColor, p_tmp_2x_bgColor] = p_scr_aroon_display(p_scr_sym_b_0_1_p_scr_aroon_up, p_scr_sym_b_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_2z,row=p_tmp_2y,text=p_tmp_2x_text,text_color=p_tmp_2x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_2x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_31 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_32 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_30_text, p_tmp_30_textColor, p_tmp_30_bgColor] = p_scr_aroon_display(p_scr_sym_c_0_1_p_scr_aroon_up, p_scr_sym_c_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_32,row=p_tmp_31,text=p_tmp_30_text,text_color=p_tmp_30_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_30_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_34 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_35 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_33_text, p_tmp_33_textColor, p_tmp_33_bgColor] = p_scr_aroon_display(p_scr_sym_d_0_1_p_scr_aroon_up, p_scr_sym_d_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_35,row=p_tmp_34,text=p_tmp_33_text,text_color=p_tmp_33_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_33_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_37 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_38 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_36_text, p_tmp_36_textColor, p_tmp_36_bgColor] = p_scr_aroon_display(p_scr_sym_e_0_1_p_scr_aroon_up, p_scr_sym_e_0_1_p_scr_aroon_down, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 0))
+            table.cell(table_id=p_screener,column=p_tmp_38,row=p_tmp_37,text=p_tmp_36_text,text_color=p_tmp_36_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_36_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_3a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_39_text, p_tmp_39_textColor, p_tmp_39_bgColor] = p_scr_psar_display(p_scr_sym_1_0_2_p_scr_psar_trend_state, p_scr_sym_1_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3b,row=p_tmp_3a,text=p_tmp_39_text,text_color=p_tmp_39_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_39_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_3d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3c_text, p_tmp_3c_textColor, p_tmp_3c_bgColor] = p_scr_psar_display(p_scr_sym_2_0_2_p_scr_psar_trend_state, p_scr_sym_2_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3e,row=p_tmp_3d,text=p_tmp_3c_text,text_color=p_tmp_3c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_3g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3f_text, p_tmp_3f_textColor, p_tmp_3f_bgColor] = p_scr_psar_display(p_scr_sym_3_0_2_p_scr_psar_trend_state, p_scr_sym_3_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3h,row=p_tmp_3g,text=p_tmp_3f_text,text_color=p_tmp_3f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_3j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3i_text, p_tmp_3i_textColor, p_tmp_3i_bgColor] = p_scr_psar_display(p_scr_sym_4_0_2_p_scr_psar_trend_state, p_scr_sym_4_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3k,row=p_tmp_3j,text=p_tmp_3i_text,text_color=p_tmp_3i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_3m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3l_text, p_tmp_3l_textColor, p_tmp_3l_bgColor] = p_scr_psar_display(p_scr_sym_5_0_2_p_scr_psar_trend_state, p_scr_sym_5_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3n,row=p_tmp_3m,text=p_tmp_3l_text,text_color=p_tmp_3l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_3p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3o_text, p_tmp_3o_textColor, p_tmp_3o_bgColor] = p_scr_psar_display(p_scr_sym_6_0_2_p_scr_psar_trend_state, p_scr_sym_6_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3q,row=p_tmp_3p,text=p_tmp_3o_text,text_color=p_tmp_3o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_3s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3r_text, p_tmp_3r_textColor, p_tmp_3r_bgColor] = p_scr_psar_display(p_scr_sym_7_0_2_p_scr_psar_trend_state, p_scr_sym_7_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3t,row=p_tmp_3s,text=p_tmp_3r_text,text_color=p_tmp_3r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_3v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3u_text, p_tmp_3u_textColor, p_tmp_3u_bgColor] = p_scr_psar_display(p_scr_sym_8_0_2_p_scr_psar_trend_state, p_scr_sym_8_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3w,row=p_tmp_3v,text=p_tmp_3u_text,text_color=p_tmp_3u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_3y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_3z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_3x_text, p_tmp_3x_textColor, p_tmp_3x_bgColor] = p_scr_psar_display(p_scr_sym_9_0_2_p_scr_psar_trend_state, p_scr_sym_9_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_3z,row=p_tmp_3y,text=p_tmp_3x_text,text_color=p_tmp_3x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_3x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_41 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_42 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_40_text, p_tmp_40_textColor, p_tmp_40_bgColor] = p_scr_psar_display(p_scr_sym_a_0_2_p_scr_psar_trend_state, p_scr_sym_a_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_42,row=p_tmp_41,text=p_tmp_40_text,text_color=p_tmp_40_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_40_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_44 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_45 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_43_text, p_tmp_43_textColor, p_tmp_43_bgColor] = p_scr_psar_display(p_scr_sym_b_0_2_p_scr_psar_trend_state, p_scr_sym_b_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_45,row=p_tmp_44,text=p_tmp_43_text,text_color=p_tmp_43_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_43_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_47 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_48 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_46_text, p_tmp_46_textColor, p_tmp_46_bgColor] = p_scr_psar_display(p_scr_sym_c_0_2_p_scr_psar_trend_state, p_scr_sym_c_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_48,row=p_tmp_47,text=p_tmp_46_text,text_color=p_tmp_46_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_46_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_4a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_49_text, p_tmp_49_textColor, p_tmp_49_bgColor] = p_scr_psar_display(p_scr_sym_d_0_2_p_scr_psar_trend_state, p_scr_sym_d_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4b,row=p_tmp_4a,text=p_tmp_49_text,text_color=p_tmp_49_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_49_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_4d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4c_text, p_tmp_4c_textColor, p_tmp_4c_bgColor] = p_scr_psar_display(p_scr_sym_e_0_2_p_scr_psar_trend_state, p_scr_sym_e_0_2_p_scr_psar_bars_since_signal, "▲", "▼", "·", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_4e,row=p_tmp_4d,text=p_tmp_4c_text,text_color=p_tmp_4c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_4g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4f_text, p_tmp_4f_textColor, p_tmp_4f_bgColor] = p_scr_adx_trend_display(p_scr_sym_1_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4h,row=p_tmp_4g,text=p_tmp_4f_text,text_color=p_tmp_4f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_4j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4i_text, p_tmp_4i_textColor, p_tmp_4i_bgColor] = p_scr_adx_trend_display(p_scr_sym_2_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4k,row=p_tmp_4j,text=p_tmp_4i_text,text_color=p_tmp_4i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_4m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4l_text, p_tmp_4l_textColor, p_tmp_4l_bgColor] = p_scr_adx_trend_display(p_scr_sym_3_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4n,row=p_tmp_4m,text=p_tmp_4l_text,text_color=p_tmp_4l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_4p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4o_text, p_tmp_4o_textColor, p_tmp_4o_bgColor] = p_scr_adx_trend_display(p_scr_sym_4_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4q,row=p_tmp_4p,text=p_tmp_4o_text,text_color=p_tmp_4o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_4s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4r_text, p_tmp_4r_textColor, p_tmp_4r_bgColor] = p_scr_adx_trend_display(p_scr_sym_5_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4t,row=p_tmp_4s,text=p_tmp_4r_text,text_color=p_tmp_4r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_4v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4u_text, p_tmp_4u_textColor, p_tmp_4u_bgColor] = p_scr_adx_trend_display(p_scr_sym_6_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4w,row=p_tmp_4v,text=p_tmp_4u_text,text_color=p_tmp_4u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_4y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_4z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_4x_text, p_tmp_4x_textColor, p_tmp_4x_bgColor] = p_scr_adx_trend_display(p_scr_sym_7_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_4z,row=p_tmp_4y,text=p_tmp_4x_text,text_color=p_tmp_4x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_4x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_51 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_52 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_50_text, p_tmp_50_textColor, p_tmp_50_bgColor] = p_scr_adx_trend_display(p_scr_sym_8_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_52,row=p_tmp_51,text=p_tmp_50_text,text_color=p_tmp_50_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_50_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_54 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_55 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_53_text, p_tmp_53_textColor, p_tmp_53_bgColor] = p_scr_adx_trend_display(p_scr_sym_9_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_55,row=p_tmp_54,text=p_tmp_53_text,text_color=p_tmp_53_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_53_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_57 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_58 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_56_text, p_tmp_56_textColor, p_tmp_56_bgColor] = p_scr_adx_trend_display(p_scr_sym_a_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_58,row=p_tmp_57,text=p_tmp_56_text,text_color=p_tmp_56_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_56_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_5a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_59_text, p_tmp_59_textColor, p_tmp_59_bgColor] = p_scr_adx_trend_display(p_scr_sym_b_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_5b,row=p_tmp_5a,text=p_tmp_59_text,text_color=p_tmp_59_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_59_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_5d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5c_text, p_tmp_5c_textColor, p_tmp_5c_bgColor] = p_scr_adx_trend_display(p_scr_sym_c_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_5e,row=p_tmp_5d,text=p_tmp_5c_text,text_color=p_tmp_5c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_5g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5f_text, p_tmp_5f_textColor, p_tmp_5f_bgColor] = p_scr_adx_trend_display(p_scr_sym_d_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_5h,row=p_tmp_5g,text=p_tmp_5f_text,text_color=p_tmp_5f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_5j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5i_text, p_tmp_5i_textColor, p_tmp_5i_bgColor] = p_scr_adx_trend_display(p_scr_sym_e_0_3_p_scr_adx_trend_state, "--", color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50), "K", color.rgb(255, 255, 255, 0), color.rgb(253, 216, 53, 0), "UT", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), "UT+", color.rgb(255, 255, 255, 0), color.rgb(8, 153, 129, 0), "UT-", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 30), "DT", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), "DT+", color.rgb(255, 255, 255, 0), color.rgb(136, 14, 79, 0), "DT-", color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 30))
+            table.cell(table_id=p_screener,column=p_tmp_5k,row=p_tmp_5j,text=p_tmp_5i_text,text_color=p_tmp_5i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_5m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5l_text, p_tmp_5l_textColor, p_tmp_5l_bgColor] = p_scr_supertrend_display(p_scr_sym_1_0_4_p_scr_supertrend_supertrend, p_scr_sym_1_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_5n,row=p_tmp_5m,text=p_tmp_5l_text,text_color=p_tmp_5l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_5p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5o_text, p_tmp_5o_textColor, p_tmp_5o_bgColor] = p_scr_supertrend_display(p_scr_sym_2_0_4_p_scr_supertrend_supertrend, p_scr_sym_2_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_5q,row=p_tmp_5p,text=p_tmp_5o_text,text_color=p_tmp_5o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_5s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5r_text, p_tmp_5r_textColor, p_tmp_5r_bgColor] = p_scr_supertrend_display(p_scr_sym_3_0_4_p_scr_supertrend_supertrend, p_scr_sym_3_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_5t,row=p_tmp_5s,text=p_tmp_5r_text,text_color=p_tmp_5r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_5v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5u_text, p_tmp_5u_textColor, p_tmp_5u_bgColor] = p_scr_supertrend_display(p_scr_sym_4_0_4_p_scr_supertrend_supertrend, p_scr_sym_4_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_5w,row=p_tmp_5v,text=p_tmp_5u_text,text_color=p_tmp_5u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_5y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_5z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_5x_text, p_tmp_5x_textColor, p_tmp_5x_bgColor] = p_scr_supertrend_display(p_scr_sym_5_0_4_p_scr_supertrend_supertrend, p_scr_sym_5_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_5z,row=p_tmp_5y,text=p_tmp_5x_text,text_color=p_tmp_5x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_5x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_61 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_62 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_60_text, p_tmp_60_textColor, p_tmp_60_bgColor] = p_scr_supertrend_display(p_scr_sym_6_0_4_p_scr_supertrend_supertrend, p_scr_sym_6_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_62,row=p_tmp_61,text=p_tmp_60_text,text_color=p_tmp_60_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_60_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_64 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_65 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_63_text, p_tmp_63_textColor, p_tmp_63_bgColor] = p_scr_supertrend_display(p_scr_sym_7_0_4_p_scr_supertrend_supertrend, p_scr_sym_7_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_65,row=p_tmp_64,text=p_tmp_63_text,text_color=p_tmp_63_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_63_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_67 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_68 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_66_text, p_tmp_66_textColor, p_tmp_66_bgColor] = p_scr_supertrend_display(p_scr_sym_8_0_4_p_scr_supertrend_supertrend, p_scr_sym_8_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_68,row=p_tmp_67,text=p_tmp_66_text,text_color=p_tmp_66_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_66_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_6a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_69_text, p_tmp_69_textColor, p_tmp_69_bgColor] = p_scr_supertrend_display(p_scr_sym_9_0_4_p_scr_supertrend_supertrend, p_scr_sym_9_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6b,row=p_tmp_6a,text=p_tmp_69_text,text_color=p_tmp_69_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_69_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_6d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6c_text, p_tmp_6c_textColor, p_tmp_6c_bgColor] = p_scr_supertrend_display(p_scr_sym_a_0_4_p_scr_supertrend_supertrend, p_scr_sym_a_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6e,row=p_tmp_6d,text=p_tmp_6c_text,text_color=p_tmp_6c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_6g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6f_text, p_tmp_6f_textColor, p_tmp_6f_bgColor] = p_scr_supertrend_display(p_scr_sym_b_0_4_p_scr_supertrend_supertrend, p_scr_sym_b_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6h,row=p_tmp_6g,text=p_tmp_6f_text,text_color=p_tmp_6f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_6j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6i_text, p_tmp_6i_textColor, p_tmp_6i_bgColor] = p_scr_supertrend_display(p_scr_sym_c_0_4_p_scr_supertrend_supertrend, p_scr_sym_c_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6k,row=p_tmp_6j,text=p_tmp_6i_text,text_color=p_tmp_6i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_6m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6l_text, p_tmp_6l_textColor, p_tmp_6l_bgColor] = p_scr_supertrend_display(p_scr_sym_d_0_4_p_scr_supertrend_supertrend, p_scr_sym_d_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6n,row=p_tmp_6m,text=p_tmp_6l_text,text_color=p_tmp_6l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_6p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6o_text, p_tmp_6o_textColor, p_tmp_6o_bgColor] = p_scr_supertrend_display(p_scr_sym_e_0_4_p_scr_supertrend_supertrend, p_scr_sym_e_0_4_p_scr_supertrend_direction, "Up", "Down", color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_6q,row=p_tmp_6p,text=p_tmp_6o_text,text_color=p_tmp_6o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_6s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6r_text, p_tmp_6r_textColor, p_tmp_6r_bgColor] = p_scr_kc_display(p_scr_sym_1_0_5_close, p_scr_sym_1_0_5_p_scr_kc_upper, p_scr_sym_1_0_5_p_scr_kc_middle, p_scr_sym_1_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_6t,row=p_tmp_6s,text=p_tmp_6r_text,text_color=p_tmp_6r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_6v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6u_text, p_tmp_6u_textColor, p_tmp_6u_bgColor] = p_scr_kc_display(p_scr_sym_2_0_5_close, p_scr_sym_2_0_5_p_scr_kc_upper, p_scr_sym_2_0_5_p_scr_kc_middle, p_scr_sym_2_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_6w,row=p_tmp_6v,text=p_tmp_6u_text,text_color=p_tmp_6u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_6y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_6z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_6x_text, p_tmp_6x_textColor, p_tmp_6x_bgColor] = p_scr_kc_display(p_scr_sym_3_0_5_close, p_scr_sym_3_0_5_p_scr_kc_upper, p_scr_sym_3_0_5_p_scr_kc_middle, p_scr_sym_3_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_6z,row=p_tmp_6y,text=p_tmp_6x_text,text_color=p_tmp_6x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_6x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_71 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_72 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_70_text, p_tmp_70_textColor, p_tmp_70_bgColor] = p_scr_kc_display(p_scr_sym_4_0_5_close, p_scr_sym_4_0_5_p_scr_kc_upper, p_scr_sym_4_0_5_p_scr_kc_middle, p_scr_sym_4_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_72,row=p_tmp_71,text=p_tmp_70_text,text_color=p_tmp_70_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_70_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_74 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_75 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_73_text, p_tmp_73_textColor, p_tmp_73_bgColor] = p_scr_kc_display(p_scr_sym_5_0_5_close, p_scr_sym_5_0_5_p_scr_kc_upper, p_scr_sym_5_0_5_p_scr_kc_middle, p_scr_sym_5_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_75,row=p_tmp_74,text=p_tmp_73_text,text_color=p_tmp_73_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_73_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_77 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_78 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_76_text, p_tmp_76_textColor, p_tmp_76_bgColor] = p_scr_kc_display(p_scr_sym_6_0_5_close, p_scr_sym_6_0_5_p_scr_kc_upper, p_scr_sym_6_0_5_p_scr_kc_middle, p_scr_sym_6_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_78,row=p_tmp_77,text=p_tmp_76_text,text_color=p_tmp_76_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_76_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_7a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_79_text, p_tmp_79_textColor, p_tmp_79_bgColor] = p_scr_kc_display(p_scr_sym_7_0_5_close, p_scr_sym_7_0_5_p_scr_kc_upper, p_scr_sym_7_0_5_p_scr_kc_middle, p_scr_sym_7_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7b,row=p_tmp_7a,text=p_tmp_79_text,text_color=p_tmp_79_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_79_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_7d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7c_text, p_tmp_7c_textColor, p_tmp_7c_bgColor] = p_scr_kc_display(p_scr_sym_8_0_5_close, p_scr_sym_8_0_5_p_scr_kc_upper, p_scr_sym_8_0_5_p_scr_kc_middle, p_scr_sym_8_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7e,row=p_tmp_7d,text=p_tmp_7c_text,text_color=p_tmp_7c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_7g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7f_text, p_tmp_7f_textColor, p_tmp_7f_bgColor] = p_scr_kc_display(p_scr_sym_9_0_5_close, p_scr_sym_9_0_5_p_scr_kc_upper, p_scr_sym_9_0_5_p_scr_kc_middle, p_scr_sym_9_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7h,row=p_tmp_7g,text=p_tmp_7f_text,text_color=p_tmp_7f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_7j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7i_text, p_tmp_7i_textColor, p_tmp_7i_bgColor] = p_scr_kc_display(p_scr_sym_a_0_5_close, p_scr_sym_a_0_5_p_scr_kc_upper, p_scr_sym_a_0_5_p_scr_kc_middle, p_scr_sym_a_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7k,row=p_tmp_7j,text=p_tmp_7i_text,text_color=p_tmp_7i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_7m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7l_text, p_tmp_7l_textColor, p_tmp_7l_bgColor] = p_scr_kc_display(p_scr_sym_b_0_5_close, p_scr_sym_b_0_5_p_scr_kc_upper, p_scr_sym_b_0_5_p_scr_kc_middle, p_scr_sym_b_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7n,row=p_tmp_7m,text=p_tmp_7l_text,text_color=p_tmp_7l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_7p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7o_text, p_tmp_7o_textColor, p_tmp_7o_bgColor] = p_scr_kc_display(p_scr_sym_c_0_5_close, p_scr_sym_c_0_5_p_scr_kc_upper, p_scr_sym_c_0_5_p_scr_kc_middle, p_scr_sym_c_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7q,row=p_tmp_7p,text=p_tmp_7o_text,text_color=p_tmp_7o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_7s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7r_text, p_tmp_7r_textColor, p_tmp_7r_bgColor] = p_scr_kc_display(p_scr_sym_d_0_5_close, p_scr_sym_d_0_5_p_scr_kc_upper, p_scr_sym_d_0_5_p_scr_kc_middle, p_scr_sym_d_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7t,row=p_tmp_7s,text=p_tmp_7r_text,text_color=p_tmp_7r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_7v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7u_text, p_tmp_7u_textColor, p_tmp_7u_bgColor] = p_scr_kc_display(p_scr_sym_e_0_5_close, p_scr_sym_e_0_5_p_scr_kc_upper, p_scr_sym_e_0_5_p_scr_kc_middle, p_scr_sym_e_0_5_p_scr_kc_lower, color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0), color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(120, 123, 134, 50))
+            table.cell(table_id=p_screener,column=p_tmp_7w,row=p_tmp_7v,text=p_tmp_7u_text,text_color=p_tmp_7u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if true
+            p_screener_indicator_cursor := p_screener_indicator_cursor + 1
+        p_screener_symbol_index := 0
+        if p_scr_sym_1_0_enabled and true
+            p_tmp_7y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_7z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_7x_text, p_tmp_7x_textColor, p_tmp_7x_bgColor] = p_scr_bbtrend_display(p_scr_sym_1_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_7z,row=p_tmp_7y,text=p_tmp_7x_text,text_color=p_tmp_7x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_7x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_2_0_enabled and true
+            p_tmp_81 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_82 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_80_text, p_tmp_80_textColor, p_tmp_80_bgColor] = p_scr_bbtrend_display(p_scr_sym_2_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_82,row=p_tmp_81,text=p_tmp_80_text,text_color=p_tmp_80_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_80_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_3_0_enabled and true
+            p_tmp_84 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_85 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_83_text, p_tmp_83_textColor, p_tmp_83_bgColor] = p_scr_bbtrend_display(p_scr_sym_3_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_85,row=p_tmp_84,text=p_tmp_83_text,text_color=p_tmp_83_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_83_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_4_0_enabled and true
+            p_tmp_87 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_88 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_86_text, p_tmp_86_textColor, p_tmp_86_bgColor] = p_scr_bbtrend_display(p_scr_sym_4_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_88,row=p_tmp_87,text=p_tmp_86_text,text_color=p_tmp_86_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_86_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_5_0_enabled and true
+            p_tmp_8a = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8b = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_89_text, p_tmp_89_textColor, p_tmp_89_bgColor] = p_scr_bbtrend_display(p_scr_sym_5_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8b,row=p_tmp_8a,text=p_tmp_89_text,text_color=p_tmp_89_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_89_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_6_0_enabled and true
+            p_tmp_8d = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8e = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8c_text, p_tmp_8c_textColor, p_tmp_8c_bgColor] = p_scr_bbtrend_display(p_scr_sym_6_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8e,row=p_tmp_8d,text=p_tmp_8c_text,text_color=p_tmp_8c_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8c_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_7_0_enabled and true
+            p_tmp_8g = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8h = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8f_text, p_tmp_8f_textColor, p_tmp_8f_bgColor] = p_scr_bbtrend_display(p_scr_sym_7_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8h,row=p_tmp_8g,text=p_tmp_8f_text,text_color=p_tmp_8f_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8f_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_8_0_enabled and true
+            p_tmp_8j = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8k = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8i_text, p_tmp_8i_textColor, p_tmp_8i_bgColor] = p_scr_bbtrend_display(p_scr_sym_8_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8k,row=p_tmp_8j,text=p_tmp_8i_text,text_color=p_tmp_8i_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8i_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_9_0_enabled and true
+            p_tmp_8m = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8n = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8l_text, p_tmp_8l_textColor, p_tmp_8l_bgColor] = p_scr_bbtrend_display(p_scr_sym_9_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8n,row=p_tmp_8m,text=p_tmp_8l_text,text_color=p_tmp_8l_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8l_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_a_0_enabled and true
+            p_tmp_8p = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8q = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8o_text, p_tmp_8o_textColor, p_tmp_8o_bgColor] = p_scr_bbtrend_display(p_scr_sym_a_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8q,row=p_tmp_8p,text=p_tmp_8o_text,text_color=p_tmp_8o_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8o_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_b_0_enabled and true
+            p_tmp_8s = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8t = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8r_text, p_tmp_8r_textColor, p_tmp_8r_bgColor] = p_scr_bbtrend_display(p_scr_sym_b_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8t,row=p_tmp_8s,text=p_tmp_8r_text,text_color=p_tmp_8r_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8r_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_c_0_enabled and true
+            p_tmp_8v = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8w = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8u_text, p_tmp_8u_textColor, p_tmp_8u_bgColor] = p_scr_bbtrend_display(p_scr_sym_c_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8w,row=p_tmp_8v,text=p_tmp_8u_text,text_color=p_tmp_8u_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8u_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_d_0_enabled and true
+            p_tmp_8y = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_8z = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_8x_text, p_tmp_8x_textColor, p_tmp_8x_bgColor] = p_scr_bbtrend_display(p_scr_sym_d_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_8z,row=p_tmp_8y,text=p_tmp_8x_text,text_color=p_tmp_8x_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_8x_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+        if p_scr_sym_e_0_enabled and true
+            p_tmp_91 = (p_screener_symbol_index % p_screener_page_size) + 1
+            p_tmp_92 = int(p_screener_symbol_index / p_screener_page_size) * (1 + p_screener_indicator_column_number) + p_screener_indicator_cursor
+            [p_tmp_90_text, p_tmp_90_textColor, p_tmp_90_bgColor] = p_scr_bbtrend_display(p_scr_sym_e_0_6_p_scr_bbtrend_bbtrend, color.rgb(255, 255, 255, 0), color.rgb(76, 175, 80, 0), color.rgb(255, 255, 255, 0), color.rgb(242, 54, 69, 0))
+            table.cell(table_id=p_screener,column=p_tmp_92,row=p_tmp_91,text=p_tmp_90_text,text_color=p_tmp_90_textColor,text_size=size.normal,text_valign=text.align_center,text_halign=text.align_center,bgcolor=p_tmp_90_bgColor,text_font_family=font.family_default,text_formatting=text.format_none)
+            p_screener_symbol_index := p_screener_symbol_index + 1
+
+//#endregion ———————————————————————————————————————————————————————————————————

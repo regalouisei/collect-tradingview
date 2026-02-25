@@ -1,0 +1,112 @@
+//@version=6
+indicator("Martell MNQ Quantum Scalper Pro", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// =========================================================================
+// 1. PARÁMETROS CENTRALES (Optimizados por IA para MNQ 1m)
+// =========================================================================
+almaLength = 150        // Ventana amplia para captar la macro tendencia
+almaOffset = 0.85       // Sesgo de Gauss
+almaSigma  = 6.0        // Desviación estándar del filtro
+
+chopLength = 14         // Período para detectar consolidación
+chopLimit  = 50.0       // Por debajo de 50 = Tendencia activa. Por encima = Consolidación (Ruido)
+
+tsiLong    = 25         // Filtro largo de momentum
+tsiShort   = 13         // Filtro corto de momentum
+tsiSignal  = 7          // Gatillo
+
+atrPeriod  = 14         // Periodo de volatilidad
+atrMult    = 2.5        // Multiplicador para SL y TP (Asegura respiro en el 1m)
+
+// =========================================================================
+// 2. MATEMÁTICA Y LÓGICA DE INDICADORES
+// =========================================================================
+// Tendencia Institucional (ALMA)
+macroTrend = ta.alma(close, almaLength, almaOffset, almaSigma)
+
+// Índice de Choppiness (Filtro Anti-Rango)
+atrSum = math.sum(ta.atr(1), chopLength)
+highestHigh = ta.highest(high, chopLength)
+lowestLow = ta.lowest(low, chopLength)
+rangeChop = highestHigh - lowestLow
+chop = rangeChop == 0 ? 50 : 100 * math.log10(atrSum / rangeChop) / math.log10(chopLength)
+isTrending = chop < chopLimit
+
+// True Strength Index (Gatillo de Momentum)
+double_smooth(src, long, short) => ta.ema(ta.ema(src, short), long)
+pc = ta.change(close)
+double_smoothed_pc = double_smooth(pc, tsiLong, tsiShort)
+double_smoothed_abs_pc = double_smooth(math.abs(pc), tsiLong, tsiShort)
+tsi = 100 * (double_smoothed_pc / double_smoothed_abs_pc)
+tsiEma = ta.ema(tsi, tsiSignal)
+
+bullishCross = ta.crossover(tsi, tsiEma) and tsi < 0 // Sobrevendido en microestructura
+bearishCross = ta.crossunder(tsi, tsiEma) and tsi > 0 // Sobrecomprado en microestructura
+
+// =========================================================================
+// 3. SEÑALES Y CONDICIONES
+// =========================================================================
+longCond  = close > macroTrend and isTrending and bullishCross
+shortCond = close < macroTrend and isTrending and bearishCross
+
+// =========================================================================
+// 4. MÁQUINA DE ESTADO Y GESTIÓN DE RIESGO (RR 1:1)
+// =========================================================================
+var int tradeState = 0 // 0 = Fuera, 1 = Largo, -1 = Corto
+var float entryPrice = na
+var float slPrice = na
+var float tpPrice = na
+
+_atr = ta.atr(atrPeriod)
+
+// A. Verificar cierres de operación (Si toca SL o TP)
+if tradeState == 1
+    if high >= tpPrice or low <= slPrice
+        tradeState := 0 // Cierra el largo
+if tradeState == -1
+    if low <= tpPrice or high >= slPrice
+        tradeState := 0 // Cierra el corto
+
+// B. Activar Nuevas Entradas (Solo si no hay una operación abierta)
+triggerLong = longCond and tradeState == 0
+triggerShort = shortCond and tradeState == 0
+
+if triggerLong
+    tradeState := 1
+    entryPrice := close
+    slPrice := close - (_atr * atrMult)
+    tpPrice := close + (_atr * atrMult) // Risk:Reward Exactamente 1:1
+
+if triggerShort
+    tradeState := -1
+    entryPrice := close
+    slPrice := close + (_atr * atrMult)
+    tpPrice := close - (_atr * atrMult) // Risk:Reward Exactamente 1:1
+
+// =========================================================================
+// 5. RENDERIZADO VISUAL
+// =========================================================================
+// Tendencia
+plot(macroTrend, color=color.new(color.blue, 20), title="ALMA Macro Trend", linewidth=2)
+
+// Señales
+plotshape(triggerLong, title="Buy Signal", location=location.belowbar, color=color.rgb(0, 255, 128), style=shape.triangleup, size=size.normal, text="BUY")
+plotshape(triggerShort, title="Sell Signal", location=location.abovebar, color=color.rgb(255, 0, 64), style=shape.triangledown, size=size.normal, text="SELL")
+
+// Trazado de Stop Loss y Take Profit Dinámicos
+plot(tradeState == 1 ? slPrice : na, title="Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(tradeState == 1 ? tpPrice : na, title="Long TP", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(tradeState == -1 ? slPrice : na, title="Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(tradeState == -1 ? tpPrice : na, title="Short TP", color=color.green, style=plot.style_linebr, linewidth=2)
+
+// Fondo visual de la zona operativa
+bgcolor(tradeState == 1 ? color.new(color.green, 90) : tradeState == -1 ? color.new(color.red, 90) : na, title="Trade Window")
+
+// =========================================================================
+// 6. ALERTAS CON SONIDO (Totalmente integradas)
+// =========================================================================
+if triggerLong
+    alert("¡COMPRA MNQ! RR 1:1. Entrada detectada. Gestiona el riesgo.", alert.freq_once_per_bar_close)
+
+if triggerShort
+    alert("¡VENTA MNQ! RR 1:1. Entrada detectada. Gestiona el riesgo.", alert.freq_once_per_bar_close)

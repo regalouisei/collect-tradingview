@@ -1,0 +1,231 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © sebamarghella
+
+//CREDITS:
+// The core Gaussian Filter logic is based on the work by @DonovanWall. 
+// I have refactored the original 'f_pole' function to use Pine Script v5/v6 Arrays for improved performance and calculation speed.
+// This strategy wraps that engine in a complete Risk Management system including ATR Stops, ADX volatility filtering, and Multi-Timeframe alignment.
+
+//@version=6
+strategy(title="[SM-021-v4] Gaussian Trend System [Optimized + Session/Day Filter]", overlay=true, calc_on_every_tick=false, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.1, slippage=3)
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Trading Direction Toggles
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+allowLongs = input.bool(true, "Enable Long Trading", group="Trading Direction")
+allowShorts = input.bool(true, "Enable Short Trading", group="Trading Direction")
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Date condition inputs
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+startDate = input.time(timestamp("1 January 2018 00:00 +0000"), "Start Date", group="Main Algo Settings")
+endDate = input.time(timestamp("31 Dec 2069 23:59 +0000"), "End Date", group="Main Algo Settings")
+timeCondition = time >= startDate and time <= endDate
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Intraday Session Filter (Entries & Exits)
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+useSessionFilter = input.bool(true, "Use Session Filter for Entries", group="Intraday Session Filter")
+sessionTime      = input.session("0930-1600", "Trading Session", group="Intraday Session Filter", tooltip="Format: HHMM-HHMM")
+sessionZone      = input.string("America/New_York", "Timezone", group="Intraday Session Filter")
+
+// Force Day Close Logic
+forceDayClose    = input.bool(true, "Force Close by End of Day?", group="Intraday Session Filter")
+dayCloseSession  = input.session("1555-1600", "EOD Exit Window", group="Intraday Session Filter", tooltip="Trades will close if price bar falls inside this time window")
+
+// Logic checks
+inSession = not useSessionFilter or not na(time(timeframe.period, sessionTime, sessionZone))
+isEodExit = forceDayClose and not na(time(timeframe.period, dayCloseSession, sessionZone))
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Day of Week Filter
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+tradeMon = input.bool(true, "Monday", group="Day of Week Filter")
+tradeTue = input.bool(true, "Tuesday", group="Day of Week Filter")
+tradeWed = input.bool(true, "Wednesday", group="Day of Week Filter")
+tradeThu = input.bool(true, "Thursday", group="Day of Week Filter")
+tradeFri = input.bool(true, "Friday", group="Day of Week Filter")
+tradeSat = input.bool(false, "Saturday", group="Day of Week Filter")
+tradeSun = input.bool(false, "Sunday", group="Day of Week Filter")
+
+// Calculate current day based on the user-selected Timezone
+currentDayOfWeek = dayofweek(time, sessionZone)
+dayCondition = (currentDayOfWeek == dayofweek.monday and tradeMon) or
+               (currentDayOfWeek == dayofweek.tuesday and tradeTue) or
+               (currentDayOfWeek == dayofweek.wednesday and tradeWed) or
+               (currentDayOfWeek == dayofweek.thursday and tradeThu) or
+               (currentDayOfWeek == dayofweek.friday and tradeFri) or
+               (currentDayOfWeek == dayofweek.saturday and tradeSat) or
+               (currentDayOfWeek == dayofweek.sunday and tradeSun)
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Filter 1: Baseline (Trend Regime)
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+useBaseline = input.bool(true, "Use Baseline Filter", group="Filter 1: Baseline")
+baselineLen = input.int(200, "Baseline Length", group="Filter 1: Baseline")
+baselineType = input.string("EMA", "Baseline Type", options=["EMA", "SMA"], group="Filter 1: Baseline")
+
+float baseline = switch baselineType
+    "EMA" => ta.ema(close, baselineLen)
+    "SMA" => ta.sma(close, baselineLen)
+    => na
+
+baselineCondition = not useBaseline or close > baseline
+plot(useBaseline ? baseline : na, color=color.white, title="Baseline Filter")
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Filter 2: ADX (Chop Filter)
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+useAdx = input.bool(false, "Use ADX Filter", group="Filter 2: ADX")
+adxLen = input.int(14, "ADX Length", group="Filter 2: ADX")
+adxThresh = input.int(20, "ADX Threshold", group="Filter 2: ADX")
+
+[diplus, diminus, adxValue] = ta.dmi(adxLen, adxLen)
+adxCondition = not useAdx or adxValue > adxThresh
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Filter 3: HTF Trend
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+useHtfFilter = input.bool(false, "Use Higher Timeframe Filter", group="Filter 3: HTF Trend")
+htfTimeframe = input.timeframe("D", "Higher Timeframe", group="Filter 3: HTF Trend")
+emaFastLen   = input.int(13, "HTF Fast EMA", group="Filter 3: HTF Trend")
+emaSlowLen   = input.int(25, "HTF Slow EMA", group="Filter 3: HTF Trend")
+
+htfFastEma = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaFastLen))
+htfSlowEma = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, emaSlowLen))
+
+htfUptrend   = htfFastEma > htfSlowEma
+htfDowntrend = htfFastEma < htfSlowEma
+htfLongCond  = not useHtfFilter or htfUptrend
+htfShortCond = not useHtfFilter or htfDowntrend
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Risk Management (ATR Stops & Targets)
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+useAtrStop   = input.bool(true, "Use ATR Stop Loss", group="Risk Management")
+useAtrTarget = input.bool(false, "Use ATR Take Profit", group="Risk Management")
+atrLength    = input.int(14, "ATR Length", group="Risk Management")
+atrMult      = input.float(2.0, "ATR Stop Multiplier", step=0.1, group="Risk Management")
+rrRatio      = input.float(3.0, "Reward to Risk Ratio", step=0.1, group="Risk Management") 
+
+atrVal = ta.atr(atrLength)
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Gaussian Channel Indicator - courtesy of @DonovanWall (Optimized)
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+src = input(defval=hl2, title="Source", group="Gaussian Settings")
+N = input.int(defval=8, title="Poles", minval=1, maxval=9, group="Gaussian Settings")
+per = input.int(defval=300, title="Sampling Period", minval=2, group="Gaussian Settings")
+mult = input.float(defval=0, title="Filtered True Range Multiplier", minval=0, group="Gaussian Settings")
+modeLag  = input.bool(defval=false, title="Reduced Lag Mode", group="Gaussian Settings")
+modeFast = input.bool(defval=false, title="Fast Response Mode", group="Gaussian Settings")
+
+// --- NEW OPTIMIZED FUNCTION START ---
+f_pole(_a, _s, _i) =>
+    var arr = array.new<float>(9, 0.0)
+    float _fn = nz(_s)
+    float _f1 = na
+    int _len = math.max(1, math.min(int(_i), 9))
+    for i = 0 to _len - 1
+        float prev_val = array.get(arr, i)
+        _fn := _a * _fn + (1 - _a) * prev_val
+        if i == 0
+            _f1 := _fn
+        array.set(arr, i, _fn)
+    [_fn, _f1]
+
+// --- NEW OPTIMIZED FUNCTION END ---
+
+beta  = (1 - math.cos(4*math.asin(1)/per)) / (math.pow(1.414, 2/N) - 1)
+alpha = -beta + math.sqrt(math.pow(beta, 2) + 2*beta)
+lag = (per - 1)/(2*N)
+srcdata = modeLag ? src + (src - src[lag]) : src
+trdata  = modeLag ? ta.tr(true) + (ta.tr(true) - ta.tr(true)[lag]) : ta.tr(true)
+
+[filtn, filt1]     = f_pole(alpha, srcdata, N)
+[filtntr, filt1tr] = f_pole(alpha, trdata,  N)
+
+filt   = modeFast ? (filtn + filt1)/2 : filtn
+filttr = modeFast ? (filtntr + filt1tr)/2 : filtntr
+hband = filt + filttr*mult
+lband = filt - filttr*mult
+fcolor   = filt > filt[1] ? #0aff68 : filt < filt[1] ? #ff0a5a : #cccccc
+barcolor = (src > src[1]) and (src > filt) and (src < hband) ? #0aff68 : 
+           (src > src[1]) and (src >= hband) ? #0aff1b : 
+           (src <= src[1]) and (src > filt) ? #00752d : 
+           (src < src[1]) and (src < filt) and (src > lband) ? #ff0a5a : 
+           (src < src[1]) and (src <= lband) ? #ff0a11 : 
+           (src >= src[1]) and (src < filt) ? #990032 : #cccccc
+
+filtplot = plot(filt, title="Filter", color=fcolor, linewidth=3)
+hbandplot = plot(hband, title="Filtered True Range High Band", color=fcolor)
+lbandplot = plot(lband, title="Filtered True Range Low Band", color=fcolor)
+fill(hbandplot, lbandplot, title="Channel Fill", color=color.new(fcolor, 80))
+barcolor(barcolor)
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Stoch RSI
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+stochSmoothK = input.int(2, "Stoch RSI K", minval=1, group="Stoch RSI")
+stochSmoothD = input.int(2, "Stoch RSI D", minval=1, group="Stoch RSI")
+stochLengthRSI = input.int(14, "Stoch RSI RSI Length", minval=1, group="Stoch RSI")
+stochLengthStoch = input.int(100, "Stoch RSI Stochastic Length", minval=1, group="Stoch RSI")
+stochSrc = input(close, title="Stoch RSI Source", group="Stoch RSI")
+
+stochRSI = ta.rsi(stochSrc, stochLengthRSI)
+k = ta.sma(ta.stoch(stochRSI, stochRSI, stochRSI, stochLengthStoch), stochSmoothK)
+d = ta.sma(k, stochSmoothD)
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Trading Logic
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+gaussianGreen = filt > filt[1]
+gaussianRed = filt < filt[1]
+
+// "inSession" ensures time of day; "dayCondition" ensures day of week
+longCondition = allowLongs and gaussianGreen and close > hband and (k > 80 or k < 20) and baselineCondition and adxCondition and htfLongCond and timeCondition and inSession and dayCondition
+closeLongCondition = ta.crossunder(close, hband) and timeCondition
+
+// "inSession" ensures time of day; "dayCondition" ensures day of week
+shortCondition = allowShorts and gaussianRed and close < lband and (k > 80 or k < 20) and htfShortCond and timeCondition and inSession and dayCondition
+closeShortCondition = ta.crossover(close, lband) and timeCondition
+
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Execution Logic
+//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// 1. Force Close Check (Priority)
+if isEodExit
+    strategy.close_all(comment="EOD Force Exit")
+
+// 2. Standard Entry/Exit Logic (Only runs if we are not in the exit window)
+else
+    if longCondition
+        strategy.entry("Long", strategy.long)
+        float slPrice = close - (atrVal * atrMult)
+        float tpPrice = close + (atrVal * atrMult * rrRatio)
+        
+        if useAtrStop and useAtrTarget
+            strategy.exit("Risk Exit Long", "Long", stop=slPrice, limit=tpPrice)
+        else if useAtrStop
+            strategy.exit("SL Exit Long", "Long", stop=slPrice)
+        else if useAtrTarget
+            strategy.exit("TP Exit Long", "Long", limit=tpPrice)
+
+    if closeLongCondition
+        strategy.close("Long", comment="Band Exit")
+
+    if shortCondition
+        strategy.entry("Short", strategy.short)
+        float slPriceShort = close + (atrVal * atrMult)
+        float tpPriceShort = close - (atrVal * atrMult * rrRatio)
+        
+        if useAtrStop and useAtrTarget
+            strategy.exit("Risk Exit Short", "Short", stop=slPriceShort, limit=tpPriceShort)
+        else if useAtrStop
+            strategy.exit("SL Exit Short", "Short", stop=slPriceShort)
+        else if useAtrTarget
+            strategy.exit("TP Exit Short", "Short", limit=tpPriceShort)
+
+    if closeShortCondition
+        strategy.close("Short", comment="Band Exit")

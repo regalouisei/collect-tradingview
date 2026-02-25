@@ -1,0 +1,198 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DarkPoolCrypto
+
+//@version=6
+indicator("Composite Fear & Greed Index", overlay=false, precision=1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1. CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Timeframe & Source ───
+grp_gen = "General Settings"
+mtf = input.timeframe("", "Indicator Timeframe", group=grp_gen, tooltip="Select the timeframe for the calculation. Leave empty to use the Chart timeframe. Higher timeframes (e.g., Daily) usually provide more reliable sentiment signals.")
+src = input.source(close, "Source Price", group=grp_gen, tooltip="The price source for calculations.")
+
+// ─── Component Settings ───
+grp_comp = "Component Settings (Internal)"
+rsiLength = input.int(14, "RSI Length", minval=2, maxval=100, group=grp_comp, tooltip="Lookback for RSI. Lower = more sensitive.")
+macdFast = input.int(12, "MACD Fast", minval=2, maxval=50, group=grp_comp, tooltip="Fast EMA for MACD.")
+macdSlow = input.int(26, "MACD Slow", minval=5, maxval=100, group=grp_comp, tooltip="Slow EMA for MACD.")
+bbLength = input.int(20, "BB Length", minval=5, maxval=50, group=grp_comp, tooltip="Bollinger Band lookback.")
+bbStdDev = input.float(2.0, "BB StdDev", minval=0.1, maxval=5.0, step=0.1, group=grp_comp, tooltip="Bollinger Band Standard Deviation.")
+zlemaShort = input.int(50, "Short Trend (ZLEMA)", minval=5, maxval=200, group=grp_comp, tooltip="Short-term Zero-Lag EMA period. ZLEMA reduces lag compared to standard SMA.")
+zlemaLong = input.int(200, "Long Trend (ZLEMA)", minval=20, maxval=500, group=grp_comp, tooltip="Long-term Zero-Lag EMA period.")
+
+// ─── Weighting ───
+grp_weight = "Component Weights"
+rsiWeight = input.float(30, "RSI %", minval=0, maxval=100, step=5, group=grp_weight, tooltip="Weight of RSI in final score.")
+macdWeight = input.float(25, "MACD %", minval=0, maxval=100, step=5, group=grp_weight, tooltip="Weight of MACD in final score.")
+bbWeight = input.float(25, "BB %", minval=0, maxval=100, step=5, group=grp_weight, tooltip="Weight of BB in final score.")
+trendWeight = input.float(20, "Trend %", minval=0, maxval=100, step=5, group=grp_weight, tooltip="Weight of Trend (ZLEMA) in final score.")
+
+// ─── Event Logic ───
+grp_event = "FOMO & Panic Logic"
+fomoVolMult = input.float(2.5, "FOMO Vol Mult", minval=1.1, step=0.1, group=grp_event, tooltip="Volume must be x times the average to trigger FOMO.")
+panicVolMult = input.float(3.0, "Panic Vol Mult", minval=1.1, step=0.1, group=grp_event, tooltip="Volume must be x times the average to trigger Panic.")
+panicDropPct = input.float(3.0, "Panic Drop %", minval=0.5, step=0.1, group=grp_event, tooltip="Intraday drop percentage to trigger Panic.")
+
+// ─── Visuals ───
+grp_vis = "Visuals"
+c_exGreed = input.color(#00FF00, "Extreme Greed", group=grp_vis, inline="1")
+c_greed = input.color(#90EE90, "Greed", group=grp_vis, inline="1")
+c_fear = input.color(#FFA500, "Fear", group=grp_vis, inline="2")
+c_exFear = input.color(#FF0000, "Extreme Fear", group=grp_vis, inline="2")
+c_fomo = input.color(#800080, "FOMO", group=grp_vis, inline="3")
+c_panic = input.color(#800000, "Panic", group=grp_vis, inline="3")
+showTable = input.bool(true, "Show Dashboard", group=grp_vis)
+divLookback = 5 // Internal setting for pivot lookback
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2. USER DEFINED FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// @function Calculates Zero Lag EMA
+math_zlema(series float src, simple int len) =>
+    lag = math.floor((len - 1) / 2)
+    ema_data = src + (src - src[lag])
+    ta.ema(ema_data, len)
+
+// @function Main Sentiment Calculation Engine
+calc_sentiment_index(float _src, float _vol, float _open, int _rsiLen, int _macdf, int _macds, int _bbl, float _bbs, int _zs, int _zl, float _wr, float _wm, float _wb, float _wt) =>
+    
+    // 1. RSI
+    float rsiVal = ta.rsi(_src, _rsiLen)
+    
+    // 2. MACD (Normalized)
+    [macdLine, sigLine, _] = ta.macd(_src, _macdf, _macds, 9)
+    float macdHist = macdLine - sigLine
+    float macdStDev = ta.stdev(macdHist, 100)
+    float safeStDev = macdStDev == 0 ? 1.0 : macdStDev
+    float macdScore = 50 + ((macdHist / safeStDev) * 16.6)
+    macdScore := math.max(0, math.min(100, macdScore))
+
+    // 3. Bollinger Bands %B
+    float basis = ta.sma(_src, _bbl)
+    float dev = ta.stdev(_src, _bbl) * _bbs
+    float upper = basis + dev
+    float lower = basis - dev
+    float bbScore = (upper - lower) == 0 ? 50 : (_src - lower) / (upper - lower) * 100
+    bbScore := math.max(0, math.min(100, bbScore))
+
+    // 4. Trend (ZLEMA)
+    float z_short = math_zlema(_src, _zs)
+    float z_long = math_zlema(_src, _zl)
+    float trendScore = 40.0
+    if _src > z_short and z_short > z_long
+        trendScore := 75.0 
+    else if _src > z_short
+        trendScore := 60.0 
+    else if _src < z_short and z_short < z_long
+        trendScore := 25.0 
+    
+    // Composite
+    float totalW = _wr + _wm + _wb + _wt
+    float finalRaw = (rsiVal * _wr + macdScore * _wm + bbScore * _wb + trendScore * _wt) / totalW
+    float finalIndex = ta.sma(finalRaw, 3) 
+
+    // Events (FOMO/Panic)
+    float volMA = ta.sma(_vol, 20)
+    bool fomo = _vol > (volMA * fomoVolMult) and rsiVal > 70 and _src > upper
+    float drop = (_src - _src[1]) / _src[1] * 100
+    bool panic = drop < (panicDropPct * -1) and _vol > (volMA * panicVolMult)
+
+    [finalIndex, fomo, panic]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3. EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[fgIndex, isFomo, isPanic] = request.security(syminfo.tickerid, mtf, calc_sentiment_index(src, volume, open, rsiLength, macdFast, macdSlow, bbLength, bbStdDev, zlemaShort, zlemaLong, rsiWeight, macdWeight, bbWeight, trendWeight))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 4. PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+col_grad = color.from_gradient(fgIndex, 20, 80, c_exFear, c_exGreed)
+p_idx = plot(fgIndex, "Sentiment Index", color=col_grad, linewidth=2)
+p_mid = plot(50, "Neutral", color=color.new(color.gray, 50), display=display.none)
+fill(p_idx, p_mid, fgIndex, 50, fgIndex > 50 ? color.new(c_greed, 85) : color.new(c_fear, 85))
+
+hline(80, "Ext Greed", c_exGreed, hline.style_dashed)
+hline(20, "Ext Fear", c_exFear, hline.style_dashed)
+
+plotshape(isFomo and not isFomo[1], "FOMO", shape.triangleup, location.bottom, c_fomo, size=size.small, text="FOMO")
+plotshape(isPanic and not isPanic[1], "PANIC", shape.triangledown, location.top, c_panic, size=size.small, text="PANIC")
+
+bgcolor(isPanic ? color.new(c_panic, 85) : isFomo ? color.new(c_fomo, 85) : na)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 5. DIVERGENCES (Corrected)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pl = ta.pivotlow(fgIndex, divLookback, divLookback)
+ph = ta.pivothigh(fgIndex, divLookback, divLookback)
+
+bool bearDiv = false
+bool bullDiv = false
+
+// Check Divergences (Loop optimized to look back 20 bars)
+if not na(ph)
+    for i = 1 to 20
+        // Price Higher High + Index Lower High
+        if not na(ph[i]) and fgIndex[divLookback] < fgIndex[divLookback+i] and high[divLookback] > high[divLookback+i]
+            bearDiv := true
+            break
+if not na(pl)
+    for i = 1 to 20
+        // Price Lower Low + Index Higher Low
+        if not na(pl[i]) and fgIndex[divLookback] > fgIndex[divLookback+i] and low[divLookback] < low[divLookback+i]
+            bullDiv := true
+            break
+
+// Plotting logic: Map boolean result to the actual Index Value for precise placement
+float bearDivY = bearDiv ? fgIndex[divLookback] : na
+float bullDivY = bullDiv ? fgIndex[divLookback] : na
+
+plotshape(bearDivY, "Bear Div", shape.circle, location.absolute, c_exFear, offset=-divLookback, size=size.tiny)
+plotshape(bullDivY, "Bull Div", shape.circle, location.absolute, c_exGreed, offset=-divLookback, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 6. DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var tbl = table.new(position.top_right, 2, 6, color.new(color.black, 60), color.gray, 1)
+
+if showTable and barstate.islast
+    string txt = fgIndex >= 80 ? "EXT GREED" : fgIndex >= 60 ? "GREED" : fgIndex <= 20 ? "EXT FEAR" : fgIndex <= 40 ? "FEAR" : "NEUTRAL"
+    color c_st = fgIndex >= 80 ? c_exGreed : fgIndex >= 60 ? c_greed : fgIndex <= 20 ? c_exFear : fgIndex <= 40 ? c_fear : color.gray
+    
+    table.cell(tbl, 0, 0, "DPC SENTIMENT", text_color=color.white, bgcolor=color.new(color.black, 10))
+    table.cell(tbl, 1, 0, mtf == "" ? timeframe.period : mtf, text_color=color.white, bgcolor=color.new(color.blue, 60))
+    
+    table.cell(tbl, 0, 1, "INDEX", text_color=color.white, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(fgIndex, "#.1"), text_color=color.white, bgcolor=c_st)
+    
+    table.cell(tbl, 0, 2, "STATE", text_color=color.white, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, txt, text_color=c_st, bgcolor=color.new(color.black, 50))
+    
+    string evt = isFomo ? "FOMO" : isPanic ? "PANIC" : "NORMAL"
+    color c_evt = isFomo ? c_fomo : isPanic ? c_panic : color.green
+    table.cell(tbl, 0, 3, "EVENT", text_color=color.white, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, evt, text_color=color.white, bgcolor=c_evt)
+
+    string divTxt = bearDiv ? "BEARISH" : bullDiv ? "BULLISH" : "NONE"
+    color c_div = bearDiv ? c_exFear : bullDiv ? c_exGreed : color.gray
+    table.cell(tbl, 0, 4, "DIVERGENCE", text_color=color.white, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, divTxt, text_color=c_div, bgcolor=color.new(color.black, 50))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 7. ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(isFomo and not isFomo[1], "FOMO Alert", "FOMO Detected")
+alertcondition(isPanic and not isPanic[1], "Panic Alert", "Panic Detected")
+alertcondition(ta.crossover(fgIndex, 80), "Extreme Greed", "Entering Extreme Greed")
+alertcondition(ta.crossunder(fgIndex, 20), "Extreme Fear", "Entering Extreme Fear")
+alertcondition(bearDiv, "Bearish Div", "Bearish Divergence on Sentiment")
+alertcondition(bullDiv, "Bullish Div", "Bullish Divergence on Sentiment")

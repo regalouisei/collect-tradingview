@@ -1,0 +1,256 @@
+//@version=5
+indicator("Hidden Impulse", overlay=false, max_bars_back=500)
+
+// ========== INPUT PARAMETERS ==========
+
+// Schaff Trend Cycle
+stc_length1 = input.int(23, "STC - Length 1", minval=1, group="Schaff Trend Cycle")
+stc_length2 = input.int(50, "STC - Length 2", minval=1, group="Schaff Trend Cycle")
+stc_smooth = input.int(10, "STC - Smoothing", minval=1, group="Schaff Trend Cycle")
+stc_level_low = input.int(25, "STC - Lower Level", minval=0, maxval=50, group="Schaff Trend Cycle")
+stc_level_high = input.int(75, "STC - Upper Level", minval=50, maxval=100, group="Schaff Trend Cycle")
+
+// Timeframe Selection
+stc_tf1 = input.timeframe("", "STC - Primary Timeframe", group="Timeframes", tooltip="Leave empty for current chart timeframe")
+stc_tf2 = input.timeframe("30", "STC - Higher Timeframe", group="Timeframes")
+
+// Force Index
+fi_period = input.int(13, "Force Index - EMA Period", minval=1, group="Force Index")
+
+// EMA Filter
+ema_period = input.int(50, "EMA - Period", minval=1, group="EMA Filter")
+
+// Setups
+show_setup_a = input.bool(true, "Setup A (Classic)", group="Signals")
+show_setup_b = input.bool(true, "Setup B (Divergence)", group="Signals")
+show_setup_c = input.bool(true, "Setup C (Bounce)", group="Signals")
+
+// Visualization
+show_labels = input.bool(true, "Show Labels on Chart", group="Visualization")
+show_mtf_stc = input.bool(true, "Show Higher TF STC", group="Visualization")
+
+// ========== SCHAFF TREND CYCLE CALCULATION ==========
+
+stc_calculate() =>
+    // MACD
+    fastMA = ta.ema(close, stc_length1)
+    slowMA = ta.ema(close, stc_length2)
+    macd = fastMA - slowMA
+    
+    // Stochastic of MACD
+    lowest_macd = ta.lowest(macd, stc_smooth)
+    highest_macd = ta.highest(macd, stc_smooth)
+    stoch1 = (macd - lowest_macd) / (highest_macd - lowest_macd) * 100
+    stoch1_smooth = ta.ema(stoch1, stc_smooth)
+    
+    // Stochastic of Stochastic
+    lowest_stoch = ta.lowest(stoch1_smooth, stc_smooth)
+    highest_stoch = ta.highest(stoch1_smooth, stc_smooth)
+    stc = (stoch1_smooth - lowest_stoch) / (highest_stoch - lowest_stoch) * 100
+    stc_final = ta.ema(stc, stc_smooth)
+    
+    stc_final
+
+// Calculate STC for both timeframes
+stc_primary = request.security(syminfo.tickerid, stc_tf1, stc_calculate())
+stc_higher = request.security(syminfo.tickerid, stc_tf2, stc_calculate())
+
+// ========== FORCE INDEX CALCULATION ==========
+
+fi_calculate() =>
+    force_raw = (close - close[1]) * volume
+    force_ema = ta.ema(force_raw, fi_period)
+    force_ema
+
+force_index = fi_calculate()
+
+// Normalize Force Index for visualization
+force_normalized = force_index / ta.sma(math.abs(force_index), 50) * 50
+
+// ========== EMA FILTER ==========
+
+ema_50 = ta.ema(close, ema_period)
+
+// ========== CONDITIONS FOR SETUPS ==========
+
+// Price position relative to EMA
+price_above_ema = close > ema_50
+price_below_ema = close < ema_50
+
+// STC crossovers
+stc_cross_up_25 = ta.crossover(stc_primary, stc_level_low)
+stc_cross_down_75 = ta.crossunder(stc_primary, stc_level_high)
+
+// Force Index zero line crossovers
+fi_cross_up = ta.crossover(force_index, 0)
+fi_cross_down = ta.crossunder(force_index, 0)
+fi_above_zero = force_index > 0
+fi_below_zero = force_index < 0
+
+// Higher timeframe confirmation
+htf_bullish = stc_higher > stc_level_low
+htf_bearish = stc_higher < stc_level_high
+
+// ========== SETUP A: CLASSIC ==========
+
+setup_a_long = show_setup_a and htf_bullish and stc_cross_up_25 and (fi_cross_up or fi_above_zero) and price_above_ema
+setup_a_short = show_setup_a and htf_bearish and stc_cross_down_75 and (fi_cross_down or fi_below_zero) and price_below_ema
+
+// ========== SETUP B: DIVERGENCE ==========
+
+// Bullish divergence: price makes LL, Force Index makes HL
+lookback = 10
+price_ll = close < ta.lowest(close[1], lookback) and close == ta.lowest(close, lookback)
+fi_hl = force_index > ta.lowest(force_index[1], lookback) and force_index == ta.highest(force_index, 3)
+
+bullish_div = price_ll and fi_hl and stc_primary < stc_level_low
+
+// Bearish divergence: price makes HH, Force Index makes LH
+price_hh = close > ta.highest(close[1], lookback) and close == ta.highest(close, lookback)
+fi_lh = force_index < ta.highest(force_index[1], lookback) and force_index == ta.lowest(force_index, 3)
+
+bearish_div = price_hh and fi_lh and stc_primary > stc_level_high
+
+// Divergence trigger
+div_trigger_long = bullish_div[1] and stc_primary > stc_primary[1] and fi_cross_up
+div_trigger_short = bearish_div[1] and stc_primary < stc_primary[1] and fi_cross_down
+
+setup_b_long = show_setup_b and div_trigger_long
+setup_b_short = show_setup_b and div_trigger_short
+
+// ========== SETUP C: QUICK BOUNCE ==========
+
+// EMA touch
+price_touch_ema_from_above = ta.cross(close, ema_50) and close[1] > ema_50
+price_touch_ema_from_below = ta.cross(close, ema_50) and close[1] < ema_50
+
+// Extreme STC zones
+stc_extreme_low = stc_primary < 15
+stc_extreme_high = stc_primary > 85
+
+setup_c_long = show_setup_c and price_touch_ema_from_above and stc_extreme_low and force_index > 0
+setup_c_short = show_setup_c and price_touch_ema_from_below and stc_extreme_high and force_index < 0
+
+// ========== COMBINED SIGNALS ==========
+
+signal_long = setup_a_long or setup_b_long or setup_c_long
+signal_short = setup_a_short or setup_b_short or setup_c_short
+
+// ========== VISUALIZATION ==========
+
+// Primary STC
+plot(stc_primary, "STC Primary", color=color.new(color.blue, 0), linewidth=2)
+
+// Higher Timeframe STC (optional)
+plot(show_mtf_stc ? stc_higher : na, "STC Higher TF", color=color.new(color.orange, 30), linewidth=1, style=plot.style_circles)
+
+// STC levels
+hline(stc_level_low, "Level 25", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(stc_level_high, "Level 75", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+hline(50, "Middle Level", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+
+// STC zones
+bgcolor(stc_primary < stc_level_low ? color.new(color.green, 90) : na, title="Oversold Zone")
+bgcolor(stc_primary > stc_level_high ? color.new(color.red, 90) : na, title="Overbought Zone")
+
+// Force Index (normalized, separate window)
+plot(force_normalized, "Force Index", color=force_index > 0 ? color.new(color.lime, 30) : color.new(color.red, 30), style=plot.style_columns)
+hline(0, "Force Zero Line", color=color.gray, linestyle=hline.style_solid, linewidth=2)
+
+// ========== CHART LABELS ==========
+
+if show_labels and signal_long
+    label_text = setup_a_long ? "LONG A" : setup_b_long ? "LONG B DIV" : "LONG C"
+    label.new(bar_index, stc_primary, label_text, 
+              color=color.new(color.green, 20), 
+              textcolor=color.white, 
+              style=label.style_label_up, 
+              size=size.normal)
+
+if show_labels and signal_short
+    label_text = setup_a_short ? "SHORT A" : setup_b_short ? "SHORT B DIV" : "SHORT C"
+    label.new(bar_index, stc_primary, label_text, 
+              color=color.new(color.red, 20), 
+              textcolor=color.white, 
+              style=label.style_label_down, 
+              size=size.normal)
+
+// ========== ALERTS ==========
+
+alertcondition(setup_a_long, "Setup A - LONG", "Classic LONG signal")
+alertcondition(setup_a_short, "Setup A - SHORT", "Classic SHORT signal")
+alertcondition(setup_b_long, "Setup B - DIV LONG", "Divergence LONG signal (best setup)")
+alertcondition(setup_b_short, "Setup B - DIV SHORT", "Divergence SHORT signal (best setup)")
+alertcondition(setup_c_long, "Setup C - BOUNCE LONG", "Quick bounce LONG")
+alertcondition(setup_c_short, "Setup C - BOUNCE SHORT", "Quick bounce SHORT")
+
+// General alerts
+alertcondition(signal_long, "ANY LONG", "Buy signal")
+alertcondition(signal_short, "ANY SHORT", "Sell signal")
+
+// ========== INFO PANEL ==========
+
+var table info_table = table.new(position.top_right, 3, 9, 
+                                  bgcolor=color.new(color.black, 80), 
+                                  frame_color=color.gray, 
+                                  frame_width=1, 
+                                  border_width=1, 
+                                  border_color=color.gray)
+
+if barstate.islast
+    // Header
+    table.cell(info_table, 0, 0, "HIDDEN IMPULSE", 
+               text_color=color.yellow, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    table.merge_cells(info_table, 0, 0, 2, 0)
+    
+    // Primary TF label
+    tf1_display = stc_tf1 == "" ? timeframe.period : stc_tf1
+    table.cell(info_table, 0, 1, "STC " + tf1_display + ":", text_color=color.white, text_size=size.small)
+    stc_color = stc_primary < stc_level_low ? color.green : stc_primary > stc_level_high ? color.red : color.gray
+    table.cell(info_table, 1, 1, str.tostring(math.round(stc_primary, 1)), 
+               text_color=stc_color, text_size=size.small)
+    
+    // Higher TF label
+    table.cell(info_table, 0, 2, "STC " + stc_tf2 + ":", text_color=color.white, text_size=size.small)
+    stc_htf_color = stc_higher < stc_level_low ? color.green : stc_higher > stc_level_high ? color.red : color.gray
+    table.cell(info_table, 1, 2, str.tostring(math.round(stc_higher, 1)), 
+               text_color=stc_htf_color, text_size=size.small)
+    
+    // Force Index
+    table.cell(info_table, 0, 3, "Force Index:", text_color=color.white, text_size=size.small)
+    fi_text = force_index > 0 ? "UP" : "DOWN"
+    fi_color = force_index > 0 ? color.lime : color.red
+    table.cell(info_table, 1, 3, fi_text, text_color=fi_color, text_size=size.small)
+    
+    // Price vs EMA
+    table.cell(info_table, 0, 4, "Price vs EMA:", text_color=color.white, text_size=size.small)
+    ema_text = price_above_ema ? "ABOVE" : "BELOW"
+    ema_color = price_above_ema ? color.lime : color.red
+    table.cell(info_table, 1, 4, ema_text, text_color=ema_color, text_size=size.small)
+    
+    // Separator
+    table.cell(info_table, 0, 5, "-------------", text_color=color.gray, text_size=size.small)
+    table.merge_cells(info_table, 0, 5, 2, 5)
+    
+    // Trend Direction
+    table.cell(info_table, 0, 6, "TREND:", text_color=color.white, text_size=size.small)
+    direction_text = htf_bullish and price_above_ema ? "LONG" : 
+                     htf_bearish and price_below_ema ? "SHORT" : "NONE"
+    direction_color = htf_bullish and price_above_ema ? color.green : 
+                      htf_bearish and price_below_ema ? color.red : color.orange
+    table.cell(info_table, 1, 6, direction_text, text_color=direction_color, text_size=size.normal)
+    table.merge_cells(info_table, 1, 6, 2, 6)
+    
+    // Active Signal
+    table.cell(info_table, 0, 7, "SIGNAL:", text_color=color.white, text_size=size.small)
+    signal_text = signal_long ? (setup_a_long ? "A: LONG" : setup_b_long ? "B: DIV L" : "C: LONG") :
+                  signal_short ? (setup_a_short ? "A: SHORT" : setup_b_short ? "B: DIV S" : "C: SHORT") : 
+                  "NONE"
+    signal_color = signal_long ? color.green : signal_short ? color.red : color.gray
+    table.cell(info_table, 1, 7, signal_text, text_color=signal_color, text_size=size.normal)
+    table.merge_cells(info_table, 1, 7, 2, 7)
+    
+    // Timeframes info
+    table.cell(info_table, 0, 8, "Timeframes:", text_color=color.new(color.gray, 30), text_size=size.tiny)
+    table.cell(info_table, 1, 8, tf1_display + " / " + stc_tf2, text_color=color.new(color.gray, 30), text_size=size.tiny)
+    table.merge_cells(info_table, 1, 8, 2, 8)

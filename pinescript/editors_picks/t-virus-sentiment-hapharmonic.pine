@@ -1,0 +1,790 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © hapharmonic
+
+//@version=6
+indicator('T-Virus Sentiment [hapharmonic]', 'T-Virus Sentiment', overlay=true, max_polylines_count = 100, max_labels_count = 500, max_lines_count = 200, scale = scale.none)
+
+// ========================== UDTs ==========================
+// Encapsulates configuration for the glowing halo effect.
+type GlowConf
+    float baseStep
+    float growth
+    int   aStart
+    int   aEnd
+    float gamma
+method alpha(GlowConf this, int i, int layers) =>
+    float u = layers <= 1 ? 1.0 : i / float(layers)
+    int(math.round(this.aStart + (this.aEnd - this.aStart) * math.pow(u, this.gamma)))
+method width(GlowConf this, int i, float baseWidth) =>
+    float w = baseWidth + (this.baseStep * (math.pow(1.0 + this.growth, i) - 1.0))
+    int(math.round(math.min(50.0, math.max(1.0, w))))
+
+// Stores signal names and tooltips for a single group.
+type SigBucket
+    array<string> names
+    array<string> tips
+method add(SigBucket this, string name, string tip) =>
+    this.names.push(name)
+    this.tips.push(tip)
+
+// Encapsulates all drawing object arrays to keep the global scope clean.
+type DrawingCache
+    array<polyline> pls
+    array<label>    bubbles
+    array<line>     gaugeL
+    array<label>    gaugeLbls
+    array<label>    sigLbls
+    array<line>     virusL
+    array<linefill> virusLF
+method clearAll(DrawingCache this) =>
+    for p in this.pls
+        p.delete()
+    this.pls.clear()
+    for lb in this.bubbles
+        lb.delete()
+    this.bubbles.clear()
+    for ln in this.gaugeL
+        ln.delete()
+    this.gaugeL.clear()
+    for gl in this.gaugeLbls
+        gl.delete()
+    this.gaugeLbls.clear()
+    for sl in this.sigLbls
+        sl.delete()
+    this.sigLbls.clear()
+    for vln in this.virusL
+        vln.delete()
+    this.virusL.clear()
+    for vlf in this.virusLF
+        vlf.delete()
+    this.virusLF.clear()
+
+// ========================== Inputs ==========================
+const float PI            = math.pi
+const float LOGO_LIFT     = 1.02
+const float STRAND_GROWTH = 0.22
+dis = display.none
+
+group_pos = '🎨 Position & Anchor'
+string anchorModeInput      = input.string('Screen Percent', 'Anchor Mode', options = ['Screen Percent','Right Offset (bars)'], group=group_pos, tooltip='Choose how the vial is anchored to the chart.', display= dis)
+float  anchorPercentInput   = input.float(1.15, 'Screen Percent (fixed)', group=group_pos, minval=0.0, maxval=1.5, step=0.01, active = anchorModeInput == 'Screen Percent', tooltip='Anchors the vial at a fixed percentage of the visible screen width (e.g., 1.10 is just off-screen to the right).', display= dis)
+int    rightOffsetBarsInput = input.int(-25, 'Offset from right (bars)', group=group_pos, active = anchorModeInput == 'Right Offset (bars)', tooltip='Anchors the vial a fixed number of bars from the rightmost visible bar.', display= dis)
+float  vialHeightInput      = input.float(100.0, 'Vial Height', group=group_pos, minval=10, tooltip='Sets the total vertical height of the vial in price units.', display= dis)
+float  vialRadiusInput      = input.float(15.0,  'Vial Radius (X)', group=group_pos, minval=5, tooltip='Sets the horizontal radius (width) of the vial.', display= dis)
+float  depthFactorInput     = input.float(0.02,  '3D Depth Factor', group=group_pos, minval=-0.03, maxval=0.5, step=0.01, tooltip='Controls the 3D perspective effect. Higher values create more depth.', display= dis)
+float  viewFlattenInput     = input.float(0.10,  'Side-View Flatten', group=group_pos, minval=0.06, maxval=0.30, step=0.01, tooltip='Controls the oval shape of the vial top/bottom, simulating a side view.', display= dis)
+
+group_vial = 'Vial Styling'
+color glassEdgeColorInput  = input.color(color.new(#CFE8FF, 10), 'Glass Edge', group=group_vial, tooltip='Color of the glass edges and outlines.')
+color glassFrontFillInput  = input.color(color.new(color.black, 80), 'Glass Front Fill', group=group_vial, tooltip='Fill color for the front face of the glass tube.')
+color glassBackFillInput   = input.color(color.new(#99D0FF, 98), 'Glass Back Fill',  group=group_vial, tooltip='Fill color for the back face of the glass tube.')
+color metalBaseColorInput  = input.color(color.new(#8F8F8F, 0),  'Metal (Base)', group=group_vial, tooltip='Base color for the metal top and bottom caps.')
+color metalShadowColor     = input.color(color.new(#3A3A3A, 40), 'Metal Shadow', group=group_vial, tooltip='Shadow color for the metal caps to create a 3D effect.')
+float capHeightFactor      = input.float(0.10, 'Cap Height %', group=group_vial, minval=0.05, maxval=0.2, tooltip='Height of the metal caps as a percentage of the total vial height.', display= dis)
+
+group_helix = 'Helix Styling'
+float helixTurnsInput      = input.float(3.0, 'Turns', group=group_helix, minval=1.0, step=0.5, tooltip='Number of full turns the DNA helix makes from bottom to top.', display= dis)
+int   helixPtsPerTurnInput = input.int(19,  'Detail (pts/turn)', group=group_helix, minval=12, maxval=120, tooltip='Number of points used to draw each turn of the helix. Higher values are smoother but may impact performance.', display= dis)
+float helixRadiusFactor    = input.float(0.70, 'Inner Radius % of Vial', group=group_helix, minval=0.2, maxval=0.9, step=0.05, tooltip='The radius of the helix as a percentage of the vial\'s radius.', display= dis)
+color inactiveCoreColorInput = input.color(color.new(#fccbcd,65), 'Inactive Core Color', group=group_helix, tooltip='Color of the DNA strands and rungs when they are in an "inactive" state.')
+
+group_rungs = 'DNA Rungs'
+int   rungsPerTurnInput    = input.int(6, 'Rungs per Turn', group=group_rungs, minval=2, maxval=16, tooltip='Number of DNA rungs (cross-connections) per full turn of the helix.', display= dis)
+float rungBowFactorInput   = input.float(0.35, 'Rung Bow Factor', group=group_rungs, minval=0.0, maxval=1.0, step=0.05, tooltip='Controls how much the DNA rungs bow outwards, creating a 3D effect.', display= dis)
+
+group_fx = 'Highlights'
+bool  drawGlassHighlights  = input.bool(true, 'Glass Highlights', group=group_fx, tooltip='Toggles the white specular highlights on the front of the glass vial.')
+color glowHighlightColor   = input.color(color.new(#FFFFFF, 80), 'Specular Highlight', group=group_fx, tooltip='Color of the glass highlights.', active=drawGlassHighlights)
+
+group_logo = 'Umbrella Logo (Top Cap)'
+bool  drawUmbrellaLogo     = input.bool(true, 'Draw Umbrella Logo', group=group_logo, tooltip='Toggles the visibility of the Umbrella Corp logo on the top cap.')
+float logoScaleInput       = input.float(0.75, 'Logo Size (vs. top radius)', group=group_logo, minval=0.2, maxval=1.0, step=0.01, tooltip='Adjusts the size of the logo relative to the top cap\'s radius.', active=drawUmbrellaLogo, display= dis)
+color logoRedColorInput    = input.color(color.new(#FF2A2A, 10), 'Red (slightly transparent)', group=group_logo, tooltip='Color for the red segments of the logo.', active=drawUmbrellaLogo)
+color logoWhiteColorInput  = input.color(color.new(color.white, 10), 'White (slightly transparent)', group=group_logo, tooltip='Color for the white segments of the logo.', active=drawUmbrellaLogo)
+color logoBorderColorInput = input.color(color.new(#000000, 30), 'Logo Border', group=group_logo, tooltip='Color for the border lines of the logo.', active=drawUmbrellaLogo)
+
+group_glow = 'Glow (Airy Halo)'
+float glowStrandBaseStep   = input.float(4.0,'Strand Base Width Step', group=group_glow, minval=0.5, maxval=10.0, tooltip='Base width for the glowing halo effect around the DNA strands.', display= dis)
+int   glowStartAlphaInput  = input.int(50, 'Glow Start Transparency', group=group_glow, minval=0, maxval=100, tooltip='Transparency of the glow at its core.', display= dis)
+int   glowEndAlphaInput    = input.int(85, 'Glow End Transparency',   group=group_glow, minval=0, maxval=100, tooltip='Transparency of the glow at its outer edge.', display= dis)
+float glowGammaInput       = input.float(1.6,'Glow Falloff Gamma',    group=group_glow, minval=0.8, maxval=3.0, step=0.05, tooltip='Controls the rate at which the glow fades out. Higher values mean a sharper falloff.', display= dis)
+GlowConf strandGlow = GlowConf.new(glowStrandBaseStep, STRAND_GROWTH, glowStartAlphaInput, glowEndAlphaInput, glowGammaInput)
+
+group_bubbles = 'Oxygen Bubbles'
+bool  showBubblesInput       = input.bool(true, 'Show Bubbles', group=group_bubbles, tooltip='Toggles the visibility of the oxygen bubbles inside the vial.')
+string volWindowModeInput    = input.string('Visible Range', 'Buy/Sell Window', options=['Visible Range','Custom Lookback'], group=group_bubbles, tooltip='Determines the lookback period for calculating buy/sell volume pressure, which affects bubble density.', active=showBubblesInput, display= dis)
+int   manualLookbackInput    = input.int(1, 'Lookback Bars', minval=1, group=group_bubbles, active = showBubblesInput and volWindowModeInput == 'Custom Lookback', tooltip='Sets a custom lookback period in bars if "Custom Lookback" is selected.', display= dis)
+bool  useCustomBubbleColors  = input.bool(false, 'Use Custom Bubble Colors', group=group_bubbles, tooltip='If enabled, uses the custom colors below. If disabled, uses system colors based on buy/sell pressure.', active=showBubblesInput)
+color bubbleCol25Input       = input.color(color.white, '25% Level Color', group=group_bubbles, inline='b25', active = showBubblesInput and useCustomBubbleColors, tooltip='Custom bubble color for the 0-25% buy pressure level.')
+color bubbleCol50Input       = input.color(color.white, '50% Level Color', group=group_bubbles, inline='b50', active = showBubblesInput and useCustomBubbleColors, tooltip='Custom bubble color for the 25-50% buy pressure level.')
+color bubbleCol75Input       = input.color(color.white, '75% Level Color', group=group_bubbles, inline='b75', active = showBubblesInput and useCustomBubbleColors, tooltip='Custom bubble color for the 50-75% buy pressure level.')
+color bubbleCol100Input      = input.color(color.white, '100% Level Color', group=group_bubbles, inline='b100', active = showBubblesInput and useCustomBubbleColors, tooltip='Custom bubble color for the 75-100% buy pressure level.')
+
+group_virus = 'Virus Mascot Styling'
+bool showVirusInput = input.bool(true, 'Show Virus Mascot', group = group_virus, tooltip = 'Toggles the visibility of the T-Virus mascot character.')
+
+// ========================== Signals Inputs ==========================
+
+group_sig = '⚙️ Signals (Placement into 5 Tube Levels)'
+bool showSignalsInput = input.bool(true, 'Show Signal Labels', group = group_sig, tooltip='Toggles the visibility of the signal indicator labels inside and around the vial.')
+int  rsiLenInput      = input.int(14, 'RSI Length', minval=2, group = group_sig, tooltip='The lookback period for the Relative Strength Index (RSI) calculation.', active=showSignalsInput, display= dis)
+float rsiSrcInput     = input.source(close, 'RSI Source', group = group_sig, tooltip='The source price for the RSI calculation.', active=showSignalsInput, display= dis)
+int  adxLenInput      = input.int(14, 'ADX Length', minval=2, group = group_sig, tooltip='The lookback period for the ADX and DI calculations.', active=showSignalsInput, display= dis)
+int  adxSmoothInput   = input.int(14, title="ADX Smoothing", minval=1, group = group_sig, tooltip='The smoothing period for the ADX calculation.', active=showSignalsInput, display= dis)
+float adxEqTolInput   = input.float(5.0, 'DI Equal Tolerance', minval=0.0, maxval=20.0, step=0.5, group = group_sig, tooltip='The tolerance range within which the +DI and -DI lines are considered equal or neutral.', active=showSignalsInput, display= dis)
+int  macdFastInput    = input.int(12, 'MACD Fast', minval=1, group = group_sig, inline = 'm1', tooltip='The length of the fast moving average for MACD.', active=showSignalsInput, display= dis)
+int  macdSlowInput    = input.int(26, 'Slow', minval=2, group = group_sig, inline = 'm1', tooltip='The length of the slow moving average for MACD.', active=showSignalsInput, display= dis)
+int  macdSigInput     = input.int(9,  'Signal', minval=1, group = group_sig, inline = '', tooltip='The length of the signal line moving average for MACD.', active=showSignalsInput, display= dis)
+string macdSrcMAInput = input.string('EMA', 'MACD Source MA', options = ['EMA','SMA'], group = group_sig, inline = 'm2', tooltip='The type of moving average to use for the fast and slow MACD lines.', active=showSignalsInput, display= dis)
+string macdSigMAInput = input.string('EMA', 'Signal MA', options = ['EMA','SMA'], group = group_sig, inline = 'm2', tooltip='The type of moving average to use for the signal line.', active=showSignalsInput, display= dis)
+
+group_ikh = 'Ichimoku'
+int conversionPeriods      = input.int(9,  minval=1, title='Conversion Line Length', group = group_ikh, tooltip='The lookback period for the Tenkan-sen (Conversion Line).', active=showSignalsInput, display= dis)
+int basePeriods            = input.int(26, minval=1, title='Base Line Length',       group = group_ikh, tooltip='The lookback period for the Kijun-sen (Base Line).', active=showSignalsInput, display= dis)
+int laggingSpan2Periods    = input.int(52, minval=1, title='Leading Span B Length',  group = group_ikh, tooltip='The lookback period for the Senkou Span B (Leading Span B).', active=showSignalsInput, display= dis)
+int displacement           = input.int(26, minval=1, title='Lagging/Cloud Displacement', group = group_ikh, tooltip='The displacement for the Chikou Span (Lagging Span) and the Kumo (Cloud).', active=showSignalsInput, display= dis)
+
+group_bb = 'Bollinger Bands'
+int   bbLenInput     = input.int(20, minval=1, title='BB Length', group = group_bb, inline='bb1', tooltip='The lookback period for the Bollinger Bands calculation.', active=showSignalsInput, display= dis)
+float bbMultInput    = input.float(2.0, minval=0.001, maxval=50, title='StdDev', group = group_bb, inline='bb1', tooltip='The standard deviation multiplier for the upper and lower bands.', active=showSignalsInput, display= dis)
+string bbMATypeInput = input.string('SMA', 'Basis MA Type', options = ['SMA','EMA','SMMA (RMA)','WMA','VWMA'], group = group_bb, tooltip='The type of moving average for the basis line.', active=showSignalsInput, display= dis)
+float  bbSrcInput    = input.source(close, 'Source', group = group_bb, tooltip='The source price for the Bollinger Bands calculation.', active=showSignalsInput, display= dis)
+
+group_obv = 'OBV'
+int   obvMaLenInput     = input.int(20, 'OBV MA Length', minval=1, group = group_obv, inline='obv1', tooltip='The lookback period for the moving average of the OBV.', active=showSignalsInput, display= dis)
+string obvMaTypeInput   = input.string('SMA', 'MA Type', options = ['SMA','EMA','SMMA (RMA)','WMA','VWMA'], group = group_obv, inline='obv1', tooltip='The type of moving average for the OBV.', active=showSignalsInput, display= dis)
+int   obvRiseShortInput = input.int(3, 'Rise (short)', minval=1, group = group_obv, tooltip='Short-term lookback to confirm a rising OBV.', active=showSignalsInput, display= dis)
+int   obvRiseLongInput  = input.int(5, 'Rise (long)',  minval=2, group = group_obv, tooltip='Long-term lookback to confirm a strong rising OBV.', active=showSignalsInput, display= dis)
+int   obvFallShortInput = input.int(3, 'Fall (short)', minval=1, group = group_obv, tooltip='Lookback to confirm a falling OBV.', active=showSignalsInput, display= dis)
+float obvNearTolPctInput= input.float(0.02, 'Near MA Tol %', minval=0.0, maxval=0.2, step=0.005, group = group_obv, tooltip='The percentage tolerance for considering the OBV to be "near" its moving average.', active=showSignalsInput, display= dis)
+float obvSpikeKInput    = input.float(1.8, 'Spike k*avg(|Δ|)', minval=0.5, maxval=5.0, step=0.1, group = group_obv, tooltip='The multiplier for the average absolute change in OBV to detect a volume spike.', active=showSignalsInput, display= dis)
+int   obvSpikeAvgLenInp = input.int(50, 'Spike Avg Len', minval=5, group = group_obv, tooltip='The lookback period for calculating the average absolute change in OBV.', active=showSignalsInput, display= dis)
+
+// ====================== Visible Range Anchor ======================
+var int leftVisIdx  = na
+var int rightVisIdx = na
+leftVisIdx  := time == chart.left_visible_bar_time  ? bar_index : nz(leftVisIdx)
+rightVisIdx := time == chart.right_visible_bar_time ? bar_index : nz(rightVisIdx)
+
+// ========================== Geometry Utils ==========================
+f_clampBarIndex(int bx) =>
+    int minX = last_bar_index - 5000, maxX = last_bar_index + 500
+    int(math.max(minX, math.min(maxX, bx)))
+f_project3DTo2D(float x3d, float y3d, float z3d, float depthFactor) =>
+    float sx = x3d + (z3d * depthFactor * 0.5)
+    int   sxi = f_clampBarIndex(int(math.round(sx)))
+    float sy = y3d - (z3d * depthFactor * 1.0)
+    chart.point.new(na, sxi, sy)
+f_buildEllipse(float cx, float cy, float rx, float ry, float zDepth, float depthFactor, int detail) =>
+    array<chart.point> pts = array.new<chart.point>()
+    for i = 0 to detail
+        float a = (i / float(detail)) * 2.0 * PI
+        float ex = cx + rx * math.cos(a), ey = cy + ry * math.sin(a)
+        pts.push(f_project3DTo2D(ex, ey, zDepth, depthFactor))
+    pts
+f_buildQuadSide(float xLeft, float xRight, float y1, float y2, float zLeft, float zRight, float depthFactor) =>
+    array<chart.point> quad = array.new<chart.point>()
+    quad.push(f_project3DTo2D(xLeft,  y1, zLeft,  depthFactor))
+    quad.push(f_project3DTo2D(xLeft,  y2, zLeft,  depthFactor))
+    quad.push(f_project3DTo2D(xRight, y2, zRight, depthFactor))
+    quad.push(f_project3DTo2D(xRight, y1, zRight, depthFactor))
+    quad
+f_buildHelix(float cx, float yStart, float yEnd, float radius, float turns, int ptsPerTurn, float zBias, float depthFactor, float phase) =>
+    array<chart.point> pts = array.new<chart.point>()
+    int total = int(turns * ptsPerTurn)
+    float dy = (yEnd - yStart)
+    for i = 0 to total
+        float t = i / float(total)
+        float ang = t * turns * 2.0 * PI + phase
+        float x  = cx + radius * math.cos(ang), z = radius * math.sin(ang) + zBias
+        float y  = yStart + dy * t
+        pts.push(f_project3DTo2D(x, y, z, depthFactor))
+    pts
+f_buildRing(float cx, float yMid, float rx, float ry, float h, float depthFactor, int detail) =>
+    float y1 = yMid, y2 = yMid + h
+    [f_buildEllipse(cx, y2, rx, ry, rx, depthFactor, detail),
+     f_buildEllipse(cx, y1, rx, ry, rx, depthFactor, detail),
+     f_buildQuadSide(cx - rx, cx + rx, y1, y2, rx, rx, depthFactor)]
+f_buildSector(float cx, float cy, float rx, float ry, float zDepth, float depthFactor, float a1, float a2) =>
+    array<chart.point> pts = array.new<chart.point>()
+    float x1 = cx + rx * math.cos(a1), y1 = cy + ry * math.sin(a1)
+    float x2 = cx + rx * math.cos(a2), y2 = cy + ry * math.sin(a2)
+    pts.push(f_project3DTo2D(cx, cy, zDepth, depthFactor))
+    pts.push(f_project3DTo2D(x1, y1, zDepth, depthFactor))
+    pts.push(f_project3DTo2D(x2, y2, zDepth, depthFactor))
+    pts
+f_buildRungArc(float cx, float y, float r, float phi, float bow, float depthFactor) =>
+    float x1 = cx + r * math.cos(phi),     z1 = r * math.sin(phi)
+    float x2 = cx + r * math.cos(phi + PI),z2 = r * math.sin(phi + PI)
+    float xm = cx,                         zm = bow * r * math.cos(phi)
+    array<chart.point> pts = array.new<chart.point>()
+    pts.push(f_project3DTo2D(x1, y, z1, depthFactor))
+    pts.push(f_project3DTo2D(xm, y, zm, depthFactor))
+    pts.push(f_project3DTo2D(x2, y, z2, depthFactor))
+    pts
+f_buildArc(float cx, float cy, float r, float z, float depthFactor, float a1, float a2, int detail) =>
+    array<chart.point> pts = array.new<chart.point>()
+    int N = math.max(4, detail)
+    for i = 0 to N
+        float t = i / float(N)
+        float a = a1 + (a2 - a1) * t
+        float ex = cx + r * math.cos(a), ey = cy + r * math.sin(a)
+        pts.push(f_project3DTo2D(ex, ey, z, depthFactor))
+    pts
+f_addLine(chart.point p1, chart.point p2, color c, int w, array<line> store) =>
+    line L = line.new(p1, p2, color = c, width = w)
+    store.push(L)
+    L
+f_addFill(line a, line b, color c, array<linefill> store) =>
+    linefill F = linefill.new(a, b, c)
+    store.push(F)
+    F
+f_buildSpikeWedge(float cx, float cy, float r0, float r1, float width, float ang, float z, color c, array<line> Ls, array<linefill> Fs, float depthFactor) =>
+    float ca = math.cos(ang), sa = math.sin(ang)
+    float px = -sa, py = ca
+    float bx = cx + r0 * ca, byy = cy + r0 * sa
+    float tx = cx + r1 * ca, ty = cy + r1 * sa
+    float hw = width * 0.5
+    chart.point bl = f_project3DTo2D(bx + px*hw, byy + py*hw, z, depthFactor)
+    chart.point br = f_project3DTo2D(bx - px*hw, byy - py*hw, z, depthFactor)
+    chart.point tp = f_project3DTo2D(tx, ty, z, depthFactor)
+    line l1 = f_addLine(bl, tp, c, 3, Ls)
+    line l2 = f_addLine(br, tp, c, 3, Ls)
+    f_addFill(l1, l2, color.new(c, 0), Fs)
+f_buildSpikeKnob(float cx, float cy, float r1, float ang, float z, color c, array<line> Ls, array<linefill> Fs, float depthFactor) =>
+    float ca = math.cos(ang), sa = math.sin(ang)
+    float rIn = r1 + 0.06*r1
+    float aL  = ang + 12*PI/180, aR = ang - 12*PI/180
+    chart.point kb = f_project3DTo2D(cx + (r1-0.02*r1)*ca, cy + (r1-0.02*r1)*sa, z, depthFactor)
+    chart.point kl = f_project3DTo2D(cx + rIn*math.cos(aL), cy + rIn*math.sin(aL), z, depthFactor)
+    chart.point kr = f_project3DTo2D(cx + rIn*math.cos(aR), cy + rIn*math.sin(aR), z, depthFactor)
+    line l3 = f_addLine(kb, kl, c, 3, Ls)
+    line l4 = f_addLine(kb, kr, c, 3, Ls)
+    f_addFill(l3, l4, color.new(c, 0), Fs)
+
+// ========================== Gradient ==========================
+f_lerp(float a, float b, float t) => a + (b - a) * t
+f_rgbLerp(int r1, int g1, int b1, int r2, int g2, int b2, float t, int a) =>
+    color.rgb(int(math.round(f_lerp(r1, r2, t))),
+              int(math.round(f_lerp(g1, g2, t))),
+              int(math.round(f_lerp(b1, b2, t))), a)
+f_helixGradient(float u, int a) =>
+    float x = math.max(0.0, math.min(1.0, u))
+    int Rr = 255, Rg = 42,  Rb = 42
+    int Or = 255, Og = 166, Ob = 60
+    int Gr = 0,   Gg = 255, Gb = 195
+    color out = na
+    if x < 0.25
+        float t = x / 0.25
+        out := f_rgbLerp(Rr, Rg, Rb, Or, Og, Ob, t, a)
+    else if x < 0.50
+        float t = (x - 0.25) / 0.25
+        out := f_rgbLerp(Or, Og, Ob, Gr, Gg, Gb, t, a)
+    else if x < 0.75
+        float t = (x - 0.50) / 0.25
+        out := f_rgbLerp(Gr, Gg, Gb, Or, Og, Ob, t, a)
+    else
+        float t = (x - 0.75) / 0.25
+        out := f_rgbLerp(Or, Og, Ob, Rr, Rg, Rb, t, a)
+    out
+
+// ========================== Strand Rendering ==========================
+f_drawGradientStrand(array<chart.point> pts, int segments, int lw, int alphaBase, array<polyline> outPL) =>
+    int n = array.size(pts)
+    if n >= 2 and segments >= 2
+        for s = 0 to segments - 1
+            int i1 = int(math.floor(s       * (n - 1) / segments))
+            int i2 = int(math.floor((s + 1) * (n - 1) / segments))
+            array<chart.point> chunk = array.new<chart.point>()
+            for i = i1 to i2
+                chunk.push(array.get(pts, i))
+            float u = s / float(segments - 1)
+            color c = f_helixGradient(u, alphaBase)
+            outPL.push(polyline.new(chunk, curved=true, closed=false, line_color=c, line_width=lw))
+f_drawCoreStrandThreshold_run(array<chart.point> pts, int segments, float uThreshold, int wActive, int wInactive, color inactiveColor, array<polyline> outPL) =>
+    int n = array.size(pts)
+    if n >= 2 and segments >= 2
+        for s = 0 to segments - 1
+            int i1 = int(math.floor(s       * (n - 1) / segments))
+            int i2 = int(math.floor((s + 1) * (n - 1) / segments))
+            array<chart.point> chunk = array.new<chart.point>()
+            for i = i1 to i2
+                chunk.push(array.get(pts, i))
+            float uCenter = (s + 0.5) / float(segments)
+            float uTier = (math.floor(uCenter * 7) + 0.5) / 7.0
+            bool isActive = uTier <= uThreshold
+            int wid = isActive ? wActive : wInactive
+            color c = isActive ? f_helixGradient(uTier, 0) : inactiveColor
+            outPL.push(polyline.new(chunk, curved=true, closed=false, line_color=c, line_width=wid))
+
+// ========================== Random & Volume Split ==========================
+f_fract(float x) => x - math.floor(x)
+f_hash(int i) => f_fract(math.sin(i * 12.9898 + 78.233) * 43758.5453)
+f_calculateBuySellVolume(float o, float h, float l, float c, float v) =>
+    float buyVolume = 0.0
+    float sellVolume = 0.0
+    if h > l
+        buyVolume  := v * (c - l) / (h - l)
+        sellVolume := v * (h - c) / (h - l)
+    else
+        buyVolume  := v * 0.5
+        sellVolume := v * 0.5
+    [math.max(0.0, buyVolume), math.max(0.0, sellVolume)]
+
+// ========================== Signal Coloring ==========================
+f_sigColor(string name) =>
+    switch name
+        'RSI'  => color.new(#F44336, 0)
+        'EMA'  => color.new(#FF9800, 0)
+        'MACD' => color.new(#9C27B0, 0)
+        'ADX'  => color.new(#3F51B5, 0)
+        'IKH'  => color.new(#00BCD4, 0)
+        'BB'   => color.new(#4CAF50, 0)
+        'OBV'  => color.new(#E91E63, 0)
+        => chart.fg_color
+
+// ========================== Label Distribution ==========================
+f_drawGroupLabelsArea(array<string> names, array<string> tips, int xLeft, int xRight, float yMin, float yMax, int seed, array<label> outLbls) =>
+    int n = array.size(names)
+    if n > 0
+        int cols = math.max(1, int(math.ceil(math.sqrt(n))))
+        int rows = math.max(1, int(math.ceil(n / cols)))
+        float w  = float(xRight - xLeft)
+        float h  = yMax - yMin
+        for idx = 0 to n - 1
+            int r = int(math.floor(idx / cols))
+            int c = idx % cols
+            float cxFrac = (c + 0.5) / float(cols)
+            float cyFrac = (r + 0.5) / float(rows)
+            float jx = (f_hash(seed*97 + idx*31) - 0.5) * w * (0.12/cols)
+            float jy = (f_hash(seed*131 + idx*17) - 0.5) * h * (0.12/rows)
+            int   xPos = f_clampBarIndex(int(math.round(xLeft + cxFrac * w + jx)))
+            float yPos = yMin + cyFrac * h + jy
+            string nm  = array.get(names, idx)
+            string tip = array.get(tips,  idx)
+            label lb = label.new(xPos, yPos, nm, style = label.style_text_outline, textcolor = f_sigColor(nm), color = color.white, size = size.normal, text_formatting = text.format_bold, tooltip = tip)
+            outLbls.push(lb)
+
+// ========================== Group Helpers ==========================
+f_ma(string method, float src, int len) =>
+    method == 'EMA' ? ta.ema(src, len) : ta.sma(src, len)
+f_ma_full(string method, float src, int len) =>
+    switch method
+        'SMA'        => ta.sma(src, len)
+        'EMA'        => ta.ema(src, len)
+        'SMMA (RMA)' => ta.rma(src, len)
+        'WMA'        => ta.wma(src, len)
+        => ta.vwma(src, len)
+f_groupRSI_ex(float r, int len, float src) =>
+    int grp = r < 20 ? 5 : r < 30 ? 4 : r > 80 ? 1 : r > 70 ? 2 : 3
+    string why = switch grp
+        1 => 'RSI Group 1 — Base Bottom\n• RSI > 80 (Overbought extreme)\n• Weakness expected\nFormula: RSI(' + str.tostring(len) + ', source)'
+        2 => 'RSI Group 2 — Lower Tube\n• 70 < RSI ≤ 80 (Overbought, easing)\nFormula: RSI(' + str.tostring(len) + ', source)'
+        3 => 'RSI Group 3 — Middle Tube\n• 30 ≤ RSI ≤ 70 (Neutral)\nFormula: RSI(' + str.tostring(len) + ', source)'
+        4 => 'RSI Group 4 — Upper Tube\n• RSI < 30 (Oversold)\nFormula: RSI(' + str.tostring(len) + ', source)'
+        5 => 'RSI Group 5 — Base Top\n• RSI < 20 (Deep Oversold, bullish potential)\nFormula: RSI(' + str.tostring(len) + ', source)'
+        => ''
+    [grp, why]
+f_groupEMA_ex(float e9,float e21,float e50,float e100,float e200,float e250) =>
+    bool bullFull = e9>e21 and e21>e50 and e50>e100 and e100>e200 and e200>e250
+    bool bull4    = e9>e21 and e21>e50 and e50>e100 and not bullFull
+    bool bull3    = e9>e21 and e21>e50 and e50<e100
+    bool bull2    = e9>e21 and e21<e50
+    bool bearFull = e9<e21 and e21<e50 and e50<e100 and e100<e200 and e200<e250
+    int grp = bearFull ? 1 : bull2 ? 2 : bull3 ? 3 : bull4 ? 4 : bullFull ? 5 : 3
+    string why = switch grp
+        1 => 'EMA Group 1 — Base Bottom\n• Strict down-sequence: 9<21<50<100<200<250'
+        2 => 'EMA Group 2 — Lower Tube\n• Early cross: 9>21 but 21<50'
+        3 => 'EMA Group 3 — Middle Tube\n• Partial up-sequence: 9>21>50 but 50<100'
+        4 => 'EMA Group 4 — Upper Tube\n• 9>21>50>100 (200/250 not fully aligned)'
+        5 => 'EMA Group 5 — Base Top\n• Full up-sequence: 9>21>50>100>200>250'
+        => ''
+    [grp, why]
+f_groupMACD_ex(float macd, float signal, float hist, int fLen, int sLen, int sigLen , srcMA , sigMA) =>
+    bool g1 = macd < 0 and hist < 0 and ta.falling(hist, 3)
+    bool g2 = macd < 0 and (hist >= 0 or ta.rising(hist, 3))
+    bool g3 = (ta.crossover(macd, signal) and macd <= 0) or (ta.crossunder(macd, signal) and macd >= 0)
+    bool g4 = macd > 0 and hist > 0 and (macd > signal or ta.rising(hist, 3))
+    bool g5 = macd > 0 and hist > 0 and ta.rising(macd, 5) and ta.rising(hist, 3)
+    int grp = g1 ? 1 : g2 ? 2 : g3 ? 3 : g5 ? 5 : g4 ? 4 : 3
+    string why = switch grp
+        1 => 'MACD Group 1 — Base Bottom\n• macd<0, hist<0 and falling(hist,3)\nMomentum negative accelerating'
+        2 => 'MACD Group 2 — Lower Tube\n• macd<0 with hist≥0 or rising(hist,3)\nNegative but improving'
+        3 => 'MACD Group 3 — Middle Tube\n• Cross events near zero (transition)'
+        4 => 'MACD Group 4 — Upper Tube\n• macd>0, hist>0 with macd>signal or rising(hist,3)'
+        5 => 'MACD Group 5 — Base Top\n• macd>0, hist>0 with rising(macd,5) & rising(hist,3)'
+        => ''
+    why += '\nFormula: MACD(' + str.tostring(fLen) + ',' + str.tostring(sLen) + ',' + str.tostring(sigLen) + '), srcMA=' + srcMA + ', sigMA=' + sigMA
+    [grp, why]
+f_groupADX_ex(float adx, float dip, float dim, float tol, int len, int smooth) =>
+    bool g1 = adx < 20 and dim > dip
+    bool g2 = adx >= 20 and adx < 25 and dim > dip
+    bool nearEq = math.abs(dip - dim) <= tol
+    bool g3 = adx >= 20 and adx < 25 and nearEq
+    bool g4 = adx >= 25 and adx <= 40 and dip > dim
+    bool g5 = adx > 40 and dip > dim
+    int grp = g5 ? 5 : g4 ? 4 : g3 ? 3 : g2 ? 2 : g1 ? 1 : 3
+    string why = 'ADX Group ' + str.tostring(grp) + '\n• ADX=' + str.tostring(adx, '#.##') + ', DI+=' + str.tostring(dip, '#.##') + ', DI-=' + str.tostring(dim, '#.##') + '\nFormula: DMI(len=' + str.tostring(len) + ', smooth=' + str.tostring(smooth) + '), tol=' + str.tostring(tol)
+    [grp, why]
+f_groupIKH_ex(float tenkan, float kijun, float spanA, float spanB, int disp) =>
+    bool hasCloud = not na(spanA[disp]) and not na(spanB[disp]) and bar_index >= disp
+    float top = hasCloud ? math.max(spanA[disp], spanB[disp]) : na
+    float bot = hasCloud ? math.min(spanA[disp], spanB[disp]) : na
+    bool belowKumo = hasCloud and close < bot
+    bool aboveKumo = hasCloud and close > top
+    bool inKumo    = hasCloud and not aboveKumo and not belowKumo
+    bool tenUp     = tenkan > kijun
+    bool tenDown   = tenkan < kijun
+    bool tenCross  = ta.cross(tenkan, kijun)
+    bool chikouAbove = bar_index >= disp and close > close[disp]
+    bool chikouBelow = bar_index >= disp and close < close[disp]
+    bool futBull = spanA > spanB and (spanA - spanB) > (spanA[1] - spanB[1])
+    int grp = 3
+    grp := tenDown and belowKumo and chikouBelow ? 1 :
+           tenDown and (inKumo or not chikouBelow) ? 2 :
+           tenCross and inKumo ? 3 :
+           tenUp and aboveKumo and chikouAbove and futBull ? 5 :
+           tenUp and aboveKumo and chikouAbove ? 4 : 3
+    string posTxt = hasCloud ? 'Cloud top=' + str.tostring(top, '#.##') + ', bot=' + str.tostring(bot, '#.##') : 'Cloud N/A'
+    string why = 'Ichimoku Group ' + str.tostring(grp) + '\n• Tenkan ' + (tenUp ? '>' : tenDown ? '<' : '=') + ' Kijun\n• ' + (aboveKumo ? 'Above Kumo' : belowKumo ? 'Below Kumo' : inKumo ? 'Inside Kumo' : 'Kumo N/A') + ', Chikou ' + (chikouAbove ? '>' : chikouBelow ? '<' : '=') + ' Price\n• Future Cloud ' + (futBull ? 'Bullish & thickening' : 'Neutral/Thin') + '\n' + posTxt + '\nFormula: Tenkan=Donchian(' + str.tostring(conversionPeriods) + '), Kijun=Donchian(' + str.tostring(basePeriods) + '), SpanA=avg(Tenkan,Kijun), SpanB=Donchian(' + str.tostring(laggingSpan2Periods) + '), disp=' + str.tostring(disp)
+    [grp, why]
+f_groupBB_ex(float price, float basis, float upper, float lower, int len, float mult , maType) =>
+    bool g1 = price < lower or (price <= lower and (ta.falling(lower, 3) or ta.falling(basis, 3)))
+    bool g5 = price > upper or (price >= upper and (ta.rising(upper, 3) or ta.rising(basis, 3)))
+    bool g2 = price >= lower and price < basis
+    bool g4 = price > basis and price <= upper
+    int grp = g1 ? 1 : g5 ? 5 : g2 ? 2 : g4 ? 4 : 3
+    string why = 'BB Group ' + str.tostring(grp) + '\n• Basis=' + str.tostring(basis, '#.##') + ', Upper=' + str.tostring(upper, '#.##') + ', Lower=' + str.tostring(lower, '#.##') + '\n• Price=' + str.tostring(price, '#.##') + ' relative to bands\nFormula: Basis=' + maType + '(' + str.tostring(len) + '), Dev=' + str.tostring(mult) + '*StDev(' + str.tostring(len) + ')'
+    [grp, why]
+f_groupOBV_ex(float obv, float obvMa, int riseShort, int riseLong, int fallShort, float delta, float absDeltaAvg, float kSpike, float nearTolPct , maType, int maLen, int spikeLen) =>
+    bool isAbove = obv > obvMa
+    bool isBelow = obv < obvMa
+    bool risingS = ta.rising(obv, riseShort)
+    bool risingL = ta.rising(obv, riseLong)
+    bool fallingS= ta.falling(obv, fallShort)
+    bool nearMa  = math.abs(obvMa) > 0 ? math.abs(obv - obvMa) <= math.abs(obvMa) * nearTolPct : math.abs(obv - obvMa) <= nearTolPct
+    bool spikeBuy= delta > kSpike * absDeltaAvg
+    int grp = isBelow and fallingS ? 1 : (isBelow and (risingS or obv >= obvMa * (1.0 - nearTolPct))) ? 2 : nearMa ? 3 : (isAbove and risingS) ? 4 : (isAbove and risingL and spikeBuy) ? 5 : 3
+    string why = 'OBV Group ' + str.tostring(grp) + '\n• OBV vs MA: ' + (isAbove ? 'Above' : isBelow ? 'Below' : 'Near') + '\n• ΔOBV=' + str.tostring(delta, '#.##') + ', avg|Δ|(' + str.tostring(spikeLen) + ')=' + str.tostring(absDeltaAvg, '#.##') + (spikeBuy ? ' [Spike]' : '') + '\n• rising(' + str.tostring(riseShort) + '/' + str.tostring(riseLong) + '), falling(' + str.tostring(fallShort) + ')\nFormula: OBV cum(sign(ΔClose)*Vol), MA=' + maType + '(' + str.tostring(maLen) + '), NearTol=' + str.tostring(nearTolPct) + ', Spike k=' + str.tostring(kSpike)
+    [grp, why]
+f_addSignalToGroup(map<int, SigBucket> groups, string name, int grp, string tip) =>
+    SigBucket bucket = groups.get(grp)
+    if na(bucket)
+        bucket := SigBucket.new(array.new<string>(), array.new<string>())
+    bucket.add(name, tip)
+    groups.put(grp, bucket)
+
+// ========================== State ==========================
+var DrawingCache cache = na
+var map<int, SigBucket> signalGroups = na
+const int BUBBLE_BASE = 140
+
+// ========================== Pre-Compute Signals ==========================
+float rsiV   = ta.rsi(rsiSrcInput, rsiLenInput)
+float ema9   = ta.ema(close, 9),  ema21  = ta.ema(close, 21), ema50 = ta.ema(close, 50)
+float ema100 = ta.ema(close,100), ema200 = ta.ema(close,200), ema250= ta.ema(close,250)
+float macdFast = f_ma(macdSrcMAInput, close, macdFastInput)
+float macdSlow = f_ma(macdSrcMAInput, close, macdSlowInput)
+float macdLine = macdFast - macdSlow
+float macSig   = f_ma(macdSigMAInput, macdLine, macdSigInput)
+float macHist  = macdLine - macSig
+[diP, diM, adxV] = ta.dmi(adxLenInput, adxSmoothInput)
+[grpRSI  , tipRSI ] = f_groupRSI_ex(rsiV, rsiLenInput, rsiSrcInput)
+[grpEMA  , tipEMA ] = f_groupEMA_ex(ema9,ema21,ema50,ema100,ema200,ema250)
+[grpMACD , tipMACD] = f_groupMACD_ex(macdLine, macSig, macHist, macdFastInput, macdSlowInput, macdSigInput, macdSrcMAInput, macdSigMAInput)
+[grpADX  , tipADX ] = f_groupADX_ex(adxV, diP, diM, adxEqTolInput, adxLenInput, adxSmoothInput)
+float tenkan = math.avg(ta.lowest(conversionPeriods), ta.highest(conversionPeriods))
+float kijun  = math.avg(ta.lowest(basePeriods),       ta.highest(basePeriods))
+float spanA  = math.avg(tenkan, kijun)
+float spanB  = math.avg(ta.lowest(laggingSpan2Periods), ta.highest(laggingSpan2Periods))
+[grpIKH , tipIKH] = f_groupIKH_ex(tenkan, kijun, spanA, spanB, displacement)
+float bbBasis = f_ma_full(bbMATypeInput, bbSrcInput, bbLenInput)
+float bbDev   = bbMultInput * ta.stdev(bbSrcInput, bbLenInput)
+float bbUpper = bbBasis + bbDev
+float bbLower = bbBasis - bbDev
+[grpBB , tipBB ] = f_groupBB_ex(close, bbBasis, bbUpper, bbLower, bbLenInput, bbMultInput, bbMATypeInput)
+float obvV       = ta.cum( (close > close[1] ? volume : close < close[1] ? -volume : 0.0) )
+float obvMa      = f_ma_full(obvMaTypeInput, obvV, obvMaLenInput)
+float obvDelta   = obvV - obvV[1]
+float obvAbsAvg  = ta.sma(math.abs(obvDelta), obvSpikeAvgLenInp)
+[grpOBV , tipOBV] = f_groupOBV_ex(obvV, obvMa, obvRiseShortInput, obvRiseLongInput, obvFallShortInput, obvDelta, obvAbsAvg, obvSpikeKInput, obvNearTolPctInput, obvMaTypeInput, obvMaLenInput, obvSpikeAvgLenInp)
+
+// Auto Active Height %
+int   sumLvls   = grpRSI + grpEMA + grpMACD + grpADX + grpIKH + grpBB + grpOBV
+float avgLvl    = sumLvls / 7.0
+float uThr      = math.min(1.0, math.max(0.0, (avgLvl - 1.0) / 4.0))
+int   activePct = int(math.round(uThr * 100.0))
+
+float sumBuy = 0.0, float sumSell = 0.0, float sumVol = 0.0
+float buyPct = 0.0, float sellPct = 0.0
+// ========================== Drawing (frame) ==========================
+if barstate.islast and not na(rightVisIdx) and not na(leftVisIdx)
+    if na(cache)
+        cache := DrawingCache.new(array.new<polyline>(), array.new<label>(), array.new<line>(), array.new<label>(), array.new<label>(), array.new<line>(), array.new<linefill>())
+    if na(signalGroups)
+        signalGroups := map.new<int, SigBucket>()
+        
+    cache.clearAll()
+    signalGroups.clear()
+
+    int visibleLeft  = leftVisIdx, visibleRight = rightVisIdx
+    int visWidth     = math.max(1, visibleRight - visibleLeft)
+
+    float cx = anchorModeInput == 'Screen Percent'
+         ? f_clampBarIndex(visibleLeft + int(math.round(anchorPercentInput * visWidth)))
+         : f_clampBarIndex(visibleRight - rightOffsetBarsInput)
+
+    float baseVis    = 300.0
+    float scaleX     = visWidth > baseVis ? visWidth / baseVis : 1.0
+    float dfBalanced = depthFactorInput / math.pow(scaleX, 0.9)
+
+    float h    = vialHeightInput
+    float yC   = close
+    float y1   = yC - h * 0.5
+    float y2   = yC + h * 0.5
+    float rx   = vialRadiusInput * scaleX
+    float ry   = rx * viewFlattenInput * (1.0 / math.pow(scaleX, 0.7))
+    float zF   = rx, zB = -rx
+    float capH = h * capHeightFactor
+    int   detail = 60
+
+    // Back glass & rings
+    array<chart.point> backSide = f_buildQuadSide(cx - rx, cx + rx, y1, y2, zB, zB, dfBalanced)
+    array<chart.point> eTopB    = f_buildEllipse(cx, y2, rx, ry, zB, dfBalanced, detail)
+    array<chart.point> eBotB    = f_buildEllipse(cx, y1, rx, ry, zB, dfBalanced, detail)
+    [topFace0, topBottomFace0, topSide0] = f_buildRing(cx, y2, rx*1.05, ry*1.05, capH, dfBalanced, detail)
+    [botFace, botBottomFace, botSide]    = f_buildRing(cx, y1 - capH, rx*1.05, ry*1.05, capH, dfBalanced, detail)
+    cache.pls.push(polyline.new(backSide, closed=true, fill_color=glassBackFillInput, line_color=color.new(glassBackFillInput, 90)))
+    cache.pls.push(polyline.new(eTopB,  closed=true, line_color=color.new(glassEdgeColorInput, 75)))
+    cache.pls.push(polyline.new(eBotB,  closed=true, line_color=color.new(glassEdgeColorInput, 75)))
+    cache.pls.push(polyline.new(botSide, closed=true, fill_color=color.new(metalShadowColor, 22), line_color=color.new(metalShadowColor, 0)))
+    cache.pls.push(polyline.new(botFace, closed=true, fill_color=color.new(metalBaseColorInput, 0), line_color=metalBaseColorInput))
+    cache.pls.push(polyline.new(botBottomFace, closed=true, fill_color=color.new(metalBaseColorInput, 12), line_color=color.new(metalBaseColorInput, 12)))
+    cache.pls.push(polyline.new(topSide0, closed=true, fill_color=color.new(metalShadowColor, 18), line_color=color.new(metalShadowColor, 0)))
+    cache.pls.push(polyline.new(topFace0, closed=true, fill_color=color.new(metalBaseColorInput, 0), line_color=metalBaseColorInput))
+    cache.pls.push(polyline.new(topBottomFace0, closed=true, fill_color=color.new(metalBaseColorInput, 12), line_color=color.new(metalBaseColorInput, 12)))
+
+    // Helix
+    const int BASE_SHAPES = 26
+    int rungCountWanted   = int(math.round(helixTurnsInput * rungsPerTurnInput))
+    int rungCount         = math.min(12, math.max(4, rungCountWanted))
+    int EXTRA_VIRUS       = 4
+    int remainBudget      = 98 - (BASE_SHAPES + rungCount + EXTRA_VIRUS)
+    int segPerStrand      = math.max(8, math.min(16, int(math.floor(remainBudget / 4))))
+
+    float innerR   = rx * helixRadiusFactor
+    float yHelix1  = y1 + capH*0.25
+    float yHelix2  = y2 - capH*0.25
+    float height   = yHelix2 - yHelix1
+    array<chart.point> h1 = f_buildHelix(cx, yHelix1, yHelix2, innerR, helixTurnsInput, helixPtsPerTurnInput, 0, dfBalanced, 0.0)
+    array<chart.point> h2 = f_buildHelix(cx, yHelix1, yHelix2, innerR, helixTurnsInput, helixPtsPerTurnInput, 0, dfBalanced, PI)
+
+    int coreWActive   = 7
+    int coreWInactive = 2
+    f_drawCoreStrandThreshold_run(h1, segPerStrand, uThr, coreWActive, coreWInactive, inactiveCoreColorInput, cache.pls)
+    f_drawCoreStrandThreshold_run(h2, segPerStrand, uThr, coreWActive, coreWInactive, inactiveCoreColorInput, cache.pls)
+    int haloAlpha = strandGlow.alpha(8, 10), haloWidth = strandGlow.width(8, 5)
+    f_drawGradientStrand(h1, segPerStrand, haloWidth, haloAlpha, cache.pls)
+    f_drawGradientStrand(h2, segPerStrand, haloWidth, haloAlpha, cache.pls)
+
+    for i = 1 to rungCount
+        float t   = i / float(rungCount + 1)
+        float phi = t * helixTurnsInput * 2.0 * PI
+        float yR  = yHelix1 + height * t
+        array<chart.point> rungArc = f_buildRungArc(cx, yR, innerR, phi, rungBowFactorInput, dfBalanced)
+        float uTier = (math.floor(t * 7) + 0.5) / 7.0
+        bool isActive = uTier <= uThr
+        int wR = isActive ? coreWActive : coreWInactive
+        color rungC = isActive ? f_helixGradient(t, 0) : inactiveCoreColorInput
+        cache.pls.push(polyline.new(rungArc, curved=true, closed=false, line_color=rungC, line_width=wR))
+
+    // -------- Buy/Sell Window --------
+    int lookbackUsed = volWindowModeInput == 'Visible Range' ? visWidth : manualLookbackInput
+    lookbackUsed := math.max(1, math.min(lookbackUsed, bar_index + 1))
+    
+    for k = 0 to lookbackUsed - 1
+        float oK = open[k], hK = high[k], lK = low[k], cK = close[k], vK = volume[k]
+        [ bK,  sK] = f_calculateBuySellVolume(oK, hK, lK, cK, vK)
+        sumBuy  += bK
+        sumSell += sK
+        sumVol  += vK
+    buyPct := sumVol > 0 ? (sumBuy / sumVol) * 100.0 : 50.0
+    sellPct := 100.0 - buyPct
+    float densityFactor = buyPct < 25 ? 0.25 : buyPct < 50 ? 0.50 : buyPct < 75 ? 0.75 : 1.0
+    color sys25 = #ff0040, sys50 = #ffffff, sys75 = #00e5ff, sys100 = #35d404
+    color bubbleBaseCol = useCustomBubbleColors
+         ? (densityFactor == 0.25 ? bubbleCol25Input : densityFactor == 0.50 ? bubbleCol50Input : densityFactor == 0.75 ? bubbleCol75Input : bubbleCol100Input)
+         : (densityFactor == 0.25 ? sys25 : densityFactor == 0.50 ? sys50 : densityFactor == 0.75 ? sys75 : sys100)
+
+    // -------- Virus Mascot --------
+    if showVirusInput
+        bool friendly = activePct > 50 and buyPct > 50
+        color vBody  = friendly ? color.rgb(124,255,87,0)  : color.rgb(255,82,82,0)
+        color vMouth = color.rgb(0,0,0,0)
+        color vPupil = color.rgb(0,0,0,0)
+        float vx = cx - rx * 1.45
+        float vy = y2 + capH * 0.55
+        float vr = rx * 0.55
+        float vz = zF * 0.98
+        float tilt = -15 * PI/180
+    
+        // Body (oval shape)
+        float vrx = vr
+        float vry = vr * 0.95
+        array<chart.point> vBodyPts = f_buildEllipse(vx, vy, vrx, vry, vz, dfBalanced, 42)
+        cache.pls.push(polyline.new(vBodyPts, closed=true, fill_color=vBody, line_color=vBody))
+    
+        // Spikes (lines + linefill)
+        int nSp = 10
+        for s = 0 to nSp - 1
+            float baseDeg = -170 + s * (340.0/nSp)
+            float a = tilt + baseDeg*PI/180
+            float r0 = vr * 0.72
+            float r1 = vr * (s % 2 == 0 ? 1.45 : 1.32)
+            float w  = vr * 0.18
+            f_buildSpikeWedge(vx, vy, r0, r1, w, a, vz, vBody, cache.virusL, cache.virusLF, dfBalanced)
+            f_buildSpikeKnob(vx, vy, r1, a, vz, vBody, cache.virusL, cache.virusLF, dfBalanced)
+    
+        // Eye (looking towards tube)
+        float ex = vx + vr * 0.10
+        float ey = vy + vr * 0.12
+        float rEye = vr * 0.40
+        float rPupil = rEye * 0.50
+        array<chart.point> eyeWhitePts = f_buildEllipse(ex, ey, rEye, rEye, vz*1.02, dfBalanced, 36)
+        array<chart.point> pupilPts    = f_buildEllipse(ex, ey, rPupil, rPupil, vz*1.03, dfBalanced, 28)
+        cache.pls.push(polyline.new(eyeWhitePts, closed=true, fill_color=color.white, line_color=color.white))
+        cache.pls.push(polyline.new(pupilPts, closed=true, fill_color=vPupil, line_color=vPupil))
+        array<chart.point> hiPts = f_buildArc(ex - rEye*0.2, ey + rEye*0.2, rEye*0.6, vz*1.04, dfBalanced, 110*PI/180, 200*PI/180, 12)
+        cache.pls.push(polyline.new(hiPts, curved=true, line_color=color.new(color.white, 75), line_width=3))
+    
+        // Mouth (always smiling, angled towards tube)
+        float mouthYOffset = vy - vr * 0.28
+        float mouthXOffset = vx + vr * 0.05
+        float mouthAngle1  = 210 * PI/180
+        float mouthAngle2  = 330 * PI/180
+        array<chart.point> mouthPts = f_buildArc(mouthXOffset, mouthYOffset, vr * 0.45, vz * 1.01, dfBalanced, mouthAngle1 + tilt, mouthAngle2 + tilt, 12)
+        cache.pls.push(polyline.new(mouthPts, curved=true, line_color=vMouth, line_width=5))
+  
+    // Re-draw top cap face to hide lower half of virus
+    [topFace, topBottomFace, topSide] = f_buildRing(cx, y2, rx*1.05, ry*1.05, capH, dfBalanced, detail)
+    cache.pls.push(polyline.new(topSide, closed=true, fill_color=color.new(metalShadowColor, 18), line_color=color.new(metalShadowColor, 0)))
+    cache.pls.push(polyline.new(topFace, closed=true, fill_color=color.new(metalBaseColorInput, 0), line_color=metalBaseColorInput))
+
+    // -------- Volume Bubbles --------
+    int N = int(math.round(BUBBLE_BASE * densityFactor))
+    if showBubblesInput and N > 0
+        float Rmax = math.max(1.0, rx * 0.95), edgeBias = 0.35, ySpan = 0.50
+        float phiG = PI * (3.0 - math.sqrt(5.0))
+        for k = 0 to N - 1
+            float q = (k + 0.5) / N
+            float ang = k * phiG
+            float rBase = Rmax * math.pow(q, edgeBias)
+            float jr = (f_hash(k*5) - 0.5) * Rmax * 0.02
+            float r = math.min(Rmax, math.max(0.0, rBase + jr))
+            float x3d = cx + r * math.cos(ang), z3d = r * math.sin(ang)
+            float yFrac = math.max(0.0, math.min(ySpan, math.pow(q, 2.0) * ySpan + (f_hash(k*11)-0.5) * 0.02))
+            float yB = y1 + h * yFrac
+            chart.point p2d = f_project3DTo2D(x3d, yB, z3d, dfBalanced)
+            float alphaB = f_lerp(42.0, 92.0, yFrac / ySpan)
+            label lb = label.new(p2d, '.\n\n\n\n\n\n\n\n\n\n\n\n\n.', style = label.style_circle, size = size.tiny, textcolor = bubbleBaseCol, color = color.new(bubbleBaseCol, int(alphaB)))
+            cache.bubbles.push(lb)
+
+    // -------- Buy/Sell Stats Labels --------
+    int   xLeftStat  = f_clampBarIndex(int(math.round(cx - rx * 0.9)))
+    int   xRightStat = f_clampBarIndex(int(math.round(cx + rx * 0.9)))
+    float yPctPos    = y1 - capH * 0.50
+    float yVolPos    = y1 - capH * 0.8
+    color BUY = #089981, SELL = #F23645
+    cache.gaugeLbls.push(label.new(xLeftStat,  yPctPos,  str.tostring(buyPct, '#.##') + '%', style = label.style_label_right,  textcolor = BUY,  color = color(na), size = size.normal, text_formatting = text.format_bold))
+    cache.gaugeLbls.push(label.new(xLeftStat,  yVolPos,  str.tostring(sumBuy,  format.volume), style = label.style_label_right,  textcolor = BUY,  color = color(na), size = size.normal, text_formatting = text.format_bold))
+    cache.gaugeLbls.push(label.new(xRightStat, yPctPos,  str.tostring(sellPct, '#.##') + '%', style = label.style_label_left,   textcolor = SELL, color = color(na), size = size.normal, text_formatting = text.format_bold))
+    cache.gaugeLbls.push(label.new(xRightStat, yVolPos,  str.tostring(sumSell, format.volume), style = label.style_label_left,   textcolor = SELL, color = color(na), size = size.normal, text_formatting = text.format_bold))
+
+    // -------- Right-side "I" Gauge --------
+    int   dtMs         = int(math.max(1, time - time[1]))
+    float marginBars   = math.max(4.0, rx * 0.5)
+    float barsToRight  = (cx + rx) - last_bar_index + marginBars
+    int   tGauge       = last_bar_time + int(math.round(barsToRight * dtMs))
+    int   tickHalfMs   = 3 * dtMs
+    float yBot2     = y1 + capH*0.25
+    float yTop2     = y2 - capH*0.25
+    float yAtPct    = yBot2 + (yTop2 - yBot2) * uThr
+    cache.gaugeL.push(line.new(tGauge, yBot2, tGauge, yTop2, xloc = xloc.bar_time, color = chart.fg_color, style = line.style_dashed))
+    cache.gaugeL.push(line.new(tGauge - tickHalfMs, yTop2, tGauge + tickHalfMs, yTop2, xloc = xloc.bar_time, color = chart.fg_color, width = 2))
+    cache.gaugeL.push(line.new(tGauge - tickHalfMs, yBot2, tGauge + tickHalfMs, yBot2, xloc = xloc.bar_time, color = chart.fg_color, width = 2))
+    cache.gaugeLbls.push(label.new(tGauge, yTop2 - math.max(h * 0.02, 1.0), '100%', xloc = xloc.bar_time, style = label.style_label_down, textcolor = chart.fg_color, color = color(na), size = size.normal, text_formatting = text.format_bold + text.format_italic))
+    cache.gaugeLbls.push(label.new(tGauge, yAtPct, '',           xloc = xloc.bar_time, style = label.style_circle,     size = size.tiny,  textcolor = color(na), color = (activePct > 80 ? color.new(#1ebb03, 0) : activePct > 60 ? color.new(#08b9bf, 0) : activePct > 30 ? color.new(#d19b00, 0) : color.new(#e91e63, 0))))
+    cache.gaugeLbls.push(label.new(tGauge, yAtPct, str.tostring(activePct) + '%', xloc = xloc.bar_time, style = label.style_label_left, textcolor = chart.fg_color, color = color(na), size = size.normal, text_formatting = text.format_bold + text.format_italic))
+
+    // -------- Signals --------
+    if showSignalsInput
+        f_addSignalToGroup(signalGroups, 'RSI',  grpRSI,  tipRSI)
+        f_addSignalToGroup(signalGroups, 'EMA',  grpEMA,  tipEMA)
+        f_addSignalToGroup(signalGroups, 'MACD', grpMACD, tipMACD)
+        f_addSignalToGroup(signalGroups, 'ADX',  grpADX,  tipADX)
+        f_addSignalToGroup(signalGroups, 'IKH',  grpIKH,  tipIKH)
+        f_addSignalToGroup(signalGroups, 'BB',   grpBB ,  tipBB)
+        f_addSignalToGroup(signalGroups, 'OBV',  grpOBV,  tipOBV)
+
+        int xLeftRing  = f_clampBarIndex(int(math.round(cx - rx * 0.50)))
+        int xRightRing = f_clampBarIndex(int(math.round(cx + rx * 0.50)))
+        int xLeftTube  = f_clampBarIndex(int(math.round(cx - rx * 0.70)))
+        int xRightTube = f_clampBarIndex(int(math.round(cx + rx * 0.70)))
+        float tubeBot = y1 + capH*0.25, tubeTop = y2 - capH*0.25
+        float sliceH  = (tubeTop - tubeBot)/3.0
+        float g1yMin = (y1 - capH*0.80), g1yMax = (y1 - capH*0.20)
+        float g5yMin = (y2 + capH*0.20), g5yMax = (y2 + capH*0.80)
+        float g2yMin = tubeBot,              g2yMax = tubeBot + sliceH
+        float g3yMin = tubeBot + sliceH,     g3yMax = tubeBot + 2.0*sliceH
+        float g4yMin = tubeBot + 2.0*sliceH, g4yMax = tubeTop
+        
+        if signalGroups.contains(1)
+            f_drawGroupLabelsArea(signalGroups.get(1).names, signalGroups.get(1).tips, xLeftRing, xRightRing, g1yMin, g1yMax, 301, cache.sigLbls)
+        if signalGroups.contains(2)
+            f_drawGroupLabelsArea(signalGroups.get(2).names, signalGroups.get(2).tips, xLeftTube, xRightTube, g2yMin, g2yMax, 302, cache.sigLbls)
+        if signalGroups.contains(3)
+            f_drawGroupLabelsArea(signalGroups.get(3).names, signalGroups.get(3).tips, xLeftTube, xRightTube, g3yMin, g3yMax, 303, cache.sigLbls)
+        if signalGroups.contains(4)
+            f_drawGroupLabelsArea(signalGroups.get(4).names, signalGroups.get(4).tips, xLeftTube, xRightTube, g4yMin, g4yMax, 304, cache.sigLbls)
+        if signalGroups.contains(5)
+            f_drawGroupLabelsArea(signalGroups.get(5).names, signalGroups.get(5).tips, xLeftRing, xRightRing, g5yMin, g5yMax, 305, cache.sigLbls)
+
+    // Front glass & highlights
+    array<chart.point> frontSide = f_buildQuadSide(cx - rx, cx + rx, y1, y2, zF, zF, dfBalanced)
+    array<chart.point> eTopF  = f_buildEllipse(cx, y2, rx, ry, zF, dfBalanced, detail)
+    array<chart.point> eBotF  = f_buildEllipse(cx, y1, rx, ry, zF, dfBalanced, detail)
+    array<chart.point> eTopI  = f_buildEllipse(cx, y2, rx*0.96, ry*0.96, zF*0.98, dfBalanced, detail)
+    array<chart.point> eBotI  = f_buildEllipse(cx, y1, rx*0.96, ry*0.96, zF*0.98, dfBalanced, detail)
+    cache.pls.push(polyline.new(frontSide, closed=true, fill_color=glassFrontFillInput, line_color=color.new(glassEdgeColorInput, 60)))
+    cache.pls.push(polyline.new(eTopF, closed=true, line_color=color.new(glassEdgeColorInput, 0)))
+    cache.pls.push(polyline.new(eBotF, closed=true, line_color=color.new(glassEdgeColorInput, 0)))
+    cache.pls.push(polyline.new(eTopI, closed=true, line_color=color.new(glassEdgeColorInput, 60)))
+    cache.pls.push(polyline.new(eBotI, closed=true, line_color=color.new(glassEdgeColorInput, 60)))
+
+    if drawGlassHighlights
+        float specW1  = rx * 0.20, specX1 = cx - rx * 0.35, specX2 = specX1 + specW1
+        array<chart.point> spL = f_buildQuadSide(specX1, specX2, y1+capH*0.5, y2-capH*0.5, zF*0.95, zF*0.95, dfBalanced)
+        array<chart.point> spR = f_buildQuadSide(cx + rx * 0.10, cx + rx * 0.20, y1+capH*0.8, y2-capH*0.8, zF*0.95, zF*0.95, dfBalanced)
+        cache.pls.push(polyline.new(spL, closed=true, fill_color=glowHighlightColor, line_color=color.new(glowHighlightColor, 100)))
+        cache.pls.push(polyline.new(spR, closed=true, fill_color=glowHighlightColor, line_color=color.new(glowHighlightColor, 100)))
+
+    if drawUmbrellaLogo
+        float rxLogo = rx * 1.05 * logoScaleInput, ryLogo = ry * 1.05 * logoScaleInput, zLogo  = zF * LOGO_LIFT
+        int   slices = 8, detailLogo = 56
+        float stepA  = 2.0 * PI / slices
+        for k = 0 to slices - 1
+            float a1 = k * stepA, a2 = (k + 1) * stepA
+            color fillC = (k % 2 == 0) ? logoRedColorInput : logoWhiteColorInput
+            array<chart.point> sector = f_buildSector(cx, y2 + capH, rxLogo, ryLogo, zLogo, dfBalanced, a1, a2)
+            cache.pls.push(polyline.new(sector, closed=true, fill_color=fillC, line_color=logoBorderColorInput))
+        array<chart.point> rim = f_buildEllipse(cx, y2 + capH, rxLogo, ryLogo, zLogo, dfBalanced, detailLogo)
+        array<chart.point> hub = f_buildEllipse(cx, y2 + capH, rxLogo * 0.12, ryLogo * 0.12, zLogo, dfBalanced, 32)
+        cache.pls.push(polyline.new(rim, closed=true, line_color=logoBorderColorInput))
+        cache.pls.push(polyline.new(hub, closed=true, fill_color=color.new(color.white, 12), line_color=color.new(color.black, 60)))
+
+plot(sumBuy, title="Buy Volume"        , display=display.all - display.status_line - display.pane, format = format.volume, editable=false)
+plot(sumSell, title="Sell Volume"      , display=display.all - display.status_line - display.pane, format = format.volume, editable=false)
+plot(sumVol, title="Sum Volume"        , display=display.all - display.status_line - display.pane, format = format.volume, editable=false)
+plot(buyPct, title="% Buy Volume"      , display=display.all - display.status_line - display.pane, format = format.percent, editable=false)
+plot(sellPct, title="% Sell Volume"    , display=display.all - display.status_line - display.pane, format = format.percent, editable=false)
+plot(activePct, title="% Overall Score", display=display.all - display.status_line - display.pane, format = format.percent, editable=false)

@@ -1,0 +1,175 @@
+//@version=6
+// © GainzAlgo
+
+indicator("Directional Logistic Oscillator | GainzAlgo", overlay=false)
+
+
+// ────────────────────────────────────────
+// Tooltip Texts
+// ────────────────────────────────────────
+string tt_di_len       = "Length for Directional Movement Index (DMI) calculation. Controls sensitivity to directional price movement."
+string tt_mean_lb      = "Lookback period used to calculate the long-term SMA mean of +DI, -DI, and ADX."
+string tt_slope        = "Steepness factor of the logistic function. Higher values → sharper transition from 0 to 1."
+string tt_smooth_len   = "EMA length applied to the raw logistic probabilities to reduce noise."
+string tt_osc_scale    = "Multiplier applied to the net directional strength before tanh bounding. Higher = more sensitive / larger swings."
+string tt_osc_smooth   = "Length used for SMA and EMA smoothing of the final oscillator value."
+string tt_buy_color    = "Color used for bullish oscillator values, signals, and background highlights."
+string tt_sell_color   = "Color used for bearish oscillator values, signals, and background highlights."
+string tt_plot_rev     = "Show arrows indicating potential cycle reversals (local turning points in smoothed oscillator)."
+string tt_plot_mr      = "Show arrows on crossover/crossunder signals from extreme oscillator zones (mean-reversion style)."
+string tt_plot_ma      = "Overlay a moving average of the oscillator on the indicator pane."
+string tt_intrabar     = "Allow the indicator to update in real-time within the current (incomplete) bar."
+string tt_percentile_lb = "Lookback period used to calculate percentile thresholds for extreme zones (mean-reversion signals)."
+
+
+// ────────────────────────────────────────
+// Inputs
+// ────────────────────────────────────────
+
+
+// DMI Settings
+di_len     = input.int(14, "DI Length", minval=1, group="DMI Settings", tooltip=tt_di_len)
+mean_lb    = input.int(360,"Mean Lookback", group="DMI Settings", tooltip=tt_mean_lb)
+
+
+// Logistic Probability Settings
+slope      = input.float(0.18, "LR Slope (higher = steeper)", step=0.02, group="Logistic Probability Settings", tooltip=tt_slope)
+smooth_len = input.int(3, "Probability Smoothing (EMA)", minval=1, maxval=9, group="Logistic Probability Settings", tooltip=tt_smooth_len)
+
+
+// Oscillator Settings
+osc_scale      = input.float(2.5, "Oscillator Scale (pre-tanh)", step=0.1, group="Oscillator Settings", tooltip=tt_osc_scale)
+osc_smooth_len = input.int(7,    "Oscillator Smoothing Length", group="Oscillator Settings", tooltip=tt_osc_smooth)
+
+
+// Color & Display Settings
+up_strong_col = input.color(#00ffaa, "Buy Color", group="Color & Display Settings", tooltip=tt_buy_color)
+dn_strong_col = input.color(#ff0000, "Sell Color", group="Color & Display Settings", tooltip=tt_sell_color)
+bp_rev        = input.bool(true, "Plot Reversion Signals", group="Color & Display Settings", tooltip=tt_plot_rev)
+bp_mr         = input.bool(true, "Plot Mean-Reversion Signals", group="Color & Display Settings", tooltip=tt_plot_mr)
+plot_ma       = input.bool(false, "Plot Oscillator MA", group="Color & Display Settings", tooltip=tt_plot_ma)
+intrabar      = input.bool(true, "Allow Intrabar Updating", group="Color & Display Settings", tooltip=tt_intrabar)
+
+
+// Intrabar index offset
+i = intrabar ? 0 : 1
+
+
+// ────────────────────────────────────────
+// Tanh
+// ────────────────────────────────────────
+tanh(x) =>
+    e2x = math.exp(2 * x)
+    (e2x - 1) / (e2x + 1)
+
+
+// ────────────────────────────────────────
+// Logistic Probability Function
+// ────────────────────────────────────────
+logistic_prob(series, mean_lb, slope, smooth_len) =>
+    mean     = ta.sma(series, mean_lb)
+    z        = (series - mean) * slope
+    prob_raw = 1.0 / (1.0 + math.exp(-z))
+    ta.ema(prob_raw, smooth_len)
+
+
+// ────────────────────────────────────────
+// Core Calculations
+// ────────────────────────────────────────
+[plus_di, minus_di, adx] = ta.dmi(di_len, di_len)
+
+prob_plus  = logistic_prob(plus_di,  mean_lb, slope, smooth_len)
+prob_minus = logistic_prob(minus_di, mean_lb, slope, smooth_len)
+prob_adx   = logistic_prob(adx,      mean_lb, slope, smooth_len)
+
+net_dir        = prob_plus - prob_minus
+strength_raw   = net_dir * prob_adx * osc_scale
+strength_bound = tanh(strength_raw)
+strength       = ta.ema(strength_bound, smooth_len)
+
+
+// Smoothed lines & cycle
+s_sma       = ta.sma(strength, osc_smooth_len)
+s_ema       = ta.ema(strength, osc_smooth_len)
+s_sma_cycle = ta.ema(s_sma, math.ceil(osc_smooth_len / 2))
+
+
+// ────────────────────────────────────────
+// Percentile-based thresholds
+// ────────────────────────────────────────
+lower_threshold_sma = ta.percentile_nearest_rank(s_sma, mean_lb, 10)
+upper_threshold_sma = ta.percentile_nearest_rank(s_sma, mean_lb, 90)
+
+lower_threshold_ema = ta.percentile_nearest_rank(s_ema, mean_lb, 5)
+upper_threshold_ema = ta.percentile_nearest_rank(s_ema, mean_lb, 95)
+
+
+// ────────────────────────────────────────
+// Signals
+// ────────────────────────────────────────
+bc1 = ta.crossover(s_sma, lower_threshold_sma)
+sc1 = ta.crossunder(s_sma, upper_threshold_sma)
+
+bc2 = ta.crossover(s_ema, lower_threshold_ema)
+sc2 = ta.crossunder(s_ema, upper_threshold_ema)
+
+rev_up_c = s_sma_cycle > s_sma_cycle[1] and not (s_sma_cycle[1] > s_sma_cycle[2])
+rev_dn_c = s_sma_cycle < s_sma_cycle[1] and not (s_sma_cycle[1] < s_sma_cycle[2])
+
+
+// ────────────────────────────────────────
+// Visuals
+// ────────────────────────────────────────
+up_weak_col = color.new(up_strong_col, 70)
+dn_weak_col = color.new(dn_strong_col, 70)
+
+strength_col = strength[i] > 0 ?
+     (strength[i] > s_ema[i] ? up_strong_col : up_weak_col) :
+     (strength[i] < s_ema[i] ? dn_strong_col : dn_weak_col)
+
+plot(strength[i], "Market Strength", color = strength_col, style=plot.style_columns, linewidth=2)
+
+hline(0,    "Zero",      color=color.gray)
+hline(0.5,  "Strong +",  color=color.new(up_strong_col, 70), linestyle=hline.style_dotted)
+hline(-0.5, "Strong -",  color=color.new(dn_strong_col, 70), linestyle=hline.style_dotted)
+
+plot(plot_ma ? s_sma[i] : na, "Osc MA", color=#1400c5, linewidth=3)
+
+plotchar(bp_mr and (bc1[i] or bc2[i]), "MR Buy",  "▲", location.belowbar, up_strong_col, size=size.tiny, force_overlay=true)
+plotchar(bp_mr and (sc1[i] or sc2[i]), "MR Sell", "▼", location.abovebar, dn_strong_col, size=size.tiny, force_overlay=true)
+
+plotchar(bp_rev and rev_up_c[i], "Rev Up", "⬆", location.belowbar, up_strong_col, size=size.tiny, force_overlay=true)
+plotchar(bp_rev and rev_dn_c[i], "Rev Dn", "⬇", location.abovebar, dn_strong_col, size=size.tiny, force_overlay=true)
+
+bgcolor(
+     strength[i] > 0.5 and s_ema[i] > 0.5 ? color.new(up_strong_col, 95) :
+     strength[i] < -0.5 and s_ema[i] < -0.5 ? color.new(dn_strong_col, 95) : na
+)
+
+barcolor(strength_col)
+
+
+// ────────────────────────────────────────
+// Alerts
+// ────────────────────────────────────────
+
+
+// Cycle Reversion Signals (potential trend reversal / turning point in oscillator cycle)
+alertcondition(rev_up_c,  title="[DLO] Reversion Up", 
+     message="DLO: Potential bullish reversion detected (cycle turning upward)")
+alertcondition(rev_dn_c,  title="[DLO] Reversion Down",
+     message="DLO: Potential bearish reversion detected (cycle turning downward)")
+
+
+// Mean-Reversion Extreme Zone Signals (oversold → buy / overbought → sell)
+alertcondition(bc1 or bc2, title="[DLO] MR Buy", 
+     message="DLO: Mean-reversion BUY – oscillator crossed up from extreme oversold zone (percentile-based)")
+alertcondition(sc1 or sc2, title="[DLO] MR Sell",
+     message="DLO: Mean-reversion SELL – oscillator crossed down from extreme overbought zone (percentile-based)")
+
+
+// Zero-line Crosses (classic directional oscillator signals – trend change)
+alertcondition(ta.crossover(strength, 0),  title="[DLO] Osc Bullish Cross", 
+     message="DLO: Oscillator crossed above zero → bullish momentum shift")
+alertcondition(ta.crossunder(strength, 0), title="[DLO] Osc Bearish Cross",
+     message="DLO: Oscillator crossed below zero → bearish momentum shift")

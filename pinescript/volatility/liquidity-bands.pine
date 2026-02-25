@@ -1,0 +1,337 @@
+//@version=5
+indicator("⚡ Liquidity Bands", shorttitle="⚡ LIQ-BANDS", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════
+grp_core = "══════ Core Settings ══════"
+length    = input.int(20, "Lookback Length", minval=1, group=grp_core)
+mult      = input.float(2.0, "StdDev Multiplier", minval=0.1, step=0.1, group=grp_core)
+src       = input.source(close, "Price Source", group=grp_core)
+inner_m   = input.float(1.0, "Inner Band Multiplier", minval=0.1, step=0.1, group=grp_core)
+
+grp_signals = "══════ Signal Settings ══════"
+signal_mode   = input.string("Mean Reversion", "Signal Mode", options=["Mean Reversion", "Breakout", "Both"], group=grp_signals)
+show_signals  = input.bool(true, "Show Signals", group=grp_signals)
+show_lma_cross = input.bool(false, "Show LMA Cross Signals", group=grp_signals)
+
+grp_style = "══════ Style ══════"
+style_theme    = input.string("Cyber", "Color Theme", options=["Cyber", "Ocean", "Lava", "Frost", "Neon"], group=grp_style)
+show_glow      = input.bool(true, "Band Glow Effect", group=grp_style)
+show_barcolor  = input.bool(true, "Dynamic Bar Coloring", group=grp_style)
+show_particles = input.bool(true, "Signal Particles", group=grp_style)
+show_zones     = input.bool(true, "Zone Fill", group=grp_style)
+show_basis_dots = input.bool(false, "LMA Dot Trail", group=grp_style)
+candle_opacity  = input.int(25, "Bar Color Intensity", minval=0, maxval=100, group=grp_style)
+
+grp_display = "══════ Display ══════"
+show_table = input.bool(true, "Show Dashboard", group=grp_display)
+table_pos  = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_display)
+
+// ═══════════════════════════════════════════
+// THEME COLORS
+// ═══════════════════════════════════════════
+var color col_upper      = na
+var color col_lower      = na
+var color col_basis      = na
+var color col_bull       = na
+var color col_bear       = na
+var color col_squeeze    = na
+var color col_accent     = na
+var color col_bg_bull    = na
+var color col_bg_bear    = na
+
+switch style_theme
+    "Cyber" =>
+        col_upper   := #00e5ff
+        col_lower   := #ff006e
+        col_basis   := #c0c0ff
+        col_bull    := #00ffab
+        col_bear    := #ff2e6c
+        col_squeeze := #ffaa00
+        col_accent  := #7b2fff
+        col_bg_bull := #00ffab
+        col_bg_bear := #ff2e6c
+    "Ocean" =>
+        col_upper   := #00b4d8
+        col_lower   := #0077b6
+        col_basis   := #90e0ef
+        col_bull    := #00f5d4
+        col_bear    := #e63946
+        col_squeeze := #f4a261
+        col_accent  := #023e8a
+        col_bg_bull := #00f5d4
+        col_bg_bear := #e63946
+    "Lava" =>
+        col_upper   := #ff6b35
+        col_lower   := #d90429
+        col_basis   := #ffba08
+        col_bull    := #70e000
+        col_bear    := #d90429
+        col_squeeze := #ff006e
+        col_accent  := #ff8800
+        col_bg_bull := #70e000
+        col_bg_bear := #d90429
+    "Frost" =>
+        col_upper   := #a2d2ff
+        col_lower   := #bde0fe
+        col_basis   := #e2eafc
+        col_bull    := #caffbf
+        col_bear    := #ffadad
+        col_squeeze := #ffd6a5
+        col_accent  := #6c757d
+        col_bg_bull := #caffbf
+        col_bg_bear := #ffadad
+    "Neon" =>
+        col_upper   := #39ff14
+        col_lower   := #ff073a
+        col_basis   := #f5f5f5
+        col_bull    := #39ff14
+        col_bear    := #ff073a
+        col_squeeze := #ffff00
+        col_accent  := #bc13fe
+        col_bg_bull := #39ff14
+        col_bg_bear := #ff073a
+
+// ═══════════════════════════════════════════
+// LIQUIDITY CALCULATION
+// ═══════════════════════════════════════════
+liq_proxy = nz(volume) * ta.tr
+liquidity = liq_proxy > 0 ? liq_proxy : 1.0
+
+sum_weights = math.sum(liquidity, length)
+lma         = sum_weights != 0 ? math.sum(src * liquidity, length) / sum_weights : na
+lma_sq      = sum_weights != 0 ? math.sum(math.pow(src, 2) * liquidity, length) / sum_weights : na
+
+variance = math.max(lma_sq - math.pow(lma, 2), 0)
+std_dev  = math.sqrt(variance)
+
+upper_band = lma + (mult * std_dev)
+lower_band = lma - (mult * std_dev)
+inner_upper = lma + (inner_m * std_dev)
+inner_lower = lma - (inner_m * std_dev)
+
+// ═══════════════════════════════════════════
+// BAND WIDTH & SQUEEZE
+// ═══════════════════════════════════════════
+band_width = lma != 0 ? (upper_band - lower_band) / lma * 100 : 0
+squeeze    = band_width < ta.lowest(band_width, 50) * 1.05
+expansion  = band_width > ta.highest(band_width[1], 20) * 0.95
+
+// Price position ratio (0 = lower band, 1 = upper band)
+price_ratio = upper_band != lower_band ? (close - lower_band) / (upper_band - lower_band) : 0.5
+price_ratio_c = math.max(0, math.min(1, price_ratio))
+
+// ═══════════════════════════════════════════
+// SIGNAL LOGIC
+// ═══════════════════════════════════════════
+mr_buy  = close[1] <= lower_band[1] and close > lower_band
+mr_sell = close[1] >= upper_band[1] and close < upper_band
+bo_buy  = ta.crossover(close, upper_band)
+bo_sell = ta.crossunder(close, lower_band)
+
+lma_cross_up   = ta.crossover(close, lma)
+lma_cross_down = ta.crossunder(close, lma)
+
+long_signal = switch signal_mode
+    "Mean Reversion" => mr_buy
+    "Breakout"       => bo_buy
+    "Both"           => mr_buy or bo_buy
+
+short_signal = switch signal_mode
+    "Mean Reversion" => mr_sell
+    "Breakout"       => bo_sell
+    "Both"           => mr_sell or bo_sell
+
+// ═══════════════════════════════════════════
+// DYNAMIC COLORS
+// ═══════════════════════════════════════════
+// Band color shifts based on squeeze/expansion
+band_state_col = squeeze ? col_squeeze : expansion ? col_bull : col_upper
+
+// Gradient-like dynamic color for basis
+basis_dyn = color.from_gradient(price_ratio_c, 0, 1, col_lower, col_upper)
+
+// Bar coloring
+bar_col = close > upper_band ? color.new(col_bull, 100 - candle_opacity) :
+          close < lower_band ? color.new(col_bear, 100 - candle_opacity) :
+          close > lma ? color.new(col_bull, 100 - candle_opacity + 30) :
+          color.new(col_bear, 100 - candle_opacity + 30)
+
+barcolor(show_barcolor ? bar_col : na)
+
+// ═══════════════════════════════════════════
+// PLOTTING — GLOW LAYERS
+// ═══════════════════════════════════════════
+// Outer glow (widest, most transparent)
+p_ug3 = plot(show_glow ? upper_band : na, title="Upper Glow 3", color=color.new(col_upper, 92), linewidth=6, display=display.pane)
+p_lg3 = plot(show_glow ? lower_band : na, title="Lower Glow 3", color=color.new(col_lower, 92), linewidth=6, display=display.pane)
+
+// Mid glow
+p_ug2 = plot(show_glow ? upper_band : na, title="Upper Glow 2", color=color.new(col_upper, 82), linewidth=4, display=display.pane)
+p_lg2 = plot(show_glow ? lower_band : na, title="Lower Glow 2", color=color.new(col_lower, 82), linewidth=4, display=display.pane)
+
+// Inner glow
+p_ug1 = plot(show_glow ? upper_band : na, title="Upper Glow 1", color=color.new(col_upper, 60), linewidth=2, display=display.pane)
+p_lg1 = plot(show_glow ? lower_band : na, title="Lower Glow 1", color=color.new(col_lower, 60), linewidth=2, display=display.pane)
+
+// Core band lines
+p_upper = plot(upper_band, title="Upper Band", color=color.new(col_upper, 0), linewidth=1)
+p_lower = plot(lower_band, title="Lower Band", color=color.new(col_lower, 0), linewidth=1)
+
+// Inner bands (dashed style simulated with thinner lines)
+p_inner_up  = plot(inner_upper, title="Inner Upper", color=color.new(col_upper, 55), linewidth=1, style=plot.style_cross)
+p_inner_low = plot(inner_lower, title="Inner Lower", color=color.new(col_lower, 55), linewidth=1, style=plot.style_cross)
+
+// Basis
+p_basis = plot(lma, title="LMA Basis", color=color.new(basis_dyn, 15), linewidth=2)
+
+// ═══════════════════════════════════════════
+// ZONE FILLS
+// ═══════════════════════════════════════════
+// Upper danger zone
+fill_col_upper = close > upper_band ? color.new(col_bull, 75) : color.new(col_upper, 93)
+fill_col_lower = close < lower_band ? color.new(col_bear, 75) : color.new(col_lower, 93)
+
+fill(p_upper, p_inner_up, title="Upper Zone", color=show_zones ? color.new(col_upper, 88) : na)
+fill(p_lower, p_inner_low, title="Lower Zone", color=show_zones ? color.new(col_lower, 88) : na)
+fill(p_inner_up, p_inner_low, title="Core Zone", color=show_zones ? color.new(col_basis, 95) : na)
+
+// Outer fill — highlights when price is outside bands
+fill(p_upper, p_basis, title="Upper Half", color=show_zones ? color.new(col_upper, 94) : na)
+fill(p_lower, p_basis, title="Lower Half", color=show_zones ? color.new(col_lower, 94) : na)
+
+// ═══════════════════════════════════════════
+// SQUEEZE BACKGROUND
+// ═══════════════════════════════════════════
+bgcolor(squeeze ? color.new(col_squeeze, 92) : na, title="Squeeze BG")
+
+// ═══════════════════════════════════════════
+// LMA DOT TRAIL
+// ═══════════════════════════════════════════
+plotchar(show_basis_dots and bar_index % 2 == 0 ? lma : na, title="LMA Dots", char="•",
+         location=location.absolute, color=color.new(basis_dyn, 30), size=size.tiny)
+
+// ═══════════════════════════════════════════
+// SIGNAL MARKERS
+// ═══════════════════════════════════════════
+// Main signals — custom labels for uniqueness
+if show_signals and long_signal
+    label.new(bar_index, low, "▲",
+         style=label.style_none, textcolor=col_bull,
+         size=size.normal, yloc=yloc.belowbar)
+    if show_particles
+        label.new(bar_index, low, "◆",
+             style=label.style_none, textcolor=color.new(col_bull, 40),
+             size=size.tiny, yloc=yloc.belowbar)
+
+if show_signals and short_signal
+    label.new(bar_index, high, "▼",
+         style=label.style_none, textcolor=col_bear,
+         size=size.normal, yloc=yloc.abovebar)
+    if show_particles
+        label.new(bar_index, high, "◆",
+             style=label.style_none, textcolor=color.new(col_bear, 40),
+             size=size.tiny, yloc=yloc.abovebar)
+
+// LMA cross signals
+plotshape(show_lma_cross and lma_cross_up, title="LMA Cross Up",
+     location=location.belowbar, style=shape.diamond,
+     size=size.tiny, color=color.new(col_bull, 20))
+
+plotshape(show_lma_cross and lma_cross_down, title="LMA Cross Down",
+     location=location.abovebar, style=shape.diamond,
+     size=size.tiny, color=color.new(col_bear, 20))
+
+// ═══════════════════════════════════════════
+// BAND TOUCH HIGHLIGHTS
+// ═══════════════════════════════════════════
+upper_touch = high >= upper_band and high[1] < upper_band[1]
+lower_touch = low <= lower_band and low[1] > lower_band[1]
+
+plotshape(show_particles and upper_touch and not short_signal, title="Upper Touch",
+     location=location.abovebar, style=shape.circle,
+     size=size.tiny, color=color.new(col_upper, 30))
+
+plotshape(show_particles and lower_touch and not long_signal, title="Lower Touch",
+     location=location.belowbar, style=shape.circle,
+     size=size.tiny, color=color.new(col_lower, 30))
+
+// ═══════════════════════════════════════════
+// DASHBOARD TABLE
+// ═══════════════════════════════════════════
+t_pos = switch table_pos
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+
+if show_table and barstate.islast
+    var table dash = table.new(t_pos, 2, 7,
+         bgcolor=color.new(#0a0a1a, 5),
+         border_color=color.new(col_accent, 40),
+         border_width=1,
+         frame_color=color.new(col_accent, 20),
+         frame_width=2)
+
+    // Header
+    table.cell(dash, 0, 0, "⚡ LIQUIDITY BANDS", text_color=col_upper, text_size=size.small,
+         bgcolor=color.new(col_accent, 80))
+    table.cell(dash, 1, 0, "━━━━━━", text_color=color.new(col_accent, 40), text_size=size.small,
+         bgcolor=color.new(col_accent, 80))
+
+    // Theme
+    table.cell(dash, 0, 1, "  Theme", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#0a0a1a, 5))
+    table.cell(dash, 1, 1, style_theme + " ●", text_color=col_upper, text_size=size.small,
+         text_halign=text.align_right, bgcolor=color.new(#0a0a1a, 5))
+
+    // Mode
+    table.cell(dash, 0, 2, "  Mode", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#111122, 10))
+    table.cell(dash, 1, 2, signal_mode, text_color=col_accent, text_size=size.small,
+         text_halign=text.align_right, bgcolor=color.new(#111122, 10))
+
+    // Band Width
+    bw_col = squeeze ? col_squeeze : expansion ? col_bull : color.new(#cccccc, 0)
+    table.cell(dash, 0, 3, "  Width", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#0a0a1a, 5))
+    table.cell(dash, 1, 3, str.tostring(band_width, "#.##") + "%", text_color=bw_col, text_size=size.small,
+         text_halign=text.align_right, bgcolor=color.new(#0a0a1a, 5))
+
+    // Status
+    status_txt = squeeze ? "⊘ SQUEEZE" : expansion ? "⊕ EXPANDING" : "◎ NORMAL"
+    status_col = squeeze ? col_squeeze : expansion ? col_bull : color.new(#888888, 0)
+    table.cell(dash, 0, 4, "  Status", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#111122, 10))
+    table.cell(dash, 1, 4, status_txt, text_color=status_col, text_size=size.small,
+         text_halign=text.align_right, bgcolor=color.new(#111122, 10))
+
+    // Position
+    pos_text = close > upper_band ? "▲ ABOVE" : close < lower_band ? "▼ BELOW" : "◈ INSIDE"
+    pos_col = close > upper_band ? col_bull : close < lower_band ? col_bear : color.new(#cccccc, 0)
+    table.cell(dash, 0, 5, "  Price", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#0a0a1a, 5))
+    table.cell(dash, 1, 5, pos_text, text_color=pos_col, text_size=size.small,
+         text_halign=text.align_right, bgcolor=color.new(#0a0a1a, 5))
+
+    // Price Ratio Bar (visual gauge)
+    pct = math.round(price_ratio_c * 100)
+    filled = math.round(pct / 10)
+    gauge = ""
+    for i = 0 to 9
+        gauge += i < filled ? "█" : "░"
+    table.cell(dash, 0, 6, "  Ratio", text_color=color.new(#aaaaaa, 0), text_size=size.small,
+         text_halign=text.align_left, bgcolor=color.new(#111122, 10))
+    table.cell(dash, 1, 6, gauge + " " + str.tostring(pct) + "%",
+         text_color=color.from_gradient(price_ratio_c, 0, 1, col_lower, col_upper),
+         text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#111122, 10))
+
+// ═══════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════
+alertcondition(long_signal,     title="Long Signal",     message="⚡ Liquidity Bands: Long on {{ticker}}")
+alertcondition(short_signal,    title="Short Signal",    message="⚡ Liquidity Bands: Short on {{ticker}}")
+alertcondition(lma_cross_up,    title="LMA Cross Up",    message="⚡ LMA Cross Up on {{ticker}}")
+alertcondition(lma_cross_down,  title="LMA Cross Down",  message="⚡ LMA Cross Down on {{ticker}}")
+alertcondition(squeeze,         title="Squeeze",         message="⚡ Squeeze detected on {{ticker}}")

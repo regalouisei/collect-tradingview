@@ -1,0 +1,120 @@
+//@version=6
+indicator("RSI 2-Close Rebuy Ladder v6 (Start Time + Baseline)", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// Always-present hidden output
+plot(na, title="(internal)", display=display.none)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+rsiLen        = input.int(14, "RSI Length", minval=1)
+rsiSrc        = input.source(close, "RSI Source")
+osLevel       = input.float(30.0, "Oversold Level (<=)", step=0.1)
+dropPercent   = input.float(5.0, "Rebuy requires drop (%) from last entry", step=0.1, minval=0.0)
+
+priceCheckSrc = input.source(close, "Price used for 5% drop check")
+entryPriceSrc = input.source(close, "Stored entry price after BUY (close/open/etc.)")
+
+useStartTime  = input.bool(true, "Use Start Time (recommended)")
+startTime     = input.time(0, "Start Time (set to your first-entry candle time)")
+
+startMode     = input.string("Seed baseline (already bought at start time)", "Start Mode",
+                 options=["Normal (wait for BUY1)", "Seed baseline (already bought at start time)"])
+baselinePx    = input.float(0.0, "Baseline price (your first buy)", step=0.01, minval=0.0)
+
+showDebug     = input.bool(false, "Show debug markers")
+
+// Display controls
+shadeOpacity  = input.int(85, "Buy bar shade opacity (0=solid, 100=off)", minval=0, maxval=100)
+lineOpacity   = input.int(70, "Buy vertical line opacity (0=solid, 100=off)", minval=0, maxval=100)
+lineWidth     = input.int(2, "Buy vertical line width", minval=1, maxval=5)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Series
+// ─────────────────────────────────────────────────────────────────────────────
+rsiVal    = ta.rsi(rsiSrc, rsiLen)
+closedBar = (not barstate.isrealtime) or barstate.isconfirmed
+dropFrac  = dropPercent / 100.0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+var bool  started   = false
+var float lastEntry = na
+var int   buyCount  = 0
+var bool  armed     = true
+var int   osCount   = 0
+
+// Start exactly at the chosen time
+bool startNow = useStartTime ? (not started and time >= startTime) : (barstate.isfirst and not started)
+
+if startNow
+    started := true
+    osCount := 0
+
+    if startMode == "Seed baseline (already bought at start time)" and baselinePx > 0
+        lastEntry := baselinePx
+        buyCount  := 1
+        armed     := false  // must go RSI > 30 before next buy
+    else
+        lastEntry := na
+        buyCount  := 0
+        armed     := true
+
+// Only run logic after we’ve started
+if started and closedBar and not na(rsiVal)
+    if rsiVal <= osLevel
+        osCount += 1
+    else
+        osCount := 0
+
+    if rsiVal > osLevel
+        armed := true
+
+dropOk = started and (buyCount > 0) and not na(lastEntry) and (priceCheckSrc <= lastEntry * (1.0 - dropFrac))
+
+// CHANGED: use osCount >= 2 (at least two closes below 30)
+buy1      = started and armed and (buyCount == 0) and (osCount >= 2)
+buyRebuy  = started and armed and (buyCount > 0) and (osCount >= 2) and dropOk
+buySignal = buy1 or buyRebuy
+
+if buySignal
+    buyCount  += 1
+    lastEntry := entryPriceSrc
+    armed     := false
+
+    // Green vertical line on the buy bar (extends across chart)
+    line.new(
+         x1=bar_index, y1=high,
+         x2=bar_index, y2=low,
+         xloc=xloc.bar_index,
+         extend=extend.both,
+         color=color.new(color.green, lineOpacity),
+         width=lineWidth
+    )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Outputs (global scope)
+// ─────────────────────────────────────────────────────────────────────────────
+plot(lastEntry, "Last Entry Price", style=plot.style_linebr, linewidth=2)
+
+// Green arrow up on buy bars
+plotshape(
+     buySignal,
+     title="BUY Arrow",
+     style=shape.arrowup,
+     location=location.belowbar,
+     size=size.normal,
+     color=color.new(color.green, 0)
+)
+
+// Green shaded vertical bar on buy candle
+bgcolor(buySignal ? color.new(color.green, shadeOpacity) : na, title="BUY Bar Shade")
+
+alertcondition(buySignal, title="RSI Rebuy Buy Signal", message="RSI Rebuy Ladder: BUY signal fired.")
+
+// Debug markers (global scope)
+plotshape(showDebug and started,         title="Debug: started", style=shape.square,   location=location.top,     size=size.tiny)
+plotshape(showDebug and osCount >= 2,    title="Debug: 2+ oversold closes", style=shape.circle, location=location.belowbar, size=size.tiny)
+plotshape(showDebug and armed,           title="Debug: armed",   style=shape.diamond,  location=location.belowbar, size=size.tiny)
+plotshape(showDebug and dropOk,          title="Debug: dropOk",  style=shape.triangleup, location=location.belowbar, size=size.tiny)

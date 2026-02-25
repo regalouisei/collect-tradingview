@@ -1,0 +1,229 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Zeiierman {
+
+//@version=6
+indicator(title = 'Dynamic RSI Regression Bands (Zeiierman)', overlay = true, max_lines_count = 3, max_labels_count = 0, max_bars_back = 1005)
+//~~}
+
+//~~ Tooltips for Inputs {
+var string t1 = "Defines how many bars the RSI uses to measure relative strength. Shorter values make it more reactive; longer values smooth out noise."
+var string t2 = "Overbought level. When RSI crosses above this, it triggers a reset of the regression channel. Common levels: 70–90."
+var string t3 = "Oversold level. When RSI crosses below this, it triggers a reset of the regression channel. Common levels: 10–30."
+var string t4 = "Toggles the central regression line. This is the core trendline recalculated on every RSI reset."
+var string t5 = "Toggles upper and lower standard deviation bands from the regression line, useful for spotting volatility zones."
+var string t6 = "Maximum lookback for calculating regression after a reset. Actual length is limited by how many bars since last RSI trigger."
+var string t7 = "Controls the width of the channel bands. Higher values make bands wider, capturing more price swings."
+var string t8 = "Minimum number of bars required to start calculating a regression channel after an RSI reset. Helps filter out noise from immediate re-crosses."
+var string t9 = "Displays triangle markers at RSI overbought (top) and oversold (bottom) resets."
+var string t10 = "Marker colors for RSI resets — red for overbought, green for oversold."
+var string t11 = "Shows dot markers when price rejects the upper or lower channel (e.g., wicks through, then closes back inside)."
+var string t12 = "Marker colors for price rejection at upper or lower regression channel bands — red for upper, green for lower."
+var string t13 = "Colors used for the upper and lower regression bands. Adjust transparency to blend or highlight."
+var string t14 = "Adjusts thickness of the regression and channel lines."
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Inputs {
+rsiLen     = input.int(5, 'RSI Length', minval = 1, group="RSI", inline="RSI", tooltip=t1)
+rsiObLevel = input.float(90.0, 'OB', minval = 0, maxval = 100, group="RSI", inline="RSI_", tooltip="")
+rsiOsLevel = input.float(10.0, 'OS', minval = 0, maxval = 100, group="RSI", inline="RSI_", tooltip=t2 + t3)
+
+showreg     = input.bool(true, title="Regression Channel", group="Regression Channel", inline="", tooltip=t4)
+showregband = input.bool(true, title="Regression Bands", group="Regression Channel", inline="", tooltip=t5)
+lrBaseLen   = input.int(1000, 'Base Regression Length (Max)', minval = 2, group="Regression Channel", inline="", tooltip=t6)
+stdevMult   = input.float(2.0, 'StdDev Channel Multiplier', minval = 0.1, group="Regression Channel", inline="", tooltip=t7)
+
+minChannelLen = input.int(2, 'Min Bars After Reset', minval = 1, group="", inline="", tooltip=t8)
+
+plotColorUpper   = input.color(color.new(color.fuchsia, 60), '', group = 'Channel Style', inline="1", tooltip=t13)
+plotColorLower   = input.color(color.new(color.aqua, 60), '', group = 'Channel Style', inline="1", tooltip=t13)
+plotLineWidth    = input.int(1, 'Line Width', group = 'Channel Style', minval = 1, maxval = 5, inline="", tooltip=t14)
+
+showResetMarker = input.bool(true, 'Show Reset Markers', group = 'RSI Reset Sign', inline="2", tooltip=t9)
+markerObColor   = input.color(color.new(color.red, 0), '', group = 'RSI Reset Sign', inline="2", tooltip=t10)
+markerOsColor   = input.color(color.new(color.green, 0), '', group = 'RSI Reset Sign', inline="2", tooltip=t10)
+
+showRejection    = input.bool(true, 'Show Rejection Markers', group = 'Rejection Sign', inline="3", tooltip=t11)
+rejectionObColor = input.color(color.new(color.red, 0), '', group = 'Rejection Sign', inline="3", tooltip=t12)
+rejectionOsColor = input.color(color.new(color.green, 0), '', group = 'Rejection Sign', inline="3", tooltip=t12)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Var {
+float lrVal_Current = na 
+float stdevVal      = na 
+float upperChannel_Plot = na 
+float lowerChannel_Plot = na 
+float slope = na 
+float intercept   = na 
+float lrVal_Start = na 
+float upperEnd    = na
+float lowerEnd    = na 
+float upperStart  = na 
+float lowerStart  = na
+var line lineMl   = na 
+var line lineUl   = na
+var line lineLl   = na 
+var linefill lineFill = na 
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+//~~ Regression Calculation {
+regression(src, length) =>
+    float sumX = 0.0
+    float sumY = 0.0
+    float sumXSqr = 0.0
+    float sumXY = 0.0
+    float _slope = na 
+    float _intercept = na 
+
+    if length > 1 
+        for i = 0 to length - 1 by 1
+            val = src[i]
+            per = i + 1.0 
+            sumX := sumX + per
+            sumY := sumY + val
+            sumXSqr := sumXSqr + per * per
+            sumXY := sumXY + val * per
+            sumXY
+
+        denominator = length * sumXSqr - sumX * sumX
+        if denominator != 0 // Avoid division by zero
+            _slope := (length * sumXY - sumX * sumY) / denominator
+            _intercept := (sumY - _slope * sumX) / length
+            _intercept
+
+    else if length == 1 
+        _slope := 0.0 
+        _intercept := src[0] 
+        _intercept
+    [_slope, _intercept]
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ RSI {
+rsi         = ta.rsi(close, rsiLen)
+rsiOB_Cross = ta.crossover(rsi, rsiObLevel) 
+rsiOS_Cross = ta.crossunder(rsi, rsiOsLevel) 
+resetCondition = rsiOB_Cross or rsiOS_Cross  
+
+var int barsSinceReset = 0
+if resetCondition[1]
+    barsSinceReset := 0
+    barsSinceReset
+else
+    barsSinceReset := barsSinceReset + 1
+    barsSinceReset
+
+effectiveLen = math.min(lrBaseLen, barsSinceReset + 1) 
+effectiveLen := math.max(minChannelLen, effectiveLen) 
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Calc {
+canCalculate = barsSinceReset >= minChannelLen - 1 
+if canCalculate
+    [currentSlope, currentIntercept] = regression(close, effectiveLen)
+    if not na(currentSlope) and not na(currentIntercept) 
+        slope := currentSlope
+        intercept := currentIntercept
+        lrVal_Current := intercept + slope * 1.0
+        lrVal_Start := intercept + slope * float(effectiveLen)
+        stdevVal := ta.stdev(close, effectiveLen)
+
+        if not na(stdevVal)
+            upperChannel_Plot := lrVal_Current + stdevMult * stdevVal
+            lowerChannel_Plot := lrVal_Current - stdevMult * stdevVal
+           
+            upperEnd := lrVal_Current + stdevMult * stdevVal 
+            lowerEnd := lrVal_Current - stdevMult * stdevVal 
+            upperStart := lrVal_Start + stdevMult * stdevVal 
+            lowerStart := lrVal_Start - stdevMult * stdevVal 
+            lowerStart
+        else
+            upperChannel_Plot := lrVal_Current
+            lowerChannel_Plot := lrVal_Current
+            upperEnd := lrVal_Current
+            lowerEnd := lrVal_Current
+            upperStart := lrVal_Start
+            lowerStart := lrVal_Start
+            lowerStart
+else 
+    slope := na
+    slope
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Line plots {
+int startBarIndex = bar_index - effectiveLen + 1
+int endBarIndex = bar_index
+
+currentLineColor = color.gray 
+if not na(slope)
+    currentLineColor := slope > 0 ? plotColorUpper : plotColorLower
+    currentLineColor
+
+if (not canCalculate or na(slope) or resetCondition) 
+  
+    line.delete(lineMl)
+    line.delete(lineUl)
+    line.delete(lineLl)
+    linefill.delete(lineFill)
+    lineMl := na
+    lineUl := na
+    lineLl := na
+    lineFill := na
+    lineFill
+    
+else 
+    if na(lineMl) and showreg
+        lineMl := line.new(startBarIndex, lrVal_Start, endBarIndex, lrVal_Current, color = currentLineColor, style = line.style_solid, width = math.max(1, plotLineWidth))
+        lineUl := line.new(startBarIndex, upperStart, endBarIndex, upperEnd, color = currentLineColor, style = line.style_dashed, width = math.max(1, plotLineWidth))
+        lineLl := line.new(startBarIndex, lowerStart, endBarIndex, lowerEnd, color = currentLineColor, style = line.style_dashed, width = math.max(1, plotLineWidth))
+        lineFill := linefill.new(lineUl, lineLl, color.new(currentLineColor,90))
+        lineFill
+    else 
+        line.set_xy1(lineMl, startBarIndex, lrVal_Start)
+        line.set_xy2(lineMl, endBarIndex, lrVal_Current)
+        line.set_xy1(lineUl, startBarIndex, upperStart)
+        line.set_xy2(lineUl, endBarIndex, upperEnd)
+        line.set_xy1(lineLl, startBarIndex, lowerStart)
+        line.set_xy2(lineLl, endBarIndex, lowerEnd)
+
+        line.set_color(lineMl, currentLineColor)
+        line.set_color(lineUl, currentLineColor)
+        line.set_color(lineLl, currentLineColor)
+        linefill.set_color(lineFill, color.new(currentLineColor,90))
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Get channel values {
+midreg   = na(lrVal_Current) ? na : lrVal_Current
+upperreg = na(upperChannel_Plot) ? na : upperChannel_Plot
+lowerreg = na(lowerChannel_Plot) ? na : lowerChannel_Plot
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Rejection { 
+upperCross = ta.crossover(high, upperreg)
+lowerCross = ta.crossunder(low, lowerreg)
+upperReject = upperCross[1] and close < upperreg and close < open and showRejection
+lowerReject = lowerCross[1] and close > lowerreg and close > open and showRejection
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Plots {
+cond_Ob = rsiOB_Cross and showResetMarker
+cond_Os = rsiOS_Cross and showResetMarker
+atr_ = ta.ema(ta.atr(20), 100)
+place_Ob = ta.highest(high, 10) + atr_
+place_Os = ta.lowest(low, 10) - atr_
+plotshape(cond_Ob ? place_Ob : na, title = 'RSI OB', location = location.absolute, color = markerObColor, style = shape.triangledown, size = size.tiny)
+plotshape(cond_Os ? place_Os : na, title = 'RSI OS', location = location.absolute, color = markerOsColor, style = shape.triangleup, size = size.tiny)
+p_ml = plot(showregband?midreg:na, title = 'Regression', color = currentLineColor, linewidth = 1, style = plot.style_linebr)
+p_ul = plot(showregband?upperreg:na, title = 'Upper Channel', color = plotColorUpper, linewidth = 1, style = plot.style_linebr)
+p_ll = plot(showregband?lowerreg:na, title = 'Lower Channel', color = plotColorLower, linewidth = 1, style = plot.style_linebr)
+
+fill(p_ul, p_ml, upperreg, midreg, color.new(currentLineColor, 90), na)
+fill(p_ll, p_ml, lowerreg, midreg, color.new(currentLineColor, 90), na)
+
+plotshape(upperReject ? place_Ob : na, title = 'Upper Rejection', location = location.absolute, color = color.new(rejectionObColor, 0), style = shape.circle, size = size.tiny, offset = -1)
+plotshape(lowerReject ? place_Os : na, title = 'Lower Rejection', location = location.absolute, color = color.new(rejectionOsColor, 0), style = shape.circle, size = size.tiny, offset = -1)
+
+// For UI Only
+plotshape(cond_Ob ? place_Ob : na, title = 'UI - RSI OB', location = location.absolute, color = color.new(markerObColor, 70), style = shape.triangledown, size = size.small)
+plotshape(cond_Os ? place_Os : na, title = 'UI - RSI OS', location = location.absolute, color = color.new(markerOsColor, 70), style = shape.triangleup, size = size.small)
+plotshape(upperReject ? place_Ob : na, title = 'UI - Upper Rejection', location = location.absolute, color = color.new(rejectionObColor, 70), style = shape.circle, size = size.small, offset = -1)
+plotshape(lowerReject ? place_Os : na, title = 'UI - Lower Rejection', location = location.absolute, color = color.new(rejectionOsColor, 70), style = shape.circle, size = size.small, offset = -1)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}

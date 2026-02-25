@@ -1,0 +1,150 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © MarkitTick
+
+//@version=6
+indicator("Adaptive Channel Breakout [MarkitTick]", overlay = true, max_bars_back = 500)
+
+// -----------------------------------------------------------------------------
+// 1. Architecture & Types
+// -----------------------------------------------------------------------------
+
+type MarketRegime
+    float adx
+    bool  is_range
+    bool  is_bull
+    bool  is_bear
+
+// -----------------------------------------------------------------------------
+// 2. Constants & Inputs 
+// -----------------------------------------------------------------------------
+
+grp_sys  = "Adaptive Parameters"
+len_in   = input.int(20, "Lookback Length", minval=5, group=grp_sys)
+mult_in  = input.float(3.2, "ATR Multiplier", minval=0.1, step=0.1, group=grp_sys, tooltip="Research default is 3.2 for outlier detection.")
+log_in   = input.bool(false, "Use Logarithmic Scale", group=grp_sys, tooltip="Recommended for Crypto/Parabolic assets.")
+
+grp_filt = "Filters & Exits"
+adx_th   = input.int(25, "ADX Threshold", group=grp_filt)
+time_ex  = input.int(10, "Time Exit (Bars)", group=grp_filt, tooltip="Marks 'Stale' trades if no progress after N bars.")
+
+grp_dash = "UI / Dashboard"
+show_tbl = input.bool(true, "Show Analytics Dashboard", group=grp_dash)
+size_tbl = input.string("Small", "Size", options = ["Tiny", "Small", "Normal"], group=grp_dash)
+
+// -----------------------------------------------------------------------------
+// 3. Calculation Core
+// -----------------------------------------------------------------------------
+
+float src_h = log_in ? math.log(high) : high
+float src_l = log_in ? math.log(low)  : low
+float src_c = log_in ? math.log(close) : close
+
+[di_plus, di_minus, adx_val] = ta.dmi(len_in, len_in)
+
+bool is_trending = adx_val >= adx_th
+bool regime_bull = is_trending and di_plus > di_minus
+bool regime_bear = is_trending and di_minus > di_plus
+bool regime_range = not is_trending
+
+MarketRegime regime = MarketRegime.new(adx_val, regime_range, regime_bull, regime_bear)
+
+float tr_log   = math.max(src_h - src_l, math.abs(src_h - src_c[1]), math.abs(src_l - src_c[1]))
+float atr_log  = ta.sma(tr_log, len_in)
+float atr_band = atr_log * mult_in
+
+float highest_h = ta.highest(src_h, len_in)
+float lowest_l  = ta.lowest(src_l, len_in)
+
+float ch_upper = log_in ? math.exp(highest_h - atr_band) : highest_h - atr_band
+float ch_lower = log_in ? math.exp(lowest_l + atr_band)  : lowest_l + atr_band
+float final_atr = log_in ? math.exp(atr_log) : atr_log
+
+// -----------------------------------------------------------------------------
+// 4. Signal Engine & State Management
+// -----------------------------------------------------------------------------
+
+bool filter_long  = regime.is_range or regime.is_bull
+bool filter_short = regime.is_range or regime.is_bear
+
+bool long_signal  = ta.crossover(close, ch_upper) and filter_long
+bool short_signal = ta.crossunder(close, ch_lower) and filter_short
+
+var int  trade_dir        = 0
+var int  bars_since_entry = 0
+
+if long_signal
+    trade_dir        := 1
+    bars_since_entry := 0
+else if short_signal
+    trade_dir        := -1
+    bars_since_entry := 0
+else
+    bars_since_entry += 1
+
+bool is_stale = bars_since_entry == time_ex and trade_dir != 0
+
+// -----------------------------------------------------------------------------
+// 5. Visualization
+// -----------------------------------------------------------------------------
+
+color col_upper = regime.is_bear ? color.new(color.gray, 70) : color.green
+color col_lower = regime.is_bull ? color.new(color.gray, 70) : color.red
+color col_fill  = regime.is_bull ? color.new(color.green, 90) : regime.is_bear ? color.new(color.red, 90) : color.new(color.yellow, 95)
+
+plot(ch_upper, "Upper Band", color=col_upper, linewidth=2)
+plot(ch_lower, "Lower Band", color=col_lower, linewidth=2)
+fill(plot(ch_upper, display=display.none), plot(ch_lower, display=display.none), color=col_fill, title="Channel Fill")
+
+plotshape(long_signal,  "Long Signal",  shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(short_signal, "Short Signal", shape.triangledown, location.abovebar, color.red,   size=size.small)
+plotshape(is_stale,     "Time Exit",    shape.xcross,       location.belowbar, color.orange, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// 6. Dashboard 
+// -----------------------------------------------------------------------------
+
+if show_tbl
+    var table dash = table.new(position.top_right, 2, 4, border_width=1, border_color=color.gray, frame_color=color.gray, frame_width=1)
+    
+    if barstate.islast
+        string txt_size = switch size_tbl
+            "Tiny"   => size.tiny
+            "Normal" => size.normal
+            => size.small
+        
+        table.cell(dash, 0, 0, "Metric", bgcolor=color.new(color.black, 20), text_color=color.white, text_size=txt_size)
+        table.cell(dash, 1, 0, "Value",  bgcolor=color.new(color.black, 20), text_color=color.white, text_size=txt_size)
+
+        string st_txt = regime.is_range ? "RANGE (Accum)" : regime.is_bull ? "TREND (Bull)" : "TREND (Bear)"
+        color  st_col = regime.is_range ? color.yellow : regime.is_bull ? color.green : color.red
+        
+        table.cell(dash, 0, 1, "Market Regime",    bgcolor=color.black, text_color=color.gray, text_size=txt_size)
+        table.cell(dash, 1, 1, st_txt,             bgcolor=color.black, text_color=st_col,     text_size=txt_size)
+        
+        table.cell(dash, 0, 2, "Volatility (ATR)", bgcolor=color.black, text_color=color.gray, text_size=txt_size)
+        table.cell(dash, 1, 2, str.tostring(final_atr, format.mintick), bgcolor=color.black, text_color=color.white, text_size=txt_size)
+        
+        table.cell(dash, 0, 3, "ADX Strength",     bgcolor=color.black, text_color=color.gray, text_size=txt_size)
+        table.cell(dash, 1, 3, str.tostring(regime.adx, "#.##"), bgcolor=color.black, text_color=regime.adx > adx_th ? color.white : color.gray, text_size=txt_size)
+
+// -----------------------------------------------------------------------------
+// 7. Automation (JSON Alerts)
+// -----------------------------------------------------------------------------
+
+float tp_long  = long_signal ? close + ((close - ch_lower) * 2) : na
+float sl_long  = long_signal ? ch_lower : na
+float tp_short = short_signal ? close - ((ch_upper - close) * 2) : na
+float sl_short = short_signal ? ch_upper : na
+
+if long_signal
+    string json_long = '{"action": "buy", "ticker": "' + syminfo.ticker + '", "price": "' + str.tostring(close, format.mintick) + '", "tp": "' + str.tostring(tp_long, format.mintick) + '", "sl": "' + str.tostring(sl_long, format.mintick) + '"}'
+    alert(json_long, alert.freq_once_per_bar_close)
+
+if short_signal
+    string json_short = '{"action": "sell", "ticker": "' + syminfo.ticker + '", "price": "' + str.tostring(close, format.mintick) + '", "tp": "' + str.tostring(tp_short, format.mintick) + '", "sl": "' + str.tostring(sl_short, format.mintick) + '"}'
+    alert(json_short, alert.freq_once_per_bar_close)
+
+if is_stale
+    string json_exit = '{"action": "close_time_limit", "ticker": "' + syminfo.ticker + '", "reason": "stale_trade"}'
+    alert(json_exit, alert.freq_once_per_bar_close)

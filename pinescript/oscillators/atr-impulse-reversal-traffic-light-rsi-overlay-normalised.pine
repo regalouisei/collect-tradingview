@@ -1,0 +1,110 @@
+//@version=5
+// SPDX-License-Identifier: MPL-2.0
+indicator("ATR Impulse Reversal Traffic-Light + RSI Overlay (Normalised)", shorttitle="Impulse TL + RSI (Norm)", overlay=false)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 1) STRETCH BAND (GATE)
+//──────────────────────────────────────────────────────────────────────────────
+groupGate = "1) Stretch Band Gate"
+src          = input.source(close, "Source", group=groupGate)
+bandEmaLen   = input.int(100, "Band EMA Length", minval=1, group=groupGate)
+atrLen       = input.int(14,  "ATR Length", minval=1, group=groupGate)
+bandAtrMult  = input.float(2.8, "Band ATR Multiplier", minval=0.1, step=0.1, group=groupGate)
+useWicksGate = input.bool(true, "Gate Uses Wicks (low)", group=groupGate)
+
+basis = ta.ema(src, bandEmaLen)
+atrv  = ta.atr(atrLen)
+lower = basis - bandAtrMult * atrv
+
+belowRef   = useWicksGate ? low : close
+priceBelow = belowRef < lower
+
+//──────────────────────────────────────────────────────────────────────────────
+// 2) ATR IMPULSE (NORMALISED MOMENTUM)
+//──────────────────────────────────────────────────────────────────────────────
+groupImp = "2) ATR Impulse"
+momSmoothLen = input.int(3, "Momentum Smoothing", minval=1, group=groupImp)
+sigLen       = input.int(4, "Signal Smoothing", minval=1, group=groupImp)
+deadzone     = input.float(0.08, "Deadzone (ATR units)", minval=0.0, step=0.01, group=groupImp)
+
+momRaw  = src - src[1]
+momSm   = ta.ema(momRaw, momSmoothLen)
+impulse = atrv > 0 ? momSm / atrv : 0.0
+sig     = ta.ema(impulse, sigLen)
+
+impDZ = math.abs(impulse) < deadzone ? 0.0 : impulse
+
+//──────────────────────────────────────────────────────────────────────────────
+// 3) REVERSAL CONTEXT
+//──────────────────────────────────────────────────────────────────────────────
+groupRev = "3) Reversal Logic"
+oversoldThr  = input.float(0.35, "Oversold Threshold (ATR units)", minval=0.0, step=0.01, group=groupRev)
+lookbackBars = input.int(8, "Oversold Lookback Bars", minval=1, group=groupRev)
+
+recentOversold = ta.lowest(impDZ, lookbackBars) <= -oversoldThr
+turningUp      = impDZ > impDZ[1]
+crossSig       = ta.crossover(impDZ, sig)
+crossZero      = ta.crossover(impDZ, 0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 4) TRAFFIC LIGHT STATES
+//──────────────────────────────────────────────────────────────────────────────
+greyRaw   = (not priceBelow) or (not recentOversold)
+redRaw    = priceBelow and recentOversold and (not turningUp)
+orangeRaw = priceBelow and recentOversold and turningUp and (not (crossSig or crossZero))
+greenRaw  = priceBelow and recentOversold and (crossSig or crossZero)
+
+// GREEN HOLD (ANTI-FLICKER)
+groupHold = "4) Debounce"
+holdGreenBars = input.int(1, "Hold GREEN (bars)", minval=0, maxval=50, group=groupHold)
+
+var int gHold = 0
+gHold := greenRaw ? holdGreenBars : math.max(gHold - 1, 0)
+
+greenCond  = gHold > 0
+orangeCond = (not greenCond) and orangeRaw
+redCond    = (not greenCond) and (not orangeCond) and redRaw
+greyCond   = (not greenCond) and (not orangeCond) and (not redCond)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 5) VISUALS
+//──────────────────────────────────────────────────────────────────────────────
+groupVis = "5) Visuals"
+showZero   = input.bool(true, "Show Zero Line", group=groupVis)
+showPaneBg = input.bool(false, "Subtle Pane BG When Below Band", group=groupVis)
+
+color barCol =
+     greenCond  ? color.new(color.lime, 0) :
+     orangeCond ? color.new(color.orange, 0) :
+     redCond    ? color.new(color.red, 0) :
+                  color.new(color.gray, 60)
+
+// ✅ ZERO LINE (LEGAL + CONDITIONAL)
+plot(showZero ? 0 : na, title="Zero", color=color.new(color.gray, 75), linewidth=1)
+
+// IMPULSE BARS
+plot(impDZ, title="ATR Impulse (Deadzoned)", style=plot.style_columns, color=barCol, linewidth=2)
+
+// Optional subtle pane background
+bgcolor(showPaneBg and priceBelow ? color.new(color.lime, 92) : na)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 6) RSI OVERLAY (NORMALISED, VISUAL ONLY)
+//──────────────────────────────────────────────────────────────────────────────
+groupRSI = "6) RSI Overlay"
+showRsi      = input.bool(true, "Show RSI Overlay", group=groupRSI)
+rsiSrc       = input.source(close, "RSI Source", group=groupRSI)
+rsiLen       = input.int(14, "RSI Length", minval=1, group=groupRSI)
+rsiLineWidth = input.int(2, "RSI Line Width", minval=1, maxval=5, group=groupRSI)
+rsiNormScale = input.float(0.9, "RSI Overlay Strength", minval=0.1, step=0.1, group=groupRSI)
+
+rsi = ta.rsi(rsiSrc, rsiLen)
+rsiNorm = ((rsi - 50.0) / 50.0) * rsiNormScale
+
+plot(showRsi ? rsiNorm : na, title="RSI Overlay (Normalised)", color=color.new(color.aqua, 0), linewidth=rsiLineWidth)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 7) ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(greenRaw,  title="GO (Green)",     message="GO: Below band + oversold context + reversal confirmed.")
+alertcondition(orangeRaw, title="READY (Orange)", message="READY: Below band + oversold context + momentum turning up.")

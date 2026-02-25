@@ -1,0 +1,280 @@
+//@version=5
+// Spot-Futures Spread Indicator
+// Calculates and displays the percentage spread between spot and perpetual futures
+indicator('Spot-Futures Spread', shorttitle='Spread', overlay=false, format=format.percent)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Display options
+maLength = input.int(20, 'Moving Average Period', minval=1, group='Display')
+showMA = input.bool(true, 'Show Moving Average', group='Display')
+showBands = input.bool(true, 'Show Standard Deviation Bands', group='Display')
+stdDevMultiplier = input.float(2.0, 'Std Dev Multiplier', minval=0.1, step=0.1, group='Display')
+showTable = input.bool(true, 'Show Statistics Table', group='Display')
+
+// Color settings
+colorPositive = input.color(color.new(#26a69a, 0), 'Positive Spread Color', group='Colors')
+colorNegative = input.color(color.new(#ef5350, 0), 'Negative Spread Color', group='Colors')
+colorMA = input.color(color.new(#ffa726, 0), 'Moving Average Color', group='Colors')
+colorBands = input.color(color.new(#64b5f6, 70), 'Bands Color', group='Colors')
+bgTransparency = input.int(90, 'Background Transparency', minval=0, maxval=100, group='Colors')
+
+// Advanced options
+useAutoExchange = input.bool(true, 'Auto-detect Exchange', tooltip='Automatically detect exchange from current chart', group='Advanced')
+exchangeInput = input.string('BINANCE', 'Manual Exchange Override', options=['BINANCE', 'BYBIT', 'OKX', 'MEXC', 'BINGX', 'BITGET', 'BITMEX', 'DERIBIT', 'WHITEBIT', 'GATEIO', 'HTX', 'KRAKEN', 'COINBASE', 'KUCOIN'], group='Advanced')
+useManualSymbol = input.bool(false, 'Use Manual Symbols', tooltip='Override automatic detection and specify symbols manually', group='Advanced')
+manualSpotSymbol = input.symbol('BINANCE:BTCUSDT', 'Manual Spot Symbol', group='Advanced')
+manualFuturesSymbol = input.symbol('BINANCE:BTCUSDT.P', 'Manual Futures Symbol', group='Advanced')
+
+// ============================================================================
+// EXCHANGE-SPECIFIC SUFFIXES
+// ============================================================================
+
+getPerpSuffix(exchange) =>
+    switch exchange
+        'BINANCE'  => '.P'
+        'BYBIT'    => '.P'
+        'OKX'      => 'SWAP'
+        'MEXC'     => 'PERPETUAL'
+        'BINGX'    => 'PERPETUAL'
+        'BITGET'   => 'PERP'
+        'BITMEX'   => ''  // BITMEX uses different format (e.g., XBTUSD)
+        'DERIBIT'  => 'PERPETUAL'
+        'WHITEBIT' => 'PERP'
+        'GATEIO'   => '_USDT'
+        'HTX'      => 'SWAP'
+        'KRAKEN'   => 'PERP'
+        'COINBASE' => ''
+        'KUCOIN'   => 'M'
+        => '.P'
+
+// ============================================================================
+// SYMBOL DETECTION AND CONSTRUCTION
+// ============================================================================
+
+// Get the actual exchange - use current chart's exchange or manual input
+activeExchange = useAutoExchange ? syminfo.prefix : exchangeInput
+
+perpSuffix = getPerpSuffix(activeExchange)
+
+// Get base currency and quote currency
+baseCurrency = syminfo.basecurrency
+quoteCurrency = syminfo.currency
+
+// Detect if current chart is a futures contract
+isFutures = str.contains(syminfo.ticker, perpSuffix) or str.contains(syminfo.ticker, 'PERP') or str.contains(syminfo.ticker, 'SWAP') or str.contains(syminfo.ticker, 'PERPETUAL')
+
+// Construct spot and futures symbols based on current chart
+var string spotTicker = na
+var string futuresTicker = na
+
+if useManualSymbol
+    spotTicker := manualSpotSymbol
+    futuresTicker := manualFuturesSymbol
+else
+    if isFutures
+        // Current chart is futures, need to find spot
+        futuresTicker := syminfo.tickerid
+        
+        // Try current exchange first
+        spotTicker := activeExchange + ':' + baseCurrency + quoteCurrency
+        
+        // If we need fallback, we'll check in the data fetching section
+    else
+        // Current chart is spot, need to find futures
+        spotTicker := syminfo.tickerid
+        
+        // Try current exchange first
+        if perpSuffix == ''
+            futuresTicker := activeExchange + ':' + baseCurrency + quoteCurrency
+        else
+            futuresTicker := activeExchange + ':' + baseCurrency + quoteCurrency + perpSuffix
+
+// ============================================================================
+// DATA FETCHING WITH FALLBACK
+// ============================================================================
+
+// Fetch closing prices from both markets
+spotPrice = request.security(spotTicker, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true)
+futuresPrice = request.security(futuresTicker, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true)
+
+// Pre-fetch all potential fallback exchanges for spot (only if not using manual symbol)
+spotBinance = not useManualSymbol ? request.security('BINANCE:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotBybit = not useManualSymbol ? request.security('BYBIT:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotOkx = not useManualSymbol ? request.security('OKX:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotGateio = not useManualSymbol ? request.security('GATEIO:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotMexc = not useManualSymbol ? request.security('MEXC:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotKucoin = not useManualSymbol ? request.security('KUCOIN:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+spotHtx = not useManualSymbol ? request.security('HTX:' + baseCurrency + quoteCurrency, timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+
+// Pre-fetch all potential fallback exchanges for futures (only if not using manual symbol)
+futBinance = not useManualSymbol ? request.security('BINANCE:' + baseCurrency + quoteCurrency + '.P', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futBybit = not useManualSymbol ? request.security('BYBIT:' + baseCurrency + quoteCurrency + '.P', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futOkx = not useManualSymbol ? request.security('OKX:' + baseCurrency + quoteCurrency + 'SWAP', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futGateio = not useManualSymbol ? request.security('GATEIO:' + baseCurrency + quoteCurrency + '_USDT', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futMexc = not useManualSymbol ? request.security('MEXC:' + baseCurrency + quoteCurrency + 'PERPETUAL', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futBitget = not useManualSymbol ? request.security('BITGET:' + baseCurrency + quoteCurrency + 'PERP', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+futKucoin = not useManualSymbol ? request.security('KUCOIN:' + baseCurrency + quoteCurrency + 'M', timeframe.period, close, gaps=barmerge.gaps_off, ignore_invalid_symbol=true) : na
+
+// Track which exchange was used
+var string usedSpotExchange = activeExchange
+var string usedFuturesExchange = activeExchange
+
+// Select spot price with fallback logic
+if not useManualSymbol and isFutures and (na(spotPrice) or spotPrice <= 0)
+    // Try each exchange in order
+    if activeExchange != 'BINANCE' and not na(spotBinance) and spotBinance > 0
+        spotPrice := spotBinance
+        usedSpotExchange := 'BINANCE'
+    else if activeExchange != 'BYBIT' and not na(spotBybit) and spotBybit > 0
+        spotPrice := spotBybit
+        usedSpotExchange := 'BYBIT'
+    else if activeExchange != 'OKX' and not na(spotOkx) and spotOkx > 0
+        spotPrice := spotOkx
+        usedSpotExchange := 'OKX'
+    else if activeExchange != 'GATEIO' and not na(spotGateio) and spotGateio > 0
+        spotPrice := spotGateio
+        usedSpotExchange := 'GATEIO'
+    else if activeExchange != 'MEXC' and not na(spotMexc) and spotMexc > 0
+        spotPrice := spotMexc
+        usedSpotExchange := 'MEXC'
+    else if activeExchange != 'KUCOIN' and not na(spotKucoin) and spotKucoin > 0
+        spotPrice := spotKucoin
+        usedSpotExchange := 'KUCOIN'
+    else if activeExchange != 'HTX' and not na(spotHtx) and spotHtx > 0
+        spotPrice := spotHtx
+        usedSpotExchange := 'HTX'
+
+// Select futures price with fallback logic
+if not useManualSymbol and not isFutures and (na(futuresPrice) or futuresPrice <= 0)
+    // Try each exchange in order
+    if activeExchange != 'BINANCE' and not na(futBinance) and futBinance > 0
+        futuresPrice := futBinance
+        usedFuturesExchange := 'BINANCE'
+    else if activeExchange != 'BYBIT' and not na(futBybit) and futBybit > 0
+        futuresPrice := futBybit
+        usedFuturesExchange := 'BYBIT'
+    else if activeExchange != 'OKX' and not na(futOkx) and futOkx > 0
+        futuresPrice := futOkx
+        usedFuturesExchange := 'OKX'
+    else if activeExchange != 'GATEIO' and not na(futGateio) and futGateio > 0
+        futuresPrice := futGateio
+        usedFuturesExchange := 'GATEIO'
+    else if activeExchange != 'MEXC' and not na(futMexc) and futMexc > 0
+        futuresPrice := futMexc
+        usedFuturesExchange := 'MEXC'
+    else if activeExchange != 'BITGET' and not na(futBitget) and futBitget > 0
+        futuresPrice := futBitget
+        usedFuturesExchange := 'BITGET'
+    else if activeExchange != 'KUCOIN' and not na(futKucoin) and futKucoin > 0
+        futuresPrice := futKucoin
+        usedFuturesExchange := 'KUCOIN'
+
+// Validate data
+validData = not na(spotPrice) and not na(futuresPrice) and spotPrice > 0
+
+// ============================================================================
+// SPREAD CALCULATION
+// ============================================================================
+
+// Calculate spread as percentage: (Futures - Spot) / Spot * 100
+spreadPercent = validData ? ((futuresPrice - spotPrice) / spotPrice * 100) : na
+
+// Calculate moving average
+spreadMA = ta.sma(spreadPercent, maLength)
+
+// Calculate standard deviation for bands
+spreadStdDev = ta.stdev(spreadPercent, maLength)
+upperBand = spreadMA + (spreadStdDev * stdDevMultiplier)
+lowerBand = spreadMA - (spreadStdDev * stdDevMultiplier)
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// Plot spread line
+spreadColor = spreadPercent >= 0 ? colorPositive : colorNegative
+plot(spreadPercent, 'Spread %', color=spreadColor, linewidth=2)
+
+// Plot moving average
+plot(showMA ? spreadMA : na, 'MA', color=colorMA, linewidth=2)
+
+// Plot bands
+upperBandPlot = plot(showBands ? upperBand : na, 'Upper Band', color=colorBands, linewidth=1)
+lowerBandPlot = plot(showBands ? lowerBand : na, 'Lower Band', color=colorBands, linewidth=1)
+fill(upperBandPlot, lowerBandPlot, color=color.new(colorBands, 85), title='Bands Fill')
+
+// Zero line
+hline(0, 'Zero Line', color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+// Background color based on spread direction
+bgColor = spreadPercent >= 0 ? color.new(colorPositive, bgTransparency) : color.new(colorNegative, bgTransparency)
+bgcolor(bgColor, title='Background')
+
+// ============================================================================
+// INFORMATION LABEL
+// ============================================================================
+
+if barstate.islast and validData
+    // Create info label
+    spreadText = str.format('Spread: {0,number,#.###}%', spreadPercent)
+    maText = str.format('MA({0}): {1,number,#.###}%', maLength, spreadMA)
+    
+    labelText = spreadText + '\n' + maText
+    
+    label.new(bar_index, spreadPercent, text=labelText, color=color.new(color.black, 10), textcolor=color.white, style=label.style_label_left, size=size.normal)
+
+// Error handling - display warning if data is invalid
+if barstate.islast and not validData
+    errorText = '⚠ Data Error\n' + 'Spot: ' + spotTicker + '\n' + 'Futures: ' + futuresTicker + '\n' + 'Could not find valid data on any exchange'
+    
+    label.new(bar_index, 0, text=errorText, color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_center, size=size.normal)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Alert conditions for significant spread movements
+alertcondition(ta.cross(spreadPercent, upperBand), title='Spread Crosses Above Upper Band', message='Futures premium is unusually high')
+
+alertcondition(ta.cross(spreadPercent, lowerBand), title='Spread Crosses Below Lower Band', message='Futures discount is unusually high')
+
+alertcondition(ta.cross(spreadPercent, 0), title='Spread Crosses Zero', message='Spot-Futures parity crossed')
+
+// ============================================================================
+// TABLE WITH STATISTICS
+// ============================================================================
+
+if showTable and barstate.islast and validData
+    var table statsTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+    
+    // Headers
+    table.cell(statsTable, 0, 0, 'Metric', text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 0, 'Value', text_color=color.white, text_size=size.small)
+    
+    // Exchange info
+    exchangeInfo = usedFuturesExchange + '/' + usedSpotExchange
+    table.cell(statsTable, 0, 1, 'Exchanges', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 1, exchangeInfo, text_color=color.yellow, text_size=size.small)
+    
+    // Current spread
+    table.cell(statsTable, 0, 2, 'Current Spread', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 2, str.format('{0,number,#.###}%', spreadPercent), text_color=spreadColor, text_size=size.small)
+    
+    // Moving average
+    table.cell(statsTable, 0, 3, 'MA(' + str.tostring(maLength) + ')', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 3, str.format('{0,number,#.###}%', spreadMA), text_color=colorMA, text_size=size.small)
+    
+    // Standard deviation
+    table.cell(statsTable, 0, 4, 'Std Dev', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 4, str.format('{0,number,#.###}%', spreadStdDev), text_color=color.white, text_size=size.small)
+    
+    // Upper band
+    table.cell(statsTable, 0, 5, 'Upper Band', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 5, str.format('{0,number,#.###}%', upperBand), text_color=colorBands, text_size=size.small)
+    
+    // Lower band
+    table.cell(statsTable, 0, 6, 'Lower Band', text_color=color.gray, text_size=size.small)
+    table.cell(statsTable, 1, 6, str.format('{0,number,#.###}%', lowerBand), text_color=colorBands, text_size=size.small)

@@ -1,0 +1,277 @@
+// <pine>
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kingthies
+//@version=6
+indicator("Order Flow Analysis", shorttitle="Order Flow", overlay=false, max_bars_back=500)
+
+// INPUTS
+lengthMA = input.int(14, "Pressure MA Length", minval=1, group="Calculation")
+volumeWeight = input.float(1.5, "Volume Weight Factor", minval=0.1, maxval=5.0, step=0.1, group="Calculation")
+wickWeight = input.float(1.2, "Wick Analysis Weight", minval=0.1, maxval=5.0, step=0.1, group="Calculation")
+absorptionLength = input.int(3, "Absorption Lookback", minval=1, maxval=10, group="Calculation")
+
+// Display Settings
+showHistogram = input.bool(true, "Show Pressure Histogram", group="Display")
+showMA = input.bool(true, "Show Pressure MA", group="Display")
+showDivergence = input.bool(true, "Show Divergence Signals", group="Display")
+showAbsorption = input.bool(true, "Show Absorption Zones", group="Display")
+
+// Color Settings
+bullColor     = input.color(color.new(#26a69a, 0), "Bullish Pressure", group="Colors")
+bearColor     = input.color(color.new(#ef5350, 0), "Bearish Pressure", group="Colors")
+neutralColor  = input.color(color.new(#FFFFFF, 0), "Neutral", group="Colors")
+
+
+// CORE CALCULATIONS
+// Candle Anatomy Analysis
+candleRange = high - low
+candleBody = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+
+// Avoid division by zero
+safeRange = candleRange > 0 ? candleRange : 1
+
+// Wick-to-Body Ratios
+upperWickRatio = upperWick / safeRange
+lowerWickRatio = lowerWick / safeRange
+bodyRatio = candleBody / safeRange
+
+// Close Position within Range (0 = at low, 1 = at high)
+closePosition = (close - low) / safeRange
+
+// VOLUME DELTA ESTIMATION
+isBullCandle = close > open
+isBearCandle = close < open
+isDoji = bodyRatio < 0.1
+
+// Volume distribution based on candle characteristic was s
+buyingVolume = isBullCandle ? volume * (closePosition + bodyRatio) / 2 : 
+               isBearCandle ? volume * closePosition * 0.3 :
+               volume * 0.5
+
+sellingVolume = isBearCandle ? volume * ((1 - closePosition) + bodyRatio) / 2 : isBullCandle ? volume * (1 - closePosition) * 0.3 : volume * 0.5
+
+// Volume Delta
+volumeDelta = buyingVolume - sellingVolume
+volumeDeltaNorm = ta.sma(volumeDelta, 5) / ta.sma(volume, 20)
+
+
+// WICK ANALYSIS - REJECTION & ACCEPTANCE
+wickPressure = (lowerWickRatio - upperWickRatio) * 100
+
+// Strong rejection patterns
+strongUpperRejection = upperWickRatio > 0.5 and bodyRatio < 0.3
+strongLowerRejection = lowerWickRatio > 0.5 and bodyRatio < 0.3
+
+wickSignal = strongLowerRejection ? 1 : strongUpperRejection ? -1 : 0
+
+// ABSORPTION PATTERNS
+avgVolume = ta.sma(volume, 20)
+volumeSpike = volume > avgVolume * 1.5
+
+isAbsorption = volumeSpike and bodyRatio < 0.3
+
+bullAbsorption = isAbsorption and closePosition > 0.5
+bearAbsorption = isAbsorption and closePosition < 0.5
+
+var float lastBullAbsPrice = na
+var float lastBearAbsPrice = na
+
+if bullAbsorption
+    lastBullAbsPrice := close
+if bearAbsorption
+    lastBearAbsPrice := close
+
+// Absorption strength over lookback period
+bullAbsCount = math.sum(bullAbsorption ? 1 : 0, absorptionLength)
+bearAbsCount = math.sum(bearAbsorption ? 1 : 0, absorptionLength)
+
+absorptionScore = (bullAbsCount - bearAbsCount) * 10
+
+// COMPOSITE PRESSURE CALCULATION
+// Combine all factors into buying/selling pressure
+closePressure = (closePosition - 0.5) * 100 // -50 to +50
+
+// Composite score
+rawPressure = (closePressure + 
+               (volumeDeltaNorm * volumeWeight * 50) + 
+               (wickPressure * wickWeight) + 
+               absorptionScore)
+
+// Smooth the pressure
+orderFlowPressure = ta.ema(rawPressure, 3)
+pressureMA = ta.sma(orderFlowPressure, lengthMA)
+
+// Pressure zones
+strongBull = orderFlowPressure > 50
+moderateBull = orderFlowPressure > 20 and orderFlowPressure <= 50
+neutral = orderFlowPressure >= -20 and orderFlowPressure <= 20
+moderateBear = orderFlowPressure < -20 and orderFlowPressure >= -50
+strongBear = orderFlowPressure < -50
+
+// DIVERGENCE DETECTION
+// Find pivot points
+pivotHigh = ta.pivothigh(close, 5, 5)
+pivotLow = ta.pivotlow(close, 5, 5)
+
+// Divergence logic
+var float lastPivotHighPrice = na
+var float lastPivotHighOFP = na
+var float lastPivotLowPrice = na
+var float lastPivotLowOFP = na
+
+bullishDiv = false
+bearishDiv = false
+
+if not na(pivotHigh)
+    if not na(lastPivotHighPrice)
+        // Bearish divergence: price makes higher high, OFP makes lower high
+        if close > lastPivotHighPrice and orderFlowPressure < lastPivotHighOFP
+            bearishDiv := true
+    lastPivotHighPrice := close
+    lastPivotHighOFP := orderFlowPressure
+
+if not na(pivotLow)
+    if not na(lastPivotLowPrice)
+        // Bullish divergence: price makes lower low, OFP makes higher low
+        if close < lastPivotLowPrice and orderFlowPressure > lastPivotLowOFP
+            bullishDiv := true
+    lastPivotLowPrice := close
+    lastPivotLowOFP := orderFlowPressure
+
+// PLOTTING
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_solid)
+hline(50, "Strong Bull", color=color.new(bullColor, 70), linestyle=hline.style_dotted)
+hline(-50, "Strong Bear", color=color.new(bearColor, 70), linestyle=hline.style_dotted)
+
+histColor = orderFlowPressure > 0 ? 
+         (orderFlowPressure > orderFlowPressure[1] ? bullColor : color.new(bullColor, 50)) :
+             (orderFlowPressure < orderFlowPressure[1] ? bearColor : color.new(bearColor, 50))
+
+plot(showHistogram ? orderFlowPressure : na, "Order Flow Pressure", 
+     color=histColor, style=plot.style_histogram, linewidth=3)
+
+plot(showMA ? pressureMA : na, "Pressure MA", color=color.new(color.white, 0), linewidth=2)
+
+plotshape(showDivergence and bullishDiv, "Bullish Divergence", 
+          shape.triangleup, location.bottom, color=color.new(color.lime, 0), 
+          size=size.small, offset=-5)
+
+plotshape(showDivergence and bearishDiv, "Bearish Divergence", 
+          shape.triangledown, location.top, color=color.new(color.red, 0), 
+          size=size.small, offset=-5)
+
+// Absorption zones background
+bgcolor(showAbsorption and bullAbsorption ? color.new(bullColor, 90) : na, title="Bull Absorption")
+bgcolor(showAbsorption and bearAbsorption ? color.new(bearColor, 90) : na, title="Bear Absorption")
+
+// TABLE
+if barstate.islast
+    var table statusTable = table.new(
+         position.top_right, 2, 6,
+         border_color = color.new(#30363D, 50),
+         border_width = 1,
+         frame_color = color.new(#FFFFFF, 20),
+         frame_width = 2)
+
+    // Headers
+    table.cell(statusTable, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 0, "Value",  text_color=color.white, text_size=size.small)
+
+    //
+    // PRESSURE
+    //
+    pressureTextColor = orderFlowPressure > 0 ? bullColor : orderFlowPressure < 0 ? bearColor : neutralColor
+    pressureBGColor   = color.new(pressureTextColor, 80)
+
+    table.cell(statusTable, 0, 1, "Pressure", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 1,
+     str.tostring(math.round(orderFlowPressure, 2)),
+     text_color=pressureTextColor,
+     bgcolor=pressureBGColor,
+     text_size=size.small)
+
+    //
+    // TREND
+    //
+    trend =
+         strongBull    ? "Strong Bull" :
+         moderateBull  ? "Moderate Bull" :
+         strongBear    ? "Strong Bear" :
+         moderateBear  ? "Moderate Bear" : "Neutral"
+
+    trendTextColor = pressureTextColor
+    trendBGColor   = color.new(trendTextColor, 80)
+
+    table.cell(statusTable, 0, 2, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 2,
+     trend,
+     text_color=trendTextColor,
+     bgcolor=trendBGColor,
+     text_size=size.small)
+
+    //
+    // VOLUME DELTA
+    //
+    volTextColor = volumeDeltaNorm > 0 ? bullColor : volumeDeltaNorm < 0 ? bearColor : neutralColor
+    volBGColor   = color.new(volTextColor, 80)
+
+    table.cell(statusTable, 0, 3, "Vol Delta", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 3,
+         str.tostring(math.round(volumeDeltaNorm, 3)),
+         text_color=volTextColor,
+         bgcolor=volBGColor,
+         text_size=size.small)
+
+    //
+    // WICK SIGNAL
+    //
+    wickText =
+         wickSignal > 0 ? "Lower Rej" :
+         wickSignal < 0 ? "Upper Rej" : "Neutral"
+
+    wickTextColor = wickSignal > 0 ? bullColor : wickSignal < 0 ? bearColor : neutralColor
+    wickBGColor   = color.new(wickTextColor, 80)
+
+    table.cell(statusTable, 0, 4, "Wick", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 4,
+         wickText,
+         text_color=wickTextColor,
+         bgcolor=wickBGColor,
+         text_size=size.small)
+
+    //
+    // ABSORPTION
+    //
+    absText =
+         bullAbsorption ? "Bull Abs" :
+         bearAbsorption ? "Bear Abs" : "None"
+
+    absTextColor =
+         bullAbsorption ? bullColor :
+         bearAbsorption ? bearColor : neutralColor
+
+    absBGColor = color.new(absTextColor, 80)
+
+    table.cell(statusTable, 0, 5, "Absorption", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 5,
+         absText,
+         text_color=absTextColor,
+         bgcolor=absBGColor,
+         text_size=size.small)
+// ALERTS
+bullCross = ta.crossover(orderFlowPressure, 0)
+bearCross = ta.crossunder(orderFlowPressure, 0)
+strongBullCross = ta.crossover(orderFlowPressure, 50)
+strongBearCross = ta.crossunder(orderFlowPressure, -50)
+
+alertcondition(bullCross, "OFP Bullish Cross", "Order Flow Pressure is bullish")
+alertcondition(bearCross, "OFP Bearish Cross", "Order Flow Pressure is bearish")
+alertcondition(strongBullCross, "OFP Strong Bull", "Strong bullish pressure detected")
+alertcondition(strongBearCross, "OFP Strong Bear", "Strong bearish pressure detected")
+alertcondition(bullishDiv, "Bullish Divergence", "Bullish divergence detected")
+alertcondition(bearishDiv, "Bearish Divergence", "Bearish divergence detected")
+alertcondition(bullAbsorption, "Bull Absorption", "Bullish absorption detected")
+alertcondition(bearAbsorption, "Bear Absorption", "Bearish absorption detected")
+// </pine>

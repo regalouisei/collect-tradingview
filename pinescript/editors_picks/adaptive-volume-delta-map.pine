@@ -1,0 +1,308 @@
+//@version=6
+indicator("Adaptive Volume Delta Map",shorttitle = "AVDM", format=format.volume,calc_bars_count = 100,max_boxes_count = 500)
+anchorInput = input.timeframe("", "Anchor period",tooltip = "Use this input to enable the CVD functionality")
+color_title_none = color.new(#2a2e39,100)
+use_seconds = input.bool(false,"Use Seconds resolution",tooltip = "Only use this if seconds resolutions are available to you.")
+use_tick = input.bool(false,"Use Tick resolution",inline = "tick",tooltip = "Only use this if tick resolutions are available to you.",active = use_seconds)
+use_bid_ask = input.bool(true,"Use Bid Ask calculated",active = use_tick and use_seconds,inline = "tick",tooltip = "If enabled, bids and asks will be used to determine the side.")
+show_volume_map = input.bool(true,"Show volume distribution",tooltip="If enabled, the diagram will include the distribution of purchase and sale volumes for each level. Development levels using Ticks Per Row")
+imbalance = input.int(300,"Imbalance",minval=0,tooltip = "Percentage threshold for imbalance detection",active = show_volume_map)
+tick_per_row = input.int(40,"Ticks Per Row",minval =0,inline = "tick_per_row")
+auto_tick_per_row = input.bool(true,"Auto",inline = "tick_per_row")
+count_rows_bar = input.int(10,"",inline = "tick_per_row",maxval = 50,minval = 2,tooltip = "Set the number of rows per bar.\nNote: in Auto mode, Ticks per Row adjusts automatically based on the specified number of rows — use the Ticks per Row input for a fixed value.")
+calc_bars_count = input.int(100000,"Calc Bars Count",tooltip = "The length of the request for each of the detailed resolutions")
+value_area = input.int(70,"Value area",minval = 0,maxval = 100)
+type change_global_input
+    bool show_volume_map
+var change_global_input = change_global_input.new(show_volume_map = show_volume_map)
+type VolumeRows
+    float volume_buy = 0
+    float volume_sell = 0
+
+type ValueArea
+    float vah_price = 0
+    float poc_price = 0
+    float val_price = 0
+    float poc_volume = 0
+    float value_area_current = 0
+    int below_index = 0
+    int above_index = 0
+    bool stop = false
+
+get_auto_row_size()=>
+    hl_range = high-low
+    row_size_auto = hl_range / (count_rows_bar-1)
+    row_size_auto
+
+
+var row_size = tick_per_row * syminfo.mintick
+row_size_auto = auto_tick_per_row ? get_auto_row_size() : na
+row_size := na(row_size_auto) ? row_size : row_size_auto
+
+volume_rows_map = map.new<float,VolumeRows>()
+volume_area = ValueArea.new()
+
+get_warning()=>
+    change_global_input.show_volume_map := false   
+    label.new(chart.right_visible_bar_time,close,"Volume Distribution disabled:\nToo many price levels detected (>50).\nTry decreasing 'Ticks Per Row' or using a lower chart resolution.\nIf you don’t care about the map, just turn off 'Show Volume Distribution'.",xloc = xloc.bar_time,color = chart.bg_color,textcolor = chart.fg_color,size = size.large,force_overlay = true)
+    1
+
+
+method rows_builder(map<float,VolumeRows> maps)=>
+    start = math.floor(low/row_size)
+    if row_size <= 0
+        get_warning()
+    else
+        for i = start * row_size to high by row_size
+            if maps.keys().size() < 50
+                maps.put(i,VolumeRows.new())
+                1
+            else
+                get_warning()
+
+method fill_volume_rows_map(map<float,VolumeRows> maps,posVol,negVol,high_,low_)=> 
+    for [key, value] in maps
+        next_rows = key + row_size
+        rowRange = next_rows - key
+        barRange = high_ - low_
+        koeff = switch
+            low_ > key and high_ <= next_rows => 1
+            low_ <= key and high_ <= next_rows and high_ >= key => (high_ - key)/barRange 
+            low_ >= key and low_ <= next_rows and high_ >= next_rows => (next_rows - low_)/barRange
+            low_ <= key and high_ >= next_rows => (barRange - (high_-next_rows) - (key-low_))/barRange
+        if not na(koeff)
+            value.volume_buy += posVol * koeff
+            value.volume_sell += negVol * koeff
+
+wrapper_fill_volume(posVol_list,negVol_list,high_list,low_list)=>
+    for [index,value] in posVol_list
+        posVol = value
+        negVol = negVol_list.get(index)
+        high_ = high_list.get(index)
+        low_ = low_list.get(index)
+        if change_global_input.show_volume_map
+            volume_rows_map.fill_volume_rows_map(posVol,negVol,high_,low_)
+method get_volume_format(float number)=>str.tostring(number,format = format.volume)
+
+
+update_vah(above_volume,above_price,index)=>
+    if volume_area.value_area_current - above_volume >= 0
+        if volume_area.below_index == index //fixed index
+            volume_area.below_index := index 
+        volume_area.above_index +=1 // get next step above
+        volume_area.value_area_current -= above_volume
+        volume_area.vah_price:= above_price
+        1
+    else
+        volume_area.stop := true
+        1
+update_val(below_volume,below_price,index)=>
+    if volume_area.value_area_current - below_volume >= 0
+        if volume_area.above_index == index
+            volume_area.above_index := index //fixed index
+        volume_area.below_index +=1 // get next step below
+        volume_area.value_area_current -= below_volume
+        volume_area.val_price:= below_price
+        1
+    else  
+        volume_area.stop := true
+        1
+
+calc_value_area(total_volume,volume_rows_map)=>
+    if value_area == 100
+        volume_area.vah_price := volume_rows_map.keys().max()
+        volume_area.val_price := volume_rows_map.keys().min()
+    else
+        volume_area.vah_price := volume_area.poc_price
+        volume_area.val_price := volume_area.poc_price
+        volume_area.value_area_current := total_volume * value_area/100
+
+        volume_area.value_area_current -= volume_area.poc_volume
+        
+        if volume_area.value_area_current > 0 
+            poc_index = volume_rows_map.keys().indexof(volume_area.poc_price)
+            above = volume_rows_map.keys().slice(poc_index,volume_rows_map.keys().size())
+            below = volume_rows_map.keys().slice(0,poc_index)
+            below.reverse()
+            above.shift()
+            max_size = above.size() > below.size() ? above.size() : below.size()
+
+            while not volume_area.stop
+                for index = 0 to max_size+1
+                    if volume_area.value_area_current <= 0 or volume_area.stop
+                        break
+                    //get local above_volume,above_price
+                    [above_volume,above_price] = if volume_area.above_index < above.size() 
+                        above_price = above.get(volume_area.above_index)
+                        above_volume_temp = volume_rows_map.get(above_price)
+                        above_volume = above_volume_temp.volume_buy + math.abs(above_volume_temp.volume_sell)
+                        [above_volume,above_price]
+                    else 
+                        [0,0]
+
+                    //get local below_volume,below_price
+                    [below_volume,below_price] = if volume_area.below_index < below.size() 
+                        below_price = below.get(volume_area.below_index)
+                        below_volume_temp = volume_rows_map.get(below_price)
+                        below_volume = below_volume_temp.volume_buy + math.abs(below_volume_temp.volume_sell)
+                        [below_volume,below_price]
+                    else 
+                        [0,0]
+
+                    switch
+                        above_volume > below_volume => update_vah(above_volume,above_price,index)
+                        above_volume < below_volume => update_val(below_volume,below_price,index)
+                        above_volume == below_volume and above_volume != 0 and below_volume != 0=> 
+                            switch
+                                above_price - volume_area.poc_price > volume_area.poc_price - below_price  => update_vah(above_volume,above_price,index)
+                                above_price - volume_area.poc_price < volume_area.poc_price - below_price => update_val(below_volume,below_price,index)
+                                => update_vah(above_volume,above_price,index)
+
+    volume_area.vah_price += row_size
+
+
+show_rows_volume()=>
+    total_delta = 0.
+    total_buy = 0.
+    total_sell = 0.
+    firts_key = volume_rows_map.keys().get(0)
+    previosly_key = 0.
+    for [key, value] in volume_rows_map
+        delta = value.volume_sell+value.volume_buy
+        //calc imbalance
+        imbalance_buy = false
+        imbalance_sell = false
+        if key != firts_key
+            if value.volume_buy != 0
+                if value.volume_buy >= math.abs(volume_rows_map.get(previosly_key).volume_sell) * (imbalance/100)
+                    imbalance_buy := true
+            if math.abs(value.volume_sell) != 0
+                next_key = key + row_size
+                if next_key <= volume_rows_map.keys().last()
+                    if math.abs(value.volume_sell) >= volume_rows_map.get(next_key).volume_buy * (imbalance/100)
+                        imbalance_sell := true
+        //draw buy/sell and delta
+        box.new(bar_index,key+row_size,bar_index,key,text = str.format("{0} {1}", value.volume_buy.get_volume_format(),imbalance_buy ? "🟢":""),text_color = color.green,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_left,force_overlay=true)
+        box.new(bar_index,key+row_size,bar_index,key,text = str.format("{1} {0}",value.volume_sell.get_volume_format(),imbalance_sell?"🔴":""),text_color = color.red,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_right,force_overlay=true)
+        box.new(bar_index,key+row_size,bar_index,key,text = str.format("                     {0}",delta.get_volume_format()),text_color = color.orange,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_left,force_overlay=true)
+        
+        //calc total buy/sell and delta
+        total_buy  += value.volume_buy
+        total_sell += value.volume_sell
+        total_delta += delta
+        //calc max total volume for poc
+        total_volume_current = math.abs(value.volume_sell) + value.volume_buy
+        if total_volume_current > volume_area.poc_volume
+            volume_area.poc_price := key
+            volume_area.poc_volume := total_volume_current
+        //update previosly_key
+        previosly_key := key
+    calc_value_area(total_buy + math.abs(total_sell),volume_rows_map)
+    label.new(bar_index,volume_area.vah_price,"VAH",color = color.green,textcolor = color.black,style = label.style_label_right,force_overlay = true,size = size.small)
+    label.new(bar_index,volume_area.val_price,"VAL",color = color.red,textcolor = color.black,style = label.style_label_right,force_overlay = true,size = size.small)
+    //draw poc
+
+    label.new(bar_index,volume_area.poc_price+(row_size/2),text = str.format("{0}{1}",total_buy,total_sell),textcolor = color_title_none,color = color.new(chart.fg_color,80),force_overlay=true,style = label.style_label_center)
+    //draw total buy/sell and delta
+    box.new(bar_index,firts_key - row_size,bar_index,firts_key,text = str.format("{0}", total_buy.get_volume_format()),text_color = color.green,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_left,force_overlay=true)
+    box.new(bar_index,firts_key - row_size,bar_index,firts_key,text = str.format("Total: {0}",total_sell.get_volume_format()),text_color = color.red,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_right,force_overlay=true)
+    box.new(bar_index,firts_key - row_size,bar_index,firts_key,text = str.format("                     {0}",total_delta.get_volume_format()),text_color = color.orange,border_color = color_title_none,bgcolor=color_title_none,text_size = size.normal,text_halign= text.align_left,force_overlay=true)
+price_calc(current_value)=>
+    isBuyVolume = switch
+        close > open     => true
+        close < open     => false
+        close > close[1] => true
+        close < close[1] => false
+        => current_value
+    isBuyVolume
+
+upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = false    
+    if timeframe.isticks and use_bid_ask
+        avg = (ask + bid)/2
+        switch
+            close == ask and close == bid => isBuyVolume := price_calc(isBuyVolume)  
+            close >= ask     => isBuyVolume := true 
+            close <= bid     => isBuyVolume := false 
+            close > avg => isBuyVolume := true
+            close < avg => isBuyVolume := false
+            => isBuyVolume := price_calc(isBuyVolume)
+    else
+        isBuyVolume := price_calc(isBuyVolume) 
+
+    if isBuyVolume
+        posVol += volume
+    else
+        negVol -= volume
+
+    diff = posVol + negVol
+    [diff,posVol,negVol,high,low]
+
+find_calculated_tf()=>
+    gtf = ""
+    tf_resolutions = array.from("1","15","60","1D")
+    if use_seconds
+        tf_resolutions.unshift("1S")
+    if use_tick
+        tf_resolutions.unshift("1T")
+    for tf_counter in tf_resolutions
+        tf = if tf_counter == "1T"
+            tf_counter
+        else 
+            timeframe.in_seconds(timeframe.period) < timeframe.in_seconds(tf_counter) ? timeframe.period : tf_counter
+        test_data = request.security_lower_tf("",tf,close,calc_bars_count = calc_bars_count)
+        if test_data.size() != 0 or barstate.islast
+            gtf := tf
+            break
+    gtf
+get_detail_data()=>
+    gtf = find_calculated_tf()
+    [diffVolArray,posVol,negVol,high_,low_] = request.security_lower_tf(syminfo.tickerid, gtf, upAndDownVolume(),calc_bars_count = calc_bars_count)
+    wrapper_fill_volume(posVol,negVol,high_,low_)
+    if gtf != gtf[1]
+        line.new(bar_index,0,bar_index,1,extend = extend.both,color = color.yellow)
+        label.new(bar_index,0,str.format("Start calc on {0} tf",gtf),color = color.yellow,textcolor = chart.fg_color)
+    diffVolArray
+
+if change_global_input.show_volume_map
+    volume_rows_map.rows_builder()
+diffVolArray = get_detail_data()
+if change_global_input.show_volume_map
+    show_rows_volume()
+
+getHighLow(arr) =>
+    float cumVolume = na
+    float maxVolume = na
+    float minVolume = na
+    for item in arr
+        cumVolume := nz(cumVolume) + item
+        maxVolume := math.max(nz(maxVolume), cumVolume)
+        minVolume := math.min(nz(minVolume), cumVolume)
+
+    var lastVolume = 0.
+
+    timeframe_change = if str.contains(anchorInput,"T") or timeframe.isticks 
+        global_time = request.security("",anchorInput,time,lookahead = barmerge.lookahead_on)
+        time == global_time
+    else
+        timeframe.change(anchorInput)
+    anchorChange = timeframe_change or (not na(lastVolume) and na(lastVolume[1]))
+
+    openVolume = anchorChange ? 0.0 : lastVolume[1]
+    maxVolume += openVolume
+    minVolume += openVolume
+    lastVolume := cumVolume + openVolume
+    [openVolume,maxVolume, minVolume, lastVolume]
+
+[openVolume,maxVolume, minVolume, lastVolume] = getHighLow(diffVolArray)
+
+col = lastVolume > openVolume ? color.teal : color.red
+hline(0)
+plotcandle(openVolume, maxVolume, minVolume, lastVolume, "Volume Delta", color = col, bordercolor = col, wickcolor = col)
+
+var cumVol = 0.
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("The data vendor doesn't provide volume data for this symbol.")

@@ -1,0 +1,100 @@
+//@version=6
+strategy("Ultimate Div - High Vis + Weekend Close", overlay=true, initial_capital=10000, currency=currency.USD, max_labels_count=500)
+
+// --- Inputs ---
+grp_div  = "Divergence Settings"
+lookback = input.int(5, "Manual Pivot Lookback", minval=2, group=grp_div)
+min_conf = input.int(2, "Min. Confluence", minval=1, maxval=3, group=grp_div)
+
+grp_vis  = "Visual Options"
+use_bg   = input.bool(true, "Use Trend Background Colors?", group=grp_vis)
+show_pnl = input.bool(true, "Show Floating Live PnL Label?", group=grp_vis)
+
+grp_safe = "Weekend Protection"
+use_weekend_close = input.bool(true, "Auto-Close on Friday?", group=grp_safe)
+friday_close_hour = input.int(21, "Friday Close Hour (UTC)", minval=0, maxval=23, group=grp_safe)
+
+// --- Colors ---
+color_bull    = #00ffbb 
+color_bear    = #ff1100 
+color_bg_bull = color.new(#006400, 92) 
+color_bg_bear = color.new(#800000, 92) 
+color_pnl_up  = #00ff00
+color_pnl_dn  = #ff4444
+
+// --- Indicator Logic ---
+rsi_val = ta.rsi(close, 14)
+[m_line, m_sig, _] = ta.macd(close, 12, 26, 9)
+stoch_k = ta.sma(ta.stoch(close, high, low, 14), 3)
+
+// Ichimoku Filter Logic
+donchian(len) => math.avg(ta.highest(high, len), ta.lowest(low, len))
+tenkan = donchian(9), kijun = donchian(26)
+senkouA = math.avg(tenkan, kijun), senkouB = donchian(52)
+ichi_bull = close > senkouA[26] and close > senkouB[26]
+ichi_bear = close < senkouA[26] and close < senkouB[26]
+
+// --- Trend Background ---
+bgcolor(use_bg and ichi_bull ? color_bg_bull : use_bg and ichi_bear ? color_bg_bear : na)
+
+// --- Weekend Risk Management ---
+is_friday_end = dayofweek == dayofweek.friday and hour >= friday_close_hour
+if use_weekend_close and is_friday_end
+    strategy.close_all(comment = "Weekend Protection")
+
+// --- Divergence Logic Function ---
+f_div(src, is_bull, lb) =>
+    p_low  = ta.pivotlow(src, lb, lb)
+    p_high = ta.pivothigh(src, lb, lb)
+    last_p_low_price = ta.valuewhen(not na(p_low), low[lb], 1)
+    last_p_low_osc   = ta.valuewhen(not na(p_low), src[lb], 1)
+    last_p_high_price = ta.valuewhen(not na(p_high), high[lb], 1)
+    last_p_high_osc   = ta.valuewhen(not na(p_high), src[lb], 1)
+    
+    div_found = false
+    if is_bull and not na(p_low)
+        div_found := low[lb] < last_p_low_price and src[lb] > last_p_low_osc
+    else if not is_bull and not na(p_high)
+        div_found := high[lb] > last_p_high_price and src[lb] < last_p_high_osc
+    div_found
+
+r_b = f_div(rsi_val, true, lookback),  m_b = f_div(m_line, true, lookback),  s_b = f_div(stoch_k, true, lookback)
+r_s = f_div(rsi_val, false, lookback), m_s = f_div(m_line, false, lookback), s_s = f_div(stoch_k, false, lookback)
+
+total_bull = (r_b ? 1 : 0) + (m_b ? 1 : 0) + (s_b ? 1 : 0)
+total_bear = (r_s ? 1 : 0) + (m_s ? 1 : 0) + (s_s ? 1 : 0)
+
+buy_sig  = total_bull >= min_conf and ichi_bull and not is_friday_end
+sell_sig = total_bear >= min_conf and ichi_bear and not is_friday_end
+
+// --- Signals & Execution ---
+plotshape(buy_sig, "Long", shape.triangleup, location.belowbar, color_bull, offset=-lookback, size=size.normal)
+plotshape(sell_sig, "Short", shape.triangledown, location.abovebar, color_bear, offset=-lookback, size=size.normal)
+
+if buy_sig
+    strategy.entry("L", strategy.long)
+if sell_sig
+    strategy.entry("S", strategy.short)
+
+// --- Live Floating PnL Label ---
+var label pnl_label = na
+if show_pnl and strategy.position_size != 0
+    pips = (strategy.openprofit / syminfo.mintick / (syminfo.type == "forex" ? 10 : 1)) / strategy.position_size
+    pnl_perc = (strategy.openprofit / strategy.equity) * 100
+    pnl_text = (strategy.position_size > 0 ? "LONG" : "SHORT") + "\nPnL: " + str.tostring(math.abs(pips), "#.#") + " Pips (" + str.tostring(pnl_perc, "#.##") + "%)"
+    
+    if na(pnl_label)
+        pnl_label := label.new(bar_index, high, pnl_text, color=color.new(color.black, 20), textcolor=pips >= 0 ? color_pnl_up : color_pnl_dn, style=label.style_label_left, size=size.normal)
+    else
+        label.set_xy(pnl_label, bar_index + 2, close)
+        label.set_text(pnl_label, pnl_text)
+        label.set_textcolor(pnl_label, pips >= 0 ? color_pnl_up : color_pnl_dn)
+else
+    label.delete(pnl_label)
+    pnl_label := na
+
+// --- Dashboard ---
+var table dash = table.new(position.top_right, 2, 2, bgcolor=color.new(color.black, 30), border_width=1, border_color=color.gray)
+if barstate.islast
+    table.cell(dash, 0, 0, "TREND", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 0, ichi_bull ? "BULL" : ichi_bear ? "BEAR" : "WAIT", bgcolor=ichi_bull ? color_bull : ichi_bear ? color_bear : color.gray)

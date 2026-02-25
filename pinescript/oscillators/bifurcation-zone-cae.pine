@@ -1,0 +1,1484 @@
+//@version=5
+indicator("Bifurcation Zone - CAE", shorttitle="BZ-CAE", overlay=true, max_bars_back=500, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+// ============ INPUTS ============
+group_cae = "🧠 Cognitive Engine"
+CAE_enable           = input.bool(true, "Enable CAE Intelligence", group=group_cae, tooltip='🎯 WHAT IT IS: Master switch for market‑state intelligence.\n\n⚡ HOW IT WORKS: Computes TCS (trend conviction), DMA (ATR‑normalized momentum), exhaustion, adversarial checks, and confidence scoring. Can annotate or filter signals depending on CAE Mode.\n\n💡 PRO TIP: Keep ON; disable only for controlled experiments.')
+CAE_mode             = input.string("Advisory", "CAE Mode", options=["Off","Advisory","Filtering"], group=group_cae, tooltip='🎯 WHAT IT IS: How CAE influences signals.\n\n⚡ HOW IT WORKS:\n• Off: No gates (raw divergence pipeline)\n• Advisory: Always show signals; attach warnings if CAE would block\n• Filtering: Block signals that fail CAE gates\n\n💡 PRO TIP: Start with Advisory to learn; move to Filtering for live selectivity.')
+CAE_trend_filter     = input.bool(true, "Strong Trend Filter", group=group_cae, tooltip='🎯 WHAT IT IS: Blocks counter‑trend trades in strong trends.\n\n⚡ HOW IT WORKS: If TCS ≥ threshold and DMA shows trend direction, counter‑signals are vetoed unless exhaustion is strong.\n\n💡 PRO TIP: Keep ON to avoid fading momentum; let exhaustion override extremes.')
+CAE_adversarial      = input.bool(true, "Adversarial Validation", group=group_cae, tooltip='🎯 WHAT IT IS: Opposing‑case dominance check.\n\n⚡ HOW IT WORKS: Quantifies bull vs bear advantage; blocks if the opposite side dominates by a margin.\n\n💡 PRO TIP: Great at avoiding signals into obvious strength the other way.')
+CAE_confidence_gate  = input.bool(true, "Confidence Gating", group=group_cae, tooltip='🎯 WHAT IT IS: Minimum confidence requirement for signals.\n\n⚡ HOW IT WORKS: Uses a composite score (TCS, |DMA|, pullback, state quality, divergence, adversarial) and requires it ≥ Min Confidence.\n\n💡 PRO TIP: Raise to trade fewer, cleaner setups.')
+CAE_min_confidence   = input.float(0.35, "Min Confidence", minval=0, maxval=1, step=0.05, group=group_cae, tooltip='🎯 WHAT IT IS: Numeric confidence threshold (0–1).\n\n⚡ HOW IT WORKS: Signals below this are blocked (Filtering) or annotated (Advisory).\n\n💡 PRO TIP: 0.35–0.45 typical. Increase on lower TFs for stricter selection.')
+group_cae_adv = "⚔️ Advanced CAE"
+CAE_tcs_threshold       = input.float(0.80, "TCS Block Threshold", minval=0.5, maxval=0.95, step=0.05, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Trend Conviction Score threshold for strong‑trend rules.\n\n⚡ HOW IT WORKS: If TCS ≥ threshold, trend filter can veto counter‑trend signals (unless exhaustion overrides).\n\n📈 HIGHER (0.85–0.95): Only the strongest trends block\n📉 LOWER (0.5–0.7): More frequent blocking\n\n💡 PRO TIP: 0.75–0.85 avoids most counter trades without being rigid.')
+CAE_dma_threshold       = input.float(0.70, "DMA Warning Zone",    minval=0.4, maxval=0.9,  step=0.05, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Reference range for classifying momentum alignment (DMA).\n\n⚡ HOW IT WORKS: Used in dashboard heuristics to flag strong directional pushes.\n\n💡 PRO TIP: 0.6–0.8 is a practical "strong momentum" zone.')
+CAE_exhaustion_required = input.float(0.50, "Exhaustion Required to Override", minval=0.3, maxval=0.9, step=0.05, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Minimum exhaustion needed to allow a counter‑trend trade in strong trends.\n\n⚡ HOW IT WORKS: If exhaustion ≥ this value, a counter‑trend idea may pass even when TCS is high.\n\n💡 PRO TIP: 0.45–0.6 balanced. Raise to reduce counter‑trend trades.')
+CAE_adv_threshold       = input.float(0.10, "Adversarial Differential Gate",   minval=0.05, maxval=0.6, step=0.05, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Threshold for the Adversarial Model.\n\n⚡ HOW IT WORKS: Checks the difference between Bull Case Score and Bear Case Score. If the opposing side is winning by more than this amount, the trade is blocked.\n\n💡 PRO TIP: Lower values (0.10) provide stricter safety checks.')
+CAE_dmi_length          = input.int(14, "DMI/ADX Length", minval=5, maxval=50, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Period length for DMI (Directional Movement Index) and ADX calculations used in TCS.\n\n⚡ HOW IT WORKS: Shorter periods (7–10) respond faster to trend changes but are noisier. Longer periods (18–25) are smoother but lag more. ADX is normalized in the 10–35 range for TCS calculation.\n\n💡 PRO TIP: Standard 14 works well across most timeframes. Lower to 10–12 for scalping, raise to 18–21 for swing trading.')
+CAE_rsi_length          = input.int(14, "RSI Length", minval=5, maxval=50, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Period length for RSI used in CAE exhaustion modeling (separate from oscillator RSI).\n\n⚡ HOW IT WORKS: CAE checks for RSI extremes (>80/<20, >75/<25) as exhaustion signals. Shorter RSI (9–11) flags exhaustion earlier but with more false positives. Longer RSI (18–21) is more conservative.\n\n💡 PRO TIP: Keep at 14 (standard) unless you find exhaustion signals trigger too early/late for your instrument.')
+CAE_roc_length          = input.int(10, "ROC Length", minval=5, maxval=30, group=group_cae_adv, tooltip='🎯 WHAT IT IS: Period length for Rate of Change calculation used in CAE state quality assessment.\n\n⚡ HOW IT WORKS: ROC measures momentum velocity. Shorter periods (5–8) detect quick momentum shifts. Longer periods (15–20) capture sustained directional moves. Used as a secondary momentum confirmation in confidence scoring.\n\n💡 PRO TIP: 10 is balanced. Scalpers may prefer 5–7, swing traders 12–15.')
+group_osc = "📊 Oscillator Settings"
+osc_type   = input.string("RSI", "Oscillator Type", options=["RSI","Stochastic","CCI","MFI","Williams %R"], group=group_osc, tooltip='🎯 WHAT IT IS: Momentum oscillator used for divergence detection.\n\n⚡ HOW IT WORKS:\n• RSI: Classic overbought/oversold (best for general use)\n• Stochastic: Range‑bound %K (best for mean reversion)\n• CCI: Deviation from statistical mean (best for cyclical markets)\n• MFI: Volume‑weighted RSI (best for volume‑driven assets)\n• Williams %R: Inverse stochastic (best for reversal extremes)\n\nAll normalized to 0–100 scale for consistent OB/OS handling.\n\n💡 PRO TIP: Start with RSI (proven). Try MFI for stocks/crypto with strong volume patterns.')
+osc_length = input.int(14, "Length", minval=2, maxval=200, group=group_osc, tooltip='🎯 WHAT IT IS: Period length for oscillator calculation.\n\n⚡ HOW IT WORKS: Shorter periods (9–11) respond faster to price changes, generating more frequent OB/OS crossings but with more noise. Longer periods (18–25) are smoother and more reliable but lag price action and generate fewer signals.\n\n💡 PRO TIP: 14 is industry standard (proven across decades). Scalpers use 9–11, swing traders use 18–21. Match to your timeframe speed.')
+osc_smooth = input.int(1,  "Smoothing", minval=1, maxval=20, group=group_osc, tooltip='🎯 WHAT IT IS: Simple moving average applied to raw oscillator for noise reduction.\n\n⚡ HOW IT WORKS: Smoothing = 1 means no smoothing (raw oscillator). Smoothing = 3 means 3‑bar SMA of oscillator values. Higher smoothing (5–10) reduces whipsaws and false divergences but delays signals and can miss quick reversals.\n\n💡 PRO TIP: Keep at 1 for crisp signals on clean timeframes (15m+). Use 2–3 on noisy lower timeframes (1–5m) or choppy instruments.')
+osc_ob     = input.int(70, "Overbought", minval=50, maxval=100, group=group_osc, tooltip='🎯 WHAT IT IS: Threshold above which oscillator is considered overbought (potential reversal zone for bearish divergences).\n\n⚡ HOW IT WORKS: When oscillator crosses above this level, market is in potential exhaustion territory. Bearish divergences in OB zone have higher probability. Standard 70 works for most markets. Tighter 75–80 for volatile instruments (fewer but stronger signals). Looser 65 for range‑bound markets (more signals, lower quality).\n\n💡 PRO TIP: 70 standard. If getting too few signals, loosen to 65–68. If too many false divergences, tighten to 72–75.')
+osc_os     = input.int(30, "Oversold",   minval=0,  maxval=50,  group=group_osc, tooltip='🎯 WHAT IT IS: Threshold below which oscillator is considered oversold (potential reversal zone for bullish divergences).\n\n⚡ HOW IT WORKS: When oscillator crosses below this level, market is in potential exhaustion territory. Bullish divergences in OS zone have higher probability. Standard 30 works for most markets. Tighter 20–25 for volatile instruments (fewer but stronger signals). Looser 35 for range‑bound markets (more signals, lower quality).\n\n💡 PRO TIP: 30 standard. Mirror your OB setting (if OB=75, use OS=25 for symmetry). Test 25–35 range to match instrument personality.')
+group_cae_viz = "🎨 CAE Visualizations"
+CAE_show_state   = input.bool(true,  "Show Market State (exhaustion shade)", group=group_cae_viz, tooltip='🎯 WHAT IT IS: Visual exhaustion warning via background shading.\n\n⚡ HOW IT WORKS: When exhaustion score exceeds 0.75, chart background displays semi‑transparent yellow highlight. This immediate visual alert warns that current move is at high reversal risk.\n\n💡 PRO TIP: Yellow shading = consider early exits on winning trades or prepare for counter‑trend entries. Disable if you find it visually distracting.')
+CAE_show_signals = input.bool(true,  "Show Signal Quality markers", group=group_cae_viz, tooltip='🎯 WHAT IT IS: Displays orange X‑cross markers for blocked signals when CAE is in Advisory mode.\n\n⚡ HOW IT WORKS: In Advisory mode, divergences that would be blocked in Filtering mode show as X‑crosses with annotation reasons. Helps you learn CAE decision logic without missing educational opportunities.\n\n💡 PRO TIP: Keep ON during learning phase (weeks 1–3). Disable in Filtering mode once you trust the system.')
+CAE_show_8d      = input.bool(false, "Show 8D State Vector (Large dash only)", group=group_cae_viz, tooltip='🎯 WHAT IT IS: Advanced dashboard section showing 8‑dimensional normalized market state metrics (Large dashboard size only).\n\n⚡ HOW IT WORKS: Displays normalized readings (0–1 scale) for: trend alignment, momentum, volatility, volume flow, Bollinger position, ROC, directional movement, and oscillator bias. Synthesized into composite market state visualization.\n\n💡 PRO TIP: For advanced users only. Provides granular state decomposition but adds dashboard clutter. Keep OFF unless analyzing specific state factors.')
+group_div = "🔍 Divergence Detection"
+enable_regular   = input.bool(true,  "Regular Divergence", group=group_div, tooltip='🎯 WHAT IT IS: Toggle for regular (reversal) divergences.\n\n⚡ HOW IT WORKS: Regular divergences signal potential trend reversals:\n• Bearish: Price makes higher high, oscillator makes lower high → reversal down\n• Bullish: Price makes lower low, oscillator makes higher low → reversal up\n\nDisabling removes reversal signals; only continuation signals remain (if hidden divs enabled).\n\n💡 PRO TIP: Keep ON for balanced trading. Disable only if trading pure trend continuation strategies.')
+enable_hidden    = input.bool(true,  "Hidden Divergence",  group=group_div, tooltip='🎯 WHAT IT IS: Toggle for hidden (continuation) divergences.\n\n⚡ HOW IT WORKS: Hidden divergences signal trend continuation:\n• Bullish hidden: Price makes higher low, oscillator makes lower low → uptrend continues\n• Bearish hidden: Price makes lower high, oscillator makes higher high → downtrend continues\n\nDisabling removes continuation signals; only reversal signals remain (if regular divs enabled).\n\n💡 PRO TIP: Keep ON for balanced trading. Disable if you only trade reversals at extremes.')
+pivot_lookback   = input.int(5,  "Pivot Lookback",    minval=2, maxval=21, group=group_div, tooltip='🎯 WHAT IT IS: Number of bars BEFORE a peak/trough required to confirm it as a pivot.\n\n⚡ HOW IT WORKS: For a high at bar X to be a pivot: high[X] must be greater than all highs in the lookback range (X‑5 to X‑1). Larger values (7–10) require more significant swings but miss smaller structures. Smaller values (3–4) catch minor pivots but increase noise.\n\n💡 PRO TIP: 5 is balanced for most timeframes. Scalpers use 3–4, swing traders use 7–9. Must match market volatility.')
+pivot_lookforward= input.int(5,  "Pivot Lookforward", minval=2, maxval=21, group=group_div, tooltip='🎯 WHAT IT IS: Number of bars AFTER a peak/trough required to confirm it as a pivot (Confirmed timing only).\n\n⚡ HOW IT WORKS: For a high at bar X to be a pivot: high[X] must be greater than all highs in the lookforward range (X+1 to X+5). Creates confirmation delay but ensures pivot validity. In Realtime mode, this parameter is bypassed (1‑bar detection).\n\n💡 PRO TIP: Match lookback for symmetry (both 5). Increase both to 7 for stricter pivots, decrease both to 3 for faster signals. Affects Confirmed mode only.')
+max_lookback     = input.int(60, "Max Lookback Range", minval=10, maxval=200, group=group_div, tooltip='🎯 WHAT IT IS: Maximum bars backward to search for comparison pivots when detecting divergences.\n\n⚡ HOW IT WORKS: When a new pivot forms, system scans up to this many bars backward for previous pivots to compare slopes. Prevents ancient, irrelevant divergences. Larger values (80–100) allow longer‑term divergences on higher timeframes. Smaller values (40–50) focus on recent structure for scalping.\n\n💡 PRO TIP: 60 balanced for day trading. Scalpers use 40–50, swing traders use 80–100. Should represent ~1–3 recent swing cycles.')
+min_slope_change = input.float(1.0, "Min Slope Change", minval=0.1, maxval=10.0, step=0.1, group=group_div, tooltip='🎯 WHAT IT IS: Minimum oscillator slope change (percentage per bar) required to validate a divergence.\n\n⚡ HOW IT WORKS: Filters weak, marginal divergences where oscillator barely disagrees with price. Formula: |osc_slope| must exceed (min_slope_change / 100). Higher values (1.2–1.5) require strong, obvious divergences but may miss early entries. Lower values (0.7–0.9) catch subtle divergences but increase false signals.\n\n💡 PRO TIP: 1.0 is standard. Raise to 1.2–1.5 if getting too many low‑quality signals. Lower to 0.8 on low‑volatility instruments.')
+group_theme = "🎨 Visual Theme"
+visual_theme = input.string("Cyberpunk", "Theme", options=["Cyberpunk","Professional","Ocean","Fire","Matrix","Monochrome"], group=group_theme)
+show_dashboard = input.bool(true, "Show Dashboard", group=group_theme)
+dash_position  = input.string("Top Right", "Dashboard Position", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group=group_theme)
+dash_size      = input.string("Normal", "Dashboard Size", options=["Small","Normal","Large"], group=group_theme)
+theme_bull = visual_theme == "Cyberpunk"     ? #00ffff : visual_theme == "Professional"  ? #2962ff : visual_theme == "Ocean"         ? #006994 : visual_theme == "Fire"          ? #ff4500 : visual_theme == "Matrix"        ? #00ff41 : #ffffff
+theme_bear = visual_theme == "Cyberpunk"     ? #ff00ff : visual_theme == "Professional"  ? #ff6d00 : visual_theme == "Ocean"         ? #ff6b6b : visual_theme == "Fire"          ? #ff1744 : visual_theme == "Matrix"        ? #ff0000 : #888888
+theme_neutral = visual_theme == "Cyberpunk"  ? #ffff00 : visual_theme == "Professional" ? #00c853 : visual_theme == "Ocean" ? #33cccc : visual_theme == "Fire"  ? #ff7f50 : visual_theme == "Matrix"? #00ff88 : #cccccc
+theme_accent  = visual_theme == "Cyberpunk"   ? #ff0080 : visual_theme == "Professional"? #6200ea : visual_theme == "Ocean"       ? #0099cc : visual_theme == "Fire"        ? #ffa500 : visual_theme == "Matrix"      ? #39ff14 : #666666
+group_sig = "📍 Signal Visuals"
+show_zones     = input.bool(true, "Draw Bifurcation Zones (Boxes)", tooltip="Draws a semi-transparent supply/demand block extending from the signal pivot.", group=group_sig)
+color_bars     = input.bool(true, "Adversarial Bar Coloring", tooltip="Colors the candles based on the internal CAE Bull/Bear debate (Heatmap).", group=group_sig)
+sig_size_opt   = input.string("Tiny", "Signal Size", options=["Tiny","Small","Normal"], group=group_sig) 
+sig_show_vline = input.bool(true,  "Show thin vertical line", group=group_sig)
+sig_transp     = input.int(10,     "Signal Transparency (0–90)", minval=0, maxval=90, group=group_sig)
+sig_keep_lines = input.int(60,     "Keep last N vertical lines", minval=0, maxval=300, group=group_sig)
+sig_size = sig_size_opt == "Tiny" ? size.tiny : sig_size_opt == "Small" ? size.small : size.normal
+calc_oscillator() =>
+    osc_raw = switch osc_type
+        "RSI"         => ta.rsi(close, osc_length)
+        "Stochastic"  => ta.stoch(high, low, close, osc_length)
+        "CCI"         => (ta.cci(hlc3, osc_length) + 100) / 2
+        "MFI"         => ta.mfi(hlc3, osc_length)
+        "Williams %R" => ta.wpr(osc_length) + 100
+        => ta.rsi(close, osc_length)
+    osc_smooth > 1 ? ta.sma(osc_raw, osc_smooth) : osc_raw
+osc = calc_oscillator()
+// ============ TIMING (Realtime or Confirmed) ============
+group_timing = "⏱ Signal Timing"
+sig_timing = input.string("Realtime (1‑bar, peak‑anchored)", "Timing",
+     options=["Realtime (1‑bar, peak‑anchored)", "Confirmed (lookforward)"], group=group_timing)
+rt_isTop  = high[1] > high and high[1] > high[2]
+rt_isBot  = low[1]  < low  and low[1]  < low[2]
+rt_oscTop = osc[1]  > osc  and osc[1]  > osc[2]
+rt_oscBot = osc[1]  < osc  and osc[1]  < osc[2]
+var bool  bull_rt = false
+var bool  bear_rt = false
+var float div_str_rt = 0.0
+var float rt_lastPriceTop = na
+var float rt_lastOscTop  = na
+var float rt_lastPriceBot = na
+var float rt_lastOscBot  = na
+atr14 = ta.atr(14)
+if barstate.isconfirmed
+    bull_rt := false
+    bear_rt := false
+    if rt_isTop
+        if not na(rt_lastPriceTop) and not na(rt_lastOscTop) and rt_oscTop
+            bear_rt := (high[1] > rt_lastPriceTop and osc[1] < rt_lastOscTop) or (high[1] < rt_lastPriceTop and osc[1] > rt_lastOscTop)
+            div_str_rt := math.min(math.abs(high[1] - rt_lastPriceTop) / math.max(atr14, 1e-10), 2.0) * 0.5
+        rt_lastPriceTop := high[1]
+        if rt_oscTop
+            rt_lastOscTop := osc[1]
+    if rt_isBot
+        if not na(rt_lastPriceBot) and not na(rt_lastOscBot) and rt_oscBot
+            bull_rt := (low[1] < rt_lastPriceBot and osc[1] > rt_lastOscBot) or (low[1] > rt_lastPriceBot and osc[1] < rt_lastOscBot)
+            div_str_rt := math.min(math.abs(low[1] - rt_lastPriceBot) / math.max(atr14, 1e-10), 2.0) * 0.5
+        rt_lastPriceBot := low[1]
+        if rt_oscBot
+            rt_lastOscBot := osc[1]
+ph_price = ta.pivothigh(high, pivot_lookback, pivot_lookforward)
+pl_price = ta.pivotlow(low,  pivot_lookback, pivot_lookforward)
+ph_osc   = ta.pivothigh(osc,  pivot_lookback, pivot_lookforward)
+pl_osc   = ta.pivotlow(osc,   pivot_lookback, pivot_lookforward)
+var array<float> price_highs      = array.new_float()
+var array<int>   price_highs_bars = array.new_int()
+var array<float> price_lows       = array.new_float()
+var array<int>   price_lows_bars  = array.new_int()
+var array<float> osc_highs        = array.new_float()
+var array<int>   osc_highs_bars   = array.new_int()
+var array<float> osc_lows         = array.new_float()
+var array<int>   osc_lows_bars    = array.new_int()
+if not na(ph_price)
+    array.unshift(price_highs, ph_price)
+    array.unshift(price_highs_bars, bar_index - pivot_lookforward)
+    if array.size(price_highs) > 10
+        array.pop(price_highs), array.pop(price_highs_bars)
+if not na(pl_price)
+    array.unshift(price_lows, pl_price)
+    array.unshift(price_lows_bars, bar_index - pivot_lookforward)
+    if array.size(price_lows) > 10
+        array.pop(price_lows), array.pop(price_lows_bars)
+if not na(ph_osc)
+    array.unshift(osc_highs, ph_osc)
+    array.unshift(osc_highs_bars, bar_index - pivot_lookforward)
+    if array.size(osc_highs) > 10
+        array.pop(osc_highs), array.pop(osc_highs_bars)
+if not na(pl_osc)
+    array.unshift(osc_lows, pl_osc)
+    array.unshift(osc_lows_bars, bar_index - pivot_lookforward)
+    if array.size(osc_lows) > 10
+        array.pop(osc_lows), array.pop(osc_lows_bars)
+var bool  bear_reg = false
+var bool  bull_reg = false
+var bool  bear_hid = false
+var bool  bull_hid = false
+var float div_str_cf = 0.0
+if barstate.isconfirmed
+    bear_reg := false, bull_reg := false, bear_hid := false, bull_hid := false
+    div_str_cf := 0.0
+    if enable_regular and array.size(price_highs) >= 2 and array.size(osc_highs) >= 2
+        max_loop = math.min(array.size(price_highs) - 1, 5)
+        for i = 1 to max_loop
+            if i < array.size(price_highs) and i < array.size(osc_highs)
+                bars_ago = bar_index - array.get(price_highs_bars, i)
+                if bars_ago <= max_lookback and bars_ago > pivot_lookback
+                    price_slope = (array.get(price_highs, 0) - array.get(price_highs, i)) / bars_ago
+                    osc_slope   = (array.get(osc_highs, 0) - array.get(osc_highs, i)) / bars_ago
+                    if price_slope > 0 and osc_slope < 0 and math.abs(osc_slope) > min_slope_change/100
+                        bear_reg := true
+                        div_str_cf := math.min(math.abs(price_slope) * math.abs(osc_slope) * 10, 1.0)
+                        break
+    if enable_regular and array.size(price_lows) >= 2 and array.size(osc_lows) >= 2
+        max_loop = math.min(array.size(price_lows) - 1, 5)
+        for i = 1 to max_loop
+            if i < array.size(price_lows) and i < array.size(osc_lows)
+                bars_ago = bar_index - array.get(price_lows_bars, i)
+                if bars_ago <= max_lookback and bars_ago > pivot_lookback
+                    price_slope = (array.get(price_lows, 0) - array.get(price_lows, i)) / bars_ago
+                    osc_slope   = (array.get(osc_lows, 0) - array.get(osc_lows, i)) / bars_ago
+                    if price_slope < 0 and osc_slope > 0 and math.abs(osc_slope) > min_slope_change/100
+                        bull_reg := true
+                        div_str_cf := math.min(math.abs(price_slope) * math.abs(osc_slope) * 10, 1.0)
+                        break
+    if enable_hidden and array.size(price_highs) >= 2 and array.size(osc_highs) >= 2
+        max_loop = math.min(array.size(price_highs) - 1, 5)
+        for i = 1 to max_loop
+            if i < array.size(price_highs) and i < array.size(osc_highs)
+                bars_ago = bar_index - array.get(price_highs_bars, i)
+                if bars_ago <= max_lookback and bars_ago > pivot_lookback
+                    price_slope = (array.get(price_highs, 0) - array.get(price_highs, i)) / bars_ago
+                    osc_slope   = (array.get(osc_highs, 0) - array.get(osc_highs, i)) / bars_ago
+                    if price_slope < 0 and osc_slope > 0 and osc_slope > min_slope_change/100
+                        bear_hid := true
+                        div_str_cf := math.min(math.abs(price_slope) * math.abs(osc_slope) * 10, 1.0) * 0.8
+                        break
+    if enable_hidden and array.size(price_lows) >= 2 and array.size(osc_lows) >= 2
+        max_loop = math.min(array.size(price_lows) - 1, 5)
+        for i = 1 to max_loop
+            if i < array.size(price_lows) and i < array.size(osc_lows)
+                bars_ago = bar_index - array.get(price_lows_bars, i)
+                if bars_ago <= max_lookback and bars_ago > pivot_lookback
+                    price_slope = (array.get(price_lows, 0) - array.get(price_lows, i)) / bars_ago
+                    osc_slope   = (array.get(osc_lows, 0) - array.get(osc_lows, i)) / bars_ago
+                    if price_slope > 0 and osc_slope < 0 and math.abs(osc_slope) > min_slope_change/100
+                        bull_hid := true
+                        div_str_cf := math.min(math.abs(price_slope) * math.abs(osc_slope) * 10, 1.0) * 0.8
+                        break
+base_bull = sig_timing == "Realtime (1‑bar, peak‑anchored)" ? bull_rt : (bull_reg or bull_hid)
+base_bear = sig_timing == "Realtime (1‑bar, peak‑anchored)" ? bear_rt : (bear_reg or bear_hid)
+div_strength = sig_timing == "Realtime (1‑bar, peak‑anchored)" ? div_str_rt : div_str_cf
+// ============ CAE METRICS ============
+normalize(v, lo, hi) => na(v) ? 0.0 : math.max(0.0, math.min(1.0, (v - lo) / math.max(1e-10, hi - lo)))
+cae_ema20  = ta.ema(close, 20)
+cae_ema50  = ta.ema(close, 50)
+cae_ema100 = ta.ema(close, 100)
+cae_ema200 = ta.ema(close, 200)
+cae_rsi14  = ta.rsi(close, CAE_rsi_length)
+cae_roc10  = ta.roc(close, CAE_roc_length)
+cae_atr14  = atr14
+cae_bb_basis = ta.sma(close, 20)
+cae_bb_dev   = ta.stdev(close, 20)
+[dmiP_tmp, dmiM_tmp, adx_tmp] = ta.dmi(CAE_dmi_length, CAE_dmi_length)
+var float diplus  = na
+var float diminus = na
+var float adx_val = na
+diplus  := dmiP_tmp
+diminus := dmiM_tmp
+adx_val := adx_tmp
+dma_raw = (ta.ema(close, 21) - ta.ema(close, 55)) / math.max(cae_atr14, 1e-10)
+CAE_dma = dma_raw
+strScore = ta.sma(((high > high[1] and high[1] > high[2]) or (low < low[1] and low[1] < low[2])) ? 1.0 : 0.0, 10)
+htf_ok   = (close > cae_ema20 and cae_ema20 > cae_ema50 and cae_ema50 > cae_ema100) or
+           (close < cae_ema20 and cae_ema20 < cae_ema50 and cae_ema50 < cae_ema100)
+CAE_tcs  = 0.35*normalize(adx_val, 10, 35) + 0.35*strScore + 0.30*(htf_ok ? 1.0 : 0.3)
+calc_exhaustion(div_present) =>
+    score = 0.0
+    vr = volume / ta.sma(volume, 50)
+    score += vr > 2.5 ? 0.25 : vr > 2.0 ? 0.15 : vr > 1.5 ? 0.10 : 0
+    score += div_present ? 0.30 : 0
+    score += (cae_rsi14 > 80 or cae_rsi14 < 20) ? 0.25 : (cae_rsi14 > 75 or cae_rsi14 < 25 ? 0.15 : 0)
+    body = math.abs(close - open)
+    upper = high - math.max(open, close)
+    lower = math.min(open, close) - low
+    pin = (upper > body*2 and lower < body*0.5) or (lower > body*2 and upper < body*0.5)
+    score += pin ? 0.15 : 0
+    tb = 0
+    isUp = close > cae_ema20
+    for i = 1 to 40
+        if (close[i] > cae_ema20[i]) == isUp
+            tb += 1
+        else
+            break
+    score += tb > 30 ? 0.15 : 0
+    math.min(score, 1.0)
+CAE_exhaustion = calc_exhaustion(base_bull or base_bear)
+dist20 = math.abs(close - cae_ema20) / math.max(cae_atr14, 1e-10)
+CAE_pullback = normalize(0.6 - math.abs(0.6 - dist20), 0.0, 0.6)
+calc_adversarial(is_bullish) =>
+    bull_score = 0.0
+    bear_score = 0.0
+    dist_ema20 = (close - cae_ema20) / close
+    if is_bullish
+        if dist_ema20 < 0
+            bull_score += math.min(math.abs(dist_ema20)*10, 0.25)
+        if close > cae_ema20 and cae_ema20 > cae_ema50
+            bull_score += 0.25
+        if cae_rsi14 < 40
+            bull_score += 0.25
+        if volume > ta.sma(volume, 20) * 1.2
+            bull_score += 0.25
+        if close < cae_ema50
+            bear_score += 0.30
+        if cae_rsi14 < 30
+            bear_score += 0.20
+    else
+        if dist_ema20 > 0
+            bear_score += math.min(dist_ema20*10, 0.25)
+        if close < cae_ema20 and cae_ema20 < cae_ema50
+            bear_score += 0.25
+        if cae_rsi14 > 60
+            bear_score += 0.25
+        if volume > ta.sma(volume, 20) * 1.2
+            bear_score += 0.25
+        if close > cae_ema50
+            bull_score += 0.30
+        if cae_rsi14 > 70
+            bull_score += 0.20
+    [bull_score, bear_score, bull_score - bear_score]
+var float bBullCase     = na
+var float bBearCase     = na
+var float adv_diff_bull = na
+var float sBullCase     = na
+var float sBearCase     = na
+var float adv_diff_bear = na
+[bull_tmp, bear_tmp, diff_tmp] = calc_adversarial(true)
+bBullCase     := bull_tmp
+bBearCase     := bear_tmp
+adv_diff_bull := diff_tmp
+[bull_tmp2, bear_tmp2, diff_tmp2] = calc_adversarial(false)
+sBullCase     := bull_tmp2
+sBearCase     := bear_tmp2
+adv_diff_bear := diff_tmp2
+bull_case = bBullCase
+bear_case = sBearCase
+adv_diff  = bull_case - bear_case
+calc_confidence(is_bullish, div_strength) =>
+    adv_val = is_bullish ? (bBullCase > bBearCase ? math.min(bBullCase - bBearCase, 0.30) : 0.05)
+                         : (sBearCase > sBullCase ? math.min(sBearCase - sBullCase, 0.30) : 0.05)
+    state_q = (normalize(adx_val, 10, 35)*0.4 + (htf_ok?1:0.3)*0.3 + strScore*0.3)
+    osc_q   = is_bullish ? (osc < osc_os ? 0.15 : osc < 50 ? 0.10 : 0.05)
+                         : (osc > osc_ob ? 0.15 : osc > 50 ? 0.10 : 0.05)
+    score = 0.30*normalize(CAE_tcs, 0, 1) + 0.25*normalize(math.abs(dma_raw),0,2) + 0.20*CAE_pullback + 0.15*state_q + 0.10*div_strength + adv_val
+    math.min(score, 1.0)
+// ============ SPACING ============
+group_space = "🧭 Signal Spacing"
+minBarsAny  = input.int(12, "Min bars between ANY signals", minval=0, group=group_space)
+minBarsSide = input.int(24, "Min bars between SAME‑SIDE signals", minval=0, group=group_space)
+enforceSide = input.bool(true, "Enforce same‑side spacing", group=group_space)
+minAtrGap   = input.float(0.0, "Min ATR distance between signals (0=off)", step=0.1, group=group_space)
+getAnchorBar() =>
+    sig_timing == "Realtime (1‑bar, peak‑anchored)" ? bar_index - 1 : bar_index - pivot_lookforward
+var int   lastAnyBar  = na
+var int   lastBullBar = na
+var int   lastBearBar = na
+var float lastSigPx   = na
+spacingOK(anchorBar, isBull) =>
+    globalOK = na(lastAnyBar) or (anchorBar - lastAnyBar) >= minBarsAny
+    sideOK   = not enforceSide or (isBull ? (na(lastBullBar) or (anchorBar - lastBullBar) >= minBarsSide) : (na(lastBearBar) or (anchorBar - lastBearBar) >= minBarsSide))
+    distOK   = minAtrGap <= 0 ? true : (na(lastSigPx) ? true : math.abs(close - lastSigPx) / math.max(cae_atr14, 1e-10) >= minAtrGap)
+    [globalOK and sideOK and distOK, globalOK, sideOK, distOK]
+// ============ SIGNAL GENERATION (Filtering + Advisory) ============
+var bool   signal_bull       = false
+var bool   signal_bear       = false
+var float  signal_confidence = 0.0
+var bool   signal_blocked    = false
+var string block_reason      = ""
+var string advisory_reason   = ""
+base_bull_detected = base_bull
+base_bear_detected = base_bear
+bull_conf = base_bull_detected ? calc_confidence(true,  div_strength) : na
+bear_conf = base_bear_detected ? calc_confidence(false, div_strength) : na
+if barstate.isconfirmed
+    signal_bull       := false
+    signal_bear       := false
+    signal_blocked    := false
+    block_reason      := ""
+    advisory_reason   := ""
+    signal_confidence := na
+    wantBull = base_bull_detected
+    wantBear = base_bear_detected
+    anchorBar = getAnchorBar()
+    if wantBull
+        [okB, _, _, _] = spacingOK(anchorBar, true)
+        if not okB
+            wantBull := false
+            waitAnyB  = na(lastAnyBar)  ? 0 : math.max(0, minBarsAny  - (anchorBar - lastAnyBar))
+            waitSideB = na(lastBullBar) ? 0 : math.max(0, minBarsSide - (anchorBar - lastBullBar))
+            advisory_reason += (advisory_reason == "" ? "" : " | ") + "Bull spacing: wait " + str.tostring(math.max(waitAnyB, waitSideB)) + " bars"
+    if wantBear
+        [okS, _, _, _] = spacingOK(anchorBar, false)
+        if not okS
+            wantBear := false
+            waitAnyS  = na(lastAnyBar)  ? 0 : math.max(0, minBarsAny  - (anchorBar - lastAnyBar))
+            waitSideS = na(lastBearBar) ? 0 : math.max(0, minBarsSide - (anchorBar - lastBearBar))
+            advisory_reason += (advisory_reason == "" ? "" : " | ") + "Bear spacing: wait " + str.tostring(math.max(waitAnyS, waitSideS)) + " bars"
+    if wantBull or wantBear
+        trend_dir = CAE_dma > 0 ? 1 : -1
+        bull_would_block = false
+        bear_would_block = false
+        bull_reason = ""
+        bear_reason = ""
+        if CAE_enable
+            if CAE_trend_filter and CAE_tcs > CAE_tcs_threshold
+                if wantBull and trend_dir == -1 and CAE_exhaustion < CAE_exhaustion_required
+                    bull_would_block := true
+                    bull_reason := "Bull: strong downtrend (TCS=" + str.tostring(CAE_tcs, "#.##") + ")"
+                if wantBear and trend_dir == 1 and CAE_exhaustion < CAE_exhaustion_required
+                    bear_would_block := true
+                    bear_reason := "Bear: strong uptrend (TCS=" + str.tostring(CAE_tcs, "#.##") + ")"
+            if CAE_adversarial
+                if wantBull and adv_diff_bull < -CAE_adv_threshold
+                    bull_would_block := true
+                    bull_reason := (bull_reason == "" ? "" : bull_reason + " | ") + "Adversarial bearish"
+                if wantBear and adv_diff_bear >  CAE_adv_threshold
+                    bear_would_block := true
+                    bear_reason := (bear_reason == "" ? "" : bear_reason + " | ") + "Adversarial bullish"
+            if CAE_confidence_gate
+                if wantBull and nz(bull_conf, 0) < CAE_min_confidence
+                    bull_would_block := true
+                    bull_reason := (bull_reason == "" ? "" : bull_reason + " | ") + "Low confidence " + str.tostring(nz(bull_conf)*100, "#") + "%"
+                if wantBear and nz(bear_conf, 0) < CAE_min_confidence
+                    bear_would_block := true
+                    bear_reason := (bear_reason == "" ? "" : bear_reason + " | ") + "Low confidence " + str.tostring(nz(bear_conf)*100, "#") + "%"
+
+        if CAE_enable and CAE_mode == "Filtering"
+            if wantBull and not bull_would_block
+                signal_bull := true
+                signal_confidence := nz(bull_conf)
+                lastAnyBar  := anchorBar
+                lastBullBar := anchorBar
+                lastSigPx   := close
+            else if wantBull and bull_would_block
+                signal_blocked := true
+                block_reason   := bull_reason
+
+            if wantBear and not signal_bull and not bear_would_block
+                signal_bear := true
+                signal_confidence := nz(bear_conf)
+                lastAnyBar  := anchorBar
+                lastBearBar := anchorBar
+                lastSigPx   := close
+            else if wantBear and not signal_bull and bear_would_block
+                signal_blocked := true
+                block_reason   := bear_reason
+        else
+            if wantBull
+                signal_bull := true
+                signal_confidence := nz(bull_conf)
+                lastAnyBar  := anchorBar
+                lastBullBar := anchorBar
+                lastSigPx   := close
+                if bull_would_block
+                    advisory_reason += (advisory_reason == "" ? "" : " | ") + bull_reason
+            if wantBear and not signal_bull
+                signal_bear := true
+                signal_confidence := nz(bear_conf)
+                lastAnyBar  := anchorBar
+                lastBearBar := anchorBar
+                lastSigPx   := close
+                if bear_would_block
+                    advisory_reason += (advisory_reason == "" ? "" : " | ") + bear_reason
+sig_offset = sig_timing == "Realtime (1‑bar, peak‑anchored)" ? -1 : -pivot_lookforward
+plotshape(series=signal_bull, title="🟢 BULL", style=shape.triangleup,   location=location.belowbar, color=color.new(theme_bull, sig_transp), size=size.tiny, offset=sig_offset)
+plotshape(series=signal_bear, title="🔴 BEAR", style=shape.triangledown, location=location.abovebar, color=color.new(theme_bear, sig_transp), size=size.tiny, offset=sig_offset)
+var box[] zones = array.new_box()
+if show_zones
+    if signal_bull
+        float z_top = high[math.abs(sig_offset)]
+        float z_bot = low[math.abs(sig_offset)]
+        b = box.new(left=bar_index + sig_offset, top=z_top, right=bar_index + sig_offset + 15, bottom=z_bot, 
+             border_color=color.new(theme_bull, 60), bgcolor=color.new(theme_bull, 85), 
+             text="Demand", text_size=size.tiny, text_color=color.new(theme_bull, 40))
+        array.push(zones, b)
+    if signal_bear
+        float z_top = high[math.abs(sig_offset)]
+        float z_bot = low[math.abs(sig_offset)]
+        b = box.new(left=bar_index + sig_offset, top=z_top, right=bar_index + sig_offset + 15, bottom=z_bot, 
+             border_color=color.new(theme_bear, 60), bgcolor=color.new(theme_bear, 85), 
+             text="Supply", text_size=size.tiny, text_color=color.new(theme_bear, 40))
+        array.push(zones, b)
+    if array.size(zones) > 20
+        box.delete(array.shift(zones))
+adv_color = not color_bars ? na : 
+             adv_diff > 0.3 ? color.new(theme_bull, 0) : 
+             adv_diff > 0.1 ? color.new(theme_bull, 50) : 
+             adv_diff < -0.3 ? color.new(theme_bear, 0) : 
+             adv_diff < -0.1 ? color.new(theme_bear, 50) : 
+             color.new(theme_neutral, 80)
+barcolor(adv_color)
+plotshape(series=CAE_show_signals and signal_blocked and base_bull_detected, title="🛑 Blocked Bull", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, offset=sig_offset)
+plotshape(series=CAE_show_signals and signal_blocked and base_bear_detected, title="🛑 Blocked Bear", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, offset=sig_offset)
+var array<line> sig_lines = array.new_line()
+if sig_show_vline and (signal_bull or signal_bear)
+    x  = bar_index + sig_offset
+    y1 = low  - cae_atr14*0.2
+    y2 = high + cae_atr14*0.2
+    col = signal_bull ? color.new(theme_bull, 0) : color.new(theme_bear, 0)
+    ln = line.new(x1=x, y1=y1, x2=x, y2=y2, xloc=xloc.bar_index, extend=extend.none, color=col, width=1, style=line.style_dotted)
+    array.push(sig_lines, ln)
+    if array.size(sig_lines) > sig_keep_lines
+        line.delete(array.shift(sig_lines))
+exhaustion_zone = CAE_show_state and CAE_exhaustion > 0.75
+bgcolor(exhaustion_zone ? color.new(color.yellow, 90) : na)
+var int total_signals     = 0
+var int blocked_signals   = 0
+var int high_conf_signals = 0
+var int low_conf_signals  = 0
+var int bull_signals      = 0
+var int bear_signals      = 0
+var string last_sig_type = "None"
+var float last_sig_conf  = 0.0
+var float last_sig_tcs   = 0.0
+var float last_sig_dma   = 0.0
+var int   last_sig_bars  = 0
+if barstate.isconfirmed
+    last_sig_bars += 1
+    if signal_bull or signal_bear or signal_blocked
+        total_signals += 1
+        if signal_blocked
+            blocked_signals += 1
+        if signal_bull
+            bull_signals += 1
+            last_sig_type := "BULL"
+            last_sig_conf := signal_confidence
+            last_sig_tcs  := CAE_tcs
+            last_sig_dma  := CAE_dma
+            last_sig_bars := 0
+        if signal_bear
+            bear_signals += 1
+            last_sig_type := "BEAR"
+            last_sig_conf := signal_confidence
+            last_sig_tcs  := CAE_tcs
+            last_sig_dma  := CAE_dma
+            last_sig_bars := 0
+        if signal_confidence > 0.70
+            high_conf_signals += 1
+        else if signal_confidence < 0.50
+            low_conf_signals += 1
+// ============ DASHBOARD ============
+if show_dashboard and barstate.islast
+    var table dashboard = na
+    dc_bg     = color.new(#1a1a2e, 5)
+    dc_header = color.new(#16213e, 10)
+    dc_section= color.new(#0f3460, 85)
+    dc_text   = color.new(#e4e4e4, 0)
+    dc_gray   = color.new(#888888, 0)
+    dc_gold   = color.new(#ffd700, 0)
+    pos = dash_position == "Top Left" ? position.top_left :
+          dash_position == "Top Right" ? position.top_right :
+          dash_position == "Bottom Left" ? position.bottom_left :
+          position.bottom_right
+    cols = 4
+    rows = dash_size == "Large" ? 35 : 25 
+    txt_header = dash_size == "Large" ? size.normal : size.small
+    txt_label  = dash_size == "Large" ? size.small  : size.tiny
+    txt_value  = dash_size == "Large" ? size.normal : size.small
+    if not na(dashboard)
+        table.delete(dashboard)
+    dashboard := table.new(pos, cols, rows, border_width=2, border_color=color.new(theme_accent, 30), bgcolor=dc_bg)
+    row = 0
+    table.merge_cells(dashboard, 0, row, cols-1, row)
+    table.cell(dashboard, 0, row, "🧠 BIFURCATION ZONE - CAE", text_halign=text.align_center, text_color=dc_gold, bgcolor=dc_header, text_size=txt_header)
+    row += 1
+    table.merge_cells(dashboard, 0, row, cols-1, row)
+    table.cell(dashboard, 0, row, "═══ 📊 OSCILLATOR ═══", text_halign=text.align_center, text_color=dc_gold, bgcolor=dc_section, text_size=txt_label)
+    row += 1
+    osc_state = osc > osc_ob ? "OVERBOUGHT" : osc < osc_os ? "OVERSOLD" : "NEUTRAL"
+    osc_state_color = osc > osc_ob ? theme_bear : osc < osc_os ? theme_bull : theme_neutral
+    table.cell(dashboard, 0, row, osc_type, text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+    table.cell(dashboard, 1, row, str.tostring(osc, "#.##"), text_color=dc_text, text_size=txt_value, bgcolor=dc_bg)
+    table.cell(dashboard, 2, row, osc_state, text_color=osc_state_color, text_size=txt_label, bgcolor=dc_bg)
+    table.cell(dashboard, 3, row, "L:" + str.tostring(osc_length), text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+    row += 1
+    if CAE_enable
+        table.merge_cells(dashboard, 0, row, cols-1, row)
+        table.cell(dashboard, 0, row, "═══ 🧠 COGNITIVE ENGINE ═══", text_halign=text.align_center, text_color=dc_gold, bgcolor=dc_section, text_size=txt_label)
+        row += 1
+        tcs_emoji = CAE_tcs > 0.75 ? "🔥" : CAE_tcs > 0.5 ? "📊" : "〰️"
+        tcs_color = CAE_tcs > CAE_tcs_threshold ? theme_bear : CAE_tcs > 0.5 ? theme_neutral : theme_bull
+        table.cell(dashboard, 0, row, "TCS", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 1, row, tcs_emoji + " " + str.tostring(CAE_tcs, "#.##"), text_color=tcs_color, text_size=txt_value, bgcolor=dc_bg)
+        dma_emoji = CAE_dma > 0.5 ? "🐂" : CAE_dma < -0.5 ? "🐻" : "⚖️"
+        dma_color = CAE_dma > 0 ? theme_bull : theme_bear
+        table.cell(dashboard, 2, row, "DMA", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 3, row, dma_emoji + " " + str.tostring(CAE_dma, "#.##"), text_color=dma_color, text_size=txt_value, bgcolor=dc_bg)
+        row += 1
+        exh_emoji = CAE_exhaustion > 0.75 ? "⚠️" : CAE_exhaustion > 0.5 ? "🟡" : "✓"
+        exh_color = CAE_exhaustion > 0.75 ? theme_bear : CAE_exhaustion > 0.5 ? theme_neutral : theme_bull
+        table.cell(dashboard, 0, row, "Exhaustion", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 1, row, exh_emoji + " " + str.tostring(CAE_exhaustion, "#.##"), text_color=exh_color, text_size=txt_value, bgcolor=dc_bg)
+        pull_color = CAE_pullback > 0.6 ? theme_bull : dc_gray
+        table.cell(dashboard, 2, row, "Pullback", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 3, row, str.tostring(CAE_pullback, "#.##"), text_color=pull_color, text_size=txt_value, bgcolor=dc_bg)
+        row += 1
+        if CAE_adversarial
+            table.cell(dashboard, 0, row, "Bull Case", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+            table.cell(dashboard, 1, row, str.tostring(bull_case, "#.##"), text_color=theme_bull, text_size=txt_value, bgcolor=dc_bg)
+            table.cell(dashboard, 2, row, "Bear Case", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+            table.cell(dashboard, 3, row, str.tostring(bear_case, "#.##"), text_color=theme_bear, text_size=txt_value, bgcolor=dc_bg)
+            row += 1
+            diff_emoji = adv_diff > 0.2 ? "📈" : adv_diff < -0.2 ? "📉" : "➡️"
+            diff_color = adv_diff > 0.2 ? theme_bull : adv_diff < -0.2 ? theme_bear : theme_neutral
+            table.cell(dashboard, 0, row, "Differential", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+            table.merge_cells(dashboard, 1, row, 3, row)
+            table.cell(dashboard, 1, row, diff_emoji + " " + str.tostring(adv_diff, "#.##"),
+                       text_halign=text.align_center, text_color=diff_color, text_size=txt_value, bgcolor=dc_bg)
+            row += 1
+        if last_sig_type != "None"
+            table.merge_cells(dashboard, 0, row, cols-1, row)
+            table.cell(dashboard, 0, row, "═══ 🕒 LAST SIGNAL METRICS ═══", text_halign=text.align_center, text_color=dc_gold, bgcolor=dc_section, text_size=txt_label)
+            row += 1
+            l_color = last_sig_type == "BULL" ? theme_bull : theme_bear
+            table.cell(dashboard, 0, row, last_sig_type + " (" + str.tostring(last_sig_bars) + " bars ago)", text_color=l_color, text_size=txt_label, bgcolor=dc_bg)
+            table.cell(dashboard, 1, row, "Conf: " + str.tostring(last_sig_conf*100, "#") + "%", text_color=dc_text, text_size=txt_value, bgcolor=dc_bg)
+            table.cell(dashboard, 2, row, "TCS: " + str.tostring(last_sig_tcs, "#.##"), text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+            table.cell(dashboard, 3, row, "DMA: " + str.tostring(last_sig_dma, "#.##"), text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+            row += 1
+        if CAE_mode == "Advisory" and advisory_reason != ""
+            table.merge_cells(dashboard, 0, row, cols-1, row)
+            table.cell(dashboard, 0, row, "Advisory: " + advisory_reason,
+                       text_halign=text.align_center, text_color=theme_neutral, bgcolor=color.new(theme_neutral, 92), text_size=txt_label)
+            row += 1
+    if total_signals > 0
+        table.merge_cells(dashboard, 0, row, cols-1, row)
+        table.cell(dashboard, 0, row, "═══ 📊 STATISTICS ═══", text_halign=text.align_center, text_color=dc_gold, bgcolor=dc_section, text_size=txt_label)
+        row += 1
+        table.cell(dashboard, 0, row, "Total", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 1, row, str.tostring(total_signals), text_color=dc_text, text_size=txt_value, bgcolor=dc_bg)
+        block_pct = (blocked_signals / math.max(total_signals, 1)) * 100
+        block_color = block_pct > 50 ? theme_bear : block_pct > 30 ? theme_neutral : theme_bull
+        table.cell(dashboard, 2, row, "Blocked", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 3, row, str.tostring(blocked_signals) + " (" + str.tostring(block_pct, "#") + "%)", text_color=block_color, text_size=txt_value, bgcolor=dc_bg)
+        row += 1
+        table.cell(dashboard, 0, row, "Bull", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 1, row, str.tostring(bull_signals), text_color=theme_bull, text_size=txt_value, bgcolor=dc_bg)
+        table.cell(dashboard, 2, row, "Bear", text_color=dc_gray, text_size=txt_label, bgcolor=dc_bg)
+        table.cell(dashboard, 3, row, str.tostring(bear_signals), text_color=theme_bear, text_size=txt_value, bgcolor=dc_bg)
+        row += 1
+    table.merge_cells(dashboard, 0, row, cols-1, row)
+    status_text = CAE_enable ? "🧠 CAE " + CAE_mode + " | " + str.tostring(total_signals) + " signals" : "📊 STANDARD MODE"
+    table.cell(dashboard, 0, row, status_text, text_halign=text.align_center, text_color=CAE_enable ? theme_accent : dc_gray, bgcolor=color.new(#0a0a0a, 10), text_size=txt_label)
+// ============ ALERTS ============
+alertcondition(signal_bull, "Bullish Divergence",  "🟢 BZ-CAE: Bullish divergence detected")
+alertcondition(signal_bear, "Bearish Divergence",  "🔴 BZ-CAE: Bearish divergence detected")
+alertcondition(signal_bull and signal_confidence > 0.70, "⭐ High Confidence Bullish", "⭐ BZ-CAE: HIGH CONFIDENCE Bullish signal")
+alertcondition(signal_bear and signal_confidence > 0.70, "⭐ High Confidence Bearish", "⭐ BZ-CAE: HIGH CONFIDENCE Bearish signal")
+alertcondition(signal_blocked, "⛔ Signal Blocked by CAE", "⛔ BZ-CAE: Signal blocked by CAE filters")
+alertcondition(CAE_exhaustion > 0.75, "⚠️ Market Exhaustion", "⚠️ BZ-CAE: Market exhaustion detected")
+alertcondition(CAE_tcs > CAE_tcs_threshold and CAE_tcs[1] <= CAE_tcs_threshold, "🔥 High Conviction Trend", "🔥 BZ-CAE: High conviction trend entered")
+//==============================================================================
+// 🧬 BIFURCATION ZONE — CAE (BZ-CAE) — COMPLETE THEORY & USER GUIDE
+//==============================================================================
+//
+// 📌 WHAT BZ-CAE IS
+// BZ-CAE is a divergence-based reversal/continuation detector enhanced by a
+// Cognitive Adversarial Engine. It identifies structural bifurcation points where
+// price and momentum disagree, then applies market-state intelligence to filter
+// noise and highlight high-probability setups. The system doesn't just find
+// divergences—it understands context: trend strength, exhaustion, adversarial
+// conditions, and overall signal quality.
+//
+// =============================================================================
+// 🧠 CORE COMPONENTS
+// =============================================================================
+//
+// 1) DIVERGENCE ENGINE
+// • Regular divergence (reversal): Price makes HH/LL while oscillator disagrees
+// • Hidden divergence (continuation): Price makes LH/HL while oscillator disagrees
+// • Symmetric pivot detection (lookback/lookforward) ensures structural validity
+// • Strength scoring via slope separation normalized by ATR
+// • Max lookback range prevents ancient divergences
+// • Supports: RSI, Stochastic, CCI, MFI, Williams %R
+//
+// 2) COGNITIVE ADVERSARIAL ENGINE (CAE)
+// The brain of the system—five interconnected intelligence layers:
+//
+// A) TCS (Trend Conviction Score) — 0 to 1 scale
+// • Formula: 0.35×normalize(ADX,10,35) + 0.35×structural_strength + 0.30×htf_alignment
+// • Structural strength = 10-bar SMA of consecutive directional bars
+// • HTF alignment = EMA stacking (20/50/100/200)
+// • Purpose: Measures how "locked in" the trend is
+// • >0.80 = Very strong trend (be cautious counter-trading)
+// • 0.50-0.80 = Moderate trend (context matters)
+// • <0.50 = Weak trend (reversals more viable)
+//
+// B) DMA (Directional Momentum Alignment) — ATR-normalized
+// • Formula: (EMA21 - EMA55) / ATR14
+// • Positive = bullish momentum; Negative = bearish momentum
+// • Magnitude = strength of directional push
+// • Purpose: Quantifies the "force" behind current price action
+// • >0.7 = Strong bull momentum
+// • <-0.7 = Strong bear momentum
+//
+// C) EXHAUSTION MODEL — 0 to 1 scale, multi-factor
+// Components (weighted):
+// • Volume spikes: >1.5x (0.10), >2.0x (0.15), >2.5x (0.25)
+// • Divergence present: 0.30
+// • RSI extremes: >80 or <20 (0.25), >75 or <25 (0.15)
+// • Pin bars: 2:1 wick-to-body ratio (0.15)
+// • Extended runs: >30 bars above/below EMA20 (0.15)
+// • Purpose: Detects when strong trends are vulnerable to reversal
+// • >0.75 = High exhaustion (yellow shading, reversal risk elevated)
+// • 0.50-0.75 = Moderate exhaustion
+// • <0.50 = Low exhaustion (trend can continue)
+//
+// D) ADVERSARIAL VALIDATION — Bull Case vs Bear Case
+// For each potential signal, CAE calculates BOTH sides simultaneously:
+//
+// Bull Case Scoring (for bullish divergences):
+// • Distance below EMA20 (up to 0.25)
+// • Bullish EMA alignment: close > EMA20 > EMA50 (0.25)
+// • Oversold RSI: <40 (0.25)
+// • Volume confirmation: >1.2x average (0.25)
+//
+// Bear Case Scoring (checks if opposing side dominates):
+// • Price below EMA50 (0.30)
+// • Very oversold RSI: <30 (0.20)
+//
+// Differential = Bull Case - Bear Case
+// • If differential < -adv_threshold: Signal BLOCKED (bear side dominates)
+// • Default threshold: 0.10 (adjustable 0.05-0.60)
+// • Purpose: Prevents trades into obvious opposing strength
+//
+// Bear signals use inverse logic (Bear Case vs Bull Case)
+//
+// E) CONFIDENCE ENGINE — 0 to 1 composite score
+// Formula:
+// • 30% TCS normalization (trend context)
+// • 25% |DMA| strength (momentum magnitude)
+// • 20% Pullback quality (distance from EMA20, sweet spot ~0.6 ATR)
+// • 15% State quality (ADX + alignment + structure)
+// • 10% Divergence strength (slope separation)
+// • Adversarial advantage bonus (up to 30%)
+// Purpose: Ranks setup quality for filtering/sizing decisions
+// • >0.70 = Premium setup (consider increased size)
+// • 0.50-0.70 = Good setup
+// • 0.35-0.50 = Acceptable setup
+// • <0.35 = Marginal setup (risky)
+//
+// CAE OPERATING MODES:
+// • Off: Raw divergence pipeline, no CAE intervention
+// • Advisory: Shows ALL signals; annotates what WOULD be blocked (learning mode)
+// • Filtering: Actively vetoes low-quality signals (live trading mode)
+//
+// CAE FILTER GATES (when enabled):
+// 1) Strong Trend Filter
+// - If TCS ≥ tcs_threshold (default 0.80):
+//   - Block counter-trend signals UNLESS
+//   - Exhaustion ≥ exhaustion_required (default 0.50)
+// - Logic: Don't fade strong trends unless overextended
+//
+// 2) Adversarial Validation
+// - Bull signal: Block if adv_diff_bull < -adv_threshold
+// - Bear signal: Block if adv_diff_bear > adv_threshold
+// - Logic: Avoid fighting obvious opposing pressure
+//
+// 3) Confidence Gating
+// - If confidence < min_confidence (default 0.35):
+//   - Filtering mode: BLOCK signal
+//   - Advisory mode: ANNOTATE with warning
+// - Logic: Only take setups with minimum quality threshold
+//
+// 3) BIFURCATION ZONES (Supply/Demand Blocks)
+// • Semi-transparent boxes extending 15 bars from signal pivot
+// • Demand zones (bullish): Theme bull color, "Demand" label
+// • Supply zones (bearish): Theme bear color, "Supply" label
+// • Auto-cleanup: Keeps last 20 zones
+// • Theory: Divergence = smart money disagreeing with crowd
+// • Zones mark institutional order placement areas
+// • Future support/resistance for exits and re-entries
+//
+// 4) ADVERSARIAL BAR COLORING
+// • Real-time heatmap of Bull Case - Bear Case differential
+// • Strong bull (>0.3): Full theme bull color
+// • Moderate bull (>0.1): 50% transparency bull
+// • Neutral (-0.1 to 0.1): Gray/neutral theme
+// • Moderate bear (<-0.1): 50% transparency bear
+// • Strong bear (<-0.3): Full theme bear color
+// • Purpose: Instant visual feedback on market "debate" state
+//
+// 5) VISUAL THEMES
+// • Cyberpunk: Cyan/Magenta/Yellow (high contrast, electric)
+// • Professional: Blue/Orange/Green (corporate, clean)
+// • Ocean: Teal/Red/Cyan (aquatic, calming)
+// • Fire: Orange/Red/Coral (warm, aggressive)
+// • Matrix: Green/Red/Lime (code aesthetic)
+// • Monochrome: White/Gray (minimal, focused)
+//
+// =============================================================================
+// 🎯 SIGNAL PIPELINE
+// =============================================================================
+//
+// STEP 1: OSCILLATOR CALCULATION
+// • Selected oscillator type with length and smoothing applied
+// • Normalized to 0-100 range for consistent OB/OS handling
+//
+// STEP 2: PIVOT DETECTION (Timing-dependent)
+// A) Realtime Mode (1-bar, peak-anchored):
+// - Detects peaks 1 bar ago: high[1] > high AND high[1] > high[2]
+// - Prints signal on NEXT bar (bar_index)
+// - Marker anchored to PEAK bar (bar_index - 1)
+// - Offset: -1
+// - Pros: Immediate alerts, responsive
+// - Cons: May repaint on forming bar (pre-confirmation)
+// - Best for: Active monitoring, real-time alerts
+//
+// B) Confirmed Mode (Lookforward):
+// - Uses pivothigh/pivotlow with symmetric lookback/lookforward
+// - Pivot fully validated before signal fires
+// - Offset: -pivot_lookforward (typically -5)
+// - Delay: pivot_lookforward bars (typically 5 bars)
+// - Pros: No repainting, historical accuracy
+// - Cons: Delayed entry compared to realtime
+// - Best for: Backtesting, conservative entries, pivot purity
+//
+// STEP 3: DIVERGENCE SCAN
+// • Compare last two pivots (price vs oscillator)
+// • Calculate slopes: (current - previous) / bars_ago
+// • Check alignment:
+//   - Regular bearish: price_slope > 0, osc_slope < 0
+//   - Regular bullish: price_slope < 0, osc_slope > 0
+//   - Hidden bearish: price_slope < 0, osc_slope > 0
+//   - Hidden bullish: price_slope > 0, osc_slope < 0
+// • Require: |osc_slope| > min_slope_change/100 (default 1.0)
+// • Must occur within max_lookback bars (default 60)
+// • Strength = min(|price_slope| × |osc_slope| × 10, 1.0)
+// • Regular divs weighted 1.0, hidden divs weighted 0.8
+//
+// STEP 4: SPACING FILTERS
+// Three independent gates (all must pass):
+// • Min bars between ANY signals (default 12)
+//   - Prevents rapid-fire clustering across both directions
+// • Min bars between SAME-SIDE signals (default 24, optional enforcement)
+//   - Prevents bull-bull or bear-bear spam
+// • Min ATR distance from last signal (default 0, optional)
+//   - Requires price to move N×ATR from last signal location
+// Purpose: Ensures breathing room, reduces noise
+//
+// STEP 5: CAE DECISION LAYER (if enabled)
+// If CAE Mode = "Filtering":
+// • Apply all three filter gates (Trend, Adversarial, Confidence)
+// • Block signal if ANY gate fails
+// • Record block reason for debugging
+// • Update spacing trackers ONLY if signal passes
+// • If blocked: Show X-cross marker (optional)
+//
+// If CAE Mode = "Advisory":
+// • Apply all three filter gates for evaluation
+// • Show signal REGARDLESS of gate results
+// • Annotate with warning if ANY gate would block
+// • Update spacing trackers (signals always fire)
+// • Purpose: Learn CAE logic before enforcing
+//
+// If CAE Mode = "Off":
+// • Show all divergence signals
+// • No CAE filtering or annotation
+// • Pure divergence system
+//
+// STEP 6: VISUAL OUTPUT
+// • Triangle markers (up/down, size: tiny/small/normal)
+// • Optional thin vertical lines (dotted, kept for last N signals)
+// • Bifurcation zone boxes (supply/demand blocks)
+// • Adversarial bar coloring (bull/bear heatmap)
+// • Exhaustion shading (yellow background when >0.75)
+// • Blocked signal X-crosses (when Advisory shows blocks)
+// • Dashboard with live metrics
+//
+// =============================================================================
+// ⚙️ PRACTICAL SETTINGS BY TIMEFRAME
+// =============================================================================
+//
+// ━━━ SCALPING (1m-5m) ━━━
+// Goal: High frequency, tight stops, quick reversals
+//
+// Oscillator:
+// • Type: RSI or Stochastic (fast response)
+// • Length: 9-11 (responsive to quick moves)
+// • Smoothing: 1 (no lag)
+// • OB/OS: 65/35 (looser to ensure frequent crossings)
+//
+// Divergence:
+// • Pivot Lookback/Lookforward: 3/3 (tight structure)
+// • Max Lookback: 40-50 bars (recent only)
+// • Min Slope Change: 0.8-1.0 (don't be too strict)
+//
+// CAE:
+// • Mode: Advisory first (learn), then Filtering
+// • Min Confidence: 0.30-0.35 (lower bar for speed)
+// • TCS Threshold: 0.70-0.75 (allow more counter-trend)
+// • Exhaustion Required: 0.45-0.50 (moderate override)
+// • Strong Trend Filter: ON (still respect major trends)
+// • Adversarial: ON (critical for scalping protection)
+//
+// Spacing:
+// • Min bars ANY: 6-10 (fast pace)
+// • Min bars SAME-SIDE: 12-20 (prevent clustering)
+// • Min ATR Distance: 0 or 0.5 (optional, loose)
+//
+// Timing: Realtime (speed over precision)
+//
+// Visuals:
+// • Signal Size: Tiny (chart clarity)
+// • Show Zones: Optional (can clutter)
+// • Bar Coloring: ON (helps read momentum)
+// • Dashboard: Small (corner reference)
+//
+// ━━━ DAY TRADING (15m-1H) ━━━
+// Goal: Balance quality and frequency, standard approach
+//
+// Oscillator:
+// • Type: RSI or MFI (proven reliability)
+// • Length: 14 (industry standard)
+// • Smoothing: 1-2
+// • OB/OS: 70/30 (classic levels)
+//
+// Divergence:
+// • Pivot Lookback/Lookforward: 5/5 (balanced structure)
+// • Max Lookback: 60 bars
+// • Min Slope Change: 1.0 (standard strictness)
+//
+// CAE:
+// • Mode: Filtering (enforce discipline)
+// • Min Confidence: 0.35-0.45 (quality filter)
+// • TCS Threshold: 0.80-0.85 (respect strong trends)
+// • Exhaustion Required: 0.50 (balanced override)
+// • Strong Trend Filter: ON
+// • Adversarial: ON
+// • Confidence Gating: ON
+//
+// Spacing:
+// • Min bars ANY: 12 (breathing room)
+// • Min bars SAME-SIDE: 24 (prevent clusters)
+// • Min ATR Distance: 0-1.0 (optional refinement)
+//
+// Timing: Confirmed (1-bar delay for reliability)
+//
+// Visuals:
+// • Signal Size: Tiny or Small
+// • Show Zones: ON (useful reference)
+// • Bar Coloring: ON (context awareness)
+// • Dashboard: Normal (full visibility)
+//
+// ━━━ SWING TRADING (4H-Daily) ━━━
+// Goal: Quality over quantity, high conviction only
+//
+// Oscillator:
+// • Type: RSI or CCI (robust on HTF)
+// • Length: 14-21 (smooth longer waves)
+// • Smoothing: 1-3
+// • OB/OS: 70/30 or 75/25 (strict extremes)
+//
+// Divergence:
+// • Pivot Lookback/Lookforward: 5/5 or 7/7 (structural purity)
+// • Max Lookback: 80-100 bars (broader context)
+// • Min Slope Change: 1.2-1.5 (require strong divergence)
+//
+// CAE:
+// • Mode: Filtering (strict enforcement)
+// • Min Confidence: 0.40-0.55 (premium setups only)
+// • TCS Threshold: 0.85-0.95 (very strong trend protection)
+// • Exhaustion Required: 0.50-0.60 (higher bar for override)
+// • Strong Trend Filter: ON (critical on HTF)
+// • Adversarial: ON (avoid obvious bad trades)
+// • Confidence Gating: ON (quality gate)
+//
+// Spacing:
+// • Min bars ANY: 20-30 (substantial separation)
+// • Min bars SAME-SIDE: 40-60 (prevent clustering)
+// • Min ATR Distance: 1.0-2.0 (require meaningful move)
+//
+// Timing: Confirmed (purity over speed)
+//
+// Visuals:
+// • Signal Size: Small or Normal (clear markers)
+// • Show Zones: ON (important levels)
+// • Bar Coloring: ON (trend awareness)
+// • Dashboard: Normal or Large (full analysis)
+//
+// =============================================================================
+// 📊 DASHBOARD INTERPRETATION GUIDE
+// =============================================================================
+//
+// ━━━ OSCILLATOR SECTION ━━━
+// • Current value + state (Overbought/Oversold/Neutral)
+// • Length parameter
+// • Quick reference for extreme conditions
+//
+// ━━━ COGNITIVE ENGINE SECTION ━━━
+//
+// TCS (Trend Conviction Score):
+// 🔥 >0.75: Very strong trend
+//    - Be VERY cautious counter-trading
+//    - Require exhaustion >0.75 to justify reversals
+//    - Focus on continuation (hidden divs) instead
+// 📊 0.50-0.75: Moderate trend
+//    - Context matters (check DMA and exhaustion)
+//    - Reversals viable if confidence is high
+// 〰️ <0.50: Weak/choppy trend
+//    - Reversals more viable
+//    - Range-bound conditions likely
+//
+// DMA (Directional Momentum Alignment):
+// 🐂 >0.5: Strong bullish momentum
+//    - Bearish divergences risky (check adversarial)
+//    - Bullish divergences favored
+// ⚖️ -0.5 to 0.5: Balanced/choppy
+//    - No strong directional bias
+//    - Both directions viable
+// 🐻 <-0.5: Strong bearish momentum
+//    - Bullish divergences risky (check adversarial)
+//    - Bearish divergences favored
+//
+// Exhaustion:
+// ⚠️ >0.75: High exhaustion (yellow shading)
+//    - Reversal risk elevated significantly
+//    - Strong trends vulnerable
+//    - Reversal divergences higher quality
+//    - Consider counter-trend even in high TCS
+// 🟡 0.50-0.75: Moderate exhaustion
+//    - Watch for confirmation
+//    - Not extreme enough to override strong trends alone
+// ✓ <0.50: Low exhaustion
+//    - Trend can continue
+//    - Counter-trend trades higher risk
+//
+// Pullback:
+// • >0.6: Good pullback quality
+//   - Ideal entry distance from EMA20
+//   - Not too close (whipsaw risk)
+//   - Not too far (chasing risk)
+// • 0.4-0.6: Acceptable
+// • <0.4: Poor pullback quality
+//   - Either hugging EMA20 or too extended
+//
+// ━━━ ADVERSARIAL SECTION (if enabled) ━━━
+//
+// Bull Case: Score 0-1+ (for bullish argument)
+// Bear Case: Score 0-1+ (for bearish argument)
+//
+// Differential (Bull Case - Bear Case):
+// 📈 >0.2: Bull advantage
+//    - Bullish divergences favored
+//    - Bearish divergences face headwind
+//    - Green/cyan bias on chart
+// ➡️ -0.2 to 0.2: Balanced
+//    - No strong advantage either way
+//    - Both directions viable
+//    - Gray/neutral on chart
+// 📉 <-0.2: Bear advantage
+//    - Bearish divergences favored
+//    - Bullish divergences face headwind
+//    - Red/magenta bias on chart
+//
+// Gate Logic:
+// • Bullish signal blocked if Differential < -0.10 (bear side dominates)
+// • Bearish signal blocked if Differential > 0.10 (bull side dominates)
+// • Threshold adjustable (0.05-0.60)
+//
+// ━━━ LAST SIGNAL METRICS (new feature) ━━━
+// • Type: BULL or BEAR
+// • Bars since signal fired
+// • Confidence % at time of signal
+// • TCS value at signal time
+// • DMA value at signal time
+// Purpose: Track signal quality and timing for learning/journaling
+//
+// ━━━ STATISTICS SECTION ━━━
+// • Total signals: Lifetime count
+// • Blocked signals: Count + percentage (filter effectiveness)
+// • Bull/Bear split: Distribution of signal types
+// Purpose: Performance overview and system health check
+//
+// =============================================================================
+// 🧩 INTERPRETATION CHEATSHEET
+// =============================================================================
+//
+// ━━━ HIGH-PROBABILITY SCENARIOS ━━━
+//
+// 🎯 PREMIUM REVERSAL SETUP:
+// • Confidence >0.70
+// • TCS <0.60 (weak trend)
+// • Exhaustion >0.75 (overextended)
+// • Pullback >0.6 (good distance)
+// • Regular divergence detected
+// → Action: High conviction entry, consider larger size
+//
+// 🎯 TREND EXHAUSTION REVERSAL:
+// • TCS >0.85 (very strong trend)
+// • DMA >0.7 or <-0.7 (strong momentum)
+// • Exhaustion >0.75 (overextended)
+// • Regular divergence counter-trend
+// • Adversarial differential supports reversal
+// → Action: Rare setup, respect it when CAE allows
+//
+// 🎯 CONTINUATION IN TREND:
+// • TCS >0.75 (strong trend)
+// • DMA aligned with trend direction
+// • Hidden divergence detected
+// • Confidence >0.50
+// → Action: Add to position or re-enter trend
+//
+// ━━━ CAUTION SCENARIOS ━━━
+//
+// ⚠️ COUNTER-TREND IN STRONG MOMENTUM:
+// • TCS >0.85, DMA >0.7 (strong uptrend)
+// • Bullish divergence (counter-trend)
+// • Exhaustion <0.50 (not overextended)
+// → CAE blocks (Advisory warns)
+// → Respect the block—trend is too strong
+//
+// ⚠️ ADVERSARIAL CONFLICT:
+// • Bullish divergence fires
+// • Adversarial Differential <-0.2 (bear advantage)
+// → CAE blocks (Advisory warns)
+// → Bear case is dominating—avoid fighting it
+//
+// ⚠️ LOW CONFIDENCE:
+// • Confidence <0.35
+// • TCS moderate, DMA unclear
+// • Poor pullback quality
+// → CAE blocks (Advisory warns)
+// → Marginal setup—skip or size down
+//
+// ━━━ CONTEXT COMBINATIONS ━━━
+//
+// TCS >0.85 + DMA >0.7 + Exhaustion <0.5:
+// → Very strong uptrend, not overextended
+// → Avoid shorts; wait for exhaustion or continuation longs
+//
+// TCS >0.85 + DMA <-0.7 + Exhaustion <0.5:
+// → Very strong downtrend, not overextended
+// → Avoid longs; wait for exhaustion or continuation shorts
+//
+// TCS <0.50 + Exhaustion >0.75 + Confidence >0.60:
+// → Choppy/weak trend, overextended, quality divergence
+// → Ideal mean reversion scenario
+//
+// Adv Diff >0.3 + Bullish divergence + Confidence >0.50:
+// → Strong bull advantage, structure supports
+// → High-probability long
+//
+// Adv Diff <-0.3 + Bearish divergence + Confidence >0.50:
+// → Strong bear advantage, structure supports
+// → High-probability short
+//
+// =============================================================================
+// 🧬 TROUBLESHOOTING & OPTIMIZATION
+// =============================================================================
+//
+// ━━━ PROBLEM: No signals appearing ━━━
+//
+// Diagnosis:
+// 1. Check dashboard oscillator value—does it cross OB/OS?
+// 2. Are pivots forming? (Look for local highs/lows)
+// 3. Is spacing too tight? (Check last signal bars ago)
+// 4. Is CAE blocking everything? (Check blocked count in stats)
+//
+// Solutions:
+// • Loosen OB/OS: Try 65/35 temporarily to verify divergence detection works
+// • Lower min_confidence: Try 0.25-0.30 (diagnostic level)
+// • Disable Strong Trend Filter temporarily
+// • Reduce min_slope_change: Try 0.7-0.8
+// • Widen spacing: Set Any to 6-8, Side to 12-16
+// • Check timing: Confirmed mode has pivot_lookforward delay (5+ bars)
+// • Switch to Realtime timing temporarily for faster signals
+//
+// ━━━ PROBLEM: Too many signals (spam) ━━━
+//
+// Diagnosis:
+// • High signal count in dashboard stats
+// • Confidence scores mostly <0.40
+// • Signals clustering together
+//
+// Solutions:
+// • Raise min_confidence: Try 0.40-0.50 (quality filter)
+// • Tighten OB/OS: Use 70/30 or 75/25
+// • Increase min_slope_change: Try 1.2-1.5 (require stronger divs)
+// • Raise TCS_threshold: Try 0.85-0.90 (stricter trend filter)
+// • Enable ALL CAE gates: Trend Filter + Adversarial + Confidence
+// • Widen spacing: Any 15-20, Side 30-40
+// • Switch to Confirmed timing (removes realtime noise)
+//
+// ━━━ PROBLEM: Signals in strong trends getting stopped out ━━━
+//
+// Analysis: This is INTENDED behavior—CAE is protecting you!
+//
+// Understanding:
+// • Check dashboard TCS when signal fired (use Last Signal Metrics)
+// • If TCS >0.85 and counter-trend: CAE correctly identified low probability
+// • Strong trends rarely reverse cleanly without major exhaustion
+//
+// If you want to override (not recommended):
+// • Lower TCS_threshold to 0.70-0.75 (allows more counter-trend)
+// • Lower exhaustion_required to 0.40 (easier override)
+// • Disable Strong Trend Filter entirely (risky)
+//
+// Better approach:
+// • TRUST THE FILTER—it's preventing costly mistakes
+// • Wait for exhaustion >0.75 before counter-trending
+// • Focus on continuation signals (hidden divs) in strong trends
+// • Use Advisory mode to see what CAE is blocking and learn
+//
+// ━━━ PROBLEM: Adversarial blocking seems wrong ━━━
+//
+// Diagnosis:
+// • Check dashboard Bull Case and Bear Case scores
+// • Look at Differential value when signal blocked
+// • Check adversarial bar colors at signal time
+//
+// Understanding:
+// • Adversarial catches "obvious" opposing momentum
+// • If Bull Case = 0.2 and Bear Case = 0.6: Bear side is clearly dominating
+// • Differential = -0.4, which is well beyond threshold
+// • Block is CORRECT—you'd be fighting strong opposing flow
+//
+// If you disagree consistently:
+// • Review blocked signals on chart—did they work or fail?
+// • Raise adv_threshold to 0.15-0.20 (more permissive)
+// • Disable Adversarial Validation temporarily (diagnostic)
+// • Use Advisory mode to learn adversarial patterns
+//
+// Remember: Adversarial is conservative BY DESIGN. It prevents "obvious" bad trades.
+//
+// ━━━ PROBLEM: Dashboard not showing or incomplete ━━━
+//
+// Solutions:
+// • Toggle "Show Dashboard" to ON
+// • Try different dashboard sizes (Small/Normal/Large)
+// • Some sections require CAE Enable = ON
+// • Statistics section requires at least 1 lifetime signal
+// • Check dashboard position (may be off-screen)
+//
+// ━━━ PROBLEM: Performance lag, chart freezing ━━━
+//
+// Diagnosis: Visual features are computationally expensive
+//
+// Solutions (in order of impact):
+// 1. Disable "Adversarial Bar Coloring" (most expensive)
+// 2. Reduce "Keep last N vertical lines" to 20-30 or set to 0
+// 3. Disable "Draw Bifurcation Zones"
+// 4. Set Dashboard Size to "Small"
+// 5. Reduce max_lines_count in indicator() if editing code
+// 6. Use shorter max_lookback (40-50 instead of 60+)
+//
+// ━━━ PROBLEM: Realtime signals repainting ━━━
+//
+// Explanation:
+// • Realtime mode detects peaks 1 bar ago (high[1] > high AND high[1] > high[2])
+// • On the FORMING bar (bar_index), the peak condition may change
+// • Once bar CONFIRMS (closes), signal is locked in
+// • This is expected behavior for realtime responsiveness
+//
+// Solutions:
+// • Use Confirmed timing for no-repaint, historical accuracy
+// • Accept realtime repaint as tradeoff for speed
+// • Only use Realtime for alerts, use Confirmed for backtesting
+//
+// =============================================================================
+// 🧭 RECOMMENDED WORKFLOW (4-PHASE APPROACH)
+// =============================================================================
+//
+// ━━━ PHASE 1: LEARNING (Week 1-2) ━━━
+//
+// Goal: Understand CAE logic and your instrument's behavior
+//
+// Settings:
+// • CAE Mode: Advisory (see everything, no blocking)
+// • Timing: Confirmed (clean backtesting)
+// • Enable ALL visual features: zones, bar colors, dashboard (Large size)
+// • Min Confidence: 0.30 (permissive, see full spectrum)
+//
+// Activity:
+// 1. Watch dashboard closely during signals:
+//    - Note TCS values when counter-trend signals fail
+//    - Observe exhaustion patterns at turning points
+//    - Study adversarial differential at signal times
+// 2. Review blocked signals (X-crosses in Advisory):
+//    - Were they right to block? Check outcome.
+//    - Did exhaustion override correctly?
+// 3. Use "Last Signal Metrics" to journal:
+//    - Record confidence, TCS, DMA at each signal
+//    - Track which scenarios work best
+// 4. Note your instrument's "personality":
+//    - What TCS level marks "too strong to fade"?
+//    - What exhaustion level reliably reverses?
+//    - Does adversarial catch the right moments?
+//
+// ━━━ PHASE 2: CALIBRATION (Week 3-4) ━━━
+//
+// Goal: Optimize settings for your style and instrument
+//
+// Settings:
+// • CAE Mode: Still Advisory (refining without enforcement)
+// • Start adjusting based on Phase 1 observations
+//
+// Calibration checklist:
+// 1. Min Confidence:
+//    - Review confidence distribution in signals
+//    - Set threshold to filter bottom 30-40% of setups
+//    - Day trading: 0.35-0.45
+//    - Swing trading: 0.40-0.55
+//
+// 2. TCS Threshold:
+//    - Note TCS when counter-trend fails consistently
+//    - Set slightly below that level
+//    - Trending instruments: 0.85-0.90
+//    - Choppy instruments: 0.75-0.80
+//
+// 3. Spacing:
+//    - Count bars between quality signals
+//    - Set to ~50-70% of that average
+//    - Too tight = spam; too wide = missed opportunities
+//
+// 4. Oscillator:
+//    - Try different types (RSI, Stochastic, MFI)
+//    - Adjust length based on timeframe
+//    - Verify OB/OS levels produce crossings
+//
+// 5. Exhaustion Override:
+//    - Find exhaustion levels that mark reliable reversals
+//    - Set exhaustion_required just below that threshold
+//    - Typical: 0.45-0.55
+//
+// ━━━ PHASE 3: PAPER TRADING (Week 5-6) ━━━
+//
+// Goal: Test settings with simulated execution
+//
+// Settings:
+// • CAE Mode: FILTERING (enforce discipline)
+// • Timing: Confirmed (conservative) or Realtime (if actively monitoring)
+// • Use calibrated settings from Phase 2
+//
+// Activity:
+// 1. Take every signal that passes CAE filters
+// 2. Journal each trade:
+//    - Entry confidence, TCS, DMA, exhaustion
+//    - Adversarial differential
+//    - Exit reason (target, stop, reversal signal)
+// 3. Track metrics:
+//    - Win rate by confidence tier (>0.70, 0.50-0.70, 0.35-0.50)
+//    - Win rate by TCS regime (weak, moderate, strong)
+//    - Adversarial accuracy (did differential predict outcome?)
+// 4. Refine:
+//    - If win rate <50%: Raise min_confidence by 0.05
+//    - If too few signals: Lower min_confidence, widen spacing
+//    - If blocked signals would've worked: Adjust TCS or adv thresholds
+//
+// ━━━ PHASE 4: LIVE DEPLOYMENT ━━━
+//
+// Goal: Disciplined live trading with proven system
+//
+// Settings:
+// • CAE Mode: FILTERING (strict enforcement)
+// • Timing: Confirmed (recommended) or Realtime (if experienced)
+// • Proven settings from Phase 3
+// • Enable high-confidence alerts (>0.70)
+//
+// Discipline rules:
+// 1. RESPECT BLOCKED SIGNALS:
+//    - If CAE blocks, trust it—don't manually override
+//    - If you disagree consistently, return to Phase 2 calibration
+// 2. CONFIDENCE-BASED SIZING:
+//    - >0.70: Standard or increased size
+//    - 0.50-0.70: Standard size
+//    - 0.35-0.50: Reduced size (or skip if conservative)
+// 3. TCS-BASED MANAGEMENT:
+//    - High TCS + counter-trend: Tight stops, quick exits
+//    - Low TCS + reversal: Wider stops, trend potential
+// 4. EXHAUSTION AWARENESS:
+//    - >0.75: Reversal risk elevated, consider early exit
+//    - <0.30: Continuation bias, hold for bigger move
+// 5. ADVERSARIAL CONTEXT:
+//    - Strong differential against you: Tight stops
+//    - Strong differential with you: Trail aggressively
+//
+// Ongoing:
+// • Review Last Signal Metrics weekly
+// • Check Statistics (blocked %, distribution)
+// • Adjust min_confidence quarterly based on results
+// • Trust the system—CAE learned from your Phase 1-3 work
+//
+// =============================================================================
+// 🎓 ADVANCED CONCEPTS & THEORY
+// =============================================================================
+//
+// ━━━ WHY "BIFURCATION"? ━━━
+//
+// In dynamical systems theory, a bifurcation point is where a system's behavior
+// fundamentally changes—a critical juncture where small perturbations can lead to
+// drastically different outcomes. In markets, this occurs when price and momentum
+// diverge: the system is at a structural inflection point where trend continuation
+// or reversal will be decided.
+//
+// The indicator identifies these critical nodes—bifurcation points where the market
+// "debate" between bulls and bears is most intense and resolution is imminent.
+//
+// ━━━ ADVERSARIAL INTELLIGENCE PHILOSOPHY ━━━
+//
+// Traditional indicators evaluate trades unilaterally: "Is this a good long?"
+// CAE uses adversarial evaluation: "Is this a good long AND is the short case weak?"
+//
+// This dual-perspective approach mirrors institutional risk management:
+// • Portfolio managers simultaneously evaluate alpha AND drawdown risk
+// • Market makers quote both bid and ask with edge protection
+// • Systematic funds run opposing-case simulations before entry
+//
+// By quantifying BOTH sides simultaneously, CAE catches scenarios where your intended
+// direction shows promise but the opposing case is overwhelmingly stronger—the most
+// dangerous trades to take.
+//
+// ━━━ EXHAUSTION AS INTELLIGENT OVERRIDE ━━━
+//
+// The exhaustion model allows counter-trend trades in high-TCS environments IF
+// overextension is extreme. This prevents the trend filter from being too rigid
+// while maintaining discipline.
+//
+// Think of it as a "circuit breaker":
+// • Normal operation: Respect strong trends, block counter-trades
+// • Extreme condition: Trend is exhausted, overrule trend filter
+// • Reset: After exhaustion resolves, return to normal operation
+//
+// This mimics human expert discretion: "Yes, the trend is strong, but it's clearly
+// overdone here—I'll take the reversal despite the trend."
+//
+// ━━━ CONFIDENCE AS PROBABILISTIC FRAMEWORK ━━━
+//
+// Rather than binary "good/bad" gating, confidence provides a 0-1 probabilistic score.
+// This allows for:
+// • Nuanced filtering (adjustable threshold)
+// • Position sizing by signal quality
+// • Risk-adjusted decision making
+// • Continuous learning (track confidence vs outcomes)
+//
+// Confidence isn't a prediction—it's a composite quality metric that correlates with
+// but doesn't guarantee success. Use it as a pre-trade risk assessment tool.
+//
+// ━━━ SUPPLY/DEMAND ZONE THEORY ━━━
+//
+// Bifurcation zones mark where institutions likely placed large orders:
+// • Divergence = smart money disagreeing with crowd
+// • Crowd pushes price to extreme (HH or LL)
+// • Oscillator disagrees (momentum waning)
+// • Signal fires at the pivot (order placement zone)
+//
+// These zones become future support/resistance because:
+// • Unfilled portions of institutional orders remain
+// • Market memory of prior reversal points
+// • Self-fulfilling prophecy as traders watch these levels
+//
+// Use zones for:
+// • Exit targets (take profit at opposite zone)
+// • Re-entry levels (if price returns to your zone)
+// • Stop placement (below/above your zone)
+//
+// =============================================================================
+// ⚡ KEY REMINDERS & BEST PRACTICES
+// =============================================================================
+//
+// 1. SPACING IS YOUR FRIEND
+// • Cluster signals = noise and overtrading
+// • Wide spacing = breathing room and selectivity
+// • Respect minimum bars; don't chase every divergence
+//
+// 2. ADVISORY TEACHES, FILTERING ENFORCES
+// • Use Advisory to learn CAE logic and your instrument's behavior
+// • Move to Filtering when you trust the gates
+// • Never jump straight to Filtering without learning phase
+//
+// 3. TCS GUARDS TRENDS—RESPECT IT
+// • High TCS + counter-trend = low probability (absent exhaustion)
+// • Don't fight strong trends unless CAE explicitly allows via exhaustion
+// • Focus on continuation (hidden divs) in high-TCS environments
+//
+// 4. ADVERSARIAL IS A VETO, NOT A STRATEGY
+// • It prevents obviously bad trades (opposing case dominates)
+// • If adversarial blocks, opposing momentum is too strong
+// • Don't fight it—trust the dual-perspective analysis
+//
+// 5. CONFIDENCE IS RELATIVE TO CONTEXT
+// • 0.40 on a choppy day might be excellent
+// • 0.40 in a clear trend might be marginal
+// • Use confidence alongside TCS, DMA, exhaustion
+//
+// 6. REALTIME VS CONFIRMED—KNOW THE TRADEOFF
+// • Realtime: Speed, alerts, may repaint on forming bar
+// • Confirmed: Historical accuracy, delay, no repaint
+// • Use Realtime for monitoring, Confirmed for backtesting
+// • NEVER backtest with Realtime mode (inflates results)
+//
+// 7. VISUAL FEATURES HAVE A COST
+// • Bar coloring is expensive computationally
+// • If lag occurs, disable features strategically
+// • Dashboard is cheap; bar coloring is expensive
+//
+// 8. DIVERGENCE ≠ IMMEDIATE REVERSAL
+// • Divergence is a WARNING, not a guarantee
+// • Use as one input in a multi-factor decision
+// • Combine with CAE context for higher probability
+//
+// 9. BLOCKED SIGNALS ARE PROTECTING YOU
+// • Don't view blocks as "missing trades"
+// • CAE filtered low-probability setups
+// • Review blocked signals—most would've failed
+//
+// 10. TRUST THE SYSTEM AFTER CALIBRATION
+// • Phase 1-3 teach you and the system
+// • Phase 4 is disciplined execution
+// • Don't second-guess CAE in Phase 4 (return to Phase 2 if needed)
+//
+// =============================================================================
+// 🏆 FINAL WORD
+// =============================================================================
+//
+// BZ-CAE is designed to be your intelligent co-pilot, not a black box.
+//
+// The Cognitive Engine THINKS about market state before presenting signals.
+// The Adversarial model DEBATES both sides of every trade.
+// The Confidence system RANKS setups so you choose your risk appetite.
+// The visual system SHOWS you the market's internal debate in real-time.
+//
+// This isn't a "buy the arrow" system—it's an intelligence layer that helps you
+// make better decisions by providing context, filtering noise, and quantifying quality.
+//
+// Respect the spacing. Trust the trend filter in strong markets. Let exhaustion be
+// your friend. Use Advisory to learn, then let Filtering enforce discipline when you
+// trade live.
+//
+// The indicator doesn't promise perfection—it promises INTELLIGENCE, TRANSPARENCY,
+// and CONTEXT. Use it wisely.
+//
+// ~ BZ-CAE — "Structure Meets Intelligence"
+//
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Version: Bifurcation Zone — Cognitive Adversarial Engine
+// Author: Dskyz (DskyzInvestments)
+// Philosophy: "Every divergence tells a story. CAE ensures you're listening to the right one."
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//==============================================================================

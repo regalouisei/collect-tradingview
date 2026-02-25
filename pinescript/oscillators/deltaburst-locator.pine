@@ -1,0 +1,88 @@
+//@version=6
+indicator("DeltaBurst", "DeltaBurst", overlay=false, max_bars_back=5000)
+
+// === Inputs ===
+fastLen = input.int(5, "Fast Pulse Length", minval=1)
+slowLen = input.int(34, "Slow Equilibrium Length", minval=2)
+obvSmooth = input.int(8, "OBV Smooth", minval=1)
+ratioCeiling = input.float(3.0, "Ratio Ceiling", minval=0.5)
+signalLen = input.int(4, "Signal EMA", minval=1)
+confirmTf = input.timeframe("240", "Confirmation Timeframe", tooltip="Higher timeframe confluence for the ratio signal.")
+divWindow = input.int(21, "Divergence Window", minval=5)
+showSignals = input.bool(false, "Show Burst Markers")
+showDivergences = input.bool(false, "Show Divergence Markers")
+showDashboard = input.bool(true, "Show Delta Dashboard")
+
+// === Helpers ===
+tanhNorm(x) =>
+    e2x = math.exp(2.0 * x)
+    denom = e2x + 1.0
+    denom == 0.0 ? 0.0 : (e2x - 1.0) / denom
+
+// === Core Measures ===
+priceChange = ta.ema(close - close[1], fastLen)
+var float obvSeries = 0.0
+obvDelta = close > close[1] ? volume : close < close[1] ? -volume : 0.0
+obvSeries += obvDelta
+obvRaw = obvSeries
+obvImpulse = ta.ema(obvRaw - obvRaw[1], obvSmooth)
+
+ratioBase = math.abs(priceChange) > syminfo.mintick ? obvImpulse / priceChange : 0.0
+ratioNormalized = tanhNorm(ratioBase / ratioCeiling)
+signal = ta.ema(ratioNormalized, signalLen)
+ratioConfirm = request.security(syminfo.tickerid, confirmTf, ratioNormalized, lookahead=barmerge.lookahead_off)
+agreement = ratioConfirm * ratioNormalized > 0
+
+expansion = ta.ema(math.abs(ratioNormalized), slowLen)
+compression = math.max(0.0, 1.0 - expansion)
+flowSlope = ta.linreg(ratioNormalized, divWindow, 0) - ta.linreg(ratioNormalized, divWindow, 1)
+priceSlope = ta.linreg(close, divWindow, 0) - ta.linreg(close, divWindow, 1)
+bullDiv = priceSlope < 0 and flowSlope > 0 and ratioNormalized < 0
+bearDiv = priceSlope > 0 and flowSlope < 0 and ratioNormalized > 0
+volumeShock = volume / math.max(ta.sma(volume, obvSmooth * 2), 1.0)
+
+// === Visuals ===
+ratioPositive = ratioNormalized >= 0 ? ratioNormalized : na
+ratioNegative = ratioNormalized < 0 ? ratioNormalized : na
+posPlot = plot(ratioPositive, "Positive Sponsorship", color=color.new(color.teal, 0), linewidth=2)
+negPlot = plot(ratioNegative, "Negative Sponsorship", color=color.new(color.red, 0), linewidth=2)
+zeroPlot = plot(0.0, "Neutral Axis", color=color.new(color.white, 60))
+plot(signal, "Delta Signal", color=color.new(color.white, 0), linewidth=2, style=plot.style_line)
+fill(posPlot, zeroPlot, color=color.new(color.teal, 80))
+fill(negPlot, zeroPlot, color=color.new(color.red, 80))
+
+// Saturation cues
+overbought = 0.65
+oversold = -0.65
+hline(overbought, "Liquidity Exhaust", color=color.new(color.red, 0), linestyle=hline.style_dotted)
+hline(oversold, "Liquidity Vacuum", color=color.new(color.teal, 0), linestyle=hline.style_dotted)
+
+// Burst signals
+burstUp = ratioNormalized > overbought and signal > overbought * 0.8
+burstDown = ratioNormalized < oversold and signal < oversold * 0.8
+
+plotshape(showSignals and burstUp, "DeltaBurst Up", location=location.bottom, color=color.new(color.teal, 0), style=shape.triangleup, size=size.tiny, text="Δ↑", textcolor=color.white)
+plotshape(showSignals and burstDown, "DeltaBurst Down", location=location.top, color=color.new(color.red, 0), style=shape.triangledown, size=size.tiny, text="Δ↓", textcolor=color.white)
+plotshape(showDivergences and bullDiv, "Delta Bull Div", location=location.bottom, style=shape.circle, color=color.new(color.lime, 0), size=size.tiny, text="Div↑", textcolor=color.white)
+plotshape(showDivergences and bearDiv, "Delta Bear Div", location=location.top, style=shape.circle, color=color.new(color.orange, 0), size=size.tiny, text="Div↓", textcolor=color.white)
+
+// Compression shading
+bgcolor(color.new(color.yellow, 100 - compression * 90.0), title="Compression Heat")
+plot(volumeShock, "Volume Shock", color=color.new(color.blue, 0), linewidth=1, style=plot.style_stepline, display=display.none)
+
+// Alerts
+alertcondition(burstUp, "DeltaBurst Bull", "DeltaBurst Locator spotted a bullish liquidity burst.")
+alertcondition(burstDown, "DeltaBurst Bear", "DeltaBurst Locator spotted a bearish liquidity burst.")
+alertcondition(bullDiv, "DeltaBurst Bull Div", "DeltaBurst Locator detected bullish sponsorship divergence.")
+alertcondition(bearDiv, "DeltaBurst Bear Div", "DeltaBurst Locator detected bearish sponsorship divergence.")
+
+// Dashboard
+var table dash = na
+if barstate.isfirst and showDashboard
+    dash := table.new(position=position.top_right, columns=1, rows=3, border_color=color.new(color.gray, 80))
+
+if showDashboard and barstate.islast
+    agreementText = agreement ? "Aligned" : "Conflict"
+    table.cell(dash, 0, 0, "ΔBurst: " + str.tostring(ratioNormalized, "#.000"), text_color=ratioNormalized >= 0 ? color.new(color.teal, 0) : color.new(color.red, 0))
+    table.cell(dash, 0, 1, "HTF Ratio: " + str.tostring(ratioConfirm, "#.000"), text_color=ratioConfirm >= 0 ? color.new(color.teal, 0) : color.new(color.red, 0))
+    table.cell(dash, 0, 2, "State: " + agreementText, text_color=agreement ? color.new(color.green, 0) : color.new(color.orange, 0))

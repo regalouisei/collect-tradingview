@@ -1,0 +1,354 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TheScalpingAnt
+// Credit: Inspired by the "Ultimate RSI" indicator by @LuxAlgo — original concept and foundational RSI logic.
+// Developed and implemented by: The Scalping Ant
+
+//@version=6
+indicator("Quantum RSI Fusion", shorttitle="Quantum RSI Fusion", overlay=false, max_lines_count=500, max_labels_count=500)
+
+// =====================================================================================
+// SETTINGS — RSI ENGINE
+// =====================================================================================
+groupRSI = "RSI Engine"
+
+length = input.int(14, minval=2, title="RSI Length", group=groupRSI,
+     tooltip="The lookback period for the RSI calculation. This RSI uses a range-normalized momentum method: it measures directional price movement relative to the highest-lowest range over this period, then smooths it with RMA. Lower values make the RSI more reactive; higher values produce a smoother, slower oscillator. Default is 14, which balances sensitivity and noise reduction across most timeframes and markets.")
+
+src = input.source(defval=close, title="Source", group=groupRSI,
+     tooltip="The price source used for the RSI calculation. 'Close' is standard. You can select other sources such as HL2 (midpoint), HLC3 (typical price), OHLC4 (average price), or any other available source. Changing the source alters the sensitivity and character of the RSI output. For most use cases, 'close' is recommended.")
+
+useVW = input.bool(false, "Volume Weighted RSI", group=groupRSI,
+     tooltip="When enabled, the RSI calculation weights each bar's directional movement by its volume. This means bars with higher volume have a proportionally greater impact on the RSI value. This can help emphasize moves backed by strong participation and de-emphasize low-volume noise. Requires volume data to be available for the current symbol. If volume data is absent or unreliable (e.g., some forex or crypto pairs), leave this disabled.")
+
+useHTF = input.bool(false, "Use Higher Timeframe RSI", group=groupRSI,
+     tooltip="When enabled, the RSI is calculated on a higher timeframe instead of the chart's current timeframe. This allows you to view a higher timeframe RSI context on a lower timeframe chart — for example, viewing the 1-hour RSI on a 5-minute chart. The higher timeframe RSI value is fetched without future data leakage (no lookahead), so it does not repaint. The value updates only when a new bar closes on the selected higher timeframe. Select the desired timeframe in the 'HTF Timeframe' input below.")
+
+htf = input.timeframe("60", "HTF Timeframe", group=groupRSI,
+     tooltip="The higher timeframe used for the RSI calculation when 'Use Higher Timeframe RSI' is enabled. Examples: '15' = 15 minutes, '60' = 1 hour, '240' = 4 hours, 'D' = Daily, 'W' = Weekly. This must be equal to or higher than your current chart timeframe. Using a timeframe lower than your chart timeframe will produce unreliable results. This input is ignored when 'Use Higher Timeframe RSI' is disabled.")
+
+// =====================================================================================
+// SETTINGS — SIGNAL LINE
+// =====================================================================================
+groupSignal = "Signal Line"
+
+smooth = input.int(14, minval=1, title="Signal Length", group=groupSignal,
+     tooltip="The smoothing period for the signal line, which is a moving average of the RSI. A shorter length makes the signal line more responsive to RSI changes, generating earlier crossover signals but potentially more false signals. A longer length produces a smoother signal line with fewer but later crossovers. Default is 14. Adjust based on your trading style — shorter for scalping, longer for swing trading.")
+
+signalType = input.string("RMA", "Smoothing Method", options=["EMA","SMA","RMA","TMA"], group=groupSignal,
+     tooltip="The type of moving average used to calculate the signal line from the RSI values.\n\n• EMA (Exponential Moving Average): Gives more weight to recent values, responds faster to changes.\n• SMA (Simple Moving Average): Equal weight to all values in the period, smoother but slower.\n• RMA (Running Moving Average / Wilder's Smoothing): Similar to EMA but with a longer effective lookback, very smooth. This is the default and matches the smoothing style used in classic RSI.\n• TMA (Triangular Moving Average): A double-smoothed SMA — applies SMA twice. Produces the smoothest signal line with the most lag.\n\nChoose based on how responsive vs. smooth you want the signal line to be.")
+
+signalColor = input.color(color.black, "Signal Line Color", group=groupSignal,
+     tooltip="The color of the signal line when displayed on the RSI panel. Choose a color that contrasts well with your chart background and the RSI ribbon fill colors for clear visibility.")
+
+showSignal = input.bool(false, "Show Signal Line", group=groupSignal,
+     tooltip="When enabled, the signal line (moving average of the RSI) is visually displayed on the indicator panel. When disabled, the signal line is still used internally for crossover detection and ribbon coloring, but it is hidden from the chart. Enable this if you want to visually inspect the signal line relative to the RSI.")
+
+// =====================================================================================
+// SETTINGS — VISUAL DISPLAY
+// =====================================================================================
+groupVisual = "Visual Display"
+
+bullFill = input.color(#1fff00, "Bullish Ribbon Color", group=groupVisual,
+     tooltip="The fill color of the ribbon between the RSI and the signal line when the RSI is above the signal line (bullish momentum). This ribbon visually represents bullish conditions — the RSI is leading the signal upward. Choose a color that intuitively represents bullish sentiment on your chart.")
+
+bearFill = input.color(#b10606, "Bearish Ribbon Color", group=groupVisual,
+     tooltip="The fill color of the ribbon between the RSI and the signal line when the RSI is below the signal line (bearish momentum). This ribbon visually represents bearish conditions — the RSI is trailing below the signal. Choose a color that intuitively represents bearish sentiment on your chart.")
+
+midFillBull = input.color(color.white, "Midline Fill — Signal Above 50", group=groupVisual,
+     tooltip="The fill color between the 50 midline and the signal line when the signal is above 50. This provides a visual background cue indicating that the overall RSI bias is bullish (above the equilibrium midline). Adjust transparency or color to match your chart theme.")
+
+midFillBear = input.color(#000000, "Midline Fill — Signal Below 50", group=groupVisual,
+     tooltip="The fill color between the 50 midline and the signal line when the signal is below 50. This provides a visual background cue indicating that the overall RSI bias is bearish (below the equilibrium midline). Adjust transparency or color to match your chart theme.")
+
+showBg = input.bool(false, "Show Overbought/Oversold Background", group=groupVisual,
+     tooltip="When enabled, a subtle colored background is shown in the overbought zone (above the overbought level to 100) and the oversold zone (below the oversold level to 0). This helps visually identify when the RSI is in extreme territory. The background uses a high transparency to avoid obscuring the RSI and signal line.")
+
+colorCandles = input.bool(false, "Color Main Chart Candles", group=groupVisual,
+     tooltip="When enabled, the candles on your main price chart are colored based on the RSI-to-signal-line relationship. Candles are colored with the bullish ribbon color when RSI is above the signal line, and the bearish ribbon color when RSI is below. This provides an at-a-glance trend context directly on your price chart without switching to the indicator panel.")
+
+// =====================================================================================
+// SETTINGS — SIGNAL CONFIRMATION (NON-REPAINTING)
+// =====================================================================================
+groupConfirm = "Signal Confirmation"
+
+confirmClose = input.bool(true, title="Confirm Signals at Candle Close (Non-Repainting)", group=groupConfirm,
+     tooltip="CRITICAL SETTING FOR REPAINTING CONTROL.\n\nWhen ENABLED (default — recommended): Entry and exit signals (green/red dots) are confirmed ONLY after the current candle has fully closed. This means the signal will not appear and then disappear — once printed, it stays. This eliminates repainting on crossover signals and is essential for backtesting accuracy and live trading reliability.\n\nWhen DISABLED: Signals appear in real-time as the candle is still forming. This provides earlier alerts but the signal may appear and disappear if price reverses before the candle closes. Use this only if you understand the repainting implications and want to monitor potential setups forming in real-time.\n\nNote: Divergence signals inherently require pivotRight bars of confirmation before appearing, so they are always plotted with an offset and do not repaint regardless of this setting.")
+
+// =====================================================================================
+// SETTINGS — TREND FILTER
+// =====================================================================================
+groupTrend = "Trend Filter"
+
+useTrendFilter = input.bool(true, "Enable Trend Filter", group=groupTrend,
+     tooltip="When enabled, crossover entry signals are filtered by the trend direction determined by an Exponential Moving Average (EMA) on the price chart.\n\n• Bullish crossover signals are shown ONLY when price is above the EMA (uptrend).\n• Bearish crossunder signals are shown ONLY when price is below the EMA (downtrend).\n\nThis reduces false signals by aligning entries with the prevailing trend. Disable this if you want to see all crossover signals regardless of trend context, for example when trading mean-reversion strategies or ranging markets.")
+
+emaLen = input.int(200, "Trend EMA Length", group=groupTrend,
+     tooltip="The period of the Exponential Moving Average used for the trend filter. A longer period (e.g., 200) defines the major trend and filters out counter-trend signals more aggressively. A shorter period (e.g., 50) is more responsive and allows more signals through. The EMA is calculated on the 'close' price of the current chart timeframe. Common values:\n• 200: Long-term trend (standard for daily charts)\n• 100: Medium-term trend\n• 50: Short-term trend\n\nThis input is ignored when 'Enable Trend Filter' is disabled.")
+
+// =====================================================================================
+// SETTINGS — LEVELS
+// =====================================================================================
+groupLevels = "Levels"
+
+ob = input.int(60, "Overbought Level", group=groupLevels,
+     tooltip="The RSI level considered overbought. When the RSI rises above this level, the market may be overextended to the upside. The default is 60, which is more conservative than the traditional 70 level — this is intentional because the custom range-normalized RSI used in this indicator tends to produce values that cluster closer to 50 than standard Wilder RSI. Adjust based on the asset and timeframe you are trading. Higher values (e.g., 70–80) will trigger fewer overbought readings; lower values (e.g., 55–60) will trigger more frequently.")
+
+os = input.int(40, "Oversold Level", group=groupLevels,
+     tooltip="The RSI level considered oversold. When the RSI falls below this level, the market may be overextended to the downside. The default is 40, which is more conservative than the traditional 30 level — this is intentional because the custom range-normalized RSI used in this indicator tends to produce values that cluster closer to 50 than standard Wilder RSI. Adjust based on the asset and timeframe you are trading. Lower values (e.g., 20–30) will trigger fewer oversold readings; higher values (e.g., 40–45) will trigger more frequently.")
+
+// =====================================================================================
+// SETTINGS — MACRO DIVERGENCES
+// =====================================================================================
+groupDiv = "Macro Divergences"
+
+showDiv = input.bool(false, "Show Macro Divergences", group=groupDiv,
+     tooltip="When enabled, the indicator detects and displays macro (classical) divergences between price and the RSI.\n\n• Bullish Divergence: Price makes a lower low while RSI makes a higher low — suggests weakening downside momentum and a potential reversal to the upside.\n• Bearish Divergence: Price makes a higher high while RSI makes a lower high — suggests weakening upside momentum and a potential reversal to the downside.\n\nDivergences are detected using pivot points and are plotted with an offset equal to the 'Pivot Right Lookback' value, meaning they appear only after confirmation. They do not repaint once printed.\n\nDivergences are a supplementary confluence tool — they should not be used in isolation for trading decisions.")
+
+pivotLeft = input.int(14, "Pivot Left Lookback", group=groupDiv,
+     tooltip="The number of bars to the left of the pivot point used for divergence detection. A higher value requires the pivot to be a more significant swing point over a longer history, producing fewer but more meaningful divergences. A lower value detects smaller, more frequent pivots. Default is 14. This value works together with 'Pivot Right Lookback' to define the pivot detection window.")
+
+pivotRight = input.int(5, "Pivot Right Lookback", group=groupDiv,
+     tooltip="The number of bars to the right of the pivot point required to confirm the pivot. This means a divergence signal will appear 'pivotRight' bars after the actual pivot occurred (the signal is plotted with a negative offset to align it with the correct bar). A higher value increases confirmation reliability but delays the signal further. A lower value shows signals sooner but with less confirmation. Default is 5.\n\nImportant: Because pivots require right-side confirmation, divergence labels always appear with a delay equal to this value. This is inherent to pivot-based detection and is not repainting — once the label appears, it does not disappear.")
+
+// =====================================================================================
+// SETTINGS — MATRIX PANEL
+// =====================================================================================
+groupMatrix = "Matrix Panel"
+
+showMatrix = input.bool(true, "Show Matrix Panel", group=groupMatrix,
+     tooltip="When enabled, a multi-timeframe confluence matrix is displayed on the chart showing the current state of each analytical layer:\n\n• Macro Trend: The EMA-based trend filter direction (Bullish if price > EMA, Bearish if price < EMA, or Disabled if trend filter is off).\n• HTF RSI: The higher timeframe RSI bias (Bullish if HTF RSI > 50, Bearish if < 50, or Disabled if HTF RSI is off).\n• Micro RSI: The current timeframe RSI-to-signal relationship (Bullish if RSI > Signal, Bearish if RSI < Signal).\n• Result: The confluence-based directional bias (LONG when all enabled layers align bullish, SHORT when all align bearish, WAIT when conflicting or neutral).\n\nThe matrix provides instant visual assessment of multi-layer alignment without interpreting each component individually.")
+
+matrixPos = input.string("Bottom Right", "Matrix Position", options=["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], group=groupMatrix,
+     tooltip="The position of the matrix panel on your chart. Choose a location that does not obstruct your view of the RSI oscillator and price action. The panel can be placed in any of the six standard corner and edge positions.")
+
+matrixTextSize = input.string("Normal", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=groupMatrix,
+     tooltip="The text size used in the matrix panel cells. Adjust based on your screen resolution and chart size for optimal readability. 'Normal' works well for most setups; 'Small' or 'Tiny' may be preferred on smaller screens or when running multiple charts.")
+
+matrixHeaderBg = input.color(#000000, "Header Background", group=groupMatrix,
+     tooltip="The background color for the left column of the matrix (row labels: Macro Trend, HTF RSI, Micro RSI, Result). Default is black for clear contrast with white text.")
+
+matrixValueBg = input.color(#ffffff, "Value Background", group=groupMatrix,
+     tooltip="The background color for the right column of the matrix (status values: Bullish/Bearish/LONG/SHORT/WAIT). Default is white to make colored text highly visible.")
+
+matrixBullColor = input.color(#00c853, "Bullish Text Color", group=groupMatrix,
+     tooltip="The text color used for bullish/long status values in the matrix (Bullish, LONG). Choose a color that clearly indicates positive/bullish conditions.")
+
+matrixBearColor = input.color(#ff1744, "Bearish Text Color", group=groupMatrix,
+     tooltip="The text color used for bearish/short status values in the matrix (Bearish, SHORT). Choose a color that clearly indicates negative/bearish conditions.")
+
+matrixNeutralColor = input.color(#757575, "Neutral Text Color", group=groupMatrix,
+     tooltip="The text color used for neutral or disabled status values in the matrix (Disabled, WAIT). Choose a color that indicates inactivity or caution.")
+
+// =====================================================================================
+// CORE RSI CALCULATION
+// =====================================================================================
+// Custom range-normalized momentum RSI:
+// Measures directional price movement relative to the highest-high / lowest-low range
+// over the lookback period. Range expansion is treated as strong directional movement;
+// range contraction or sideways action uses simple bar-to-bar changes.
+// Result is smoothed with RMA and normalized to 0–100.
+
+calcRsi(src_input, len, use_vol) =>
+    upper = ta.highest(src_input, len)
+    lower = ta.lowest(src_input, len)
+    rng = upper - lower
+    d = src_input - src_input[1]
+    diff = upper > upper[1] ? rng : lower < lower[1] ? -rng : d
+    vol_mult = use_vol ? volume : 1.0
+    num = ta.rma(diff * vol_mult, len)
+    den = ta.rma(math.abs(diff) * vol_mult, len)
+    num / den * 50 + 50
+
+arsiBase = calcRsi(src, length, useVW)
+
+// =====================================================================================
+// HIGHER TIMEFRAME RSI (NON-REPAINTING)
+// =====================================================================================
+// Uses barmerge.lookahead_off to prevent future data leakage.
+// The HTF RSI is always calculated for matrix display purposes, but only used
+// for the main RSI plot when useHTF is enabled.
+
+htfRsi = request.security(syminfo.tickerid, htf, calcRsi(src, length, useVW), lookahead=barmerge.lookahead_off)
+
+arsi = useHTF ? htfRsi : arsiBase
+
+// =====================================================================================
+// TREND FILTER — EMA
+// =====================================================================================
+emaVal = ta.ema(close, emaLen)
+trendBull = close > emaVal
+trendBear = close < emaVal
+
+// =====================================================================================
+// SIGNAL LINE CALCULATION
+// =====================================================================================
+signal =
+     signalType == "EMA" ? ta.ema(arsi, smooth) :
+     signalType == "SMA" ? ta.sma(arsi, smooth) :
+     signalType == "RMA" ? ta.rma(arsi, smooth) :
+     ta.sma(ta.sma(arsi, smooth), smooth) // TMA
+
+// =====================================================================================
+// CROSSOVER SIGNALS WITH NON-REPAINTING CONFIRMATION
+// =====================================================================================
+bullRaw = ta.crossover(arsi, signal)
+bearRaw = ta.crossunder(arsi, signal)
+
+bullConf = confirmClose ? (bullRaw and barstate.isconfirmed) : bullRaw
+bearConf = confirmClose ? (bearRaw and barstate.isconfirmed) : bearRaw
+
+// Apply trend filter
+bull = useTrendFilter ? (bullConf and trendBull) : bullConf
+bear = useTrendFilter ? (bearConf and trendBear) : bearConf
+
+// =====================================================================================
+// MACRO DIVERGENCE DETECTION
+// =====================================================================================
+plFound = not na(ta.pivotlow(arsi, pivotLeft, pivotRight))
+phFound = not na(ta.pivothigh(arsi, pivotLeft, pivotRight))
+
+rsiPl1 = ta.valuewhen(plFound, arsi[pivotRight], 1)
+pricePl1 = ta.valuewhen(plFound, low[pivotRight], 1)
+
+rsiPh1 = ta.valuewhen(phFound, arsi[pivotRight], 1)
+pricePh1 = ta.valuewhen(phFound, high[pivotRight], 1)
+
+bullDiv = showDiv and plFound and (low[pivotRight] < pricePl1) and (arsi[pivotRight] > rsiPl1)
+bearDiv = showDiv and phFound and (high[pivotRight] > pricePh1) and (arsi[pivotRight] < rsiPh1)
+
+// =====================================================================================
+// PLOTTING — MIDLINE FILLS
+// =====================================================================================
+pMid = plot(50, title="Midline Reference", display=display.none)
+sigAbove = plot(signal > 50 ? signal : na, title="Signal Above 50", display=display.none)
+sigBelow = plot(signal < 50 ? signal : na, title="Signal Below 50", display=display.none)
+
+fill(pMid, sigAbove, midFillBull, title="Midline Fill Bullish")
+fill(pMid, sigBelow, midFillBear, title="Midline Fill Bearish")
+
+// =====================================================================================
+// PLOTTING — RSI & SIGNAL LINE WITH RIBBON
+// =====================================================================================
+plotRSI = plot(arsi, "RSI", color=color.new(color.gray, 100), linewidth=2)
+plotSig = plot(signal, title="Signal Line", color=signalColor, linewidth=2, display=showSignal ? display.all : display.none)
+fill(plotRSI, plotSig, arsi > signal ? bullFill : bearFill, title="RSI-Signal Ribbon")
+
+// =====================================================================================
+// PLOTTING — LEVEL LINES & BACKGROUND
+// =====================================================================================
+h_ob = hline(ob, "Overbought", color=color.new(color.red, 60))
+h_os = hline(os, "Oversold", color=color.new(color.green, 60))
+hline(50, "Midline", color=color.new(color.white, 85))
+
+h_100 = hline(100, title="Upper Bound", display=display.none)
+h_0   = hline(0, title="Lower Bound", display=display.none)
+
+fill(h_100, h_ob, color=showBg ? color.new(color.red, 90) : na, title="Overbought Background")
+fill(h_os, h_0, color=showBg ? color.new(color.green, 90) : na, title="Oversold Background")
+
+// =====================================================================================
+// PLOTTING — DIVERGENCE LABELS
+// =====================================================================================
+plotshape(bullDiv ? arsi[pivotRight] : na, title="Bullish Divergence", location=location.absolute, color=color.new(#01f30a, 0), style=shape.labelup, text="DIV", textcolor=color.rgb(0, 0, 0), size=size.tiny, offset=-pivotRight)
+plotshape(bearDiv ? arsi[pivotRight] : na, title="Bearish Divergence", location=location.absolute, color=color.new(#f80303, 0), style=shape.labeldown, text="DIV", textcolor=color.rgb(0, 0, 0), size=size.tiny, offset=-pivotRight)
+
+// =====================================================================================
+// PLOTTING — ENTRY / EXIT MARKERS
+// =====================================================================================
+plotshape(bull, title="Bullish Entry Signal", style=shape.circle, location=location.bottom, color=#00ff00, size=size.tiny)
+plotshape(bear, title="Bearish Entry Signal", style=shape.circle, location=location.top, color=#ff0000, size=size.tiny)
+
+// =====================================================================================
+// ALERTS
+// =====================================================================================
+alertcondition(bull, title="Bullish Entry Signal", message="Quantum RSI Fusion — Bullish Entry: RSI crossed above Signal Line on {{ticker}} ({{interval}}). Confirmed at candle close.")
+alertcondition(bear, title="Bearish Entry Signal", message="Quantum RSI Fusion — Bearish Entry: RSI crossed below Signal Line on {{ticker}} ({{interval}}). Confirmed at candle close.")
+alertcondition(bullDiv, title="Bullish Macro Divergence", message="Quantum RSI Fusion — Bullish Divergence detected on {{ticker}} ({{interval}}): Price made a lower low while RSI made a higher low.")
+alertcondition(bearDiv, title="Bearish Macro Divergence", message="Quantum RSI Fusion — Bearish Divergence detected on {{ticker}} ({{interval}}): Price made a higher high while RSI made a lower high.")
+alertcondition(arsi > ob, title="RSI Entered Overbought Zone", message="Quantum RSI Fusion — RSI entered overbought territory on {{ticker}} ({{interval}}).")
+alertcondition(arsi < os, title="RSI Entered Oversold Zone", message="Quantum RSI Fusion — RSI entered oversold territory on {{ticker}} ({{interval}}).")
+alertcondition(ta.crossover(arsi, 50), title="RSI Crossed Above Midline", message="Quantum RSI Fusion — RSI crossed above 50 midline on {{ticker}} ({{interval}}). Momentum shifting bullish.")
+alertcondition(ta.crossunder(arsi, 50), title="RSI Crossed Below Midline", message="Quantum RSI Fusion — RSI crossed below 50 midline on {{ticker}} ({{interval}}). Momentum shifting bearish.")
+
+// =====================================================================================
+// BAR COLORING — OVERLAY CANDLES
+// =====================================================================================
+candleColor = arsi > signal ? bullFill : bearFill
+plotcandle(open, high, low, close, title="Colored Candles", color=candleColor, wickcolor=candleColor, bordercolor=candleColor, force_overlay=true, display=colorCandles ? display.all : display.none)
+
+// =====================================================================================
+// MATRIX PANEL — CONFLUENCE DASHBOARD
+// =====================================================================================
+// Convert position string to position constant
+tablePos = switch matrixPos
+    "Top Right"     => position.top_right
+    "Middle Right"  => position.middle_right
+    "Bottom Right"  => position.bottom_right
+    "Top Left"      => position.top_left
+    "Middle Left"   => position.middle_left
+    "Bottom Left"   => position.bottom_left
+    => position.bottom_right
+
+// Convert text size string to size constant
+textSize = switch matrixTextSize
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.normal
+
+// Create table with dynamic position
+var table matrixPanel = table.new(tablePos, 2, 4, border_width=1, border_color=color.gray)
+
+if barstate.islast and showMatrix
+    // ===== LAYER 1: MACRO TREND (EMA-based trend filter) =====
+    macroTxt = useTrendFilter ? (trendBull ? "BULLISH" : "BEARISH") : "DISABLED"
+    macroCol = useTrendFilter ? (trendBull ? matrixBullColor : matrixBearColor) : matrixNeutralColor
+    
+    // ===== LAYER 2: HTF RSI (Higher timeframe momentum) =====
+    htfTxt = useHTF ? (htfRsi > 50 ? "BULLISH" : "BEARISH") : "DISABLED"
+    htfCol = useHTF ? (htfRsi > 50 ? matrixBullColor : matrixBearColor) : matrixNeutralColor
+    
+    // ===== LAYER 3: MICRO RSI (Current timeframe RSI vs Signal) =====
+    microTxt = arsi > signal ? "BULLISH" : "BEARISH"
+    microCol = arsi > signal ? matrixBullColor : matrixBearColor
+    
+    // ===== LAYER 4: RESULT (Confluence assessment) =====
+    // Evaluate alignment of all ENABLED layers
+    // If a layer is disabled, it is considered "neutral" and does not block alignment
+    
+    trendOk      = useTrendFilter ? trendBull : true      // Bullish alignment check
+    htfOk        = useHTF ? (htfRsi > 50) : true          // Bullish alignment check
+    microOk      = arsi > signal                          // Bullish alignment check
+    
+    trendOkBear  = useTrendFilter ? trendBear : true      // Bearish alignment check
+    htfOkBear    = useHTF ? (htfRsi < 50) : true          // Bearish alignment check
+    microOkBear  = arsi < signal                          // Bearish alignment check
+    
+    // Determine result based on full alignment
+    resTxt = "WAIT"
+    resCol = matrixNeutralColor
+    
+    if trendOk and htfOk and microOk
+        resTxt := "LONG"
+        resCol := matrixBullColor
+    else if trendOkBear and htfOkBear and microOkBear
+        resTxt := "SHORT"
+        resCol := matrixBearColor
+    
+    // ===== BUILD THE MATRIX TABLE =====
+    // Row 0: Macro Trend
+    table.cell(matrixPanel, 0, 0, "MACRO TREND", text_color=color.white, bgcolor=matrixHeaderBg, text_size=textSize, text_halign=text.align_left)
+    table.cell(matrixPanel, 1, 0, macroTxt, text_color=macroCol, bgcolor=matrixValueBg, text_size=textSize, text_halign=text.align_center)
+    
+    // Row 1: HTF RSI
+    table.cell(matrixPanel, 0, 1, "HTF RSI", text_color=color.white, bgcolor=matrixHeaderBg, text_size=textSize, text_halign=text.align_left)
+    table.cell(matrixPanel, 1, 1, htfTxt, text_color=htfCol, bgcolor=matrixValueBg, text_size=textSize, text_halign=text.align_center)
+    
+    // Row 2: Micro RSI
+    table.cell(matrixPanel, 0, 2, "MICRO RSI", text_color=color.white, bgcolor=matrixHeaderBg, text_size=textSize, text_halign=text.align_left)
+    table.cell(matrixPanel, 1, 2, microTxt, text_color=microCol, bgcolor=matrixValueBg, text_size=textSize, text_halign=text.align_center)
+    
+    // Row 3: Result
+    table.cell(matrixPanel, 0, 3, "RESULT", text_color=color.white, bgcolor=matrixHeaderBg, text_size=textSize, text_halign=text.align_left)
+    table.cell(matrixPanel, 1, 3, resTxt, text_color=resCol, bgcolor=matrixValueBg, text_size=textSize, text_halign=text.align_center)

@@ -1,0 +1,541 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © DDCA Composite Risk Metric v0.2
+// Based on: Benjamin Cowen Macro Risk Memo Q1 2026 + Investment Cookbook 2026-2030
+// Purpose: Single 0-1 risk oscillator for Dynamic DCA buying/selling
+// 0.0 = MAX opportunity (all-in buy) → 1.0 = MAX risk (sell everything)
+// v2.0: Adaptive percentile+ROC normalization, Puell Multiple, SSR
+// v2.1: Sigmoid rescale, F&G proxy replaces Bitfinex L/S
+// v0.2: Symmetric 7-band zones: <0.25 ALL-IN | 0.45-0.55 HOLD | >0.75 ALL-OUT
+//       On-chain 35% | Technical 30% | Macro 25% | Sentiment 10% = 100%
+
+//@version=6
+indicator("DDCA Composite Risk Metric", shorttitle="DDCA Risk", overlay=false, precision=3, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+grp_t = "═══ TIER TOGGLES ═══"
+tierMacro   = input.bool(true, "TIER 1 — MACRO & LIQUIDITY",  group=grp_t)
+tierOnchain = input.bool(true, "TIER 2 — ON-CHAIN",           group=grp_t)
+tierTech    = input.bool(true, "TIER 3 — TECHNICAL",           group=grp_t)
+tierSent    = input.bool(true, "TIER 4 — SENTIMENT",           group=grp_t)
+
+grp_w = "═══ WEIGHTS (sum to 100) ═══"
+// TIER 1: MACRO & LIQUIDITY (25%)
+e01 = input.bool(true, "① FED Rate Direction ——— ON/OFF", group=grp_w)
+w01 = input.float(3.5,  "    ↳ Weight",      minval=0, maxval=20, step=0.5, group=grp_w)
+e02 = input.bool(true, "② Global M2 YoY ——— ON/OFF", group=grp_w)
+w02 = input.float(8.0,  "    ↳ Weight",           minval=0, maxval=20, step=0.5, group=grp_w)
+e03 = input.bool(true, "③ FED Balance Sheet ——— ON/OFF", group=grp_w)
+w03 = input.float(3.0,  "    ↳ Weight",        minval=0, maxval=20, step=0.5, group=grp_w)
+e04 = input.bool(true, "④ US Real Yields ——— ON/OFF", group=grp_w)
+w04 = input.float(3.5,  "    ↳ Weight",           minval=0, maxval=20, step=0.5, group=grp_w)
+e05 = input.bool(true, "⑤ Unemployment Trend ——— ON/OFF", group=grp_w)
+w05 = input.float(2.0,  "    ↳ Weight",       minval=0, maxval=20, step=0.5, group=grp_w)
+e06 = input.bool(true, "⑥ DXY Dollar ——— ON/OFF", group=grp_w)
+w06 = input.float(5.0,  "    ↳ Weight",              minval=0, maxval=20, step=0.5, group=grp_w)
+// TIER 2: ON-CHAIN (35%)
+e07 = input.bool(true, "⑦ MVRV Z-Score ——— ON/OFF", group=grp_w)
+w07 = input.float(13.0, "    ↳ Weight",            minval=0, maxval=20, step=0.5, group=grp_w)
+e08 = input.bool(true, "⑧ NUPL ——— ON/OFF", group=grp_w)
+w08 = input.float(5.0,  "    ↳ Weight",                    minval=0, maxval=20, step=0.5, group=grp_w)
+e09 = input.bool(true, "⑨ Puell Multiple ——— ON/OFF", group=grp_w)
+w09 = input.float(6.0,  "    ↳ Weight",  minval=0, maxval=20, step=0.5, group=grp_w)
+e10 = input.bool(true, "⑩ LTH Proxy (365 SMA) ——— ON/OFF", group=grp_w)
+w10 = input.float(6.0,  "    ↳ Weight",       minval=0, maxval=20, step=0.5, group=grp_w)
+e11 = input.bool(true, "⑪ Hash Ribbons ——— ON/OFF", group=grp_w)
+w11 = input.float(5.0,  "    ↳ Weight",            minval=0, maxval=20, step=0.5, group=grp_w)
+// TIER 3: TECHNICAL (30%)
+e12 = input.bool(true, "⑫ 200W MA Ratio ——— ON/OFF", group=grp_w)
+w12 = input.float(5.0,  "    ↳ Weight",           minval=0, maxval=20, step=0.5, group=grp_w)
+e13 = input.bool(true, "⑬ Bull Mkt Support Band ——— ON/OFF", group=grp_w)
+w13 = input.float(5.0,  "    ↳ Weight",   minval=0, maxval=20, step=0.5, group=grp_w)
+e14 = input.bool(true, "⑭ Pi Cycle Top ——— ON/OFF", group=grp_w)
+w14 = input.float(3.5,  "    ↳ Weight",            minval=0, maxval=20, step=0.5, group=grp_w)
+e15 = input.bool(true, "⑮ BTC Dominance ——— ON/OFF", group=grp_w)
+w15 = input.float(7.0,  "    ↳ Weight",           minval=0, maxval=20, step=0.5, group=grp_w)
+e16 = input.bool(true, "⑯ Log Regression Band ——— ON/OFF", group=grp_w)
+w16 = input.float(6.0,  "    ↳ Weight",     minval=0, maxval=20, step=0.5, group=grp_w)
+e17 = input.bool(true, "⑰ Stablecoin Supply Ratio ——— ON/OFF", group=grp_w)
+w17 = input.float(3.5,  "    ↳ Weight",      minval=0, maxval=20, step=0.5, group=grp_w)
+// TIER 4: SENTIMENT (10%)
+e18 = input.bool(true, "⑱ Fear & Greed Proxy ——— ON/OFF", group=grp_w)
+w18 = input.float(6.0,  "    ↳ Weight",      minval=0, maxval=20, step=0.5, group=grp_w)
+e19 = input.bool(true, "⑲ Altcoin Breadth ——— ON/OFF", group=grp_w)
+w19 = input.float(4.0,  "    ↳ Weight",         minval=0, maxval=20, step=0.5, group=grp_w)
+
+grp_s = "═══ SETTINGS ═══"
+smoothLen   = input.int(7,    "Composite SMA smoothing",  minval=1, maxval=30, group=grp_s)
+showBands   = input.bool(true, "Show DDCA action bands",  group=grp_s)
+showSub     = input.bool(false,"Show sub-scores (debug)",  group=grp_s)
+showTable   = input.bool(true, "Show score table",         group=grp_s)
+
+grp_x = "═══ EXECUTION LAYER ═══"
+showExec    = input.bool(false,"Show Execution Multiplier", group=grp_x)
+buyCeiling  = input.float(0.45,   "BUY — Ceiling (HOLD above)",    minval=0.3, maxval=0.7, step=0.05, group=grp_x)
+buyPivot    = input.float(0.35,   "BUY — Pivot (mult = 1.0×)",     minval=0.1, maxval=0.5, step=0.05, group=grp_x)
+buyPower    = input.float(1.4650, "BUY — Power (ln5/ln3)",         minval=0.5, maxval=4.0, step=0.01, group=grp_x)
+buyClamp    = input.float(0.15,   "BUY — Clamp below (flat 5×)",   minval=0.0, maxval=0.25,step=0.05, group=grp_x)
+sellFloor   = input.float(0.55,   "SELL — Floor (HOLD below)",     minval=0.4, maxval=0.8, step=0.05, group=grp_x)
+sellPivot   = input.float(0.60,   "SELL — Pivot (mult = 1.0×)",    minval=0.5, maxval=0.85,step=0.05, group=grp_x)
+sellPower   = input.float(0.8982, "SELL — Power (ln5/ln6)",        minval=0.5, maxval=4.0, step=0.01, group=grp_x)
+sellClamp   = input.float(0.85,   "SELL — Clamp above (flat 5×)",  minval=0.7, maxval=1.0, step=0.05, group=grp_x)
+
+// ============================================================================
+// DATA FETCHING — ~22 request.security() calls (within 40 limit)
+// ============================================================================
+
+// --- MACRO DATA (FRED) ---
+fedRate     = request.security("FRED:FEDFUNDS",  "D", close, ignore_invalid_symbol=true)
+us02y       = request.security("TVC:US02Y",      "D", close, ignore_invalid_symbol=true)
+m2          = request.security("FRED:M2SL",      "M", close, ignore_invalid_symbol=true)
+walcl       = request.security("FRED:WALCL",     "W", close, ignore_invalid_symbol=true)
+rrp         = request.security("FRED:RRPONTSYD", "D", close, ignore_invalid_symbol=true)
+realYield   = request.security("FRED:DFII10",    "D", close, ignore_invalid_symbol=true)
+unrate      = request.security("FRED:UNRATE",    "M", close, ignore_invalid_symbol=true)
+dxy         = request.security("TVC:DXY",        "D", close, ignore_invalid_symbol=true)
+
+// --- ON-CHAIN DATA ---
+btcMcap     = request.security("GLASSNODE:BTC_MARKETCAP",       "D", close, ignore_invalid_symbol=true)
+btcRcap     = request.security("COINMETRICS:BTC_MARKETCAPREAL", "D", close, ignore_invalid_symbol=true)
+btcHashrate = request.security("INTOTHEBLOCK:BTC_HASHRATE",     "D", close, ignore_invalid_symbol=true)
+// btcNetflow removed — IntoTheBlock feed dead, replaced by 365 SMA proxy
+minerRev    = request.security("QUANDL:BCHAIN/MIREV",           "D", close, ignore_invalid_symbol=true)
+
+// --- MARKET DATA ---
+btcD        = request.security("CRYPTOCAP:BTC.D",    "D", close, ignore_invalid_symbol=true)
+totalMcap   = request.security("CRYPTOCAP:TOTAL",    "D", close, ignore_invalid_symbol=true)
+total2Mcap  = request.security("CRYPTOCAP:TOTAL2",   "D", close, ignore_invalid_symbol=true)
+usdtMcap    = request.security("CRYPTOCAP:USDT",     "D", close, ignore_invalid_symbol=true)
+usdcMcap    = request.security("CRYPTOCAP:USDC",     "D", close, ignore_invalid_symbol=true)
+
+// --- BTC PRICE (weekly for long-term MAs) ---
+btcW        = request.security(syminfo.tickerid,      "W", close)
+btcWsma200  = request.security(syminfo.tickerid,      "W", ta.sma(close, 200))
+btcWsma20   = request.security(syminfo.tickerid,      "W", ta.sma(close, 20))
+btcWema21   = request.security(syminfo.tickerid,      "W", ta.ema(close, 21))
+
+// ============================================================================
+// HELPER: clamp to 0-1
+// ============================================================================
+clamp(float val) =>
+    math.max(0.0, math.min(1.0, val))
+
+// Normalize value within a range to 0-1
+normRange(float val, float lo, float hi) =>
+    clamp((val - lo) / (hi - lo))
+
+// ============================================================================
+// INDICATOR 1: FED RATE DIRECTION (5%)
+// INVERTED: High rates = assets cheap = LOW risk to buy
+// Low/cutting rates = assets pumping = HIGH risk to buy
+// ============================================================================
+fedSpread    = nz(fedRate) - nz(us02y)
+fedRoc6m     = nz(fedRate) - nz(fedRate[126])
+s01_spread   = normRange(fedSpread, -1.0, 2.0)
+s01_dir      = normRange(fedRoc6m, -2.0, 1.0)
+s01          = 1.0 - clamp(0.6 * s01_spread + 0.4 * s01_dir)
+
+// ============================================================================
+// INDICATOR 2: GLOBAL M2 YoY% (11%)
+// INVERTED: Contracting M2 = cheap assets = LOW risk to buy
+// Expanding M2 = expensive assets = HIGH risk to buy
+// ============================================================================
+m2_yoy       = nz(m2) > 0 ? (nz(m2) - nz(m2[12])) / nz(m2[12]) * 100 : 0.0
+m2Pct        = nz(ta.percentrank(m2_yoy, 1460) / 100.0, normRange(m2_yoy, 0.0, 10.0))
+s02          = m2Pct
+
+// ============================================================================
+// INDICATOR 3: FED BALANCE SHEET / NET LIQUIDITY (4%)
+// INVERTED: QT / shrinking = cheap assets = LOW risk to buy
+// QE / expanding = expensive assets = HIGH risk to buy
+// ============================================================================
+netLiq       = nz(walcl) - nz(rrp)
+netLiq3m     = nz(netLiq[63])
+liqRoc       = netLiq3m > 0 ? (netLiq - netLiq3m) / netLiq3m * 100 : 0.0
+liqSmooth    = ta.sma(liqRoc, 21)
+s03          = nz(ta.percentrank(liqSmooth, 1460) / 100.0, normRange(liqSmooth, -3.0, 3.0))
+
+// ============================================================================
+// INDICATOR 4: US REAL YIELDS (5%)
+// INVERTED: High real yields = assets beaten down = LOW risk to buy
+// Negative real yields = everything pumped = HIGH risk to buy
+// ============================================================================
+ry           = nz(realYield)
+s04          = 1.0 - normRange(ry, -1.0, 3.0)
+
+// ============================================================================
+// INDICATOR 5: UNEMPLOYMENT TREND (3%)
+// INVERTED: Rising unemployment = recession fear = cheap prices = LOW risk to buy
+// Low/falling unemployment = economy booming = expensive = HIGH risk
+// ============================================================================
+unrateRoc    = nz(unrate) - nz(unrate[126])
+unrateSmooth = ta.sma(unrateRoc, 21)
+s05          = 1.0 - nz(ta.percentrank(unrateSmooth, 1460) / 100.0, normRange(unrateSmooth, -1.0, 2.0))
+
+// ============================================================================
+// INDICATOR 6: DXY DOLLAR INDEX (7%)
+// INVERTED: Strong dollar = global pain = cheap crypto = LOW risk to buy
+// Weak dollar = liquidity party = expensive = HIGH risk
+// ============================================================================
+dxySma200    = ta.sma(nz(dxy), 200)
+dxyRatio     = nz(dxy) / nz(dxySma200, 100.0)
+dxySmooth    = ta.sma(dxyRatio, 21)
+s06          = 1.0 - nz(ta.percentrank(dxySmooth, 1460) / 100.0, normRange(dxySmooth, 0.96, 1.06))
+
+// ============================================================================
+// INDICATOR 7: MVRV Z-SCORE (11%) — ADAPTIVE
+// (MarketCap - RealizedCap) / StdDev(MarketCap)
+// Uses rolling percentile + ROC blend to handle cycle compression
+// ============================================================================
+mc           = nz(btcMcap)
+rc           = nz(btcRcap)
+mcStd        = ta.stdev(mc, 400)
+mvrvZ        = mcStd > 0 ? (mc - rc) / mcStd : 0.0
+// 70% rolling percentile (4yr) + 30% 90-day momentum
+// nz() fallback to fixed range when percentrank has insufficient history
+mvrvPct      = nz(ta.percentrank(mvrvZ, 1460) / 100.0, normRange(mvrvZ, -0.5, 8.0))
+mvrvRoc90    = nz(ta.change(mvrvZ, 90), 0.0)
+mvrvRocStd   = nz(ta.stdev(mvrvZ, 365), 1.0)
+mvrvRocNorm  = mvrvRocStd > 0 ? normRange(mvrvRoc90 / mvrvRocStd, -2.0, 2.0) : 0.5
+s07          = clamp(0.7 * mvrvPct + 0.3 * mvrvRocNorm)
+
+// ============================================================================
+// INDICATOR 8: NUPL (5%) — ADAPTIVE
+// (MarketCap - RealizedCap) / MarketCap * 100
+// Rolling percentile + ROC blend
+// ============================================================================
+nupl         = mc > 0 ? (mc - rc) / mc * 100 : 0.0
+nuplPct      = nz(ta.percentrank(nupl, 1460) / 100.0, normRange(nupl, -25.0, 80.0))
+nuplRoc90    = nz(ta.change(nupl, 90), 0.0)
+nuplRocStd   = nz(ta.stdev(nupl, 365), 1.0)
+nuplRocNorm  = nuplRocStd > 0 ? normRange(nuplRoc90 / nuplRocStd, -2.0, 2.0) : 0.5
+s08          = clamp(0.7 * nuplPct + 0.3 * nuplRocNorm)
+
+// ============================================================================
+// INDICATOR 9: PUELL MULTIPLE (4%) — ADAPTIVE
+// Daily miner revenue / 365D SMA of miner revenue
+// High = miners earning a lot = tops. Low = miner capitulation = bottoms.
+// ============================================================================
+mr           = nz(minerRev)
+mrSma365     = ta.sma(mr, 365)
+puell        = mrSma365 > 0 ? mr / mrSma365 : 1.0
+// Rolling percentile + ROC blend
+puellPct     = nz(ta.percentrank(puell, 1460) / 100.0, normRange(puell, 0.3, 4.0))
+puellRoc90   = nz(ta.change(puell, 90), 0.0)
+puellRocStd  = nz(ta.stdev(puell, 365), 1.0)
+puellRocNorm = puellRocStd > 0 ? normRange(puellRoc90 / puellRocStd, -2.0, 2.0) : 0.5
+s09          = clamp(0.7 * puellPct + 0.3 * puellRocNorm)
+
+// ============================================================================
+// INDICATOR 10: LTH BEHAVIOR PROXY — Price vs 365 SMA (4%)
+// Far below 365 SMA = accumulation zone = low risk (buy)
+// Far above 365 SMA = distribution zone = high risk (sell)
+// ============================================================================
+sma365       = ta.sma(close, 365)
+lthRatio     = close / nz(sma365, close)
+s10          = nz(ta.percentrank(lthRatio, 1460) / 100.0, normRange(lthRatio, 0.5, 2.5))
+
+// ============================================================================
+// INDICATOR 11: HASH RIBBONS (4%)
+// 30D SMA vs 60D SMA of hashrate
+// Capitulation (30 < 60) = buy zone. Recovery cross = strong buy.
+// ============================================================================
+hr           = nz(btcHashrate)
+hrSma30      = ta.sma(hr, 30)
+hrSma60      = ta.sma(hr, 60)
+hrCapitulating = hrSma30 < hrSma60
+hrRatio      = hrSma60 > 0 ? hrSma30 / hrSma60 : 1.0
+s11          = hrCapitulating ? 0.1 : normRange(hrRatio, 0.95, 1.15)
+
+// ============================================================================
+// INDICATOR 12: 200-WEEK MA RATIO (4%) — ADAPTIVE
+// Price / 200W SMA. Rolling percentile + ROC blend.
+// ============================================================================
+ratio200w    = nz(btcWsma200) > 0 ? close / nz(btcWsma200) : 1.0
+logRatio     = math.log(math.max(ratio200w, 0.3))
+r200Pct      = nz(ta.percentrank(logRatio, 1460) / 100.0, normRange(logRatio, math.log(0.5), math.log(4.0)))
+r200Roc90    = nz(ta.change(logRatio, 90), 0.0)
+r200RocStd   = nz(ta.stdev(logRatio, 365), 1.0)
+r200RocNorm  = r200RocStd > 0 ? normRange(r200Roc90 / r200RocStd, -2.0, 2.0) : 0.5
+s12          = clamp(0.7 * r200Pct + 0.3 * r200RocNorm)
+
+// ============================================================================
+// INDICATOR 13: BULL MARKET SUPPORT BAND (4%) — ADAPTIVE
+// 20W SMA × 21W EMA. Rolling percentile + ROC blend.
+// ============================================================================
+bandMid      = (nz(btcWsma20) + nz(btcWema21)) / 2.0
+bandRatio    = bandMid > 0 ? close / bandMid : 1.0
+bmsbPct      = nz(ta.percentrank(bandRatio, 1460) / 100.0, normRange(bandRatio, 0.7, 1.8))
+bmsbRoc90    = nz(ta.change(bandRatio, 90), 0.0)
+bmsbRocStd   = nz(ta.stdev(bandRatio, 365), 1.0)
+bmsbRocNorm  = bmsbRocStd > 0 ? normRange(bmsbRoc90 / bmsbRocStd, -2.0, 2.0) : 0.5
+s13          = clamp(0.7 * bmsbPct + 0.3 * bmsbRocNorm)
+
+// ============================================================================
+// INDICATOR 14: PI CYCLE TOP (3%)
+// 111DMA vs 350DMA × 2. Cross = cycle top.
+// Use proximity as gradient, not just binary.
+// ============================================================================
+ma111        = ta.sma(close, 111)
+ma350x2      = ta.sma(close, 350) * 2
+piRatio      = nz(ma350x2) > 0 ? nz(ma111) / nz(ma350x2) : 0.5
+piTriggered  = ta.crossover(ma111, ma350x2)
+// Ratio approaching 1.0 = danger. Range 0.3 to 1.05
+s14          = piTriggered ? 1.0 : normRange(piRatio, 0.3, 1.05)
+
+// ============================================================================
+// INDICATOR 15: BTC DOMINANCE ADJUSTED (6%)
+// High BTC.D = early cycle = lower risk for BTC = buy
+// Low BTC.D = altseason = late cycle = sell
+// ============================================================================
+adjBtcD      = nz(totalMcap) - nz(usdtMcap) > 0 ? nz(btcD) * nz(totalMcap) / (nz(totalMcap) - nz(usdtMcap)) : nz(btcD)
+s15          = 1.0 - nz(ta.percentrank(adjBtcD, 1460) / 100.0, normRange(adjBtcD, 35.0, 70.0))
+
+// ============================================================================
+// INDICATOR 16: LOG REGRESSION BAND (5%)
+// Position in long-term log growth channel
+// Approximate: log(price) = a * ln(days_since_genesis) + b
+// ============================================================================
+daysSinceGenesis = (time - timestamp(2009, 1, 3, 0, 0, 0)) / 86400000.0
+logFairValue = daysSinceGenesis > 0 ? 5.84 * math.log10(daysSinceGenesis) - 17.01 : 0.0
+logPrice     = close > 0 ? math.log10(close) : 0.0
+logDeviation = logPrice - logFairValue
+// Deviation range: -3 (deep below) to +3 (far above)
+s16          = nz(ta.percentrank(logDeviation, 1460) / 100.0, normRange(logDeviation, -2.0, 2.0))
+
+// ============================================================================
+// INDICATOR 17: STABLECOIN SUPPLY RATIO — SSR (3%) — ADAPTIVE
+// BTC market cap / total stablecoin supply
+// Low SSR = lots of dry powder relative to BTC = bullish = low risk
+// High SSR = no stablecoin ammo = high risk
+// ============================================================================
+stableSupply = nz(usdtMcap) + nz(usdcMcap)
+ssr          = stableSupply > 0 ? mc / stableSupply : 10.0
+// Percentile only (no ROC — slow-moving structural metric)
+ssrPct       = nz(ta.percentrank(ssr, 1460) / 100.0, normRange(ssr, 2.0, 20.0))
+s17          = clamp(ssrPct)
+
+// ============================================================================
+// INDICATOR 18: CRYPTO FEAR & GREED PROXY (6%)
+// 3-component oscillator: Momentum + Volatility + Price Strength
+// Oscillates 0-1 like alternative.me F&G index
+// ============================================================================
+// Component 1: Momentum (40%) — RSI blend
+fgRsi14      = ta.rsi(close, 14)
+fgRsi30      = ta.rsi(close, 30)
+fgMomentum   = (nz(fgRsi14) * 0.6 + nz(fgRsi30) * 0.4) / 100.0
+
+// Component 2: Volatility (30%) — 20D realized vol, percentile-ranked
+// High vol = fear (low score after inversion), low vol = greed
+fgReturns    = close / close[1] - 1.0
+fgVol20      = ta.stdev(fgReturns, 20) * math.sqrt(365) * 100.0
+fgVolPct     = nz(ta.percentrank(fgVol20, 365) / 100.0, 0.5)
+fgVolScore   = 1.0 - fgVolPct  // Invert: high vol = fear = low score
+
+// Component 3: Price Strength (30%) — position vs 50 & 200 SMA
+fgSma50      = ta.sma(close, 50)
+fgSma200     = ta.sma(close, 200)
+fgAbove50    = close > fgSma50 ? 1.0 : 0.0
+fgAbove200   = close > fgSma200 ? 1.0 : 0.0
+fgMargin50   = nz(fgSma50) > 0 ? clamp((close / fgSma50 - 0.85) / 0.3) : 0.5
+fgStrength   = fgAbove50 * 0.3 + fgAbove200 * 0.3 + fgMargin50 * 0.4
+
+// Composite F&G: 0 = extreme fear, 1 = extreme greed
+fgRaw        = fgMomentum * 0.4 + fgVolScore * 0.3 + fgStrength * 0.3
+s18          = ta.sma(fgRaw, 7)  // Smooth 7D to reduce noise
+
+// ============================================================================
+// INDICATOR 19: ALTCOIN BREADTH (4%)
+// TOTAL2 / TOTAL ratio. Rising = broadening (late cycle). Declining = narrow.
+// ============================================================================
+breadth      = nz(totalMcap) > 0 ? nz(total2Mcap) / nz(totalMcap) : 0.4
+// Range: 0.25 (BTC heavy, low risk) to 0.65 (altseason, high risk)
+s19          = normRange(breadth, 0.25, 0.65)
+
+// ============================================================================
+// COMPOSITE SCORE — WEIGHTED AVERAGE (respects ON/OFF toggles)
+// ============================================================================
+// Effective weights: 0 when tier OR individual toggled off
+ew01 = tierMacro and e01 ? w01 : 0.0
+ew02 = tierMacro and e02 ? w02 : 0.0
+ew03 = tierMacro and e03 ? w03 : 0.0
+ew04 = tierMacro and e04 ? w04 : 0.0
+ew05 = tierMacro and e05 ? w05 : 0.0
+ew06 = tierMacro and e06 ? w06 : 0.0
+ew07 = tierOnchain and e07 ? w07 : 0.0
+ew08 = tierOnchain and e08 ? w08 : 0.0
+ew09 = tierOnchain and e09 ? w09 : 0.0
+ew10 = tierOnchain and e10 ? w10 : 0.0
+ew11 = tierOnchain and e11 ? w11 : 0.0
+ew12 = tierTech and e12 ? w12 : 0.0
+ew13 = tierTech and e13 ? w13 : 0.0
+ew14 = tierTech and e14 ? w14 : 0.0
+ew15 = tierTech and e15 ? w15 : 0.0
+ew16 = tierTech and e16 ? w16 : 0.0
+ew17 = tierTech and e17 ? w17 : 0.0
+ew18 = tierSent and e18 ? w18 : 0.0
+ew19 = tierSent and e19 ? w19 : 0.0
+
+// Na-aware weighted sum: skip indicators with no data instead of defaulting to 0.5
+// This prevents pre-2018 dilution when SSR, Breadth, LTH etc. return na
+v01 = na(s01) ? 0.0 : s01*ew01,  a01 = na(s01) ? 0.0 : ew01
+v02 = na(s02) ? 0.0 : s02*ew02,  a02 = na(s02) ? 0.0 : ew02
+v03 = na(s03) ? 0.0 : s03*ew03,  a03 = na(s03) ? 0.0 : ew03
+v04 = na(s04) ? 0.0 : s04*ew04,  a04 = na(s04) ? 0.0 : ew04
+v05 = na(s05) ? 0.0 : s05*ew05,  a05 = na(s05) ? 0.0 : ew05
+v06 = na(s06) ? 0.0 : s06*ew06,  a06 = na(s06) ? 0.0 : ew06
+v07 = na(s07) ? 0.0 : s07*ew07,  a07 = na(s07) ? 0.0 : ew07
+v08 = na(s08) ? 0.0 : s08*ew08,  a08 = na(s08) ? 0.0 : ew08
+v09 = na(s09) ? 0.0 : s09*ew09,  a09 = na(s09) ? 0.0 : ew09
+v10 = na(s10) ? 0.0 : s10*ew10,  a10 = na(s10) ? 0.0 : ew10
+v11 = na(s11) ? 0.0 : s11*ew11,  a11 = na(s11) ? 0.0 : ew11
+v12 = na(s12) ? 0.0 : s12*ew12,  a12 = na(s12) ? 0.0 : ew12
+v13 = na(s13) ? 0.0 : s13*ew13,  a13 = na(s13) ? 0.0 : ew13
+v14 = na(s14) ? 0.0 : s14*ew14,  a14 = na(s14) ? 0.0 : ew14
+v15 = na(s15) ? 0.0 : s15*ew15,  a15 = na(s15) ? 0.0 : ew15
+v16 = na(s16) ? 0.0 : s16*ew16,  a16 = na(s16) ? 0.0 : ew16
+v17 = na(s17) ? 0.0 : s17*ew17,  a17 = na(s17) ? 0.0 : ew17
+v18 = na(s18) ? 0.0 : s18*ew18,  a18 = na(s18) ? 0.0 : ew18
+v19 = na(s19) ? 0.0 : s19*ew19,  a19 = na(s19) ? 0.0 : ew19
+
+// ============================================================================
+// TIER SUB-SCORES — na-aware weighted averages
+// ============================================================================
+tier_macro_raw   = (a01+a02+a03+a04+a05+a06) > 0 ? (v01+v02+v03+v04+v05+v06) / (a01+a02+a03+a04+a05+a06) : na
+tier_onchain_raw = (a07+a08+a09+a10+a11) > 0 ? (v07+v08+v09+v10+v11) / (a07+a08+a09+a10+a11) : na
+tier_tech_raw    = (a12+a13+a14+a15+a16+a17) > 0 ? (v12+v13+v14+v15+v16+v17) / (a12+a13+a14+a15+a16+a17) : na
+tier_sent_raw    = (a18+a19) > 0 ? (v18+v19) / (a18+a19) : na
+
+// ============================================================================
+// TIER-LEVEL PERCENTILE NORMALIZATION
+// Each tier's relative extremes stretch to full 0-1 independently
+// Macro saying "most overheated in 4yr" = same punch as on-chain saying it
+// ============================================================================
+tier_macro   = na(tier_macro_raw)   ? na : nz(ta.percentrank(tier_macro_raw, 1460) / 100.0, tier_macro_raw)
+tier_onchain = na(tier_onchain_raw) ? na : nz(ta.percentrank(tier_onchain_raw, 1460) / 100.0, tier_onchain_raw)
+tier_tech    = na(tier_tech_raw)    ? na : nz(ta.percentrank(tier_tech_raw, 1460) / 100.0, tier_tech_raw)
+tier_sent    = na(tier_sent_raw)    ? na : nz(ta.percentrank(tier_sent_raw, 1460) / 100.0, tier_sent_raw)
+
+// Combine normalized tiers with tier weights (35/30/25/10)
+// Na-aware: skip tiers that have no data
+tierW_macro   = na(tier_macro)   ? 0.0 : 25.0
+tierW_onchain = na(tier_onchain) ? 0.0 : 35.0
+tierW_tech    = na(tier_tech)    ? 0.0 : 30.0
+tierW_sent    = na(tier_sent)    ? 0.0 : 10.0
+tierW_total   = tierW_macro + tierW_onchain + tierW_tech + tierW_sent
+
+raw_composite = tierW_total > 0 ?
+     (nz(tier_macro, 0.0) * tierW_macro + nz(tier_onchain, 0.0) * tierW_onchain +
+      nz(tier_tech, 0.0) * tierW_tech + nz(tier_sent, 0.0) * tierW_sent) / tierW_total : 0.5
+
+// Smoothed composite
+compositeSmooth = ta.sma(raw_composite, smoothLen)
+
+// ============================================================================
+// RESCALE — Sigmoid curve compresses extremes, keeps middle responsive
+// ============================================================================
+grp_n = "═══ RESCALING ═══"
+centerPoint = input.float(0.50, "Center (raw midpoint)", minval=0.1, maxval=0.8, step=0.05, group=grp_n)
+steepness   = input.float(8.0,  "Sigmoid steepness",     minval=2.0, maxval=20.0, step=0.5, group=grp_n)
+
+sigmoid_input = -steepness * (compositeSmooth - centerPoint)
+composite     = math.max(0.05, math.min(0.95, 1.0 / (1.0 + math.exp(sigmoid_input))))
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// DDCA Action Bands
+
+// Background bands
+hline(0.25, "0.25 ALL-IN↓",    color=color.new(#00e676, 40), linestyle=hline.style_solid)
+hline(0.35, "0.35",             color=color.new(#66bb6a, 80), linestyle=hline.style_dotted)
+hline(0.45, "0.45 BUY↑ HOLD↓", color=color.new(#ffc107, 60), linestyle=hline.style_solid)
+hline(0.5, "0.5",               color=color.new(#78909c, 85), linestyle=hline.style_dotted)
+hline(0.55, "0.55 HOLD↑ SELL↓", color=color.new(#ff5722, 60), linestyle=hline.style_solid)
+hline(0.65, "0.65",             color=color.new(#ef5350, 80), linestyle=hline.style_dotted)
+hline(0.75, "0.75 ALL-OUT↑",   color=color.new(#d50000, 40), linestyle=hline.style_solid)
+
+// Background fill — tight bounds so chart doesn't waste vertical space
+h045 = hline(0.45, color=color.new(color.white, 100))
+h055 = hline(0.55, color=color.new(color.white, 100))
+h_lo = hline(0.08, color=color.new(color.white, 100))
+h_hi = hline(0.92, color=color.new(color.white, 100))
+fill(h_lo, h045, color=showBands ? color.new(#00e676, 92) : na, title="Buy Zone")
+fill(h045, h055, color=showBands ? color.new(#78909c, 93) : na, title="Hold Zone")
+fill(h055, h_hi, color=showBands ? color.new(#ff5722, 92) : na, title="Sell Zone")
+
+// Main composite line
+compositeColor = composite <= 0.25 ? #00e676 : composite <= 0.35 ? #66bb6a : composite <= 0.45 ? #a5d6a7 : composite <= 0.55 ? #ffc107 : composite <= 0.65 ? #ffab91 : composite <= 0.75 ? #ff5722 : #d50000
+
+plot(composite, "DDCA Risk", color=compositeColor, linewidth=3)
+
+// ── Tracking tooltip — invisible labels on curve, hover to see popup ──
+bandLabel = composite < 0.25 ? "🟢 ALL-IN" : composite < 0.35 ? "🟢 STRONG BUY" : composite < 0.45 ? "🟢 BUY" : composite < 0.55 ? "🟡 HOLD" : composite < 0.65 ? "🔴 SELL" : composite < 0.75 ? "🔴 STRONG SELL" : "🔴 ALL-OUT"
+tipText  = "Risk: " + str.tostring(composite, "#.###") + "\n" + bandLabel + "\n─────────\nMacro:     " + str.tostring(tier_macro, "#.##") + "\nOn-Chain:  " + str.tostring(tier_onchain, "#.##") + "\nTechnical: " + str.tostring(tier_tech, "#.##") + "\nSentiment: " + str.tostring(tier_sent, "#.##")
+label.new(bar_index, composite, "", color=color.new(compositeColor, 100), textcolor=color.new(color.white, 100), style=label.style_label_center, size=size.tiny, tooltip=tipText)
+
+// ── Persistent label on current bar — always visible, colored by band ──
+var label curLabel = na
+if barstate.islast
+    label.delete(curLabel)
+    curLabel := label.new(bar_index + 2, composite, str.tostring(composite, "#.##") + " " + bandLabel, color=color.new(compositeColor, 20), textcolor=color.white, style=label.style_label_left, size=size.normal, textalign=text.align_left)
+
+// Sub-score plots (toggle)
+plot(showSub ? tier_macro : na,   "Tier: Macro",    color=color.new(#e94560, 50), linewidth=1)
+plot(showSub ? tier_onchain : na, "Tier: On-Chain",  color=color.new(#2196f3, 50), linewidth=1)
+plot(showSub ? tier_tech : na,    "Tier: Technical", color=color.new(#9c27b0, 50), linewidth=1)
+plot(showSub ? tier_sent : na,    "Tier: Sentiment", color=color.new(#ff9800, 50), linewidth=1)
+
+// ============================================================================
+// TABLE — Current scores breakdown
+// ============================================================================
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 4, 24, bgcolor=color.new(#0a0a14, 10), border_width=1, border_color=color.new(#333333, 0))
+    header_bg = color.new(#1a1a2e, 0)
+    
+    table.cell(t, 0, 0, "DDCA COMPOSITE RISK", text_color=#e94560, text_size=size.small, bgcolor=header_bg, text_halign=text.align_left)
+    table.cell(t, 1, 0, str.tostring(composite, "#.###"), text_color=compositeColor, text_size=size.normal, bgcolor=header_bg)
+    actionLabel = composite <= 0.25 ? "ALL-IN" : composite <= 0.35 ? "STRONG BUY" : composite <= 0.45 ? "BUY" : composite <= 0.55 ? "HOLD" : composite <= 0.65 ? "SELL" : composite <= 0.75 ? "STRONG SELL" : "ALL-OUT"
+    table.cell(t, 2, 0, actionLabel, text_color=compositeColor, text_size=size.small, bgcolor=header_bg)
+    table.cell(t, 3, 0, "", bgcolor=header_bg)
+
+    // Tier summaries
+    table.cell(t, 0, 1, "Macro 25%",    text_color=#e94560, text_size=size.tiny, bgcolor=color.new(#111111, 0), text_halign=text.align_left)
+    table.cell(t, 1, 1, str.tostring(tier_macro, "#.##"), text_color=#e94560, text_size=size.tiny, bgcolor=color.new(#111111, 0))
+    table.cell(t, 0, 2, "OnChain 35%",  text_color=#2196f3, text_size=size.tiny, bgcolor=color.new(#111111, 0), text_halign=text.align_left)
+    table.cell(t, 1, 2, str.tostring(tier_onchain, "#.##"), text_color=#2196f3, text_size=size.tiny, bgcolor=color.new(#111111, 0))
+    table.cell(t, 0, 3, "Tech 30%",     text_color=#9c27b0, text_size=size.tiny, bgcolor=color.new(#111111, 0), text_halign=text.align_left)
+    table.cell(t, 1, 3, str.tostring(tier_tech, "#.##"), text_color=#9c27b0, text_size=size.tiny, bgcolor=color.new(#111111, 0))
+    table.cell(t, 0, 4, "Sentiment 10%",text_color=#ff9800, text_size=size.tiny, bgcolor=color.new(#111111, 0), text_halign=text.align_left)
+    table.cell(t, 1, 4, str.tostring(tier_sent, "#.##"), text_color=#ff9800, text_size=size.tiny, bgcolor=color.new(#111111, 0))
+
+    // Individual scores
+    row = 5
+    labels = array.from("①FED Rate","②M2 YoY","③WALCL","④RealYld","⑤Unempl","⑥DXY","⑦MVRV-Z","⑧NUPL","⑨Puell","⑩LTH 365","⑪HashRib","⑫200W MA","⑬BMSB","⑭PiCycle","⑮BTC.D","⑯LogReg","⑰SSR","⑱F&G","⑲Breadth")
+    scores = array.from(s01,s02,s03,s04,s05,s06,s07,s08,s09,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19)
+    weights = array.from(w01,w02,w03,w04,w05,w06,w07,w08,w09,w10,w11,w12,w13,w14,w15,w16,w17,w18,w19)
+    
+    for i = 0 to array.size(labels) - 1
+        sc = array.get(scores, i)
+        wt = array.get(weights, i)
+        scColor = sc <= 0.3 ? #00e676 : sc <= 0.6 ? #ffc107 : #ef5350
+        r = row + i
+        table.cell(t, 0, r, array.get(labels, i), text_color=#888888, text_size=size.tiny, bgcolor=color.new(#0d0d14, 0), text_halign=text.align_left)
+        table.cell(t, 1, r, str.tostring(sc, "#.##"), text_color=scColor, text_size=size.tiny, bgcolor=color.new(#0d0d14, 0))
+        table.cell(t, 2, r, str.tostring(wt, "#") + "%", text_color=#555555, text_size=size.tiny, bgcolor=color.new(#0d0d14, 0))
+        // Mini bar
+        table.cell(t, 3, r, str.tostring(math.round(sc * 100)) + "%", text_color=scColor, text_size=size.tiny, bgcolor=color.new(#0d0d14, 0))
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(ta.crossunder(composite, 0.25), "RISK < 0.25 — ALL-IN",       "DDCA Risk dropped below 0.25 — ALL-IN buy signal")
+alertcondition(ta.crossunder(composite, 0.35), "RISK < 0.35 — STRONG BUY",  "DDCA Risk dropped below 0.35 — Strong buy signal")
+alertcondition(ta.crossunder(composite, 0.45), "RISK < 0.45 — BUY",         "DDCA Risk dropped below 0.45 — Buy signal")
+alertcondition(ta.crossover(composite, 0.55),  "RISK > 0.55 — SELL",        "DDCA Risk rose above 0.55 — Sell signal")
+alertcondition(ta.crossover(composite, 0.65),  "RISK > 0.65 — STRONG SELL", "DDCA Risk rose above 0.65 — Strong sell signal")
+alertcondition(ta.crossover(composite, 0.75),  "RISK > 0.75 — ALL-OUT",     "DDCA Risk rose above 0.75 — ALL-OUT signal")

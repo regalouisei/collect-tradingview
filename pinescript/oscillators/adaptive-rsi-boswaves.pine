@@ -1,0 +1,321 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+import TradingView/ta/11 as ta
+
+indicator("Adaptive RSI [BOSWaves]", overlay=false)
+
+// ┌────────────────────────────── BOSWaves ─ Constants ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string group_calc   = "Core Calculation"
+const string group_adapt  = "Adaptive Thresholds"
+const string group_visual = "Visualization"
+const string group_div = "Divergences"
+
+enum MAType
+    SMA
+    HMA
+    EMA
+    WMA
+    DEMA
+    RMA
+    LINREG
+    TEMA
+
+// ┌────────────────────────────── BOSWaves ─ Tooltips ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string tt1  = "Base lookback length for the RSI calculation."
+const string tt2  = "Price source used to compute the oscillator."
+const string tt3  = "Applies smoothing to the oscillator after RSI is calculated."
+const string tt4  = "Smoothing length applied to the oscillator when smoothing is enabled."
+const string tt5  = "Moving average type used for smoothing the oscillator."
+const string tt6  = "Number of historical confirmed oscillator values stored for percentile thresholding. Larger values adapt slower but are more stable."
+const string tt7  = "Upper percentile used as the adaptive long threshold. Higher values require stronger momentum to flip bullish."
+const string tt8  = "Lower percentile used as the adaptive short threshold. Lower values require stronger downside momentum to flip bearish."
+const string tt9  = "Show the adaptive threshold lines on the oscillator."
+const string tt10 = "Color the chart candles using the oscillator regime color."
+const string tt11 = "Show shaded extreme bands and strength intensity based on distance from midline."
+const string tt12 = "Enable regular bullish/bearish divergence detection between price and the oscillator. This is required for divergence alerts."
+const string tt13 = "Pivot size used to confirm swing points for divergence detection. Higher values reduce noise but trigger fewer signals."
+const string tt14 = "Minimum bars allowed between pivots being compared."
+
+// ┌────────────────────────────── BOSWaves ─ Inputs ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+int   rsi_length          = input.int(18, "RSI Length", minval=1, group=group_calc, tooltip=tt1)
+float osc_source          = input.source(close, "Source", group=group_calc, tooltip=tt2)
+
+bool  use_smoothing       = input.bool(true, "Smooth Oscillator", group=group_calc, tooltip=tt3)
+int   smooth_length       = input.int(20, "Smoothing Length", minval=1, group=group_calc, tooltip=tt4)
+MAType smooth_type        = input.enum(MAType.SMA, "Smoothing Type", group=group_calc, tooltip=tt5)
+
+int   adapt_lookback      = input.int(1000, "Adaptive Lookback", minval=50, group=group_adapt, tooltip=tt6)
+int   upper_percentile    = input.int(50, "Upper Percentile", minval=1, maxval=99, group=group_adapt, tooltip=tt7)
+int   lower_percentile    = input.int(45, "Lower Percentile", minval=1, maxval=99, group=group_adapt, tooltip=tt8)
+
+bool  show_thresholds     = input.bool(true, "Show Threshold Lines", group=group_visual, tooltip=tt9)
+bool  color_candles       = input.bool(false, "Color Candles", group=group_visual, tooltip=tt10)
+
+color bull_color          = input.color(#00C8FF, "Bull Color", group=group_visual, inline="colors")
+color bear_color          = input.color(#FF005D, "Bear Color", group=group_visual, inline="colors")
+bool  show_extremes       = input.bool(true, "Show Extreme Bands", group=group_visual, tooltip=tt11)
+
+bool show_divergences     = input.bool(true, "Calculate Divergences", group=group_div, tooltip=tt12, display=display.data_window)
+bool show_div_labels      = input.bool(true, "Show Divergence Labels", group=group_div)
+bool show_div_lines       = input.bool(true, "Show Divergence Lines on Price", group=group_div)
+
+int div_left              = input.int(15, "Pivot Left", minval=1, group=group_div, tooltip=tt13, inline="div1")
+int div_right             = input.int(15, "Right", minval=1, group=group_div, tooltip=tt13, inline="div1")
+int div_range_min         = input.int(5, "Min Pivot Distance", minval=1, group=group_div, tooltip=tt14, inline="div2")
+int div_range_max         = input.int(60, "Max", minval=1, group=group_div, tooltip=tt14, inline="div2")
+
+// ┌────────────────────────────── BOSWaves ─ Helpers ────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+clamp(value, min_val, max_val) =>
+    math.max(min_val, math.min(value, max_val))
+
+ma_smoothing(src, len, MAType t) =>
+    switch t
+        MAType.SMA    => ta.sma(src, len)
+        MAType.HMA    => ta.hma(src, len)
+        MAType.EMA    => ta.ema(src, len)
+        MAType.WMA    => ta.wma(src, len)
+        MAType.DEMA   => ta.dema(src, len)
+        MAType.RMA    => ta.rma(src, len)
+        MAType.LINREG => ta.linreg(src, len, 0)
+        MAType.TEMA   => ta.tema(src, len)
+
+
+in_range(bool pivot_cond) =>
+    int bars = ta.barssince(pivot_cond)
+    bars >= div_range_min and bars <= div_range_max
+
+percentile_value(float[] arr, int pct) =>
+    arr.size() > 0 ? arr.percentile_linear_interpolation(pct) : na
+
+// ┌────────────────────────────── BOSWaves ─ Oscillator ─────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+float base_src = ta.hma(osc_source, 4)
+float osc_raw  = ta.rsi(base_src, rsi_length)
+float osc      = use_smoothing ? ma_smoothing(osc_raw, smooth_length, smooth_type) : osc_raw
+
+var float osc_confirmed = na
+if barstate.isconfirmed
+    osc_confirmed := osc
+
+// ┌────────────────────────────── BOSWaves ─ Adaptive Thresholds ────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var float[] history = array.new<float>()
+
+if not na(osc_confirmed)
+    history.unshift(osc_confirmed)
+    if history.size() > adapt_lookback
+        history.remove(history.size() - 1)
+
+float upper_thr = na
+float lower_thr = na
+
+if not na(osc_confirmed)
+    float[] sorted = history.copy()
+    sorted.sort()
+    upper_thr := percentile_value(sorted, upper_percentile)
+    lower_thr := percentile_value(sorted, lower_percentile)
+
+// ┌────────────────────────────── BOSWaves ─ Regime State ───────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var int regime_state = 0
+
+if barstate.isconfirmed
+    if osc > upper_thr
+        regime_state := 1
+    else if osc < lower_thr
+        regime_state := -1
+    else
+        regime_state := nz(regime_state[1], 0)
+
+// ┌────────────────────────────── BOSWaves ─ Plotting ───────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+color regime_color =
+     regime_state == 1 ? bull_color :
+     regime_state == -1 ? bear_color :
+     #787b86
+
+int regime_state_fixed = fixnan(regime_state)
+
+plot(show_thresholds ? upper_thr : na, "Upper Threshold", color=bull_color)
+plot(show_thresholds ? lower_thr : na, "Lower Threshold", color=bear_color)
+
+plot_osc = plot(osc, "Adaptive RSI", color=regime_color, linewidth=3)
+
+plot_shader = plot(ta.tema(osc, 30), "Shader", color=color.white, display=display.none)
+plot_mid = plot(50, "Midline", color=color.gray, display=display.none)
+
+plotcandle(
+    open,high,low,close, 
+    "RSI Trend", 
+    regime_color, 
+    regime_color, 
+    force_overlay=true,
+    bordercolor=regime_color, 
+    display=color_candles?display.all:display.none
+)
+
+fill(plot_shader, plot_osc, regime_color, "Regime Fill")
+fill(plot_osc, plot_mid,
+     osc > 50 ? osc : 50,
+     osc > 50 ? 50 : osc,
+     osc > 50 ? color.new(bull_color, 10) : na,
+     osc > 50 ? na : color.new(bear_color, 10))
+
+// ┌────────────────────────────── BOSWaves ─ Extreme Bands ──────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+float lo = float(15)
+float hi = float(85)
+float mid = float(50)
+float max_strength = (hi - lo) * 0.5
+
+float osc_clamped = clamp(osc, lo, hi)
+float strength = math.abs(osc_clamped - mid)
+float strength_pct = max_strength > 0 ? math.min(strength / max_strength * 100.0, 100.0) : 0.0
+int alpha_val = int(100.0 - strength_pct)
+
+plot_u1 = plot(show_extremes ? 100 : na, "Upper Extreme", color=#787b864d)
+plot_u2 = plot(show_extremes ? 85 : na, "Upper Band", color=#787b864d)
+fill(plot_u1, plot_u2, osc_clamped > mid ? color.new(bull_color, alpha_val) : color.new(color.white, 100), "Upper Strength")
+
+plot_l1 = plot(show_extremes ? 0 : na, "Lower Extreme", color=#787b864d)
+plot_l2 = plot(show_extremes ? 15 : na, "Lower Band", color=#787b864d)
+fill(plot_l1, plot_l2, osc_clamped < mid ? color.new(bear_color, alpha_val) : color.new(color.white, 100), "Lower Strength")
+
+// ┌────────────────────────────── BOSWaves ─ Divergences ────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+
+bool pl_found = false
+bool ph_found = false
+bool bull_div = false
+bool bear_div = false
+
+float osc_r = osc[div_right]
+
+if show_divergences
+    // Storage arrays for pivot tracking
+    var int[] ph_bars = array.new_int()
+    var float[] ph_vals = array.new_float()
+    var float[] ph_prices = array.new_float()
+    var int[] pl_bars = array.new_int()
+    var float[] pl_vals = array.new_float()
+    var float[] pl_prices = array.new_float()
+    
+    // Track last divergence bar to prevent duplicates
+    var int lastBearDivBar = 0
+    var int lastBullDivBar = 0
+
+    // Detect pivot high
+    float ph = ta.pivothigh(osc, div_left, div_right)
+    if not na(ph)
+        ph_found := true
+        array.push(ph_bars, bar_index[div_right])
+        array.push(ph_vals, ph)
+        array.push(ph_prices, high[div_right])
+        
+        // Limit array size
+        if array.size(ph_bars) > 20
+            array.shift(ph_bars)
+            array.shift(ph_vals)
+            array.shift(ph_prices)
+        
+        // Check for regular bearish divergence: price HH, osc LH
+        if array.size(ph_bars) >= 2
+            for i = array.size(ph_bars) - 2 to math.max(0, array.size(ph_bars) - 6)
+                int bar1 = array.get(ph_bars, i)
+                float val1 = array.get(ph_vals, i)
+                float price1 = array.get(ph_prices, i)
+                int bar2 = bar_index[div_right]
+                float val2 = ph
+                float price2 = high[div_right]
+                
+                int barDiff = bar2 - bar1
+                
+                if barDiff >= div_range_min and barDiff <= div_range_max
+                    if price2 > price1 and val2 < val1
+                        if bar2 - lastBearDivBar > div_left * 2
+                            bear_div := true
+                            lastBearDivBar := bar2
+                            
+                            // Draw line on oscillator pane
+                            if show_div_lines
+                                line.new(bar1, val1, bar2, val2, color=color.new(bear_color, 20), width=3)
+                            
+                            // Draw line on price chart
+                            if show_div_lines
+                                line.new(bar1, price1, bar2, price2, color=color.new(bear_color, 30), width=3, force_overlay=true)
+                            break
+
+    // Detect pivot low
+    float pl = ta.pivotlow(osc, div_left, div_right)
+    if not na(pl)
+        pl_found := true
+        array.push(pl_bars, bar_index[div_right])
+        array.push(pl_vals, pl)
+        array.push(pl_prices, low[div_right])
+        
+        if array.size(pl_bars) > 20
+            array.shift(pl_bars)
+            array.shift(pl_vals)
+            array.shift(pl_prices)
+        
+        // Check for regular bullish divergence: price LL, osc HL
+        if array.size(pl_bars) >= 2
+            for i = array.size(pl_bars) - 2 to math.max(0, array.size(pl_bars) - 6)
+                int bar1 = array.get(pl_bars, i)
+                float val1 = array.get(pl_vals, i)
+                float price1 = array.get(pl_prices, i)
+                int bar2 = bar_index[div_right]
+                float val2 = pl
+                float price2 = low[div_right]
+                
+                int barDiff = bar2 - bar1
+                
+                if barDiff >= div_range_min and barDiff <= div_range_max
+                    if price2 < price1 and val2 > val1
+                        if bar2 - lastBullDivBar > div_left * 2
+                            bull_div := true
+                            lastBullDivBar := bar2
+                            
+                            // Draw line on oscillator pane
+                            if show_div_lines
+                                line.new(bar1, val1, bar2, val2, color=color.new(bull_color, 20), width=3)
+                            
+                            // Draw line on price chart
+                            if show_div_lines
+                                line.new(bar1, price1, bar2, price2, color=color.new(bull_color, 30), width=3, force_overlay=true)
+                            break
+
+plot(pl_found and show_divergences ? osc_r : na, title="Bull Pivot (osc)", offset=-div_right, linewidth=3, color=color.new(bull_color, bull_div ? 0 : 100), display=display.pane, editable=show_divergences)
+plot(ph_found and show_divergences ? osc_r : na, title="Bear Pivot (osc)", offset=-div_right, linewidth=3, color=color.new(bear_color, bear_div ? 0 : 100), display=display.pane, editable=show_divergences)
+
+plotshape(show_divergences and show_div_labels and bull_div ? osc_r : na, title="Bullish Divergence", offset=-div_right, style=shape.labelup, location=location.absolute, color=bull_color, text="𝐁𝐮𝐥𝐥", textcolor=chart.fg_color, display=display.pane)
+plotshape(show_divergences and show_div_labels and bear_div ? osc_r : na, title="Bearish Divergence", offset=-div_right, style=shape.labeldown, location=location.absolute, color=bear_color, text="𝐁𝐞𝐚𝐫", textcolor=chart.fg_color, display=display.pane)
+
+// ┌────────────────────────────── BOSWaves ─ Reversals ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+plotchar(osc>80?104:na, title="", char="✦", location=location.absolute, color=bear_color, size=size.tiny)
+plotchar(osc<15?-4:na, title="", char="✦", location=location.absolute, color=bull_color, size=size.tiny)
+
+// ┌────────────────────────────── BOSWaves ─ Alerts ─────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+bool long  = barstate.isconfirmed and regime_state == 1 and regime_state[1] != 1
+bool short = barstate.isconfirmed and regime_state == -1 and regime_state[1] != -1
+
+bool cross_upper = barstate.isconfirmed and ta.crossover(osc, upper_thr)
+bool cross_lower = barstate.isconfirmed and ta.crossunder(osc, lower_thr)
+
+alertcondition(long,  title="Adaptive RSI Long",  message="Adaptive RSI Long {{exchange}}:{{ticker}}")
+alertcondition(short, title="Adaptive RSI Short", message="Adaptive RSI Short {{exchange}}:{{ticker}}")
+
+alertcondition(cross_upper, title="Adaptive RSI Crossed Upper Threshold", message="Adaptive RSI crossed ABOVE upper threshold {{exchange}}:{{ticker}}")
+alertcondition(cross_lower, title="Adaptive RSI Crossed Lower Threshold", message="Adaptive RSI crossed BELOW lower threshold {{exchange}}:{{ticker}}")
+
+alertcondition(bull_div, title="Regular Bullish Divergence", message="Adaptive RSI  Bullish Divergence {{exchange}}:{{ticker}})")
+alertcondition(bear_div, title="Regular Bearish Divergence", message="Adaptive RSI Bearish Divergence {{exchange}}:{{ticker}}")

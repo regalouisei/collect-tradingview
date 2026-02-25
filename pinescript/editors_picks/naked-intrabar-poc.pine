@@ -1,0 +1,144 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © rumpypumpydumpy
+
+//@version=5
+indicator("Naked Intrabar POC", overlay = true, max_lines_count = 500)
+
+// -----------------------------------------------------------------------------
+
+inp_tf =            input.timeframe("1",        title = "Sampling lower timeframe")
+inp_num_bins =      input.int(250,              title = "Sample bins")
+inp_type =          input.string("Time",        title = "POC Type",                 options = ["Time", "Volume"])
+inp_hide_hit =      input.bool(false,           title = "Only Display Naked POCs?")
+inp_hit_col =       input.color(color.gray,     title = "POC Hit color")
+inp_naked_col =     input.color(color.blue,     title = "Naked POC color")
+inp_linewidth =     input.int(1,                title = "POC line width")
+inp_linestyle =     input.string("Dashed",      title = "POC Line style",           options = ["Solid", "Dotted", "Dashed"])
+inp_extend_poc =    input.bool(true,            title = "Extend Naked POCs?")
+inp_poc_dot_color = input.color(color.yellow,   title = "Intrabar POC dot color")
+inp_show_hv_npoc =  input.bool(false,           title = "Display highest volume Naked POC?")
+inp_hv_npoc_lb =    input.int(30,               title = "Highest Volume Naked POC lookback", maxval = 500)
+inp_hv_npoc_col =   input.color(color.red,      title = "Highest Volume Naked POC color")
+
+// -----------------------------------------------------------------------------
+
+[intrabar_highs, intrabar_lows, intrabar_vol] = request.security_lower_tf(syminfo.tickerid, inp_tf, [high, low, volume])
+
+poc_linestyle = switch inp_linestyle
+    "Solid" =>  line.style_solid
+    "Dotted" => line.style_dotted
+    "Dashed" => line.style_dashed
+
+float intrabar_poc = na
+
+// -----------------------------------------------------------------------------
+
+size = array.size(intrabar_highs)
+
+if size > 0
+
+    float[] tpo_bins = array.new_float()
+
+    for i = 0 to inp_num_bins - 1
+        array.push(tpo_bins, 0)
+
+    inc = (high - low) / inp_num_bins
+    num_vals = array.size(intrabar_highs)
+    for i = 0 to inp_num_bins - 1
+        bin_bottom = low + i * inc
+        bin_top = bin_bottom + inc
+
+        for j = 0 to num_vals - 1
+            intrabar_high = array.get(intrabar_highs, j)
+            intrabar_low = array.get(intrabar_lows, j)
+            intrabar_volume = inp_type == "Time" ? 1 : array.get(intrabar_vol, j)
+            
+            inside_bin = intrabar_high <= bin_top and intrabar_low >= bin_bottom
+            spans_bin = intrabar_high > bin_top and intrabar_low < bin_bottom
+            up_bin = intrabar_high > bin_bottom and intrabar_high < bin_top and intrabar_low < bin_bottom
+            dn_bin = intrabar_low < bin_top and intrabar_low > bin_bottom and intrabar_high > bin_top
+            
+            if inside_bin
+                current = array.get(tpo_bins, i)
+                array.set(tpo_bins, i, current + (1 * intrabar_volume))
+            else if spans_bin
+                current = array.get(tpo_bins, i)
+                val = (bin_top - bin_bottom) / (intrabar_high - intrabar_low) * intrabar_volume
+                array.set(tpo_bins, i, current + val)
+            else if up_bin
+                current = array.get(tpo_bins, i)
+                val = (intrabar_high - bin_bottom) / (intrabar_high - intrabar_low) * intrabar_volume
+                array.set(tpo_bins, i, current + val)
+            else if dn_bin
+                current = array.get(tpo_bins, i)
+                val = (bin_top - intrabar_low) / (intrabar_high - intrabar_low) * intrabar_volume
+                array.set(tpo_bins, i, current + val)
+    
+    poc_val = array.max(tpo_bins)
+    poc_index = array.indexof(tpo_bins, poc_val)
+    
+    intrabar_poc := low + inc * (poc_index + 0.5)
+
+// -----------------------------------------------------------------------------
+    
+plot(intrabar_poc, color = inp_poc_dot_color, linewidth = 2, style = plot.style_circles, title = "Intrabar POC")
+
+var line[]  poc_lines = array.new_line()
+var bool[]  poc_hit = array.new_bool()
+var int[]   poc_index = array.new_int()
+var float[] volume_vals = array.new_float()
+
+
+if array.size(poc_lines) > 0
+    for i = array.size(poc_lines) - 1 to 0
+        temp_line = array.get(poc_lines, i)
+        temp_poc_price = line.get_y1(temp_line)
+        if low <= temp_poc_price and high >= temp_poc_price and not array.get(poc_hit, i)
+            if inp_hide_hit
+                array.remove(poc_hit, i)
+                line.delete(temp_line)
+                array.remove(poc_lines, i)
+                array.remove(poc_index, i)
+                array.remove(volume_vals, i)
+            else
+                array.set(poc_hit, i, true)
+                line.set_color(temp_line, color = inp_hit_col)
+                line.set_extend(temp_line, extend = extend.none)
+                line.set_x2(temp_line, x = bar_index)
+
+array.unshift(poc_lines, line.new(x1 = bar_index, y1 = intrabar_poc, x2 = bar_index + 1, y2 = intrabar_poc, color = inp_naked_col, style = poc_linestyle, width = inp_linewidth, extend = inp_extend_poc ? extend.right : extend.none))
+array.unshift(poc_hit, false)
+array.unshift(poc_index, bar_index)
+array.unshift(volume_vals, volume)
+
+if array.size(poc_lines) > 500
+    temp_line = array.pop(poc_lines)
+    line.delete(temp_line)
+    array.pop(poc_hit)
+    array.pop(poc_index)
+    array.pop(volume_vals)
+
+if array.size(poc_lines) > 0
+    for i = 0 to array.size(poc_lines) - 1
+        temp_line = array.get(poc_lines, i)
+        if array.get(poc_hit, i) == false
+            line.set_x2(temp_line, x = bar_index + 1)
+
+float highest_npoc_volume = 0.0
+float hv_npoc = na
+
+if array.size(poc_index) > 0
+    for i = 0 to array.size(poc_index) - 1
+        temp_index = array.get(poc_index, i)
+        temp_volume = array.get(volume_vals, i)
+        if temp_index >= bar_index - inp_hv_npoc_lb
+            if temp_volume > highest_npoc_volume and not array.get(poc_hit, i)
+                highest_npoc_volume := temp_volume
+                hv_npoc := intrabar_poc[bar_index - temp_index]
+        else
+            break
+
+plot(inp_show_hv_npoc ? hv_npoc : na, linewidth = 2, style = plot.style_circles, color = inp_hv_npoc_col, title = "Highest Volume Naked POC")
+
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------

@@ -1,0 +1,135 @@
+//@version=6
+indicator("Time ORB [AlgoRich]", overlay = true, max_boxes_count = 10000)
+
+// === INPUTS PRINCIPALES ===
+utc_offset = input.int(-3, "UTC de tu zona horaria", minval = -12, maxval = 14, group = "📌 ORB Open Range Breakout")
+
+// Selección de Mecha o Cuerpo
+tipo_calculo = input.string("Mechas", "Calcular Rango por:", options = ["Mechas", "Cuerpo"], group = "📌 ORB Open Range Breakout")
+
+hora_inicio_rango = input.int(20, "Hora inicio rango (24h)", minval = 0, maxval = 23, group = "📌 ORB Open Range Breakout")
+min_inicio_rango  = input.int(0,  "Minuto inicio rango",     minval = 0, maxval = 59, group = "📌 ORB Open Range Breakout")
+hora_fin_rango    = input.int(4,  "Hora fin rango (24h)",    minval = 0, maxval = 23, group = "📌 ORB Open Range Breakout")
+min_fin_rango     = input.int(0,  "Minuto fin rango",        minval = 0, maxval = 59, group = "📌 ORB Open Range Breakout")
+
+permitir_segunda_entrada = input.bool(true, "Permitir segunda entrada en reversión", group = "📌 ORB Open Range Breakout")
+
+// === NUEVO: LÍMITE DE EXTENSIÓN ===
+hora_fin_extension = input.int(12, "Hora Fin de Extensión (Corte)", minval = 0, maxval = 23, group = "📌 Límite de Extensión", tooltip = "Hora a la que las líneas dejarán de dibujarse y se anulan las señales")
+min_fin_extension  = input.int(0,  "Minuto Fin de Extensión",       minval = 0, maxval = 59, group = "📌 Límite de Extensión")
+
+// === COLORES CONFIGURABLES ===
+color_buy        = input.color(#00ff80, "Color LÍNEA SUPERIOR (Buy)", group = "📌 ORB - Colores")
+color_sell       = input.color(#ff003a, "Color LÍNEA INFERIOR (Sell)", group = "📌 ORB - Colores")
+color_equil      = input.color(#ffbf00, "Color EQUILIBRIUM",           group = "📌 ORB - Colores")
+texto_color_buy  = input.color(#000000, "Color texto BUY",             group = "📌 ORB - Colores")
+texto_color_sell = input.color(color.white, "Color texto SELL",        group = "📌 ORB - Colores")
+
+// === LÓGICA DE TIEMPO ===
+offset_string = "UTC" + (utc_offset >= 0 ? "+" : "") + str.tostring(utc_offset)
+h_actual = hour(time, offset_string)
+m_actual = minute(time, offset_string)
+minutos_actuales = h_actual * 60 + m_actual
+
+// Convertir horas a minutos totales
+minutos_inicio_val = hora_inicio_rango * 60 + min_inicio_rango
+minutos_fin_val    = hora_fin_rango * 60 + min_fin_rango
+minutos_fin_ext_val = hora_fin_extension * 60 + min_fin_extension
+
+// 1. Determinar si estamos en el RANGO DE CÁLCULO
+bool en_rango = false
+if minutos_inicio_val < minutos_fin_val
+    en_rango := minutos_actuales >= minutos_inicio_val and minutos_actuales < minutos_fin_val
+else
+    en_rango := minutos_actuales >= minutos_inicio_val or minutos_actuales < minutos_fin_val
+
+// 2. Determinar si estamos en el PERIODO DE EXTENSIÓN VISUAL (Desde fin de rango hasta fin de extensión)
+// Nota: La extensión comienza cuando termina el rango (minutos_fin_val)
+bool en_extension = false
+if minutos_fin_val < minutos_fin_ext_val
+    en_extension := minutos_actuales >= minutos_fin_val and minutos_actuales < minutos_fin_ext_val
+else
+    // Caso cruce de medianoche para la extensión
+    en_extension := minutos_actuales >= minutos_fin_val or minutos_actuales < minutos_fin_ext_val
+
+bool inicio_sesion = en_rango and not en_rango[1]
+bool fin_sesion    = not en_rango and en_rango[1]
+
+// === VARIABLES ===
+var float maximo = na
+var float minimo = na
+var bool niveles_disponibles = false
+var bool primera_confirmada = false
+var bool segunda_confirmada = false
+var int direccion_primera = 0
+var float rango_high = na
+var float rango_low = na
+var int t_high = na
+var int t_low = na
+
+// Lógica para determinar qué valores usar según el input
+float fuente_high = tipo_calculo == "Mechas" ? high : math.max(open, close)
+float fuente_low  = tipo_calculo == "Mechas" ? low  : math.min(open, close)
+
+if inicio_sesion
+    maximo := na, minimo := na, niveles_disponibles := false
+    primera_confirmada := false, segunda_confirmada := false, direccion_primera := 0
+    rango_high := fuente_high
+    rango_low := fuente_low
+    t_high := time, t_low := time
+
+if en_rango
+    if fuente_high > rango_high
+        rango_high := fuente_high
+        t_high := time
+    if fuente_low < rango_low
+        rango_low := fuente_low
+        t_low := time
+
+// === DIBUJO DE LÍNEAS ESTÁTICAS (LINE.NEW para la caja del rango) ===
+if fin_sesion
+    maximo := rango_high
+    minimo := rango_low
+    niveles_disponibles := true
+    // Estas líneas marcan solo la caja del rango calculado
+    line.new(t_high, maximo, time, maximo, xloc = xloc.bar_time, color = color_buy, width = 2)
+    line.new(t_low, minimo, time, minimo, xloc = xloc.bar_time, color = color_sell, width = 2)
+
+equilibrium = (maximo + minimo) / 2
+
+// === CONDICIONES DE OPERACIÓN ===
+// Solo operamos si niveles están disponibles, NO estamos en rango de cálculo Y estamos DENTRO del tiempo de extensión
+condiciones_basicas = niveles_disponibles and not en_rango and en_extension
+
+// === SEÑALES ===
+senal_buy  = condiciones_basicas and not primera_confirmada and close > maximo and close[1] <= maximo
+senal_sell = condiciones_basicas and not primera_confirmada and close < minimo and close[1] >= minimo
+
+if senal_buy
+    primera_confirmada := true, direccion_primera := 1
+    label.new(bar_index, low, "Buy", style = label.style_label_up, yloc = yloc.belowbar, color = color_buy, textcolor = texto_color_buy, size = size.small)
+
+if senal_sell
+    primera_confirmada := true, direccion_primera := -1
+    label.new(bar_index, high, "Sell", style = label.style_label_down, yloc = yloc.abovebar, color = color_sell, textcolor = texto_color_sell, size = size.small)
+
+// === SEGUNDA ENTRADA ===
+segunda_buy  = permitir_segunda_entrada and primera_confirmada and not segunda_confirmada and direccion_primera == -1 and close > maximo and close[1] <= maximo and en_extension
+segunda_sell = permitir_segunda_entrada and primera_confirmada and not segunda_confirmada and direccion_primera == 1  and close < minimo and close[1] >= minimo and en_extension
+
+if segunda_buy
+    segunda_confirmada := true
+    label.new(bar_index, low, "Buy", style = label.style_label_up, yloc = yloc.belowbar, color = color_buy, textcolor = texto_color_buy, size = size.small)
+if segunda_sell
+    segunda_confirmada := true
+    label.new(bar_index, high, "Sell", style = label.style_label_down, yloc = yloc.abovebar, color = color_sell, textcolor = texto_color_sell, size = size.small)
+
+// === VISUALIZACIÓN CONTINUA ===
+// Las líneas plot solo se muestran si estamos dentro del periodo de extensión permitido
+plot_visible = niveles_disponibles and not en_rango and en_extension
+
+plot(plot_visible ? maximo : na, "Máximo", color = color_buy, style = plot.style_linebr, linewidth = 2)
+plot(plot_visible ? minimo : na, "Mínimo", color = color_sell, style = plot.style_linebr, linewidth = 2)
+plot(plot_visible ? equilibrium : na, "Equil", color = color_equil, style = plot.style_linebr, linewidth = 1)
+
+barcolor((senal_buy or segunda_buy) ? color_buy : (senal_sell or segunda_sell) ? color_sell : na)

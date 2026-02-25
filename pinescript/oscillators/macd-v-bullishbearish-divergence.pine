@@ -1,0 +1,254 @@
+//@version=6
+indicator('MACD-v Bullish/Bearish Divergence', 'MACD-v Div', overlay = true)
+
+// --- MAIN SETTINGS ---
+i_tf         = input.timeframe('', 'MACD Timeframe', group = "General Settings")
+
+// AUTO-DETECT LOGIC
+tooltip_auto = "ON: Automatically uses LTF settings if timeframe is <= 1 Hour.\nOFF: Uses the manual checkbox below."
+i_auto_mode  = input.bool(true, 'Auto-Detect Settings', group = "General Settings", tooltip = tooltip_auto)
+i_manual_ltf = input.bool(false, 'Force LTF Mode (Manual)', group = "General Settings", tooltip = "Only works if Auto-Detect is OFF.\nON = Scalping Settings (+/- 150)\nOFF = Swing Settings (+/- 100)")
+
+// --- INVALIDATION SETTINGS ---
+i_use_strict = input.bool(true, 'Strict Invalidation', group = "General Settings", tooltip = "ON: Cancels setup if MACD crosses the Invalidation Level.\nOFF: Ignores invalidation (allows macro divergence).")
+
+// --- MACD SETTINGS ---
+// Updated defaults: 26, 52, 9
+i_fast_len   = input.int(26, 'Fast Length', group = "MACD Calculation")
+i_slow_len   = input.int(52, 'Slow Length', group = "MACD Calculation")
+i_src        = input(close, 'Source', group = "MACD Calculation")
+i_signal_len = input.int(9, 'Signal Smoothing', group = "MACD Calculation")
+
+// Signal Line Multiplier
+i_smooth_mult = input.float(1.5, 'Active Signal Multiplier', minval=1.0, step=0.1, group = "MACD Calculation", tooltip = "Multiplies Signal Smoothing ONLY when a Trade is Active.")
+
+// --- MODE DETERMINATION ---
+bool is_timeframe_ltf = timeframe.isseconds or (timeframe.isintraday and timeframe.multiplier <= 60)
+bool use_ltf = i_auto_mode ? is_timeframe_ltf : i_manual_ltf
+
+// --- DYNAMIC THRESHOLDS ---
+int t_ext_ob      = use_ltf ? 150 : 100
+int t_ob          = use_ltf ? 60  : 50
+int t_os          = use_ltf ? -60 : -50
+int t_ext_os      = use_ltf ? -150 : -100
+
+// Triggers match the Zones
+int t_bear_trig   = t_ob
+int t_bull_trig   = t_os
+
+// Invalidation & Chop
+int t_grey_len    = use_ltf ? 30 : 19
+int t_inv_upper   = use_ltf ? 50 : 0
+int t_inv_lower   = use_ltf ? -50 : 0
+
+// ==========================================
+//        MACD-v CALCULATION (Raw + Dual Signal)
+// ==========================================
+macdv_data() =>
+    float fast_ma = ta.ema(i_src, i_fast_len)
+    float slow_ma = ta.ema(i_src, i_slow_len)
+    float vola = ta.atr(26)
+    
+    // 1. Raw Calculation (ALWAYS used now)
+    float val = vola != 0 ? math.round((fast_ma - slow_ma) / vola * 100, 2) : 0
+    
+    // 2. Signal Line Smoothing (Dynamic)
+    // Normal Signal
+    float sign_norm = math.round(ta.ema(val, i_signal_len), 2)
+    // Active Signal (Smoothed by Multiplier)
+    int sig_smooth_len = math.max(1, math.round(i_signal_len * i_smooth_mult))
+    float sign_slow = math.round(ta.ema(val, sig_smooth_len), 2)
+    
+    [val, sign_norm, sign_slow]
+
+[m_val, m_sign_norm, m_sign_slow] = request.security(syminfo.tickerid, i_tf, macdv_data())
+
+// ==========================================
+//        DYNAMIC SMOOTHING SWITCH
+// ==========================================
+var color bg_state = na
+
+// SMART SWITCH: Use Smoothed SIGNAL if Active. MACD Value is always Raw.
+bool is_active_trade = bg_state == color.red or bg_state == color.green
+float m_sign = is_active_trade ? m_sign_slow : m_sign_norm
+
+// ==========================================
+//        COLOR LOGIC (Helper Function)
+// ==========================================
+calc_color(_val, _sign) =>
+    bool _in_range = t_ob > _val and _val > t_os
+    int _in_range_bs = ta.barssince(_in_range and not _in_range[1])
+    
+    color _c = na
+    _c := switch 
+        _in_range and _in_range_bs >= t_grey_len => color.gray
+        _val >= t_ext_ob and _val > _sign => color.blue
+        t_ext_ob > _val and _val >= t_ob and _val > _sign => #0d6b57 
+        t_ob > _val and _val > t_ext_os and _val > _sign => color.green
+        _val > t_os and _val < _sign => color.orange
+        t_os >= _val and _val > t_ext_os and _val < _sign => color.red
+        _val <= t_ext_os and _val < _sign => color.blue
+        => nz(_c[1], color.gray)
+    _c
+
+// 1. Current Display Color
+color m_col = calc_color(m_val, m_sign)
+
+// 2. Slow Color (Using Raw Val vs Slow Signal)
+color m_col_slow = calc_color(m_val, m_sign_slow)
+
+// 3. Range Check (The Safe Zone)
+bool in_range = t_ob > m_val and m_val > t_os
+
+// ==========================================
+//           BEARISH LOGIC (Tops)
+// ==========================================
+var float run_max_price = na
+var float run_max_val = na
+
+if m_val > m_sign
+    run_max_price := math.max(high, nz(run_max_price, high))
+    run_max_val   := math.max(m_val, nz(run_max_val, m_val))
+else
+    run_max_price := na
+    run_max_val   := na
+
+bool cross_down = ta.crossunder(m_val, m_sign)
+
+var float ref_price_bear = na
+var float ref_val_bear = na
+var bool bear_setup_active = false
+var bool bear_zone_exited = false 
+
+bool fire_yellow = false
+bool fire_red = false
+
+if bear_setup_active and m_val < t_ext_ob
+    bear_zone_exited := true
+
+if cross_down
+    float peak_price = run_max_price[1]
+    float peak_val   = run_max_val[1]
+
+    // A. TRIGGER (Red Dot)
+    if bear_setup_active and bear_zone_exited and peak_price >= ref_price_bear and peak_val < ref_val_bear and peak_val > t_bear_trig
+        fire_red := true
+        bear_setup_active := false
+        bear_zone_exited := false 
+    
+    // B. SETUP (Yellow Dot)
+    else if peak_val >= t_ext_ob 
+        if not bear_setup_active or peak_val >= ref_val_bear
+            ref_price_bear := peak_price
+            ref_val_bear   := peak_val
+            bear_setup_active := true
+            bear_zone_exited := false
+            fire_yellow := true
+
+if bear_setup_active and i_use_strict 
+    if m_val < t_inv_lower 
+        bear_setup_active := false
+        bear_zone_exited := false
+
+// ==========================================
+//           BULLISH LOGIC (Bottoms)
+// ==========================================
+var float run_min_price = na
+var float run_min_val = na
+
+if m_val < m_sign
+    run_min_price := math.min(low, nz(run_min_price, low))
+    run_min_val   := math.min(m_val, nz(run_min_val, m_val))
+else
+    run_min_price := na
+    run_min_val   := na
+
+bool cross_up = ta.crossover(m_val, m_sign)
+
+var float ref_price_bull = na
+var float ref_val_bull = na
+var bool bull_setup_active = false
+var bool bull_zone_exited = false
+
+bool fire_blue_setup = false 
+bool fire_green = false
+
+if bull_setup_active and m_val > t_ext_os
+    bull_zone_exited := true
+
+if cross_up
+    float trough_price = run_min_price[1]
+    float trough_val   = run_min_val[1]
+
+    // A. TRIGGER (Green Dot)
+    if bull_setup_active and bull_zone_exited and trough_price <= ref_price_bull and trough_val > ref_val_bull and trough_val < t_bull_trig
+        fire_green := true
+        bull_setup_active := false
+        bull_zone_exited := false
+    
+    // B. SETUP (Blue Dot)
+    else if trough_val <= t_ext_os
+        if not bull_setup_active or trough_val <= ref_val_bull
+            ref_price_bull := trough_price
+            ref_val_bull   := trough_val
+            bull_setup_active := true
+            bull_zone_exited := false
+            fire_blue_setup := true
+
+if bull_setup_active and i_use_strict 
+    if m_val > t_inv_upper
+        bull_setup_active := false
+        bull_zone_exited := false
+
+// ==========================================
+//          BACKGROUND SHADING LOGIC
+// ==========================================
+bool is_slow_green = m_col_slow == color.green or m_col_slow == #0d6b57
+bool is_slow_red   = m_col_slow == color.red or m_col_slow == color.orange
+
+bool is_active_green = m_col == color.green or m_col == #0d6b57
+bool is_active_red   = m_col == color.red or m_col == color.orange
+
+// --- LATCH LOGIC ---
+var bool exit_allowed = false
+
+// 1. SET STATE (Inputs)
+// NOTE: We do NOT set bg_state for Setup (Yellow/Blue), only for Triggers (Red/Green)
+if fire_red
+    bg_state := color.red
+    exit_allowed := false 
+
+if fire_green
+    bg_state := color.green
+    exit_allowed := false 
+
+// 2. CHECK LATCH
+if bg_state == color.red and is_slow_red
+    exit_allowed := true 
+
+if bg_state == color.green and is_slow_green
+    exit_allowed := true
+
+// 3. RESET STATE (Exit Conditions)
+if bg_state == color.red and is_active_green and exit_allowed and not in_range
+    bg_state := na
+
+if bg_state == color.green and is_active_red and exit_allowed and not in_range
+    bg_state := na
+
+// 3. PLOT BACKGROUND
+bgcolor(color.new(bg_state, 88), title="Signal Background")
+
+// --- OUTPUTS & ALERTS ---
+plotshape(fire_blue_setup, title = "Bull Setup (Blue)", style = shape.circle, location = location.belowbar, color = color.new(color.blue, 0), size = size.tiny)
+plotshape(fire_green, title = "Bull Trigger (Green)", style = shape.circle, location = location.belowbar, color = color.new(color.green, 0), size = size.small)
+
+plotshape(fire_yellow, title = "Bear Setup (Yellow)", style = shape.circle, location = location.abovebar, color = color.new(color.yellow, 0), size = size.tiny)
+plotshape(fire_red, title = "Bear Trigger (Red)", style = shape.circle, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
+
+// ALERTS LOGIC
+bool background_ended = na(bg_state) and not na(bg_state[1])
+
+alertcondition(fire_green, title="Bull Trigger (Entry)", message="MACD-v Bullish Divergence Entry")
+alertcondition(fire_red, title="Bear Trigger (Entry)", message="MACD-v Bearish Divergence Entry")
+alertcondition(background_ended, title="Signal Reset/Exit", message="MACD-v Signal Reset / Exit Trade")

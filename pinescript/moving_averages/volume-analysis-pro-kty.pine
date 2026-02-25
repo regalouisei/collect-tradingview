@@ -1,0 +1,444 @@
+//@version=6
+indicator('Volume Analysis Pro [KTY]', format = format.volume, max_bars_back = 4999, max_labels_count = 500, max_lines_count = 500)
+
+
+// --- Account Tier (hidden, default Standard) ---
+const string TIER_BASIC    = "Standard (Basic, Plus, Essential)"
+const string TIER_PREMIUM  = "Premium (Seconds Data)"
+const string TIER_ULTIMATE = "Ultimate (Tick Data)"
+
+string accountTierInput = TIER_BASIC
+bool useBidAsk = true
+int calcBarsLTF = 100000
+
+//===== Inputs =====
+groupChart  = '✅ Chart Overlay'
+groupOsc    = '✅ Oscillator'
+groupDiv    = '✅ Volume Divergence'
+
+// --- Chart Overlay Inputs ---
+bool usecandle = input.bool(true, title = 'Volume Candles', group = groupChart, tooltip = "⏩ Volume Candles\n\nVisualizes buy/sell volume ratio\non candle bodies with color.\n\n📊 How it works\n• Bull candle: dark green = buy, light = sell\n• Bear candle: dark red = sell, light = buy\n• Larger dark area = stronger dominance\n\n✅ How to use\n• Bull candle with large light area → weakening\n• Bear candle with large light area → weakening")
+color C_Up   = input.color(#178e61, 'Buy Volume', inline = 'c', group = groupChart)
+color C_Down = input.color(#c82d39, 'Sell Volume', inline = 'c', group = groupChart)
+bool useCloud = input.bool(true, 'VWMA Cloud', group = groupChart, tooltip = "⏩ Buy/Sell VWMA Cloud\n\nVisualizes the difference between\nbuy-weighted and sell-weighted\naverage prices as a cloud.\n\n📊 How it works\n• Green cloud: buy dominance (bullish)\n• Red cloud: sell dominance (bearish)\n\n✅ How to use\n• Cloud color = current flow direction\n• Cloud flip = shift in dominance")
+bool useCross = input.bool(true, 'Cloud Cross ▲▼', group = groupChart, tooltip = "⏩ Cloud Cross Markers\n\nShows ▲▼ on chart when\nbuy/sell clouds cross.\n\n• ▲: Buy cross + price above cloud\n• ▼: Sell cross + price below cloud")
+
+// --- Oscillator Inputs ---
+bool useConflict   = input.bool(true, 'Candle-Volume Conflict ▼▲', group = groupOsc, tooltip = "⏩ Candle-Volume Conflict\n\nShows when candle direction and\nactual volume disagree.\n\n• Red ▼: Bull candle but sell dominant\n• Green ▲: Bear candle but buy dominant\n• Possible fake candle → caution")
+bool useSpike      = input.bool(true, 'Volume Spike ■', group = groupOsc, tooltip = "⏩ Volume Spike Detection\n\nShows ■ when volume surges\nsignificantly above average.\n\n• Green ■: Buy dominant spike\n• Red ■: Sell dominant spike\n• Trend acceleration or climax signal")
+bool useVolMa = input.bool(true, 'Volume EMA Line', group = groupOsc, tooltip = "⏩ Volume EMA Line\n\nShows volume moving average\nwith glow effect on oscillator.\n\n• Rising = increasing volume trend\n• Falling = decreasing volume trend")
+color volMaColor = input.color(color.white, 'Volume EMA Color', group = groupOsc, tooltip = "Volume EMA line color")
+
+// --- Divergence Inputs ---
+bool useDiv = input.bool(true, 'Volume Divergence', group = groupDiv, tooltip = "⏩ Volume Divergence\n\nAuto-detects when price and volume\nflow move in opposite directions.\n\n📊 How it works\n• 🔴 D: Price rising but volume dropping\n  → Momentum fading, possible reversal\n• 🟢 D: Price falling but volume rising\n  → Energy building, possible reversal\n• Shown as lines + D labels on chart")
+bool useHiddenDiv = input.bool(false, 'Hidden Divergence', group = groupDiv, tooltip = "⏩ Hidden Divergence (Trend Continuation)\n\n• 🟢 HD: Pullback volume fading in uptrend\n  → Trend likely to continue\n• 🔴 HD: Bounce volume fading in downtrend\n  → Downtrend likely to continue")
+
+
+// Hardcoded values
+int vwmaFastLen = 20
+int vwmaSlowLen = 60
+int divPivotLen = 5
+int volMaLen = 14
+float divMinPct = 40.0
+int divMaxBars = 100
+
+string alert_freq = alert.freq_once_per_bar_close
+float spikeMultiplier = 2.5
+int spikeMaLength = 20
+float conflictMinPct = 55.0
+
+
+//===== UDTs =====
+type VolumeData
+    float buyVol
+    float sellVol
+    float pcBuy
+    float pcSell
+    bool  isBuyGreater
+    float higherVol
+    float lowerVol
+    color higherCol
+    color lowerCol
+
+
+//===== Helpers =====
+S(x, fmt) => str.tostring(x, fmt)
+FV = format.volume
+FP = format.percent
+
+rng(float h, float l) => math.max(h - l, syminfo.mintick)
+
+price_side(bool prevState) =>
+    switch
+        close > open     => true
+        close < open     => false
+        close > close[1] => true
+        close < close[1] => false
+        => prevState
+
+upDownVolume() =>
+    float posVol = 0.0
+    float negVol = 0.0
+    var bool isBuy = false
+    if timeframe.isticks and useBidAsk
+        float mid = (ask + bid) * 0.5
+        switch
+            close == ask and close == bid => isBuy := price_side(isBuy)
+            close >= ask => isBuy := true
+            close <= bid => isBuy := false
+            close >  mid => isBuy := true
+            close <  mid => isBuy := false
+            => isBuy := price_side(isBuy)
+    else
+        isBuy := price_side(isBuy)
+    if isBuy
+        posVol += volume
+    else
+        negVol -= volume
+    [posVol, negVol]
+
+find_lower_tf() =>
+    string tf = ''
+    array<string> cands = switch accountTierInput
+        TIER_ULTIMATE => array.from('1T', '1S', '1')
+        TIER_PREMIUM  => array.from('1S', '1')
+        => array.from('1')
+
+    for cand in cands
+        array<float> probe = request.security_lower_tf(syminfo.tickerid, cand, volume, calc_bars_count = calcBarsLTF)
+        if array.size(probe) > 0
+            tf := cand
+            break
+    tf
+
+get_split_volumes() =>
+    string ltf = find_lower_tf()
+    float buy = na
+    float sell = na
+    if ltf != ''
+        [posList, negList] = request.security_lower_tf(syminfo.tickerid, ltf, upDownVolume(), calc_bars_count = calcBarsLTF)
+        float sumBuy  = 0.0
+        float sumSell = 0.0
+        for v in posList
+            sumBuy += v
+        for v in negList
+            sumSell += v
+        if (sumBuy == 0.0 and sumSell == 0.0) and (volume > 0.0)
+            buy := na
+            sell := na
+        else
+            buy  := sumBuy
+            sell := sumSell
+    [ltf, buy, sell]
+
+buildVolumeData(float buy, float sell) =>
+    float tot = math.abs(sell) + buy
+    float pBuy  = tot != 0.0 ? (buy  / tot) * 100.0 : 0.0
+    float pSell = 100.0 - pBuy
+    bool  isBuyGt = buy > math.abs(sell)
+    float hiVol   = isBuyGt ? buy : math.abs(sell)
+    float loVol   = isBuyGt ? math.abs(sell) : buy
+    color hiCol   = isBuyGt ? color.new(C_Up, 0) : color.new(C_Down, 0)
+    color loCol   = isBuyGt ? color.new(C_Down, 65) : color.new(C_Up, 65)
+    VolumeData.new(buy, sell, pBuy, pSell, isBuyGt, hiVol, loVol, hiCol, loCol)
+
+
+//===== Main Split Logic =====
+[ltfUsed, buyVol, sellVol] = get_split_volumes()
+
+if na(buyVol) or na(sellVol)
+    float buyEst  = volume * (close - low) / rng(high, low)
+    float sellEst = volume - buyEst
+    buyVol  := math.max(buyEst,  0.0)
+    sellVol := -math.max(sellEst, 0.0)
+
+volData = buildVolumeData(buyVol, sellVol)
+
+
+//===== Volume Columns (Oscillator) =====
+plot(volume, color=volData.lowerCol, style=plot.style_columns, title='Weak Volume (Back)', display = display.all - display.status_line)
+plot(volData.higherVol, color=volData.higherCol, style=plot.style_columns, title='Dominant Volume (Front)', display = display.all - display.status_line)
+
+volStr        = S(math.sign(ta.change(close)) * volume, FV)
+buyVolStr     = S(volData.buyVol,  FV)
+sellVolStr    = S(volData.sellVol, FV)
+buyPercentStr = S(volData.pcBuy,   FP)
+sellPercentStr= S(volData.pcSell,  FP)
+sup = not na(volume)
+
+bool isBullish = close >= open
+
+
+//===== Signal Detection =====
+
+// --- 1. Candle-Volume Conflict ---
+bool bullConflict = isBullish and volData.pcSell >= conflictMinPct and sup
+bool bearConflict = not isBullish and volData.pcBuy >= conflictMinPct and sup
+
+// --- 2. Volume Spike ---
+float spikeMa = ta.sma(volume, spikeMaLength)
+float spikeRatio = sup and spikeMa > 0 ? volume / spikeMa : 0.0
+bool isSpike = spikeRatio >= spikeMultiplier
+
+
+//===== Oscillator Markers =====
+
+// Conflict ▼▲
+plotshape(useConflict and bullConflict, style=shape.triangledown, location=location.top,
+     color=C_Down, size=size.tiny, title='Conflict: Bull+Sell', display=display.pane)
+plotshape(useConflict and bearConflict, style=shape.triangleup, location=location.top,
+     color=C_Up, size=size.tiny, title='Conflict: Bear+Buy', display=display.pane)
+
+// Spike ■
+plotshape(useSpike and isSpike and volData.isBuyGreater, style=shape.square, location=location.top,
+     color=C_Up, size=size.tiny, title='Spike: Buy', display=display.pane)
+plotshape(useSpike and isSpike and not volData.isBuyGreater, style=shape.square, location=location.top,
+     color=C_Down, size=size.tiny, title='Spike: Sell', display=display.pane)
+
+
+//===== Volume EMA (glow) =====
+float volEma = ta.ema(volume, volMaLen)
+plot(useVolMa ? volEma : na, color = color.new(volMaColor, 0), linewidth = 2, title = 'Volume EMA', display = display.pane)
+plot(useVolMa ? volEma : na, color = color.new(volMaColor, 70), linewidth = 8, title = 'Volume EMA Glow 1', display = display.pane)
+plot(useVolMa ? volEma : na, color = color.new(volMaColor, 90), linewidth = 16, title = 'Volume EMA Glow 2', display = display.pane)
+
+
+//===== Buy/Sell VWMA Cloud =====
+float absSellVol = math.abs(volData.sellVol)
+
+float sumBuyVF  = math.sum(nz(volData.buyVol), vwmaFastLen)
+float buyVWMA   = sumBuyVF > 0 ? math.sum(close * nz(volData.buyVol), vwmaFastLen) / sumBuyVF : close
+
+float sumSellVS = math.sum(nz(absSellVol), vwmaSlowLen)
+float sellVWMA  = sumSellVS > 0 ? math.sum(close * nz(absSellVol), vwmaSlowLen) / sumSellVS : close
+
+bool cloudBull = buyVWMA >= sellVWMA
+color cloudCol = cloudBull ? C_Up : C_Down
+
+bool vwmaCrossOver  = ta.crossover(buyVWMA, sellVWMA)
+bool vwmaCrossUnder = ta.crossunder(buyVWMA, sellVWMA)
+
+
+//===== Volume Divergence =====
+float ph = ta.pivothigh(high, divPivotLen, divPivotLen)
+float pl = ta.pivotlow(low, divPivotLen, divPivotLen)
+
+float volEmaAtPivot = nz(volEma[divPivotLen])
+
+var float prevPhPrice  = na
+var float prevPhVolEma = na
+var int   prevPhBar    = na
+
+var float prevPlPrice  = na
+var float prevPlVolEma = na
+var int   prevPlBar    = na
+
+noHigherHigh(int fromBar, int toBar, float lvl) =>
+    bool ok = true
+    int dist = toBar - fromBar
+    if dist > 0
+        for i = 1 to dist - 1
+            if high[toBar - fromBar - i] > lvl
+                ok := false
+                break
+    ok
+
+noLowerLow(int fromBar, int toBar, float lvl) =>
+    bool ok = true
+    int dist = toBar - fromBar
+    if dist > 0
+        for i = 1 to dist - 1
+            if low[toBar - fromBar - i] < lvl
+                ok := false
+                break
+    ok
+
+pctChange(float prev, float curr) =>
+    prev > 0 ? math.abs(curr - prev) / prev * 100.0 : 0.0
+
+if useDiv and not na(ph)
+    int   currBar = bar_index - divPivotLen
+    float currVolEma = volEmaAtPivot
+    int   barDist = currBar - nz(prevPhBar, 0)
+    float chg = pctChange(prevPhVolEma, currVolEma)
+
+    if not na(prevPhPrice) and ph > prevPhPrice and currVolEma < prevPhVolEma and chg >= divMinPct and barDist <= divMaxBars and noHigherHigh(prevPhBar, currBar, ph)
+        line.new(prevPhBar, prevPhPrice, currBar, ph,
+             color = C_Down, width = 2, style = line.style_solid, force_overlay = true)
+        label.new(currBar, ph, 'D',
+             color = color.new(C_Down, 80), textcolor = C_Down,
+             style = label.style_label_down, size = size.small, force_overlay = true)
+        alert('🔴 Bearish Divergence: Price HH + Volume LH (' + S(chg, '#.#') + '% drop)\n' +
+             'Price: ' + S(prevPhPrice, '#.##') + ' → ' + S(ph, '#.##'), alert_freq)
+
+    if useHiddenDiv and not na(prevPhPrice) and ph < prevPhPrice and currVolEma > prevPhVolEma and barDist <= divMaxBars
+        line.new(prevPhBar, prevPhPrice, currBar, ph,
+             color = color.new(C_Down, 40), width = 1, style = line.style_dotted, force_overlay = true)
+        label.new(currBar, ph, 'HD',
+             color = color.new(C_Down, 80), textcolor = C_Down,
+             style = label.style_label_down, size = size.small, force_overlay = true)
+        alert('🔴 Hidden Bearish: Price LH + Volume HH', alert_freq)
+
+    prevPhPrice  := ph
+    prevPhVolEma := currVolEma
+    prevPhBar    := currBar
+
+if useDiv and not na(pl)
+    int   currBar = bar_index - divPivotLen
+    float currVolEma = volEmaAtPivot
+    int   barDist = currBar - nz(prevPlBar, 0)
+    float chg = pctChange(prevPlVolEma, currVolEma)
+
+    if not na(prevPlPrice) and pl < prevPlPrice and currVolEma > prevPlVolEma and chg >= divMinPct and barDist <= divMaxBars and noLowerLow(prevPlBar, currBar, pl)
+        line.new(prevPlBar, prevPlPrice, currBar, pl,
+             color = C_Up, width = 2, style = line.style_solid, force_overlay = true)
+        label.new(currBar, pl, 'D',
+             color = color.new(C_Up, 80), textcolor = C_Up,
+             style = label.style_label_up, size = size.small, force_overlay = true)
+        alert('🟢 Bullish Divergence: Price LL + Volume HL (' + S(chg, '#.#') + '% rise)\n' +
+             'Price: ' + S(prevPlPrice, '#.##') + ' → ' + S(pl, '#.##'), alert_freq)
+
+    if useHiddenDiv and not na(prevPlPrice) and pl > prevPlPrice and currVolEma < prevPlVolEma and barDist <= divMaxBars
+        line.new(prevPlBar, prevPlPrice, currBar, pl,
+             color = color.new(C_Up, 40), width = 1, style = line.style_dotted, force_overlay = true)
+        label.new(currBar, pl, 'HD',
+             color = color.new(C_Up, 80), textcolor = C_Up,
+             style = label.style_label_up, size = size.small, force_overlay = true)
+        alert('🟢 Hidden Bullish: Price HL + Volume LH', alert_freq)
+
+    prevPlPrice  := pl
+    prevPlVolEma := currVolEma
+    prevPlBar    := currBar
+
+
+//===== Volume Candles =====
+bool uc = usecandle and sup
+
+color bullDominant = C_Up
+color bullWeak     = color.new(C_Up, 75)
+color bearDominant = C_Down
+color bearWeak     = color.new(C_Down, 75)
+
+float dominantRatio = isBullish ? volData.pcBuy / 100.0 : volData.pcSell / 100.0
+
+float candleBodyTop = math.max(open, close)
+float candleBodyBtm = math.min(open, close)
+float bodyHeight = candleBodyTop - candleBodyBtm
+
+float dominantTop = isBullish ? candleBodyBtm + bodyHeight * dominantRatio : candleBodyTop
+float dominantBtm = isBullish ? candleBodyBtm : candleBodyTop - bodyHeight * dominantRatio
+
+float weakTop = isBullish ? candleBodyTop : dominantBtm
+float weakBtm = isBullish ? dominantTop : candleBodyBtm
+
+color dominantColor = isBullish ? bullDominant : bearDominant
+color weakColor = isBullish ? bullWeak : bearWeak
+
+barcolor(uc ? color.new(close >= open ? C_Up : C_Down, 100) : na)
+
+plotcandle(uc ? dominantBtm : na, uc ? dominantBtm : na, uc ? dominantTop : na, uc ? dominantTop : na,
+  title='Dominant Part', color=dominantColor, bordercolor=dominantColor, wickcolor=na,
+  display = display.all - display.status_line - display.price_scale, force_overlay=true, editable=false)
+
+plotcandle(uc ? weakBtm : na, uc ? weakBtm : na, uc ? weakTop : na, uc ? weakTop : na,
+  title='Weak Part', color=weakColor, bordercolor=weakColor, wickcolor=na,
+  display = display.all - display.status_line - display.price_scale, force_overlay=true, editable=false)
+
+plotcandle(uc ? candleBodyTop : na, uc ? high : na, uc ? candleBodyTop : na, uc ? candleBodyTop : na,
+  title='Upper Wick', color=na, bordercolor=na, wickcolor=dominantColor,
+  display = display.all - display.status_line - display.price_scale, force_overlay=true, editable=false)
+
+plotcandle(uc ? candleBodyBtm : na, uc ? candleBodyBtm : na, uc ? low : na, uc ? candleBodyBtm : na,
+  title='Lower Wick', color=na, bordercolor=na, wickcolor=dominantColor,
+  display = display.all - display.status_line - display.price_scale, force_overlay=true, editable=false)
+
+var line priceLine = na
+if barstate.islast and uc
+    if not na(priceLine)
+        line.delete(priceLine)
+    priceLine := line.new(bar_index - 500, close, bar_index + 50, close,
+         color = close >= open ? C_Up : C_Down,
+         style = line.style_dotted, width = 1,
+         extend = extend.both, force_overlay = true)
+
+
+//===== Chart Markers: Cloud Cross ▲▼ =====
+float cloudTop = math.max(buyVWMA, sellVWMA)
+float cloudBtm = math.min(buyVWMA, sellVWMA)
+
+bool bullTriFilter = close > cloudTop
+bool bearTriFilter = close < cloudBtm
+
+plotshape(vwmaCrossOver and useCloud and useCross and bullTriFilter, style=shape.triangleup, location=location.belowbar,
+     color=C_Up, size=size.small, force_overlay=true, title='Cloud Bull Cross', display=display.pane)
+plotshape(vwmaCrossUnder and useCloud and useCross and bearTriFilter, style=shape.triangledown, location=location.abovebar,
+     color=C_Down, size=size.small, force_overlay=true, title='Cloud Bear Cross', display=display.pane)
+
+
+//===== VWMA Cloud Plot (glow 2 layers) =====
+float PB = useCloud ? buyVWMA  : na
+float PV = useCloud ? sellVWMA : na
+
+p1 = plot(PB, color = cloudCol, editable = false, force_overlay = true, display = display.pane)
+plot(PB, color = color.new(cloudCol, 80), linewidth = 10, editable = false, force_overlay = true, display = display.pane)
+plot(PB, color = color.new(cloudCol, 93), linewidth = 25, editable = false, force_overlay = true, display = display.pane)
+p2 = plot(PV, color = cloudCol, editable = false, force_overlay = true, display = display.pane)
+plot(PV, color = color.new(cloudCol, 80), linewidth = 10, editable = false, force_overlay = true, display = display.pane)
+plot(PV, color = color.new(cloudCol, 93), linewidth = 25, editable = false, force_overlay = true, display = display.pane)
+
+fill(p1, p2, top_value = cloudBull ? buyVWMA : sellVWMA,
+     bottom_value      = cloudBull ? sellVWMA : buyVWMA,
+     top_color  = color.new(cloudCol, 80),
+     bottom_color = color.new(cloudCol, 95))
+
+
+//===== Alerts =====
+string msg = '---------\n' + 'Buy Vol = ' + buyVolStr + '\nBuy % = ' + buyPercentStr + '\nSell Vol = ' + sellVolStr + '\nSell % = ' + sellPercentStr + '\nNet = ' + volStr + '\n---------'
+
+if vwmaCrossOver and useCloud
+    alert('▲ Buy VWMA Cross Up\n' + msg, alert_freq)
+if vwmaCrossUnder and useCloud
+    alert('▼ Sell VWMA Cross Down\n' + msg, alert_freq)
+if useConflict and bullConflict
+    alert('⚠️ Conflict: Bull candle + Sell ' + sellPercentStr + '\n' + msg, alert_freq)
+if useConflict and bearConflict
+    alert('⚠️ Conflict: Bear candle + Buy ' + buyPercentStr + '\n' + msg, alert_freq)
+if useSpike and isSpike
+    alert('🔥 Spike (' + S(spikeRatio, '#.#') + 'x) ' + (volData.isBuyGreater ? 'Buy' : 'Sell') + '\n' + msg, alert_freq)
+
+
+// Vendor volume guard
+var float cumVol = 0.0
+cumVol += nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("The data vendor doesn't provide volume data for this symbol.")
+
+
+guide_group = "📚 Guide"
+
+string guide_note = input.text_area(
+     defval='📖 Scroll down to read\n' +
+             '━━━━━━━━━━━━━━━\n' +
+             'Hover (i) icons next to each setting\n' +
+             'for detailed descriptions\n\n' +
+             '📊 Oscillator (Bottom)\n' +
+             '━━━━━━━━━━━━━━━\n' +
+             '• Green/Red columns: Buy/Sell split\n' +
+             '• ▼▲: Candle-Volume conflict\n' +
+             '• ■: Volume spike\n' +
+             '• EMA line: Volume flow direction\n\n' +
+             '☁️ VWMA Cloud (Chart)\n' +
+             '━━━━━━━━━━━━━━━\n' +
+             '• Green = Buy dominant / Red = Sell\n' +
+             '• ▲▼: Cloud cross signals\n\n' +
+             '📈 Volume Divergence (Chart)\n' +
+             '━━━━━━━━━━━━━━━\n' +
+             '• D: Price vs Volume mismatch → reversal\n' +
+             '• HD: Hidden divergence → continuation\n\n' +
+             '💡 Tips\n' +
+             '━━━━━━━━━━━━━━━\n' +
+             '• Repeated conflicts → trend weakening\n' +
+             '• D + cloud flip = strong reversal signal\n' +
+             '• Spike + direction match = trend accel.',
+     title='',
+     group=guide_group)

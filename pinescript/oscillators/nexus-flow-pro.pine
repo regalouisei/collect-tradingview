@@ -1,0 +1,161 @@
+//@version=6
+indicator("Nexus Flow Pro", shorttitle="NF_Pro", overlay=false)
+
+// ==========================================
+// 1. SYSTEM ENGINE CONFIGURATION
+// ==========================================
+showCoreEngine = input.bool(true,  "Activate Primary Engine", group="Engine Control")
+showAuraEngine = input.bool(true,  "Activate Secondary Engine", group="Engine Control")
+coreScale      = input.float(1.5, "Primary Amplification", minval=0.1, group="Visual Dynamics")
+auraScale      = input.float(0.5, "Secondary Compression", minval=0.1, group="Visual Dynamics")
+
+// ==========================================
+// 2. PRIMARY ENGINE PARAMETERS
+// ==========================================
+p_len1 = input.int(5,   "Core Sensitivity 1", group="Primary Engine")
+p_len2 = input.int(20,  "Core Sensitivity 2", group="Primary Engine")
+p_len3 = input.int(15,  "Core Sensitivity 3", group="Primary Engine")
+p_trend1  = input.int(20,  "Trend Resonance 1",  group="Primary Engine")
+p_trend2  = input.int(15,  "Trend Resonance 2",  group="Primary Engine")
+
+// Primary Engine Aesthetics
+core_up1 = input.color(color.new(#64ffda, 50), "Osc Momentum Bull+", group="Primary Aesthetics")
+core_up2 = input.color(color.new(#089981, 50), "Osc Momentum Bull-", group="Primary Aesthetics")
+core_dn1 = input.color(color.new(color.red, 50), "Osc Momentum Bear+", group="Primary Aesthetics")
+core_dn2 = input.color(color.new(#8B0000, 50), "Osc Momentum Bear-", group="Primary Aesthetics")
+core_t_up = input.color(#64ffda, "Trend Line Bull", group="Primary Aesthetics")
+core_t_dn = input.color(#ff5252, "Trend Line Bear", group="Primary Aesthetics")
+core_shd  = input.color(color.new(#000000, 0), "Backdrop Glow", group="Primary Aesthetics")
+
+// ==========================================
+// 3. SECONDARY ENGINE PARAMETERS
+// ==========================================
+s_source = input.source(hlc3, "Spectral Source", group="Secondary Engine")
+s_chLen  = input.int(9,     "Channel Width", group="Secondary Engine")
+s_avgLen = input.int(12,    "Average Depth", group="Secondary Engine")
+s_maLen  = input.int(3,     "Smoothing Factor", group="Secondary Engine")
+
+s_obLimit = input.int(53,  "Upper Threshold", group="Secondary Engine")
+s_osLimit = input.int(-53, "Lower Threshold", group="Secondary Engine")
+
+showFlowArea = input.bool(true, "Display Flow Waves", group="Secondary Engine")
+showFastWave = input.bool(true, "Display Velocity Curve", group="Secondary Engine")
+showFluidity = input.bool(true, "Display Fluidity Index", group="Secondary Engine")
+showSpectral = input.bool(true, "Display Spectral RSI", group="Secondary Engine")
+showMarkers  = input.bool(true, "Display Divergence Points", group="Secondary Engine")
+
+// Secondary Engine Aesthetics
+aura_w1 = input.color(color.new(#4994ec, 70), "Wave Alpha", group="Secondary Aesthetics")
+aura_w2 = input.color(color.new(#1f1559, 75), "Wave Beta", group="Secondary Aesthetics")
+aura_vel = input.color(color.new(color.white, 45), "Velocity Color", group="Secondary Aesthetics")
+aura_f_pos = input.color(color.new(#3ee145, 50), "Fluidity Positive", group="Secondary Aesthetics")
+aura_f_neg = input.color(color.new(#ff3d2e, 50), "Fluidity Negative", group="Secondary Aesthetics")
+aura_rsi_c = input.color(color.new(color.purple, 25), "Spectral Neutral", group="Secondary Aesthetics")
+aura_sig_up = input.color(#64ffda, "Signal Node Bull", group="Secondary Aesthetics")
+aura_sig_dn = input.color(#ff5252, "Signal Node Bear", group="Secondary Aesthetics")
+
+// ==========================================
+// 4. CORE COMPUTATIONAL LOGIC
+// ==========================================
+// Primary Calculations
+p_raw_osc = ta.rsi(ta.ema(close, p_len1) - ta.ema(close, p_len2), p_len3) - 50
+p_raw_trd = ta.rsi(ta.ema(close, p_trend1), p_trend2) - 50
+
+f_smooth_t3(src, len) =>
+    e1 = ta.ema(src, len)
+    e2 = ta.ema(e1, len)
+    e3 = ta.ema(e2, len)
+    e4 = ta.ema(e3, len)
+    e5 = ta.ema(e4, len)
+    e6 = ta.ema(e5, len)
+    b = 0.7
+    c1 = -b*b*b
+    c2 = 3*b*b + 3*b*b*b
+    c3 = -6*b*b - 3*b - 3*b*b*b
+    c4 = 1 + 3*b + b*b*b + 3*b*b
+    c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3
+    
+p_raw_ma = f_smooth_t3(p_raw_osc, 5)
+
+// Scaled Primary
+core_osc_val = p_raw_osc * coreScale
+core_trd_val = p_raw_trd * coreScale
+core_ma_val  = p_raw_ma * coreScale
+
+// Secondary Calculations
+f_fluidity(_p, _m, _tf) => 
+    request.security(syminfo.tickerid, _tf, ta.sma(((close - open) / (math.max(high - low, 1e-10))) * _m, _p) - 2.5)
+
+f_spectral_wave(src, cl, al, ml, tf) =>
+    t = request.security(syminfo.tickerid, tf, src)
+    e = ta.ema(t, cl)
+    d = ta.ema(math.abs(t - e), cl)
+    c = (t - e) / (0.015 * d)
+    w1 = request.security(syminfo.tickerid, tf, ta.ema(c, al))
+    w2 = request.security(syminfo.tickerid, tf, ta.sma(w1, ml))
+    [w1, w2]
+
+[s_raw_w1, s_raw_w2] = f_spectral_wave(s_source, s_chLen, s_avgLen, s_maLen, timeframe.period)
+s_raw_rsi = ta.rsi(close, 14)
+s_raw_flu = f_fluidity(60, 150, timeframe.period)
+s_raw_vel = s_raw_w1 - s_raw_w2
+
+// Scaled Secondary
+aura_w1_val  = s_raw_w1 * auraScale
+aura_w2_val  = s_raw_w2 * auraScale
+aura_rsi_val = s_raw_rsi * auraScale
+aura_flu_val = s_raw_flu * auraScale
+aura_vel_val = s_raw_vel * auraScale
+
+// Signal Engine
+s_cross = ta.cross(s_raw_w1, s_raw_w2)
+
+f_detect_div(src, hi, lo, use) =>
+    top = src[4] < src[2] and src[3] < src[2] and src[2] > src[1] and src[2] > src[0] and (use ? src[2] >= hi : true)
+    bot = src[4] > src[2] and src[3] > src[2] and src[2] < src[1] and src[2] < src[0] and (use ? src[2] <= lo : true)
+    b_sig = top and high[2] > ta.valuewhen(top, high[2], 1) and src[2] < ta.valuewhen(top, src[2], 1)
+    l_sig = bot and low[2] < ta.valuewhen(bot, low[2], 1) and src[2] > ta.valuewhen(bot, src[2], 1)
+    [b_sig, l_sig]
+
+[s_div_bear, s_div_bull] = f_detect_div(s_raw_w2, 45, -65, true)
+[r_div_bear, r_div_bull] = f_detect_div(s_raw_rsi, 60, 30, true)
+
+// ==========================================
+// 5. RENDERING - PRIMARY LAYER
+// ==========================================
+core_osc_c = p_raw_osc > 0 ? (p_raw_osc > p_raw_osc[1] ? core_up1 : core_up2) : (p_raw_osc > p_raw_osc[1] ? core_dn1 : core_dn2)
+plot(showCoreEngine ? core_osc_val : na, color=core_osc_c, style=plot.style_columns, linewidth=1, title="Core Momentum")
+
+plot(showCoreEngine ? core_ma_val : na, color=core_shd, style=plot.style_line, linewidth=5, title="Core Shadow", display=display.none)
+plot(showCoreEngine ? core_ma_val : na, color=p_raw_ma > p_raw_ma[1] ? color.lime : color.red, style=plot.style_line, linewidth=3, title="Core Curve", display=display.none)
+
+core_trd_c = p_raw_trd > 0 ? (p_raw_trd > p_raw_trd[1] ? color.lime : #228B22) : (p_raw_trd > p_raw_trd[1] ? color.red : #8B0000)
+plot(showCoreEngine ? core_trd_val : na, color=color.new(core_trd_c, 80), style=plot.style_histogram, linewidth=2, title="Core Trend BG", display=display.none)
+
+core_line_c = p_raw_trd > p_raw_trd[1] ? core_t_up : core_t_dn
+plot(showCoreEngine ? core_trd_val : na, color=core_line_c, style=plot.style_line, linewidth=2, title="Core Trend Path")
+
+// ==========================================
+// 6. RENDERING - SECONDARY LAYER
+// ==========================================
+plot(0, color=color.new(color.white, 50), title="Equilibrium", display=display.none)
+
+plot(showAuraEngine and showFlowArea ? aura_w1_val : na, style=plot.style_area, title='Aura Alpha', color=aura_w1, display=display.none)
+plot(showAuraEngine and showFlowArea ? aura_w2_val : na, style=plot.style_area, title='Aura Beta', color=aura_w2, display=display.none)
+plot(showAuraEngine and showFastWave ? aura_vel_val : na, title='Aura Velocity', color=aura_vel, style=plot.style_area, linewidth=2, display=display.none)
+plot(showAuraEngine and showFluidity ? aura_flu_val : na, style=plot.style_area, title='Aura Fluidity', color=s_raw_flu > 0 ? aura_f_pos : aura_f_neg, display=display.none)
+
+aura_rsi_final_c = s_raw_rsi <= 30 ? color.new(color.green, 25) : s_raw_rsi >= 60 ? color.new(color.red, 25) : aura_rsi_c
+plot(showAuraEngine and showSpectral ? aura_rsi_val : na, title='Aura Spectral', color=aura_rsi_final_c, linewidth=2, display=display.none)
+
+plot(auraScale * 60, title='Limit High', color=color.new(color.white, 85), style=plot.style_stepline, display=display.none)
+plot(auraScale * -60, title='Limit Low',  color=color.new(color.white, 85), style=plot.style_stepline, display=display.none)
+
+node_c = s_raw_w2 - s_raw_w1 > 0 ? aura_sig_dn : aura_sig_up
+plot(showAuraEngine and s_cross ? aura_w2_val : na, title='Nexus Signal Node', color=color.new(node_c, 15), style=plot.style_circles, linewidth=3, display = display.all - display.price_scale)
+
+// Indicators
+has_bull = s_div_bull or r_div_bull
+has_bear = s_div_bear or r_div_bear
+plotchar(showAuraEngine and showMarkers and has_bull ? -106 * auraScale : na, title='Nexus Bull Marker', char='•', color=aura_sig_up, location=location.absolute, size=size.small, offset=-2, display=display.none)
+plotchar(showAuraEngine and showMarkers and has_bear ? 106 * auraScale : na, title='Nexus Bear Marker', char='•', color=aura_sig_dn, location=location.absolute, size=size.small, offset=-2, display=display.none)

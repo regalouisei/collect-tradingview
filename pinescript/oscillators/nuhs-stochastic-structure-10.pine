@@ -1,0 +1,357 @@
+//@version=6
+indicator("Nuh's Stochastic + Structure 1.0", overlay=false, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// STOCHASTIC SETTINGS
+// ============================================================================
+grpStoch = "STOCHASTIC"
+len       = input.int(14,  "Length",       group=grpStoch)
+smoothK   = input.int(3,   "Smooth K",     group=grpStoch)
+smoothD   = input.int(3,   "Smooth D",     group=grpStoch)
+upLine    = input.int(80,  "Overbought",   minval=50, maxval=90, group=grpStoch)
+lowLine   = input.int(20,  "Oversold",     minval=10, maxval=50, group=grpStoch)
+
+// ============================================================================
+// RESOLUTION
+// ============================================================================
+grpRes        = "RESOLUTION"
+useCurrentRes = input.bool(true,  "Use Current Timeframe", group=grpRes)
+resCustom     = input.timeframe("60", "Custom Resolution", group=grpRes)
+res           = useCurrentRes ? timeframe.period : resCustom
+
+// ============================================================================
+// STRUCTURE SETTINGS
+// ============================================================================
+grpStruct       = "STRUCTURE"
+useStructure    = input.bool(true, "Enable Structure Analysis", group=grpStruct)
+pivotLeft       = input.int(5, "Pivot Left",   minval=2,  maxval=20, group=grpStruct)
+pivotRight      = input.int(2, "Pivot Right",  minval=1,  maxval=10, group=grpStruct)
+useDynamicPivot = input.bool(true, "Dynamic Pivot (ATR-based)", group=grpStruct)
+atrMultPivot    = input.float(1.5, "ATR Multiplier for Pivot", minval=0.5, maxval=5, step=0.1, group=grpStruct)
+
+// ============================================================================
+// DIVERGENCE SETTINGS
+// ============================================================================
+grpDiv        = "DIVERGENCE"
+useDivergence = input.bool(true, "Enable Divergence Detection", group=grpDiv)
+divLookback   = input.int(30, "Divergence Lookback", minval=10, maxval=100, group=grpDiv)
+divMinBars    = input.int(5,  "Min Bars Between Pivots", minval=3, maxval=20, group=grpDiv)
+
+// ============================================================================
+// VOLUME SETTINGS
+// ============================================================================
+grpVol        = "VOLUME"
+useVolume     = input.bool(true, "Enable Volume Filter", group=grpVol)
+volMaLen      = input.int(20, "Volume MA Length", minval=5, maxval=50, group=grpVol)
+volSpikeMulti = input.float(1.5, "Volume Spike Multiplier", minval=1.0, maxval=3.0, step=0.1, group=grpVol)
+
+// ============================================================================
+// MTF SETTINGS
+// ============================================================================
+grpMTF  = "MULTI-TIMEFRAME"
+useMTF  = input.bool(true, "Enable MTF Confirmation", group=grpMTF)
+htfRes  = input.timeframe("60", "Higher Timeframe", group=grpMTF)
+
+// ============================================================================
+// EXTREME DURATION SETTINGS
+// ============================================================================
+grpTime        = "EXTREME DURATION"
+useExtremeDur  = input.bool(true, "Enable Extreme Duration Filter", group=grpTime)
+minExtremeBars = input.int(3, "Min Bars in Extreme Zone", minval=1, maxval=20, group=grpTime)
+
+// ============================================================================
+// VISUAL SETTINGS
+// ============================================================================
+grpVisual      = "VISUALS"
+showDivLines   = input.bool(true,  "Show Divergence Lines", group=grpVisual)
+showLabels     = input.bool(true,  "Show Signal Labels",    group=grpVisual)
+showBackground = input.bool(true,  "Show Trend Background", group=grpVisual)
+
+
+// ============================================================================
+// STOCHASTIC CALCULATION
+// ============================================================================
+k_raw    = ta.stoch(close, high, low, len)
+k_smooth = ta.sma(k_raw, smoothK)
+d_smooth = ta.sma(k_smooth, smoothD)
+
+outK = request.security(syminfo.tickerid, res, k_smooth)
+outD = request.security(syminfo.tickerid, res, d_smooth)
+
+
+// ============================================================================
+// DYNAMIC ATR PIVOT
+// ============================================================================
+atr14   = ta.atr(14)
+atrNorm = atr14 / close * 100.0
+
+dynPivotLeft  = useDynamicPivot ? math.max(3, math.min(15, math.round(pivotLeft  * (1 + atrNorm * atrMultPivot))))          : pivotLeft
+dynPivotRight = useDynamicPivot ? math.max(1, math.min(8,  math.round(pivotRight * (1 + atrNorm * atrMultPivot * 0.5))))   : pivotRight
+
+
+// ============================================================================
+// STRUCTURE (HH, HL, LH, LL)
+// ============================================================================
+pH = ta.pivothigh(high, int(dynPivotLeft),  int(dynPivotRight))
+pL = ta.pivotlow(low,   int(dynPivotLeft),  int(dynPivotRight))
+
+var float lastH   = na
+var float prevH   = na
+var float lastL   = na
+var float prevL   = na
+
+if not na(pH) and useStructure
+    prevH := lastH
+    lastH := pH
+
+if not na(pL) and useStructure
+    prevL := lastL
+    lastL := pL
+
+isHH = not na(lastH) and not na(prevH) and lastH > prevH
+isLH = not na(lastH) and not na(prevH) and lastH < prevH
+isHL = not na(lastL) and not na(prevL) and lastL > prevL
+isLL = not na(lastL) and not na(prevL) and lastL < prevL
+
+trendUpStruct   = isHH or isHL
+trendDownStruct = isLH or isLL
+
+
+// ============================================================================
+// DIVERGENCE ENGINE
+// ============================================================================
+var float[] priceLows     = array.new_float()
+var float[] priceHighs    = array.new_float()
+var float[] stochLows     = array.new_float()
+var float[] stochHighs    = array.new_float()
+var int[]   priceLowBars  = array.new_int()
+var int[]   priceHighBars = array.new_int()
+
+if not na(pL) and useDivergence
+    array.push(priceLows, pL)
+    array.push(stochLows, outK[1])
+    array.push(priceLowBars, bar_index - 1)
+    if array.size(priceLows) > 10
+        array.shift(priceLows), array.shift(stochLows), array.shift(priceLowBars)
+
+if not na(pH) and useDivergence
+    array.push(priceHighs, pH)
+    array.push(stochHighs, outK[1])
+    array.push(priceHighBars, bar_index - 1)
+    if array.size(priceHighs) > 10
+        array.shift(priceHighs), array.shift(stochHighs), array.shift(priceHighBars)
+
+bullishDiv    = false
+bearishDiv    = false
+hiddenBullDiv = false
+hiddenBearDiv = false
+
+if useDivergence and array.size(priceLows) >= 2
+    cp  = array.get(priceLows, array.size(priceLows) - 1)
+    pp  = array.get(priceLows,  array.size(priceLows) - 2)
+    cs  = array.get(stochLows, array.size(stochLows) - 1)
+    ps  = array.get(stochLows, array.size(stochLows) - 2)
+
+    if cp < pp and cs > ps
+        bullishDiv := true
+
+    if cp > pp and cs < ps
+        hiddenBullDiv := true
+
+if useDivergence and array.size(priceHighs) >= 2
+    cp  = array.get(priceHighs, array.size(priceHighs) - 1)
+    pp  = array.get(priceHighs, array.size(priceHighs) - 2)
+    cs  = array.get(stochHighs, array.size(stochHighs) - 1)
+    ps  = array.get(stochHighs, array.size(stochHighs) - 2)
+
+    if cp > pp and cs < ps
+        bearishDiv := true
+
+    if cp < pp and cs > ps
+        hiddenBearDiv := true
+
+
+// ============================================================================
+// VOLUME ENGINE
+// ============================================================================
+volMA    = ta.sma(volume, volMaLen)
+volSpike = volume > volMA * volSpikeMulti
+volConfirm = not useVolume or volSpike
+
+
+// ============================================================================
+// MTF STOCHASTIC
+// ============================================================================
+htfK = request.security(syminfo.tickerid, htfRes, k_smooth)
+htfD = request.security(syminfo.tickerid, htfRes, d_smooth)
+
+htfTrendUp   = htfK > htfD and htfK > 50
+htfTrendDown = htfK < htfD and htfK < 50
+htfNeutral   = not htfTrendUp and not htfTrendDown
+
+mtfConfirmUp   = not useMTF or htfTrendUp   or htfNeutral
+mtfConfirmDown = not useMTF or htfTrendDown or htfNeutral
+
+
+// ============================================================================
+// EXTREME DURATION
+// ============================================================================
+var int barsInOB = 0
+var int barsInOS = 0
+
+if outK > upLine
+    barsInOB += 1
+    barsInOS := 0
+else if outK < lowLine
+    barsInOS += 1
+    barsInOB := 0
+else
+    barsInOB := 0
+    barsInOS := 0
+
+extremeDurOB = not useExtremeDur or barsInOB >= minExtremeBars
+extremeDurOS = not useExtremeDur or barsInOS >= minExtremeBars
+
+
+// ============================================================================
+// MOMENTUM
+// ============================================================================
+kSlope = outK - outK[1]
+
+momUpStrong   = outK > outD and outK > upLine   and kSlope > 0
+momDownStrong = outK < outD and outK < lowLine  and kSlope < 0
+momUpWeak     = outK > upLine  and kSlope < 0
+momDownWeak   = outK < lowLine and kSlope > 0
+
+
+// ============================================================================
+// SCORE ENGINE
+// ============================================================================
+var float bullScore = 0
+var float bearScore = 0
+
+bullScore := 0
+bearScore := 0
+
+if trendUpStruct
+    bullScore += 25
+if trendDownStruct
+    bearScore += 25
+
+if bullishDiv
+    bullScore += 30
+if hiddenBullDiv
+    bullScore += 20
+
+if bearishDiv
+    bearScore += 30
+if hiddenBearDiv
+    bearScore += 20
+
+if volSpike
+    bullScore += 15
+    bearScore += 15
+
+if htfTrendUp
+    bullScore += 20
+if htfTrendDown
+    bearScore += 20
+
+if extremeDurOS
+    bullScore += 10
+if extremeDurOB
+    bearScore += 10
+
+
+// ============================================================================
+// SIGNALS
+// ============================================================================
+crossUp   = ta.crossover(outK, outD)
+crossDown = ta.crossunder(outK, outD)
+
+strongBullSignal = crossUp   and outK < lowLine and bullScore >= 50 and volConfirm and mtfConfirmUp
+strongBearSignal = crossDown and outK > upLine  and bearScore >= 50 and volConfirm and mtfConfirmDown
+
+mediumBullSignal = crossUp   and outK < 50 and bullScore >= 30 and not strongBullSignal
+mediumBearSignal = crossDown and outK > 50 and bearScore >= 30 and not strongBearSignal
+
+divBullSignal = bullishDiv and outK < lowLine and volConfirm
+divBearSignal = bearishDiv and outK > upLine  and volConfirm
+
+
+// ============================================================================
+// COLOR FUSION
+// ============================================================================
+trendUpContinue   = momUpStrong and trendUpStruct
+trendDownContinue = momDownStrong and trendDownStruct
+trendUpWeakStruct   = momUpWeak or (trendDownStruct and momUpStrong)
+trendDownWeakStruct = momDownWeak or (trendUpStruct and momDownStrong)
+
+crossColor = strongBullSignal  ? color.lime :
+             strongBearSignal  ? color.fuchsia :
+             divBullSignal     ? color.aqua :
+             divBearSignal     ? color.orange :
+             trendUpContinue   ? color.blue :
+             trendDownContinue ? color.purple :
+             trendUpWeakStruct ? color.white :
+             trendDownWeakStruct ? color.gray :
+             color.yellow
+
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+hline(50, "Mid", color.gray, hline.style_dotted)
+plot(upLine,  "Overbought", color.new(color.red,   50))
+plot(lowLine, "Oversold",   color.new(color.green, 50))
+
+plot(outK, "K", color.new(color.lime, 0), 2)
+plot(outD, "D", color.new(color.red,  0), 1)
+
+plot(useMTF ? htfK : na, "HTF K", color.new(color.lime, 70), 1, plot.style_stepline)
+plot(useMTF ? htfD : na, "HTF D", color.new(color.red,  70), 1, plot.style_stepline)
+
+plotshape(ta.cross(outK, outD) ? outD : na,
+     style=shape.circle, location=location.absolute,
+     color=crossColor, size=size.tiny)
+
+plotshape(strongBullSignal ? lowLine - 5 : na,
+     style=shape.triangleup, location=location.absolute,
+     color=color.lime, size=size.small)
+
+plotshape(strongBearSignal ? upLine + 5 : na,
+     style=shape.triangledown, location=location.absolute,
+     color=color.fuchsia, size=size.small)
+
+plotshape(divBullSignal and showLabels ? lowLine - 10 : na,
+     style=shape.diamond, location=location.absolute,
+     color=color.aqua, size=size.tiny)
+
+plotshape(divBearSignal and showLabels ? upLine + 10 : na,
+     style=shape.diamond, location=location.absolute,
+     color=color.orange, size=size.tiny)
+
+
+// ============================================================================
+// BACKGROUND COLORS
+// ============================================================================
+bgColor =
+     strongBullSignal ? color.new(color.lime,    90) :
+     strongBearSignal ? color.new(color.fuchsia, 90) :
+     (htfTrendUp   ? color.new(color.green, 95) :
+      htfTrendDown ? color.new(color.red,   95) : na)
+
+bgcolor(showBackground ? bgColor : na)
+
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(strongBullSignal, "STRONG BUY",  "Strong bullish signal")
+alertcondition(strongBearSignal, "STRONG SELL", "Strong bearish signal")
+alertcondition(mediumBullSignal, "Medium Buy",  "Medium bullish signal")
+alertcondition(mediumBearSignal, "Medium Sell", "Medium bearish signal")
+alertcondition(divBullSignal, "Bull Div", "Bullish divergence")
+alertcondition(divBearSignal, "Bear Div", "Bearish divergence")
+alertcondition(crossUp and outK < lowLine,  "Cross Up OS", "Stoch crossed up from oversold")
+alertcondition(crossDown and outK > upLine, "Cross Down OB", "Stoch crossed down from overbought")

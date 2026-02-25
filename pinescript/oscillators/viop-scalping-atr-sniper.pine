@@ -1,0 +1,126 @@
+//@version=5
+strategy("VİOP Scalping - ATR SNIPER (V4 - Fully Adjustable)", overlay=true, initial_capital=1000000, commission_type=strategy.commission.percent, commission_value=0.01)
+
+// ═══════════════════════════════════════════════════════════
+// 1. SETTINGS MENU (INPUTS)
+// ═══════════════════════════════════════════════════════════
+
+// GROUP: INDICATOR PERIODS
+grp_ind = "Indicator Settings"
+wmaLen     = input.int(50, "Main Trend (WMA) Period", group=grp_ind)
+emaFastLen = input.int(8, "Fast EMA", group=grp_ind)
+emaSlowLen = input.int(21, "Slow EMA", group=grp_ind)
+rsiLen     = input.int(14, "RSI Period", group=grp_ind)
+adxLen     = input.int(14, "ADX Period", group=grp_ind)
+
+// GROUP: SIGNAL THRESHOLDS (ADJUSTABLE LOGIC)
+grp_sig = "Signal & Entry Conditions"
+emaDiffTr  = input.float(0.03, "EMA Difference Threshold (Min)", step=0.01, group=grp_sig, tooltip="Min difference between Fast and Slow EMA")
+adxLimit   = input.float(16.0, "ADX Threshold (Min)", step=0.1, group=grp_sig, tooltip="Trend strength must be higher than this value")
+
+// RSI Limits (Separate for Long and Short)
+rsiLongMin  = input.int(48, "Long RSI Lower Limit", group=grp_sig, tooltip="RSI must be GREATER than this to enter Long")
+rsiLongMax  = input.int(65, "Long RSI Upper Limit", group=grp_sig, tooltip="RSI must be LOWER than this to enter Long")
+rsiShortMax = input.int(52, "Short RSI Upper Limit", group=grp_sig, tooltip="RSI must be LOWER than this to enter Short")
+rsiShortMin = input.int(35, "Short RSI Lower Limit", group=grp_sig, tooltip="RSI must be GREATER than this to enter Short")
+
+// GROUP: ATR SNIPER RISK MANAGEMENT
+grp_risk = "ATR Sniper Risk Management"
+atrLength     = input.int(14, "ATR Period", group=grp_risk)
+atrMultiplier = input.float(2.0, "Stop Width (ATR Multiplier)", step=0.1, group=grp_risk, tooltip="How many ATRs away from price for the Stop Loss?")
+rrRatio       = input.float(1.5, "Risk/Reward Ratio (R:R)", step=0.1, group=grp_risk, tooltip="Target is how many times the Stop distance? (e.g., 1.5)")
+
+// GROUP: TIME FILTER
+grp_time = "Time Settings"
+useTimeFilter = input.bool(true, "Apply No-Trade Hours (e.g. 09:30-10:05)", group=grp_time)
+noTradeSession = input.session("0930-1005", "No-Trade Session Hours", group=grp_time)
+
+// ═══════════════════════════════════════════════════════════
+// 2. CALCULATIONS
+// ═══════════════════════════════════════════════════════════
+
+// Indicators
+mainTrendWMA = ta.wma(close, wmaLen)
+emaFast      = ta.ema(close, emaFastLen)
+emaSlow      = ta.ema(close, emaSlowLen)
+emaDiff      = emaFast - emaSlow
+prevEmaDiff  = emaDiff[1] // Momentum check (previous difference)
+rsiVal       = ta.rsi(close, rsiLen)
+[_, _, adxVal] = ta.dmi(adxLen, adxLen) // Built-in PineScript DMI function for ADX
+atr          = ta.atr(atrLength)
+
+// Time Check
+isInNoTradeTime = useTimeFilter ? not na(time(timeframe.period, noTradeSession)) : false
+
+// Main Trend Direction
+isMainTrendUp   = close > mainTrendWMA
+isMainTrendDown = close < mainTrendWMA
+
+// ═══════════════════════════════════════════════════════════
+// 3. ENTRY CONDITIONS (LOGIC)
+// ═══════════════════════════════════════════════════════════
+
+// LONG Signal:
+// 1. EMA Difference is positive and > Threshold (0.03)
+// 2. Momentum is increasing (Current Diff > Previous Diff)
+// 3. RSI is within defined range (e.g., 48-65)
+// 4. Current price > Previous Close (Confirmation)
+// 5. ADX is strong enough (> 16)
+// 6. Price is ABOVE WMA50 (Main Trend)
+longCondition = (emaDiff > emaDiffTr) and (emaDiff > prevEmaDiff) and (rsiVal > rsiLongMin and rsiVal < rsiLongMax) and (close > close[1]) and (adxVal > adxLimit) and isMainTrendUp and not isInNoTradeTime
+
+// SHORT Signal:
+// 1. EMA Difference is negative and < -Threshold (-0.03)
+// 2. Momentum is decreasing (Short getting stronger)
+// 3. RSI is within defined range (e.g., 35-52)
+// 4. Current price < Previous Close
+// 5. ADX is strong enough
+// 6. Price is BELOW WMA50 (Main Trend)
+shortCondition = (emaDiff < -emaDiffTr) and (emaDiff < prevEmaDiff) and (rsiVal < rsiShortMax and rsiVal > rsiShortMin) and (close < close[1]) and (adxVal > adxLimit) and isMainTrendDown and not isInNoTradeTime
+
+// ═══════════════════════════════════════════════════════════
+// 4. TRADE MANAGEMENT (ATR STOP & TARGET)
+// ═══════════════════════════════════════════════════════════
+
+// Variables to store dynamic Stop and Target prices
+var float tradeStopPrice = na
+var float tradeTargetPrice = na
+
+// --- LONG ENTRY ---
+if (longCondition and strategy.position_size == 0)
+    // Calculate Dynamic Levels based on ATR
+    float stopDist = atr * atrMultiplier
+    tradeStopPrice := close - stopDist
+    tradeTargetPrice := close + (stopDist * rrRatio) // Risk x 1.5 Reward
+    
+    strategy.entry("Long Sniper", strategy.long, comment="L | TP:" + str.tostring(math.round(tradeTargetPrice, 0)))
+
+// --- SHORT ENTRY ---
+if (shortCondition and strategy.position_size == 0)
+    // Calculate Dynamic Levels based on ATR
+    float stopDist = atr * atrMultiplier
+    tradeStopPrice := close + stopDist
+    tradeTargetPrice := close - (stopDist * rrRatio) // Risk x 1.5 Reward
+    
+    strategy.entry("Short Sniper", strategy.short, comment="S | TP:" + str.tostring(math.round(tradeTargetPrice, 0)))
+
+// --- EXITS ---
+// Exit only using the calculated dynamic ATR levels
+if (strategy.position_size > 0)
+    strategy.exit("Exit Long", "Long Sniper", stop=tradeStopPrice, limit=tradeTargetPrice)
+
+if (strategy.position_size < 0)
+    strategy.exit("Exit Short", "Short Sniper", stop=tradeStopPrice, limit=tradeTargetPrice)
+
+// ═══════════════════════════════════════════════════════════
+// 5. VISUALS
+// ═══════════════════════════════════════════════════════════
+
+// Trend and Indicators
+plot(mainTrendWMA, color=color.yellow, linewidth=2, title="WMA 50 Trend")
+plot(emaFast, color=color.green, title="EMA 8")
+plot(emaSlow, color=color.red, title="EMA 21")
+
+// Plot Stop and Target lines when in a position
+plot(strategy.position_size != 0 ? tradeStopPrice : na, color=color.red, style=plot.style_linebr, title="Dynamic Stop")
+plot(strategy.position_size != 0 ? tradeTargetPrice : na, color=color.green, style=plot.style_linebr, title="Dynamic Target")

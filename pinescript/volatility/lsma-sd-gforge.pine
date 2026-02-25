@@ -1,0 +1,191 @@
+//@version=6
+indicator("LSMA SD | GForge", overlay=false, max_labels_count=500)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                         DISPLAY OPTIONS                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+show_signals         = input.bool(true,  "Show Signal Markers",        tooltip="Diamond markers on the oscillator when signals fire.",     group="📊 Display Options")
+show_overlay_signals = input.bool(true,  "Show Signals on Price Chart", tooltip="Diamond markers on the main price chart.",                group="📊 Display Options")
+show_bar_color       = input.bool(true,  "Color Price Chart Bars",      tooltip="Gradient candle coloring driven by oscillator position.", group="📊 Display Options")
+theme                = input.string("GForge Signature", "Visual Theme", options=["GForge Signature","Quantum Blue","Plasma Fire","Deep Ocean","Royal Purple","Matrix Green","Sunset Gold","Arctic Ice","Dark Matter","Pearl White"], group="🎨 Visual Settings")
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                           THEME COLORS                                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+[primary_up, secondary_up, primary_dn, secondary_dn, accent, bg_primary, bg_secondary] = switch theme
+    "GForge Signature" => [#00E5FF, #00B8D4, #FF1744, #D50000, #FFD700, #0A0A0A, #1A1A1A]
+    "Quantum Blue"     => [#40C4FF, #0091EA, #FF6D00, #E65100, #69FFDA, #000D12, #001219]
+    "Plasma Fire"      => [#FFEA00, #FFD600, #FF1493, #C2185B, #76FF03, #0D0000, #1A0000]
+    "Deep Ocean"       => [#00E5D4, #00BFA5, #FF5252, #D50000, #69FF47, #001020, #001F3A]
+    "Royal Purple"     => [#EA80FC, #CE93D8, #FFD740, #FFA000, #FF80AB, #0D0010, #1A0033]
+    "Matrix Green"     => [#00FF41, #00C853, #FF1744, #B71C1C, #CCFF00, #000000, #030D00]
+    "Sunset Gold"      => [#FFD600, #FFAB00, #FF4081, #F50057, #FFFF8D, #0D0800, #1A1000]
+    "Arctic Ice"       => [#18FFFF, #00E5FF, #448AFF, #2962FF, #B2EBF2, #000D12, #00161C]
+    "Dark Matter"      => [#D500F9, #AA00FF, #FF4081, #F50057, #64FFDA, #0A0010, #12001E]
+    "Pearl White"      => [#0D47A1, #1565C0, #BF360C, #D84315, #00695C, #FAFAFA, #F5F5F5]
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                        STRATEGY SETTINGS                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+trade_mode = input.string("Long/Cash", "Trading Mode", options=["Long/Short","Long/Cash"],
+     tooltip="Long/Short: flips between long and short.\nLong/Cash: exits to flat instead of shorting.",
+     group="⚙️ Strategy Settings")
+
+startDate  = input.int(1,    "Start Date",  minval=1,    maxval=31,   group="📅 Backtest Date Range")
+startMonth = input.int(1,    "Start Month", minval=1,    maxval=12,   group="📅 Backtest Date Range")
+startYear  = input.int(2018, "Start Year",  minval=1800, maxval=2100, group="📅 Backtest Date Range")
+
+in_date_range = time >= timestamp(syminfo.timezone, startYear, startMonth, startDate, 0, 0)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                       INDICATOR PARAMETERS                                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+src        = input(close,     "Source",             tooltip="Default hlc3 (typical price). Averages the full bar range into the regression, reducing end-of-session close distortion.", group="📈 LSMA·SD Settings")
+ls_len     = input.int(21,   "LSMA Length",        minval=10, maxval=300, tooltip="Lookback for the least-squares regression line. Longer = smoother trend direction, slower to respond to new trends.",  group="📈 LSMA·SD Settings")
+smooth_len = input.int(4,    "Endpoint Smoothing", minval=1,  maxval=10,  tooltip="Short EMA over the raw LSMA output. Dampens window-edge snap artifacts without meaningful lag. 1 = off.",              group="📈 LSMA·SD Settings")
+sd_len     = input.int(32,   "StdDev Length",      minval=5,  maxval=300, tooltip="Lookback for the StdDev band width. Can differ from LSMA length.",                                                     group="📈 LSMA·SD Settings")
+sd_mult    = input.float(2.9, "StdDev Multiplier", minval=0.5, maxval=5.0, step=0.1, tooltip="Band width = StdDev × this. ±2.0 covers ~95% of price history by definition. No dynamic scaling.",        group="📈 LSMA·SD Settings")
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                          SIGNAL SETTINGS                                  ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+long_threshold  = input.float(76, "Long Threshold",  minval=50, maxval=95, tooltip="Crossover above this level triggers a long signal.",  group="🎯 Signal Settings")
+short_threshold = input.float(30, "Short Threshold", minval=5,  maxval=80, tooltip="Crossunder below this level triggers exit or short.", group="🎯 Signal Settings")
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                          CORE CALCULATION                                 ║
+// ║                                                                           ║
+// ║  LSMA: least-squares regression line over ls_len bars, smoothed with    ║
+// ║  a short EMA to remove window-edge snap artifacts.                       ║
+// ║                                                                           ║
+// ║  Fixed StdDev bands wrap the basis. Width responds only to actual        ║
+// ║  price volatility — no secondary scaling layer.                          ║
+// ║                                                                           ║
+// ║  Oscillator = price position within bands on a 0–100 scale.             ║
+// ║  Signals fire on threshold crossovers.                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+float raw_lsma = ta.linreg(src, ls_len, 0)
+float basis    = ta.ema(raw_lsma, smooth_len)
+float dev      = sd_mult * ta.stdev(src, sd_len)
+float upper    = basis + dev
+float lower    = basis - dev
+float band_rng = upper - lower
+float osc      = band_rng > 0 ? 100.0 * (src - lower) / band_rng : 50.0
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                           SIGNAL LOGIC                                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+bool sig_long  = ta.crossover(osc,  long_threshold)
+bool sig_short = ta.crossunder(osc, short_threshold)
+
+var bool   is_long_state = true
+var string signal_state  = "long"
+
+if sig_long and in_date_range
+    is_long_state := true
+    signal_state  := "long"
+else if sig_short and in_date_range
+    is_long_state := false
+    signal_state  := trade_mode == "Long/Short" ? "short" : "cash"
+
+bool long_signal  = sig_long  and in_date_range and signal_state[1] != "long"
+bool short_signal = sig_short and in_date_range and signal_state[1] != "short" and trade_mode == "Long/Short"
+bool cash_signal  = sig_short and in_date_range and signal_state[1] != "cash"  and trade_mode == "Long/Cash"
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║          LOWER PANEL — OSCILLATOR CANDLES + GRADIENT BACKGROUND           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+float clamped_osc  = math.max(0, math.min(100, osc))
+float mid_point    = (long_threshold + short_threshold) / 2
+float norm_floor   = -mid_point - 15
+float norm_ceiling = (100 - mid_point) + 15
+float band_step    = (norm_ceiling - norm_floor) / 10
+
+// Map each OHLC price into oscillator panel coordinates
+float osc_O = band_rng > 0 ? math.max(norm_floor, math.min(norm_ceiling, 100 * (open  - lower) / band_rng - mid_point)) : 0
+float osc_H = band_rng > 0 ? math.max(norm_floor, math.min(norm_ceiling, 100 * (high  - lower) / band_rng - mid_point)) : 0
+float osc_L = band_rng > 0 ? math.max(norm_floor, math.min(norm_ceiling, 100 * (low   - lower) / band_rng - mid_point)) : 0
+float osc_C = band_rng > 0 ? math.max(norm_floor, math.min(norm_ceiling, 100 * (close - lower) / band_rng - mid_point)) : 0
+
+color candle_col = color.from_gradient(clamped_osc, 0, 80, primary_dn, primary_up)
+
+// 10-slice vertical gradient background
+p_lv0  = plot(norm_floor,                  display=display.none, editable=false)
+p_lv1  = plot(norm_floor + band_step,      display=display.none, editable=false)
+p_lv2  = plot(norm_floor + band_step * 2,  display=display.none, editable=false)
+p_lv3  = plot(norm_floor + band_step * 3,  display=display.none, editable=false)
+p_lv4  = plot(norm_floor + band_step * 4,  display=display.none, editable=false)
+p_lv5  = plot(norm_floor + band_step * 5,  display=display.none, editable=false)
+p_lv6  = plot(norm_floor + band_step * 6,  display=display.none, editable=false)
+p_lv7  = plot(norm_floor + band_step * 7,  display=display.none, editable=false)
+p_lv8  = plot(norm_floor + band_step * 8,  display=display.none, editable=false)
+p_lv9  = plot(norm_floor + band_step * 9,  display=display.none, editable=false)
+p_lv10 = plot(norm_ceiling,                display=display.none, editable=false)
+
+fill(p_lv0,  p_lv1,  color.new(color.from_gradient(0,  0, 100, primary_dn, primary_up), 88))
+fill(p_lv1,  p_lv2,  color.new(color.from_gradient(10, 0, 100, primary_dn, primary_up), 88))
+fill(p_lv2,  p_lv3,  color.new(color.from_gradient(20, 0, 100, primary_dn, primary_up), 88))
+fill(p_lv3,  p_lv4,  color.new(color.from_gradient(30, 0, 100, primary_dn, primary_up), 88))
+fill(p_lv4,  p_lv5,  color.new(color.from_gradient(40, 0, 100, primary_dn, primary_up), 90))
+fill(p_lv5,  p_lv6,  color.new(color.from_gradient(50, 0, 100, primary_dn, primary_up), 92))
+fill(p_lv6,  p_lv7,  color.new(color.from_gradient(60, 0, 100, primary_dn, primary_up), 90))
+fill(p_lv7,  p_lv8,  color.new(color.from_gradient(70, 0, 100, primary_dn, primary_up), 88))
+fill(p_lv8,  p_lv9,  color.new(color.from_gradient(80, 0, 100, primary_dn, primary_up), 88))
+fill(p_lv9,  p_lv10, color.new(color.from_gradient(90, 0, 100, primary_dn, primary_up), 88))
+
+// Oscillator candles, threshold lines, centre reference
+plotcandle(osc_O, osc_H, osc_L, osc_C, title="Oscillator Candles",
+     color=candle_col, bordercolor=candle_col, wickcolor=candle_col, display=display.pane)
+
+plot(long_threshold  - mid_point, "Long Threshold",  color=color.new(primary_up, 55), linewidth=1, display=display.pane)
+plot(short_threshold - mid_point, "Short Threshold", color=color.new(primary_dn, 55), linewidth=1, display=display.pane)
+hline(0, "Centre", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+
+// Panel signal diamonds
+plotshape(show_signals and long_signal ? osc_C : na,
+     title="Long Signal",  style=shape.diamond, location=location.absolute, color=primary_up, size=size.tiny)
+plotshape(show_signals and (short_signal or cash_signal) ? osc_C : na,
+     title="Short Signal", style=shape.diamond, location=location.absolute, color=primary_dn, size=size.tiny)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                    MAIN CHART — BAR COLOR + SIGNALS                       ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+bar_color = show_bar_color and in_date_range ?
+     color.from_gradient(clamped_osc, 0, 100, primary_dn, primary_up) : na
+
+plotcandle(open, high, low, close, title="Price Bars",
+     color=bar_color, bordercolor=bar_color, wickcolor=bar_color, force_overlay=true)
+
+plotshape(show_overlay_signals and long_signal ? low : na,
+     title="Overlay Long",  style=shape.diamond,
+     location=location.belowbar, color=primary_up, size=size.tiny, force_overlay=true)
+plotshape(show_overlay_signals and (short_signal or cash_signal) ? high : na,
+     title="Overlay Short", style=shape.diamond,
+     location=location.abovebar, color=primary_dn, size=size.tiny, force_overlay=true)
+
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                              ALERTS                                        ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+alertcondition(long_signal,  "Long Signal",  "LSMA SD: Long entry")
+alertcondition(short_signal, "Short Signal", "LSMA SD: Short entry")
+alertcondition(cash_signal,  "Cash Signal",  "LSMA SD: Exit to cash")

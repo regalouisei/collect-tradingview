@@ -1,0 +1,171 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DarkPoolCrypto
+
+//@version=6
+indicator("Money Flow Matrix ", overlay=false)
+
+// ==========================================
+// 1. SETTINGS
+// ==========================================
+grp_mf    = "Money Flow & Thresholds"
+grp_hw    = "Hyper Wave (Oscillator)"
+grp_div   = "Divergences (Regular & Hidden)"
+grp_rev   = "Reversal Signals"
+grp_dash  = "Confluence Meter"
+
+// --- Money Flow ---
+mfLen     = input.int(14, "Money Flow Length", group=grp_mf, tooltip="Base lookback for volume/price sensitivity.")
+mfSmooth  = input.int(3, "Money Flow Smoothing", group=grp_mf, tooltip="Smoothing factor to reduce noise in the columns.")
+bbLen     = input.int(20, "Threshold Length", group=grp_mf, tooltip="Bollinger Band length for the dynamic volatility thresholds.")
+bbMult    = input.float(2.0, "Threshold Multiplier", group=grp_mf, tooltip="Standard deviation for the thresholds. Higher = less overflow.")
+
+// --- Hyper Wave ---
+tsiLong   = input.int(25, "Hyper Wave Long", group=grp_hw, tooltip="Slow length for the oscillator ribbon.")
+tsiShort  = input.int(13, "Hyper Wave Short", group=grp_hw, tooltip="Fast length for the oscillator ribbon.")
+
+// --- Divergences ---
+showReg   = input.bool(true, "Show Regular Divergences (Reversal)", group=grp_div, tooltip="Bullish: Lower Low in Price, Higher Low in Osc.\nBearish: Higher High in Price, Lower High in Osc.")
+showHid   = input.bool(true, "Show Hidden Divergences (Continuation)", group=grp_div, tooltip="Bullish: Higher Low in Price, Lower Low in Osc.\nBearish: Lower High in Price, Higher High in Osc.")
+divLook   = input.int(5, "Divergence Lookback", group=grp_div, tooltip="Pivot lookback period.")
+
+// --- Meter ---
+showMeter = input.bool(true, "Show Confluence Meter", group=grp_dash, tooltip="Dashboard status panel.")
+
+// ==========================================
+// 2. CALCULATIONS
+// ==========================================
+
+// --- Money Flow (Enhanced) ---
+// We use a normalized RSI/Volume calculation to ensure consistent scaling
+rsiSource = ta.rsi(close, mfLen) - 50
+mfVolume  = (volume / ta.sma(volume, mfLen))
+// Normalized Money Flow
+moneyFlow = ta.ema(rsiSource * mfVolume, mfSmooth)
+
+// --- Dynamic Thresholds ---
+[bbMiddle, bbUpper, bbLower] = ta.bb(moneyFlow, bbLen, bbMult)
+isOverflowUp = moneyFlow > bbUpper
+isOverflowDn = moneyFlow < bbLower
+
+// --- Hyper Wave (TSI) ---
+double_smooth(float src, int long, int short) =>
+    fist_smooth = ta.ema(src, long)
+    ta.ema(fist_smooth, short)
+
+pc = ta.change(close)
+ds_pc = double_smooth(pc, tsiLong, tsiShort)
+ds_abs_pc = double_smooth(math.abs(pc), tsiLong, tsiShort)
+// Safety check and scaling
+hyperWave = ds_abs_pc != 0 ? (100 * (ds_pc / ds_abs_pc)) / 2 : 0
+
+// --- Signals ---
+// Dots (Warning)
+revDotBull = ta.crossover(hyperWave, -30)
+revDotBear = ta.crossunder(hyperWave, 30)
+
+// Triangles (Major Cross)
+majorBull = ta.crossover(moneyFlow, 0) and hyperWave > hyperWave[1]
+majorBear = ta.crossunder(moneyFlow, 0) and hyperWave < hyperWave[1]
+
+// ==========================================
+// 3. ADVANCED DIVERGENCE LOGIC
+// ==========================================
+ph = ta.pivothigh(hyperWave, divLook, divLook)
+pl = ta.pivotlow(hyperWave, divLook, divLook)
+
+// -- Regular (Reversal) --
+bullReg = false
+bearReg = false
+if not na(pl) and showReg
+    if low[divLook] < low[divLook*2] and hyperWave[divLook] > hyperWave[divLook*2]
+        bullReg := true
+if not na(ph) and showReg
+    if high[divLook] > high[divLook*2] and hyperWave[divLook] < hyperWave[divLook*2]
+        bearReg := true
+
+// -- Hidden (Continuation) --
+bullHid = false
+bearHid = false
+if not na(pl) and showHid
+    // Price Higher Low, Osc Lower Low
+    if low[divLook] > low[divLook*2] and hyperWave[divLook] < hyperWave[divLook*2]
+        bullHid := true
+if not na(ph) and showHid
+    // Price Lower High, Osc Higher High
+    if high[divLook] < high[divLook*2] and hyperWave[divLook] > hyperWave[divLook*2]
+        bearHid := true
+
+// ==========================================
+// 4. VISUALS (GRADIENTS & PLOTS)
+// ==========================================
+
+// Confluence Background
+mfState = moneyFlow > 0 ? 1 : -1
+hwState = hyperWave > hyperWave[1] ? 1 : -1
+confluence = mfState == hwState
+
+bg_col = confluence ? (mfState == 1 ? color.new(color.green, 92) : color.new(color.red, 92)) : na
+bgcolor(bg_col, title="Confluence Zone")
+
+// Thresholds
+p_upper = plot(bbUpper, "Upper Band", color=color.new(color.gray, 60))
+p_lower = plot(bbLower, "Lower Band", color=color.new(color.gray, 60))
+fill(p_upper, p_lower, color=color.new(color.gray, 95))
+
+// Money Flow with Gradient
+col_mf = moneyFlow > 0 
+     ? color.from_gradient(moneyFlow, 0, bbUpper * 1.5, color.new(color.green, 60), color.new(color.lime, 10)) 
+     : color.from_gradient(moneyFlow, bbLower * 1.5, 0, color.new(color.maroon, 10), color.new(color.red, 60))
+
+// Override for Overflow
+if isOverflowUp 
+    col_mf := color.new(#00ff08, 0) // Neon Green
+if isOverflowDn 
+    col_mf := color.new(#ff002f, 0) // Neon Red
+
+plot(moneyFlow, "Money Flow", color=col_mf, style=plot.style_columns)
+
+// Hyper Wave
+col_hw = hyperWave >= hyperWave[1] ? #00E676 : #FF5252
+plot(hyperWave, "Hyper Wave", color=col_hw, linewidth=2)
+
+// Reversal Dots
+plot(revDotBull ? hyperWave - 5 : na, "Warning Dot Bull", color=color.green, style=plot.style_circles, linewidth=2)
+plot(revDotBear ? hyperWave + 5 : na, "Warning Dot Bear", color=color.red, style=plot.style_circles, linewidth=2)
+
+// Major Triangles
+plotshape(majorBull, "Major Buy", shape.triangleup, location.bottom, color.green, size=size.small)
+plotshape(majorBear, "Major Sell", shape.triangledown, location.top, color.red, size=size.small)
+
+// Divergence Labels (R = Regular, H = Hidden)
+// FIXED: First argument controls both logic AND Y-position via ternary operator
+plotshape(bullReg ? hyperWave[divLook]-5 : na, "Bull Reg", shape.labelup, location.absolute, color.green, textcolor=color.white, offset=-divLook, text="R", size=size.tiny)
+plotshape(bearReg ? hyperWave[divLook]+5 : na, "Bear Reg", shape.labeldown, location.absolute, color.red, textcolor=color.white, offset=-divLook, text="R", size=size.tiny)
+plotshape(bullHid ? hyperWave[divLook]-5 : na, "Bull Hid", shape.labelup, location.absolute, #006064, textcolor=color.white, offset=-divLook, text="H", size=size.tiny)
+plotshape(bearHid ? hyperWave[divLook]+5 : na, "Bear Hid", shape.labeldown, location.absolute, #880e4f, textcolor=color.white, offset=-divLook, text="H", size=size.tiny)
+
+// ==========================================
+// 5. ALERTS
+// ==========================================
+alertcondition(majorBull, title="Major Buy Alert", message="Money Flow Matrix: Major BUY Signal")
+alertcondition(majorBear, title="Major Sell Alert", message="Money Flow Matrix: Major SELL Signal")
+alertcondition(revDotBull, title="Reversal Warning (Bull)", message="Money Flow Matrix: Bullish Rotation")
+alertcondition(revDotBear, title="Reversal Warning (Bear)", message="Money Flow Matrix: Bearish Rotation")
+alertcondition(bullReg, title="Regular Bullish Divergence", message="Money Flow Matrix: Regular Bullish Div")
+alertcondition(bearReg, title="Regular Bearish Divergence", message="Money Flow Matrix: Regular Bearish Div")
+
+// ==========================================
+// 6. DASHBOARD
+// ==========================================
+var table dash = table.new(position.bottom_right, 2, 2, bgcolor=color.new(color.black, 40), border_width=1)
+if showMeter and barstate.islast
+    int score = 0
+    score := score + (moneyFlow > 0 ? 1 : -1)
+    score := score + (hyperWave > 0 ? 1 : -1)
+    score := score + (hyperWave > hyperWave[1] ? 1 : -1)
+    
+    color c_color = score > 0 ? color.green : score < 0 ? color.red : color.gray
+    string c_text = score > 1 ? "STRONG BUY" : score == 1 ? "WEAK BUY" : score < -1 ? "STRONG SELL" : score == -1 ? "WEAK SELL" : "NEUTRAL"
+    
+    table.cell(dash, 0, 0, "Matrix", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, c_text, text_color=c_color, text_size=size.small, bgcolor=color.new(c_color, 85))

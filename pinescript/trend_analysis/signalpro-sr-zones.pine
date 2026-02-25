@@ -1,0 +1,189 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// SignalPro - Clean Support & Resistance v1.2
+// Detects key S/R levels from pivot swing highs/lows with clean zone visualization
+
+//@version=6
+indicator("SignalPro S/R Zones", overlay=true, max_lines_count=100, max_boxes_count=100, max_labels_count=100)
+
+// ──────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────
+
+grp_sr      = "Support & Resistance"
+pivotLen    = input.int(10, "Pivot Lookback", minval=3, maxval=50, group=grp_sr)
+zoneWidthPct= input.float(0.15, "Zone Width %", minval=0.01, maxval=2.0, step=0.05, group=grp_sr)
+maxLevels   = input.int(8, "Max Levels Shown", minval=2, maxval=20, group=grp_sr)
+mergeDistPct= input.float(0.3, "Merge Distance %", minval=0.05, maxval=3.0, step=0.05, group=grp_sr)
+minTouches  = input.int(1, "Min Touches", minval=1, maxval=10, group=grp_sr)
+extendBars  = input.int(50, "Extend Right (bars)", minval=10, maxval=200, group=grp_sr)
+proxPct     = input.float(5.0, "Show Within % of Price", minval=0, maxval=50, step=1, group=grp_sr)
+
+grp_style   = "Style"
+resColor    = input.color(#EF4444, "Resistance Color", group=grp_style)
+supColor    = input.color(#22C55E, "Support Color", group=grp_style)
+showLabels  = input.bool(true, "Show Price Labels", group=grp_style)
+showTouches = input.bool(true, "Show Touch Count", group=grp_style)
+lnWidth     = input.int(1, "Line Width", minval=1, maxval=4, group=grp_style)
+
+grp_alerts  = "Alerts"
+alertProx   = input.float(0.1, "Alert Proximity %", minval=0.01, maxval=1.0, step=0.01, group=grp_alerts)
+
+// ──────────────────────────────────────────────────────────────────
+// STORAGE
+// ──────────────────────────────────────────────────────────────────
+
+var float[] lvlPrice   = array.new_float()
+var int[]   lvlTouches = array.new_int()
+var int[]   lvlBar     = array.new_int()
+
+// ──────────────────────────────────────────────────────────────────
+// ADD / MERGE PIVOTS
+// ──────────────────────────────────────────────────────────────────
+
+addLevel(float p) =>
+    mergeDist = p * mergeDistPct / 100.0
+    idx = -1
+    if array.size(lvlPrice) > 0
+        for i = 0 to array.size(lvlPrice) - 1
+            if math.abs(array.get(lvlPrice, i) - p) <= mergeDist
+                idx := i
+                break
+    if idx >= 0
+        oldP = array.get(lvlPrice, idx)
+        oldT = array.get(lvlTouches, idx)
+        array.set(lvlPrice, idx, (oldP * oldT + p) / (oldT + 1))
+        array.set(lvlTouches, idx, oldT + 1)
+        array.set(lvlBar, idx, bar_index - pivotLen)
+    else
+        array.push(lvlPrice, p)
+        array.push(lvlTouches, 1)
+        array.push(lvlBar, bar_index - pivotLen)
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    addLevel(ph)
+if not na(pl)
+    addLevel(pl)
+
+// ──────────────────────────────────────────────────────────────────
+// DRAW ON LAST BAR
+// ──────────────────────────────────────────────────────────────────
+
+var line[]  drawnLines  = array.new_line()
+var box[]   drawnBoxes  = array.new_box()
+var label[] drawnLabels = array.new_label()
+var table   infoTbl     = table.new(position.top_right, 2, 1, bgcolor=color.new(#1E1E2E, 30), border_color=color.new(#FFFFFF, 85), border_width=1)
+
+if barstate.islast
+    // Clean previous drawings
+    while array.size(drawnLines) > 0
+        line.delete(array.pop(drawnLines))
+    while array.size(drawnBoxes) > 0
+        box.delete(array.pop(drawnBoxes))
+    while array.size(drawnLabels) > 0
+        label.delete(array.pop(drawnLabels))
+
+    sz = array.size(lvlPrice)
+    if sz > 0
+        curPrice = close
+        zoneHalf = curPrice * zoneWidthPct / 200.0
+        maxBack  = 500
+        minBar   = bar_index - maxBack
+
+        // Build sorted index array by distance to price
+        var int[]   sortIdx  = array.new_int() 
+        var float[] sortDist = array.new_float()
+        array.clear(sortIdx)
+        array.clear(sortDist)
+
+        for i = 0 to sz - 1
+            p = array.get(lvlPrice, i)
+            t = array.get(lvlTouches, i)
+            if t < minTouches
+                continue
+            d = math.abs(curPrice - p) / curPrice * 100.0
+            if proxPct > 0 and d > proxPct
+                continue
+            array.push(sortIdx, i)
+            array.push(sortDist, d)
+
+        // Sort by distance (simple bubble sort)
+        n = array.size(sortIdx)
+        if n > 1
+            for i = 0 to n - 2
+                for j = i + 1 to n - 1
+                    if array.get(sortDist, j) < array.get(sortDist, i)
+                        tmpI = array.get(sortIdx, i)
+                        tmpD = array.get(sortDist, i)
+                        array.set(sortIdx, i, array.get(sortIdx, j))
+                        array.set(sortDist, i, array.get(sortDist, j))
+                        array.set(sortIdx, j, tmpI)
+                        array.set(sortDist, j, tmpD)
+
+        // Draw up to maxLevels
+        count = math.min(n, maxLevels)
+        rCnt  = 0
+        sCnt  = 0
+
+        if count > 0
+            for k = 0 to count - 1
+                i    = array.get(sortIdx, k)
+                p    = array.get(lvlPrice, i)
+                t    = array.get(lvlTouches, i)
+                bIdx = array.get(lvlBar, i)
+
+                isRes = p > curPrice
+                col   = isRes ? resColor : supColor
+                fillC = color.new(col, 88)
+                bordC = color.new(col, 60)
+
+                x1 = math.max(bIdx, minBar)
+                x2 = bar_index + extendBars
+                yT = p + zoneHalf
+                yB = p - zoneHalf
+
+                array.push(drawnBoxes, box.new(x1, yT, x2, yB, border_color=bordC, border_width=1, bgcolor=fillC))
+                array.push(drawnLines, line.new(x1, p, x2, p, color=col, width=lnWidth, style=line.style_solid))
+
+                if showLabels
+                    lY = isRes ? yT : yB
+                    lS = isRes ? label.style_label_down : label.style_label_up
+                    array.push(drawnLabels, label.new(x2, lY, str.tostring(p, format.mintick), color=color.new(col, 30), textcolor=color.white, style=lS, size=size.small))
+
+                if showTouches and t >= 2
+                    dS = t >= 5 ? size.normal : t >= 3 ? size.small : size.tiny
+                    dY = isRes ? yT : yB
+                    array.push(drawnLabels, label.new(x1, dY, str.tostring(t) + "x", color=color.new(col, 40), textcolor=color.white, style=label.style_label_center, size=dS))
+
+                if isRes
+                    rCnt += 1
+                else
+                    sCnt += 1
+
+        table.cell(infoTbl, 0, 0, "R " + str.tostring(rCnt), text_color=resColor, text_size=size.small)
+        table.cell(infoTbl, 1, 0, "S " + str.tostring(sCnt), text_color=supColor, text_size=size.small)
+
+// ──────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────
+
+nearRes = false
+nearSup = false
+
+if array.size(lvlPrice) > 0
+    aDist = close * alertProx / 100.0
+    for i = 0 to array.size(lvlPrice) - 1
+        if array.get(lvlTouches, i) >= minTouches
+            p = array.get(lvlPrice, i)
+            if math.abs(close - p) <= aDist
+                if p > close
+                    nearRes := true
+                else
+                    nearSup := true
+
+alertcondition(nearRes, "Near Resistance", "Price approaching resistance level")
+alertcondition(nearSup, "Near Support", "Price approaching support level")
+alertcondition(nearRes or nearSup, "Near S/R Level", "Price approaching support or resistance level")

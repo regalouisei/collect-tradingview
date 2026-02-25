@@ -1,0 +1,371 @@
+//@version=6
+indicator("TTP Universal Divergence Detector", shorttitle="TTP UDD", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ==================== INPUTS ====================
+
+// Source Selection
+src = input.source(close, title="Indicator Source", group="📊 Source Settings", 
+     tooltip="Select any indicator available on your chart. This will be compared against price action to detect divergences.")
+
+// Pivot Settings
+leftBars = input.int(5, title="Pivot Left Bars", minval=1, group="🎯 Pivot Settings",
+     tooltip="Number of bars to the left of the pivot point")
+rightBars = input.int(5, title="Pivot Right Bars", minval=1, group="🎯 Pivot Settings",
+     tooltip="Number of bars to the right of the pivot point.\n\n⚠️ CRITICAL: Signals trigger AFTER this many bars because we need confirmation that a pivot has formed.")
+
+// Divergence Type Selection
+showRegularBull = input.bool(true, title="Regular Bullish", group="🔍 Divergence Types", inline="reg")
+showRegularBear = input.bool(true, title="Regular Bearish", group="🔍 Divergence Types", inline="reg")
+showHiddenBull = input.bool(true, title="Hidden Bullish", group="🔍 Divergence Types", inline="hid")
+showHiddenBear = input.bool(true, title="Hidden Bearish", group="🔍 Divergence Types", inline="hid")
+
+// Display Mode Selection
+displayMode = input.string("Divergences Only", title="Display Mode", 
+     options=["Divergences Only", "Signals Only", "Both"], 
+     group="📺 Display Settings",
+     tooltip="🎨 DIVERGENCES ONLY:\n  • Shows beautiful pattern lines connecting pivots\n  • REPAINTS as new bars form\n  • Great for analysis, NOT for trading\n\n🚦 SIGNALS ONLY:\n  • Shows trade entry markers on current bar\n  • NON-REPAINTING (what you see is what you get)\n  • Appears after pivot confirmation (based on Right Bars setting)\n  • Use for actual trading and backtesting\n\n📊 BOTH:\n  • See the full picture\n  • Divergence lines show the pattern\n  • Signal markers show when you could actually enter")
+
+// Lookback Settings
+maxLookback = input.int(60, title="Max Lookback Bars", minval=10, maxval=500, group="⚙️ Detection Settings",
+     tooltip="Maximum number of bars to look back for divergence patterns")
+minLookback = input.int(5, title="Min Lookback Bars", minval=1, maxval=100, group="⚙️ Detection Settings",
+     tooltip="Minimum number of bars between pivots to consider valid divergence")
+
+// Backtesting Settings
+enableBacktesting = input.bool(false, title="Enable Backtesting Outputs", group="🤖 Backtesting",
+     tooltip="Enables binary (1/0) plot outputs for each signal type.\n\nThese outputs are NON-REPAINTING and can be referenced by other scripts for automated strategy testing.\n\nOnly SIGNALS generate backtesting data (divergence patterns are excluded).")
+
+// Visual Settings
+lineWidth = input.int(2, title="Line Width", minval=1, maxval=5, group="🎨 Visual Settings")
+labelSize = input.string("small", title="Label Size", options=["tiny", "small", "normal", "large"], group="🎨 Visual Settings")
+
+// Color Settings
+colorRegBull = input.color(color.new(color.green, 0), title="Regular Bullish", group="🎨 Colors", inline="c1")
+colorRegBear = input.color(color.new(color.red, 0), title="Regular Bearish", group="🎨 Colors", inline="c1")
+colorHidBull = input.color(color.new(color.blue, 0), title="Hidden Bullish", group="🎨 Colors", inline="c2")
+colorHidBear = input.color(color.new(color.orange, 0), title="Hidden Bearish", group="🎨 Colors", inline="c2")
+
+// ==================== PIVOT DETECTION ====================
+
+// Pivot High Detection
+pivotHigh = ta.pivothigh(high, leftBars, rightBars)
+pivotHighFound = not na(pivotHigh)
+
+// Pivot Low Detection
+pivotLow = ta.pivotlow(low, leftBars, rightBars)
+pivotLowFound = not na(pivotLow)
+
+// Store pivot values and corresponding indicator values
+var float[] priceHighs = array.new_float(0)
+var int[] priceHighBars = array.new_int(0)
+var float[] indicatorHighs = array.new_float(0)
+
+var float[] priceLows = array.new_float(0)
+var int[] priceLowBars = array.new_int(0)
+var float[] indicatorLows = array.new_float(0)
+
+// Maximum array size to prevent memory issues
+const int MAX_ARRAY_SIZE = 100
+
+// Store pivot highs
+if pivotHighFound
+    array.unshift(priceHighs, high[rightBars])
+    array.unshift(priceHighBars, bar_index - rightBars)
+    array.unshift(indicatorHighs, src[rightBars])
+    
+    if array.size(priceHighs) > MAX_ARRAY_SIZE
+        array.pop(priceHighs)
+        array.pop(priceHighBars)
+        array.pop(indicatorHighs)
+
+// Store pivot lows
+if pivotLowFound
+    array.unshift(priceLows, low[rightBars])
+    array.unshift(priceLowBars, bar_index - rightBars)
+    array.unshift(indicatorLows, src[rightBars])
+    
+    if array.size(priceLows) > MAX_ARRAY_SIZE
+        array.pop(priceLows)
+        array.pop(priceLowBars)
+        array.pop(indicatorLows)
+
+// ==================== DIVERGENCE DETECTION FUNCTIONS ====================
+
+// Function to detect Regular Bullish Divergence
+// Price makes lower low, but indicator makes higher low
+detectRegularBullish() =>
+    detected = false
+    detectedBar = 0
+    detectedPrice1 = 0.0
+    detectedPrice2 = 0.0
+    detectedInd1 = 0.0
+    detectedInd2 = 0.0
+    
+    if array.size(priceLows) >= 2
+        currentLowPrice = array.get(priceLows, 0)
+        currentLowBar = array.get(priceLowBars, 0)
+        currentLowInd = array.get(indicatorLows, 0)
+        
+        for i = 1 to math.min(array.size(priceLows) - 1, maxLookback)
+            prevLowPrice = array.get(priceLows, i)
+            prevLowBar = array.get(priceLowBars, i)
+            prevLowInd = array.get(indicatorLows, i)
+            
+            barDiff = currentLowBar - prevLowBar
+            
+            if barDiff >= minLookback and barDiff <= maxLookback
+                // Price makes lower low, indicator makes higher low
+                if currentLowPrice < prevLowPrice and currentLowInd > prevLowInd
+                    detected := true
+                    detectedBar := prevLowBar
+                    detectedPrice1 := prevLowPrice
+                    detectedPrice2 := currentLowPrice
+                    detectedInd1 := prevLowInd
+                    detectedInd2 := currentLowInd
+                    break
+    
+    [detected, detectedBar, detectedPrice1, detectedPrice2, detectedInd1, detectedInd2]
+
+// Function to detect Regular Bearish Divergence
+// Price makes higher high, but indicator makes lower high
+detectRegularBearish() =>
+    detected = false
+    detectedBar = 0
+    detectedPrice1 = 0.0
+    detectedPrice2 = 0.0
+    detectedInd1 = 0.0
+    detectedInd2 = 0.0
+    
+    if array.size(priceHighs) >= 2
+        currentHighPrice = array.get(priceHighs, 0)
+        currentHighBar = array.get(priceHighBars, 0)
+        currentHighInd = array.get(indicatorHighs, 0)
+        
+        for i = 1 to math.min(array.size(priceHighs) - 1, maxLookback)
+            prevHighPrice = array.get(priceHighs, i)
+            prevHighBar = array.get(priceHighBars, i)
+            prevHighInd = array.get(indicatorHighs, i)
+            
+            barDiff = currentHighBar - prevHighBar
+            
+            if barDiff >= minLookback and barDiff <= maxLookback
+                // Price makes higher high, indicator makes lower high
+                if currentHighPrice > prevHighPrice and currentHighInd < prevHighInd
+                    detected := true
+                    detectedBar := prevHighBar
+                    detectedPrice1 := prevHighPrice
+                    detectedPrice2 := currentHighPrice
+                    detectedInd1 := prevHighInd
+                    detectedInd2 := currentHighInd
+                    break
+    
+    [detected, detectedBar, detectedPrice1, detectedPrice2, detectedInd1, detectedInd2]
+
+// Function to detect Hidden Bullish Divergence
+// Price makes higher low, but indicator makes lower low
+detectHiddenBullish() =>
+    detected = false
+    detectedBar = 0
+    detectedPrice1 = 0.0
+    detectedPrice2 = 0.0
+    detectedInd1 = 0.0
+    detectedInd2 = 0.0
+    
+    if array.size(priceLows) >= 2
+        currentLowPrice = array.get(priceLows, 0)
+        currentLowBar = array.get(priceLowBars, 0)
+        currentLowInd = array.get(indicatorLows, 0)
+        
+        for i = 1 to math.min(array.size(priceLows) - 1, maxLookback)
+            prevLowPrice = array.get(priceLows, i)
+            prevLowBar = array.get(priceLowBars, i)
+            prevLowInd = array.get(indicatorLows, i)
+            
+            barDiff = currentLowBar - prevLowBar
+            
+            if barDiff >= minLookback and barDiff <= maxLookback
+                // Price makes higher low, indicator makes lower low
+                if currentLowPrice > prevLowPrice and currentLowInd < prevLowInd
+                    detected := true
+                    detectedBar := prevLowBar
+                    detectedPrice1 := prevLowPrice
+                    detectedPrice2 := currentLowPrice
+                    detectedInd1 := prevLowInd
+                    detectedInd2 := currentLowInd
+                    break
+    
+    [detected, detectedBar, detectedPrice1, detectedPrice2, detectedInd1, detectedInd2]
+
+// Function to detect Hidden Bearish Divergence
+// Price makes lower high, but indicator makes higher high
+detectHiddenBearish() =>
+    detected = false
+    detectedBar = 0
+    detectedPrice1 = 0.0
+    detectedPrice2 = 0.0
+    detectedInd1 = 0.0
+    detectedInd2 = 0.0
+    
+    if array.size(priceHighs) >= 2
+        currentHighPrice = array.get(priceHighs, 0)
+        currentHighBar = array.get(priceHighBars, 0)
+        currentHighInd = array.get(indicatorHighs, 0)
+        
+        for i = 1 to math.min(array.size(priceHighs) - 1, maxLookback)
+            prevHighPrice = array.get(priceHighs, i)
+            prevHighBar = array.get(priceHighBars, i)
+            prevHighInd = array.get(indicatorHighs, i)
+            
+            barDiff = currentHighBar - prevHighBar
+            
+            if barDiff >= minLookback and barDiff <= maxLookback
+                // Price makes lower high, indicator makes higher high
+                if currentHighPrice < prevHighPrice and currentHighInd > prevHighInd
+                    detected := true
+                    detectedBar := prevHighBar
+                    detectedPrice1 := prevHighPrice
+                    detectedPrice2 := currentHighPrice
+                    detectedInd1 := prevHighInd
+                    detectedInd2 := currentHighInd
+                    break
+    
+    [detected, detectedBar, detectedPrice1, detectedPrice2, detectedInd1, detectedInd2]
+
+// ==================== DETECTION AND SIGNAL GENERATION ====================
+
+// Detect all divergences
+[regBullDetected, regBullBar, regBullP1, regBullP2, regBullI1, regBullI2] = detectRegularBullish()
+[regBearDetected, regBearBar, regBearP1, regBearP2, regBearI1, regBearI2] = detectRegularBearish()
+[hidBullDetected, hidBullBar, hidBullP1, hidBullP2, hidBullI1, hidBullI2] = detectHiddenBullish()
+[hidBearDetected, hidBearBar, hidBearP1, hidBearP2, hidBearI1, hidBearI2] = detectHiddenBearish()
+
+// SIGNALS: These trigger on the CURRENT bar when divergence is confirmed
+// They are NON-REPAINTING because they only appear after rightBars confirmation
+signalRegularBull = showRegularBull and pivotLowFound and regBullDetected
+signalRegularBear = showRegularBear and pivotHighFound and regBearDetected
+signalHiddenBull = showHiddenBull and pivotLowFound and hidBullDetected
+signalHiddenBear = showHiddenBear and pivotHighFound and hidBearDetected
+
+// Get label size
+lblSize = labelSize == "tiny" ? size.tiny : 
+         labelSize == "small" ? size.small : 
+         labelSize == "normal" ? size.normal : size.large
+
+// Display flags
+showDivergences = displayMode == "Divergences Only" or displayMode == "Both"
+showSignals = displayMode == "Signals Only" or displayMode == "Both"
+
+// ==================== DIVERGENCE PLOTTING (Repainting) ====================
+
+if showDivergences
+    // Regular Bullish Divergence - Pattern Lines
+    if signalRegularBull
+        line.new(regBullBar, regBullP1, bar_index - rightBars, regBullP2, 
+             color=colorRegBull, width=lineWidth, style=line.style_solid)
+        label.new(bar_index - rightBars, regBullP2, "RB", 
+             color=colorRegBull, textcolor=color.white, 
+             style=label.style_label_up, size=lblSize,
+             tooltip="Regular Bullish Divergence\nPrice LL: " + str.tostring(regBullP2, format.mintick) + "\nIndicator HL: " + str.tostring(regBullI2))
+
+    // Regular Bearish Divergence - Pattern Lines
+    if signalRegularBear
+        line.new(regBearBar, regBearP1, bar_index - rightBars, regBearP2, 
+             color=colorRegBear, width=lineWidth, style=line.style_solid)
+        label.new(bar_index - rightBars, regBearP2, "RB", 
+             color=colorRegBear, textcolor=color.white, 
+             style=label.style_label_down, size=lblSize,
+             tooltip="Regular Bearish Divergence\nPrice HH: " + str.tostring(regBearP2, format.mintick) + "\nIndicator LH: " + str.tostring(regBearI2))
+
+    // Hidden Bullish Divergence - Pattern Lines
+    if signalHiddenBull
+        line.new(hidBullBar, hidBullP1, bar_index - rightBars, hidBullP2, 
+             color=colorHidBull, width=lineWidth, style=line.style_dashed)
+        label.new(bar_index - rightBars, hidBullP2, "HB", 
+             color=colorHidBull, textcolor=color.white, 
+             style=label.style_label_up, size=lblSize,
+             tooltip="Hidden Bullish Divergence\nPrice HL: " + str.tostring(hidBullP2, format.mintick) + "\nIndicator LL: " + str.tostring(hidBullI2))
+
+    // Hidden Bearish Divergence - Pattern Lines
+    if signalHiddenBear
+        line.new(hidBearBar, hidBearP1, bar_index - rightBars, hidBearP2, 
+             color=colorHidBear, width=lineWidth, style=line.style_dashed)
+        label.new(bar_index - rightBars, hidBearP2, "HB", 
+             color=colorHidBear, textcolor=color.white, 
+             style=label.style_label_down, size=lblSize,
+             tooltip="Hidden Bearish Divergence\nPrice LH: " + str.tostring(hidBearP2, format.mintick) + "\nIndicator HH: " + str.tostring(hidBearI2))
+
+// ==================== SIGNAL PLOTTING (Non-Repainting) ====================
+
+// Using plotshape for cleaner, more professional signal display
+// B = Buy signal (bullish divergences)
+// S = Sell signal (bearish divergences)
+// Colors distinguish between Regular and Hidden divergences
+
+// plotshape must be called at global scope, so we use conditional logic in the series parameter
+// Regular Bullish Signal - Clean buy marker
+plotshape(showSignals and signalRegularBull, title="Regular Bullish Signal", 
+     style=shape.labelup, location=location.belowbar, 
+     color=colorRegBull, text="B", textcolor=color.white)
+
+// Regular Bearish Signal - Clean sell marker
+plotshape(showSignals and signalRegularBear, title="Regular Bearish Signal", 
+     style=shape.labeldown, location=location.abovebar, 
+     color=colorRegBear, text="S", textcolor=color.white)
+
+// Hidden Bullish Signal - Clean buy marker
+plotshape(showSignals and signalHiddenBull, title="Hidden Bullish Signal", 
+     style=shape.labelup, location=location.belowbar, 
+     color=colorHidBull, text="B", textcolor=color.white)
+
+// Hidden Bearish Signal - Clean sell marker
+plotshape(showSignals and signalHiddenBear, title="Hidden Bearish Signal", 
+     style=shape.labeldown, location=location.abovebar, 
+     color=colorHidBear, text="S", textcolor=color.white)
+
+// ==================== BACKTESTING OUTPUTS ====================
+// These are ONLY for SIGNALS (non-repainting)
+// Binary outputs that other scripts can reference
+
+plot(enableBacktesting and signalRegularBull ? 1 : 0, title="BT: Regular Bullish Signal", display=display.none)
+plot(enableBacktesting and signalRegularBear ? 1 : 0, title="BT: Regular Bearish Signal", display=display.none)
+plot(enableBacktesting and signalHiddenBull ? 1 : 0, title="BT: Hidden Bullish Signal", display=display.none)
+plot(enableBacktesting and signalHiddenBear ? 1 : 0, title="BT: Hidden Bearish Signal", display=display.none)
+
+// Combined signal outputs
+anyBullishSignal = signalRegularBull or signalHiddenBull
+anyBearishSignal = signalRegularBear or signalHiddenBear
+plot(enableBacktesting and anyBullishSignal ? 1 : 0, title="BT: Any Bullish Signal", display=display.none)
+plot(enableBacktesting and anyBearishSignal ? 1 : 0, title="BT: Any Bearish Signal", display=display.none)
+
+// ==================== ALERTS (SIGNALS ONLY) ====================
+// All alerts are for NON-REPAINTING signals only
+
+// Individual signal alerts
+alertcondition(signalRegularBull, 
+     title="🟢 Regular Bullish Signal", 
+     message="🟢 REGULAR BULLISH SIGNAL on {{ticker}}\n✅ Confirmed and non-repainting\n💡 Potential trend reversal UP\n📊 Price: {{close}}")
+
+alertcondition(signalRegularBear, 
+     title="🔴 Regular Bearish Signal", 
+     message="🔴 REGULAR BEARISH SIGNAL on {{ticker}}\n✅ Confirmed and non-repainting\n💡 Potential trend reversal DOWN\n📊 Price: {{close}}")
+
+alertcondition(signalHiddenBull, 
+     title="🔵 Hidden Bullish Signal", 
+     message="🔵 HIDDEN BULLISH SIGNAL on {{ticker}}\n✅ Confirmed and non-repainting\n💡 Trend continuation UP\n📊 Price: {{close}}")
+
+alertcondition(signalHiddenBear, 
+     title="🟠 Hidden Bearish Signal", 
+     message="🟠 HIDDEN BEARISH SIGNAL on {{ticker}}\n✅ Confirmed and non-repainting\n💡 Trend continuation DOWN\n📊 Price: {{close}}")
+
+// Combined alerts
+alertcondition(anyBullishSignal, 
+     title="📈 Any Bullish Signal", 
+     message="📈 BULLISH SIGNAL DETECTED on {{ticker}}\n✅ Non-repainting - Safe to trade\n📊 Price: {{close}}")
+
+alertcondition(anyBearishSignal, 
+     title="📉 Any Bearish Signal", 
+     message="📉 BEARISH SIGNAL DETECTED on {{ticker}}\n✅ Non-repainting - Safe to trade\n📊 Price: {{close}}")
+
+alertcondition(anyBullishSignal or anyBearishSignal, 
+     title="⚡ Any Signal", 
+     message="⚡ DIVERGENCE SIGNAL on {{ticker}}\n✅ Non-repainting\n📊 Price: {{close}}")

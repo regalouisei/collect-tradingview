@@ -1,0 +1,277 @@
+//@version=5
+indicator('JrKG - Optimized v3', shorttitle='JrKg v3', overlay=false)
+
+// ═══════════════════════════════════════════════════════════════════
+// OPTIMIZED INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+// PSAR - Optimized
+start = input.float(0.02, title='PSAR Start', minval=0.01, maxval=0.05, step=0.01, tooltip='Lower = more sensitive')
+increment = input.float(0.02, title='PSAR Increment', minval=0.01, maxval=0.05, step=0.01, tooltip='Lower = tighter stops')
+maximum = input.float(0.18, title='PSAR Max Value', minval=0.1, maxval=0.3, step=0.01, tooltip='Lower = more responsive')
+psar = ta.sar(start, increment, maximum)
+
+// EMAs - Optimized
+emaLow = input.int(5, 'Entry EMA', minval=3, maxval=13, tooltip='Faster EMA for entries')
+emaHigh = input.int(13, 'Base EMA', minval=8, maxval=21, tooltip='Base EMA for confirmation')
+ema_trend_filter = input.int(50, 'Trend Filter EMA', minval=20, maxval=200, tooltip='Trend filter (50 more responsive than 200)')
+
+// AMA EXIT - 40, 4, 20
+ama_length = input.int(40, 'AMA Length', minval=5, maxval=100, group='AMA Exit', tooltip='Period for AMA calculation (40 = looser trail)')
+ama_fast_length = input.int(4, 'AMA Fast Length', minval=2, maxval=10, group='AMA Exit', tooltip='Fast multiplier (4 = faster response)')
+ama_slow_length = input.int(20, 'AMA Slow Length', minval=10, maxval=50, group='AMA Exit', tooltip='Slow multiplier (20 = balanced)')
+ama_source = input.string('HLC3', 'AMA Source', options=['Close', 'HL2', 'HLC3'], group='AMA Exit', tooltip='HLC3 recommended for smoother exits')
+show_ama = input.bool(true, 'Show AMA on Indicator', group='AMA Exit')
+
+// EXIT LOGIC
+respect_ama = input.bool(true, 'Respect AMA for Exits', group='Exit Logic', tooltip='Only exit when price crosses below AMA (recommended)')
+use_ema50_filter = input.bool(false, 'Use EMA50 Filter', group='Exit Logic', tooltip='Turn ON for stricter trend filtering')
+
+// NEW: 200 EMA FILTER FOR BUY SIGNALS
+use_ema200_filter = input.bool(true, 'Require Price Above 200 EMA for Buy', group='Entry Logic', tooltip='Only generate buy signals when price is above 200 EMA')
+
+// FILTERS - Optional (default OFF for maximum signals)
+use_volume_filter = input.bool(false, 'Use Volume Filter', group='Filters', tooltip='Require above-average volume')
+volume_mult = input.float(1.2, title='Volume Multiplier', minval=1.0, maxval=2.0, step=0.1, group='Filters', tooltip='Volume threshold multiplier')
+use_atr_filter = input.bool(false, 'Use ATR Filter', group='Filters', tooltip='Require minimum volatility')
+atr_threshold = input.float(0.5, title='Min ATR %', minval=0.1, maxval=2.0, step=0.1, group='Filters', tooltip='Minimum ATR percentage')
+
+// SIGNAL SETTINGS
+signal_confirmation = input.int(0, 'Signal Confirmation Bars', minval=0, maxval=3, group='Signal Quality', tooltip='0=instant, 1-3=wait for confirmation')
+avoid_choppy = input.bool(false, 'Avoid Choppy Markets', group='Signal Quality', tooltip='Filter ranging markets')
+
+// ═══════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════
+
+ema5 = ta.ema(close, emaLow)
+ema13 = ta.ema(close, emaHigh)
+ema50 = ta.ema(close, ema_trend_filter)
+ema200 = ta.ema(close, 200)
+ema5to13CrossOver = ta.crossover(ema5, ema13)
+ema13to5CrossOver = ta.crossover(ema13, ema5)
+
+// ATR for volatility filter
+atr = ta.atr(14)
+atr_percent = (atr / close) * 100
+
+// Volume filter
+vol_ma = ta.sma(volume, 20)
+volume_ok = not use_volume_filter or volume > vol_ma * volume_mult
+
+// Choppy market detection
+ema_diff = math.abs(ema5 - ema13) / ema13 * 100
+is_choppy = avoid_choppy and ema_diff < 0.5
+
+// ATR filter
+atr_ok = not use_atr_filter or atr_percent > atr_threshold
+
+// NEW: 200 EMA filter check
+ema200_ok = not use_ema200_filter or close > ema200
+
+// ═══════════════════════════════════════════════════════════════════
+// AMA CALCULATION (40, 4, 20, HLC3)
+// ═══════════════════════════════════════════════════════════════════
+ama_src = ama_source == 'Close' ? close : (ama_source == 'HL2' ? hl2 : hlc3)
+
+fastAlpha = 2 / (ama_fast_length + 1)
+slowAlpha = 2 / (ama_slow_length + 1)
+
+hh = ta.highest(high, ama_length + 1)
+ll = ta.lowest(low, ama_length + 1)
+mltp = (hh - ll) != 0 ? math.abs(2 * ama_src - ll - hh) / (hh - ll) : 0
+ssc = mltp * (fastAlpha - slowAlpha) + slowAlpha
+
+var float ama = na
+ama := na(ama[1]) ? ama_src : ama[1] + math.pow(ssc, 2) * (ama_src - ama[1])
+
+ama_cross_under = ta.crossunder(close, ama)
+
+// ═══════════════════════════════════════════════════════════════════
+// CORE INDICATOR LOGIC (IMPROVED!)
+// ═══════════════════════════════════════════════════════════════════
+
+psarCrossOver = ta.crossover(psar, close)
+psarCrossUnder = ta.crossunder(psar, close)
+psarValue = psar >= close ? -15 : 15
+
+emaValue = 0.0
+if ema13to5CrossOver and psar >= close
+    emaValue := -10
+else if ema5to13CrossOver and psar <= close
+    emaValue := 10
+else if ema5 >= ema13 and psar <= close
+    emaValue := 10.1
+else if ama_cross_under
+    emaValue := -10.1
+
+smooth = (((close - close[1]) / close[1]) * 100) / 2.0
+final = psarValue + emaValue + smooth
+
+col = color.orange
+finalToDraw = 0.0
+
+emaEntryToCloseCrossOver = ta.crossover(close, ema5)
+ema50Crossover = ta.crossover(close, ema50)
+ema200Crossover = ta.crossover(close, ema200)
+
+// IMPROVED LOGIC - Respects AMA and 200 EMA
+if respect_ama
+    // NEW: AMA-respecting logic with 200 EMA filter
+    if close < ama and ama_cross_under
+        // Only force negative when actually crosses below AMA
+        finalToDraw := -5.1 + smooth
+    else if use_ema50_filter and close < ema50 and close < ama
+        // Optional: More conservative with both EMA50 and AMA
+        finalToDraw := finalToDraw[1] + smooth
+        if finalToDraw > 0.0
+            finalToDraw := -1.1
+    else if use_ema200_filter and close < ema200
+        // NEW: Force negative when below 200 EMA
+        finalToDraw := finalToDraw[1] + smooth
+        if finalToDraw > 0.0
+            finalToDraw := -1.1
+    else if ema50Crossover and psar < close and ema5 > ema13 and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if psar < close and finalToDraw[1] < 0 and emaEntryToCloseCrossOver and ema5 > ema13 and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if ((ema5to13CrossOver and psar < close) or (psar < close and finalToDraw[1] < 0 and psarCrossUnder and close > ema5 and ema5 > ema13)) and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if close <= close[1] and psar < close
+        finalToDraw := finalToDraw[1] + smooth
+    else if (close > ema5 and ema5 > ema13 and psar < close) and close[1] < ema5 and ema200_ok
+        finalToDraw := finalToDraw[1] < 0.0 ? 5.5 + smooth : finalToDraw[1] + smooth
+    else if finalToDraw[1] < 0 and psarCrossUnder and ema5 > ema13 and psar < close and ema200_ok
+        finalToDraw := 5.5 + smooth
+    else
+        finalToDraw := finalToDraw[1] + smooth
+else
+    // ORIGINAL LOGIC (with EMA50 and 200 EMA filter)
+    if use_ema200_filter and close < ema200
+        // NEW: Force negative when below 200 EMA
+        finalToDraw := finalToDraw[1] + smooth
+        if finalToDraw > 0.0
+            finalToDraw := -1.1
+    else if close < ema50
+        finalToDraw := finalToDraw[1] + smooth
+        if finalToDraw > 0.0 and (close < ama or psar > close)
+            finalToDraw := -1.1
+    else if ema50Crossover and psar < close and ema5 > ema13 and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if (ama_cross_under and psar > close) or (close < ama and psar > close and finalToDraw[1] > 0)
+        finalToDraw := -5.1 + smooth
+    else if psar < close and finalToDraw[1] < 0 and emaEntryToCloseCrossOver and ema5 > ema13 and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if ((ema5to13CrossOver and psar < close) or (psar < close and finalToDraw[1] < 0 and psarCrossUnder and close > ema5 and ema5 > ema13)) and ema200_ok
+        finalToDraw := 5.1 + smooth
+    else if close <= close[1] and psar < close
+        finalToDraw := finalToDraw[1] + smooth
+    else if (close > ema5 and ema5 > ema13 and psar < close) and close[1] < ema5 and ema200_ok
+        finalToDraw := finalToDraw[1] < 0.0 ? 5.5 + smooth : finalToDraw[1] + smooth
+    else if finalToDraw[1] < 0 and psarCrossUnder and ema5 > ema13 and psar < close and ema200_ok
+        finalToDraw := 5.5 + smooth
+    else
+        finalToDraw := finalToDraw[1] + smooth
+
+// ═══════════════════════════════════════════════════════════════════
+// COLOR LOGIC
+// ═══════════════════════════════════════════════════════════════════
+
+if finalToDraw >= 0
+    col := close >= close[1] ? color.green : color.blue
+else
+    col := close >= close[1] ? color.orange : color.red
+
+// ═══════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION - WITH 200 EMA FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+// Basic zero line crosses (ALWAYS detected)
+zero_cross_above = ta.crossover(finalToDraw, 0)
+zero_cross_below = ta.crossunder(finalToDraw, 0)
+
+// Apply optional filters for quality indication - NOW INCLUDING 200 EMA
+all_filters_pass = volume_ok and atr_ok and not is_choppy and ema200_ok
+
+// Signal generation - BUY SIGNALS NOW REQUIRE 200 EMA FILTER
+buy_signal = false
+sell_signal = false
+buy_signal_quality = false
+
+if signal_confirmation == 0
+    buy_signal := zero_cross_above and ema200_ok  // NEW: Added 200 EMA filter
+    sell_signal := zero_cross_below
+    buy_signal_quality := zero_cross_above and all_filters_pass
+else
+    var int buy_count = 0
+    var int sell_count = 0
+    
+    if zero_cross_above and ema200_ok  // NEW: Added 200 EMA filter
+        buy_count := buy_count + 1
+    else
+        buy_count := 0
+    
+    if zero_cross_below
+        sell_count := sell_count + 1
+    else
+        sell_count := 0
+    
+    buy_signal := buy_count == signal_confirmation
+    sell_signal := sell_count == signal_confirmation
+    buy_signal_quality := buy_signal and all_filters_pass
+
+// Early exit (AMA-based)
+early_exit = ama_cross_under and finalToDraw > 5
+
+// ═══════════════════════════════════════════════════════════════════
+// PLOTTING - ALL IN ONE PANEL
+// ═══════════════════════════════════════════════════════════════════
+
+// Main indicator line
+plot(finalToDraw, color=col, linewidth=2, title='JrKG Indicator')
+
+// Zero line
+hline(0, title='Zero Line', color=color.black, linestyle=hline.style_solid, linewidth=2)
+
+// PSAR circles
+plot(psarCrossOver ? finalToDraw : na, style=plot.style_circles, linewidth=4, color=color.red, title='PSAR Bearish')
+plot(psarCrossUnder ? finalToDraw : na, style=plot.style_circles, linewidth=4, color=color.green, title='PSAR Bullish')
+
+// AMA line (scaled to indicator range)
+ama_scaled = (ama - close) / close * 100 + finalToDraw
+ama_color = close > ama ? color.new(color.green, 50) : color.new(color.red, 50)
+plot(show_ama ? ama_scaled : na, color=ama_color, linewidth=2, title='AMA Line', style=plot.style_line)
+
+// ═══════════════════════════════════════════════════════════════════
+// BUY/SELL SIGNALS - WITH 200 EMA FILTERING
+// ═══════════════════════════════════════════════════════════════════
+
+// BUY signals with quality indication (now with 200 EMA requirement)
+plotshape(buy_signal and buy_signal_quality, title='BUY High Quality', style=shape.triangleup, location=location.bottom, color=color.new(color.lime, 0), size=size.normal, text='BUY')
+plotshape(buy_signal and not buy_signal_quality, title='BUY Standard', style=shape.triangleup, location=location.bottom, color=color.new(color.yellow, 0), size=size.normal, text='BUY')
+
+// SELL signal
+plotshape(sell_signal, title='SELL SIGNAL', style=shape.triangledown, location=location.top, color=color.new(color.red, 0), size=size.normal, text='SELL')
+
+// Early exit
+plotshape(early_exit, title='EARLY EXIT', style=shape.diamond, location=location.top, color=color.new(color.orange, 0), size=size.small, text='EXIT')
+
+// Debug markers - showing zero crosses that don't meet 200 EMA requirement
+plotshape(zero_cross_above and not ema200_ok, title='Zero Up Filtered by 200EMA', style=shape.circle, location=location.bottom, color=color.new(color.gray, 50), size=size.tiny)
+plotshape(zero_cross_above and ema200_ok, title='Zero Up Valid', style=shape.circle, location=location.bottom, color=color.new(color.yellow, 70), size=size.tiny)
+plotshape(zero_cross_below, title='Zero Down', style=shape.circle, location=location.top, color=color.new(color.red, 70), size=size.tiny)
+
+// Background coloring
+bgcolor(finalToDraw > 0 ? color.new(color.green, 95) : color.new(color.red, 95), title='Trend Background')
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS - UPDATED WITH 200 EMA CONTEXT
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(buy_signal, title='BUY Signal', message='JrKG v3: BUY SIGNAL - Enter Long - Price above 200 EMA')
+alertcondition(sell_signal, title='SELL Signal', message='JrKG v3: SELL SIGNAL - Exit Position')
+alertcondition(early_exit, title='Early Exit', message='JrKG v3: EARLY EXIT - Price crossed below AMA')
+alertcondition(ama_cross_under, title='AMA Exit', message='JrKG v3: AMA crossed below - Consider exit')
+alertcondition(zero_cross_above and ema200_ok, title='Zero Cross Up Valid', message='JrKG v3: Indicator crossed above zero with price above 200 EMA')
+alertcondition(zero_cross_above and not ema200_ok, title='Zero Cross Up Filtered', message='JrKG v3: Indicator crossed above zero but price below 200 EMA - No signal')
+alertcondition(zero_cross_below, title='Zero Cross Down', message='JrKG v3: Indicator crossed below zero')

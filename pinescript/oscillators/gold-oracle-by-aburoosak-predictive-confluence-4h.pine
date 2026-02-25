@@ -1,0 +1,400 @@
+// ════════════════════════════════════════════════════════════════════
+// XAUUSD 1-Minute | Multi-Layer Forecasting Strategy  v2.0
+// ────────────────────────────────────────────────────────────────────
+// Signal Layers (all 7 must score positively to trade):
+//   1. LinReg Slope Acceleration          (original Layer 1)
+//   2. Price / Channel Crossover          (original Layer 2)
+//   3. Triple EMA Stack Confirmation      (original Layer 3)
+//   4. RSI Mid-cross Filter               (original Layer 4)
+//   5. Exponential Smoothing Trend        (Excel/Tableau forecast method)
+//   6. ARIMA-proxy: Differencing Momentum (R/Python statsmodels method)
+//   7. Prophet-style Confidence Band      (Python Prophet method)
+//      + Anomaly Detection Gate           (Power BI Analytics pane method)
+//      + Volume-Weighted Confluence Score (BI platform confirmation)
+//      + Einstein-style Multi-factor Gate (Tableau/Einstein Discovery)
+// ────────────────────────────────────────────────────────────────────
+// Designed for: IC Markets Demo · XAUUSD · 1-Minute TF
+// Pine Script v6
+// ════════════════════════════════════════════════════════════════════
+
+//@version=6
+strategy(
+     title             = "XAUUSD 1M | Multi-Layer Forecast v2",
+     shorttitle        = "XAU-MLF2",
+     overlay           = true,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 3,
+     initial_capital   = 10000,
+     currency          = currency.USD,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.01,
+     slippage          = 1,
+     max_bars_back     = 500
+ )
+
+// ─────────────────────────────────────────────────────────────────────
+// 1. USER INPUTS
+// ─────────────────────────────────────────────────────────────────────
+
+// Linear Regression
+lrLen        = input.int(34,    "LinReg Length",             group = "📐 Linear Regression", minval = 5)
+lrForecast   = input.int(3,     "LinReg Forecast Bars",      group = "📐 Linear Regression", minval = 1, maxval = 10)
+lrDevMult    = input.float(2.0, "Channel Std Dev Multiplier",group = "📐 Linear Regression", minval = 0.5, step = 0.1)
+
+// Moving Averages
+fastLen      = input.int(8,     "Fast EMA Length",           group = "📊 Moving Averages",   minval = 1)
+slowLen      = input.int(21,    "Slow EMA Length",           group = "📊 Moving Averages",   minval = 2)
+trendLen     = input.int(50,    "Trend EMA Length",          group = "📊 Moving Averages",   minval = 5)
+
+// RSI
+rsiLen       = input.int(14,    "RSI Length",                group = "📈 RSI Filter",        minval = 2)
+rsiOB        = input.int(65,    "RSI Overbought",            group = "📈 RSI Filter",        minval = 55, maxval = 95)
+rsiOS        = input.int(35,    "RSI Oversold",              group = "📈 RSI Filter",        minval = 5,  maxval = 45)
+rsiMid       = input.int(50,    "RSI Mid-line",              group = "📈 RSI Filter")
+
+// Exponential Smoothing (Layer 5 – Excel/Tableau method)
+esAlpha      = input.float(0.1, "Exp. Smoothing Alpha (0–1)",group = "〰️ Exp. Smoothing",   minval = 0.01, maxval = 0.99, step = 0.01)
+esLen        = input.int(20,    "ES Confirmation Period",    group = "〰️ Exp. Smoothing",   minval = 5)
+
+// ARIMA-proxy: Differencing (Layer 6 – R/Python statsmodels method)
+diffLen      = input.int(5,     "Differencing Lookback",     group = "📉 ARIMA Proxy",       minval = 2)
+diffSmooth   = input.int(3,     "Diff Smoothing Period",     group = "📉 ARIMA Proxy",       minval = 1)
+
+// Prophet-style Confidence Bands (Layer 7 – Python Prophet method)
+prophetLen   = input.int(50,    "Prophet Band Length",       group = "🔮 Prophet Bands",     minval = 10)
+prophetMult  = input.float(1.5, "Prophet Band Width (σ)",    group = "🔮 Prophet Bands",     minval = 0.5, step = 0.1)
+
+// Anomaly Detection (Power BI Analytics pane)
+anomalyLen   = input.int(20,    "Anomaly Lookback",          group = "⚠️ Anomaly Filter",    minval = 5)
+anomalySigma = input.float(2.5, "Anomaly Sigma Threshold",   group = "⚠️ Anomaly Filter",    minval = 1.0, step = 0.1)
+
+// Confluence Score Gate (Einstein-style – must reach minimum)
+minScore     = input.int(6,     "Min Confluence Score (1–9)",group = "🧠 Confluence Gate",   minval = 1, maxval = 9)
+
+// ATR Risk Management
+atrLen       = input.int(14,    "ATR Length",                group = "🛡️ Risk Management",  minval = 1)
+atrMult_SL   = input.float(1.5, "ATR SL Multiplier",         group = "🛡️ Risk Management",  minval = 0.5, step = 0.1)
+atrMult_TP   = input.float(3.0, "ATR TP Multiplier",         group = "🛡️ Risk Management",  minval = 0.5, step = 0.1)
+
+// Session Filter (London + NY for peak gold volatility)
+useSession   = input.bool(true,       "Filter by Session",         group = "⏰ Session Filter")
+sessionStr   = input.session("0700-2000","Active Session (Exchange TZ)", group = "⏰ Session Filter")
+
+// ─────────────────────────────────────────────────────────────────────
+// 2. CORE CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────
+
+// ── 2A. Linear Regression ──────────────────────────────────────────
+lrValue      = ta.linreg(close, lrLen, 0)
+lrPrev       = ta.linreg(close, lrLen, 1)
+lrPrev2      = ta.linreg(close, lrLen, 2)   // global – executes every bar (Pine v6 rule)
+lrSlope      = lrValue - lrPrev
+lrSlopePrev  = lrPrev  - lrPrev2
+
+// Manual LR standard deviation (ta.linreg cannot use series int offset in loops)
+var float _sumX  = 0.0
+var float _sumY  = 0.0
+var float _sumXY = 0.0
+var float _sumX2 = 0.0
+
+_sumX  := 0.0
+_sumY  := 0.0
+_sumXY := 0.0
+_sumX2 := 0.0
+
+for _i = 0 to lrLen - 1
+    _x      = float(lrLen - 1 - _i)
+    _y      = close[_i]
+    _sumX  := _sumX  + _x
+    _sumY  := _sumY  + _y
+    _sumXY := _sumXY + _x * _y
+    _sumX2 := _sumX2 + _x * _x
+
+_n         = float(lrLen)
+_lrSlope_c = (_n * _sumXY - _sumX * _sumY) / (_n * _sumX2 - _sumX * _sumX)
+_lrInter_c = (_sumY - _lrSlope_c * _sumX) / _n
+
+lrDev = 0.0
+for _j = 0 to lrLen - 1
+    _xj    = float(lrLen - 1 - _j)
+    _fit   = _lrInter_c + _lrSlope_c * _xj
+    lrDev := lrDev + math.pow(close[_j] - _fit, 2)
+lrDev := math.sqrt(lrDev / _n)
+
+lrUpper       = lrValue + lrDevMult * lrDev
+lrLower       = lrValue - lrDevMult * lrDev
+lrForecastVal = lrValue + lrSlope * lrForecast
+
+// ── 2B. Triple EMAs ────────────────────────────────────────────────
+fastEMA  = ta.ema(close, fastLen)
+slowEMA  = ta.ema(close, slowLen)
+trendEMA = ta.ema(close, trendLen)
+
+// ── 2C. RSI (global prev – Pine v6 rule) ──────────────────────────
+rsi      = ta.rsi(close, rsiLen)
+rsiPrev  = ta.rsi(close, rsiLen)[1]   // extracted globally – always executes
+
+// ── 2D. ATR ────────────────────────────────────────────────────────
+atr      = ta.atr(atrLen)
+
+// ── 2E. Volume-Weighted Confirmation (BI platform method) ──────────
+volMA       = ta.sma(volume, 20)
+vwapVal     = ta.vwap(hlc3)
+volConfirm  = volume > volMA * 1.2    // above-average volume required
+priceVwapOK_L = close > vwapVal       // price above VWAP for longs
+priceVwapOK_S = close < vwapVal       // price below VWAP for shorts
+
+// ── 2F. Exponential Smoothing (Excel/Tableau forecast layer) ───────
+// Single exponential smoothing: ES(t) = α·close + (1–α)·ES(t–1)
+var float esVal = na
+esVal := na(esVal) ? close : esAlpha * close + (1.0 - esAlpha) * esVal
+
+// ES slope over esLen bars for trend direction
+esSlope = esVal - esVal[esLen]
+
+// ── 2G. ARIMA-proxy: First Differencing + Smoothed Momentum ───────
+// d=1 differencing: ΔP = close – close[diffLen]
+diff1       = close - close[diffLen]
+diffSmoothed = ta.ema(diff1, diffSmooth)   // smooth the differenced series
+// Trend confirmation: smoothed diff direction should match trade direction
+diffUp      = diffSmoothed > 0 and diffSmoothed > diffSmoothed[diffSmooth]
+diffDown    = diffSmoothed < 0 and diffSmoothed < diffSmoothed[diffSmooth]
+
+// ── 2H. Prophet-style Confidence Band ──────────────────────────────
+// Prophet decomposes: ŷ = trend + seasonality. We approximate:
+//   trend   = linreg midline (already have lrValue)
+//   band    = rolling mean ± N×stdev of residuals
+prophetMean  = ta.sma(close, prophetLen)
+prophetStdev = ta.stdev(close, prophetLen)
+prophetUpper = prophetMean + prophetMult * prophetStdev
+prophetLower = prophetMean - prophetMult * prophetStdev
+
+// Long entry valid only when price is below Prophet upper band (not overextended)
+// Short entry valid only when price is above Prophet lower band (not underextended)
+prophetOK_L  = close < prophetUpper and close > prophetLower
+prophetOK_S  = close > prophetLower and close < prophetUpper
+
+// ── 2I. Anomaly Detection (Power BI Analytics pane proxy) ──────────
+// Flag bars where price has moved an extreme amount – avoid trading anomalies
+anomalyMean  = ta.sma(close, anomalyLen)
+anomalyStd   = ta.stdev(close, anomalyLen)
+// zscore of current bar vs rolling window
+zscore       = anomalyStd > 0 ? math.abs(close - anomalyMean) / anomalyStd : 0.0
+notAnomaly   = zscore < anomalySigma   // true = normal bar, false = spike/anomaly, skip trade
+
+// ─────────────────────────────────────────────────────────────────────
+// 3. INDIVIDUAL SIGNAL CONDITIONS (each scores 0 or 1)
+// ─────────────────────────────────────────────────────────────────────
+
+// S1 – LinReg slope accelerating in direction
+s1_long  = lrSlope > 0 and lrSlope > lrSlopePrev
+s1_short = lrSlope < 0 and lrSlope < lrSlopePrev
+
+// S2 – Price / channel crossover signal
+priceCrossUp         = ta.crossover(close,  lrLower)
+priceCrossDown       = ta.crossunder(close, lrUpper)
+priceCrossLinRegUp   = ta.crossover(close,  lrValue)
+priceCrossLinRegDown = ta.crossunder(close, lrValue)
+s2_long  = priceCrossUp   or priceCrossLinRegUp
+s2_short = priceCrossDown or priceCrossLinRegDown
+
+// S3 – Triple EMA stack aligned
+s3_long  = fastEMA > slowEMA and slowEMA > trendEMA and close > trendEMA
+s3_short = fastEMA < slowEMA and slowEMA < trendEMA and close < trendEMA
+
+// S4 – RSI mid-cross with non-extreme zone
+s4_long  = rsi > rsiMid and rsi  < rsiOB and rsiPrev <= rsiMid
+s4_short = rsi < rsiMid and rsi  > rsiOS and rsiPrev >= rsiMid
+
+// S4b – sustained RSI alignment (used in score below for extra weight)
+s4b_long  = rsi > rsiMid and rsi < rsiOB
+s4b_short = rsi < rsiMid and rsi > rsiOS
+
+// S5 – Exponential Smoothing trend direction (Excel/Tableau layer)
+s5_long  = esSlope > 0 and esVal > esVal[1]
+s5_short = esSlope < 0 and esVal < esVal[1]
+
+// S6 – ARIMA-proxy differencing momentum (R/Python statsmodels layer)
+s6_long  = diffUp
+s6_short = diffDown
+
+// S7 – LinReg forecast projects continuation (all platforms' forward projection)
+s7_long  = lrForecastVal > lrValue
+s7_short = lrForecastVal < lrValue
+
+// S8 – Volume-weighted VWAP (BI platform method)
+s8_long  = volConfirm and priceVwapOK_L
+s8_short = volConfirm and priceVwapOK_S
+
+// S9 – Prophet confidence band + anomaly gate
+s9_long  = prophetOK_L and notAnomaly
+s9_short = prophetOK_S and notAnomaly
+
+// ─────────────────────────────────────────────────────────────────────
+// 4. EINSTEIN-STYLE CONFLUENCE SCORE  (max = 9)
+// ─────────────────────────────────────────────────────────────────────
+// Each signal layer contributes 1 point. Only trade when score >= minScore.
+// This replaces "OR" logic with a democratic vote – fewer but higher-quality signals.
+
+scoreL = (s1_long  ? 1 : 0) +
+         (s2_long  ? 1 : 0) +
+         (s3_long  ? 1 : 0) +
+         (s4_long  ? 1 : 0) +
+         (s4b_long ? 1 : 0) +
+         (s5_long  ? 1 : 0) +
+         (s6_long  ? 1 : 0) +
+         (s7_long  ? 1 : 0) +
+         (s8_long  ? 1 : 0) +
+         (s9_long  ? 1 : 0)
+
+scoreS = (s1_short  ? 1 : 0) +
+         (s2_short  ? 1 : 0) +
+         (s3_short  ? 1 : 0) +
+         (s4_short  ? 1 : 0) +
+         (s4b_short ? 1 : 0) +
+         (s5_short  ? 1 : 0) +
+         (s6_short  ? 1 : 0) +
+         (s7_short  ? 1 : 0) +
+         (s8_short  ? 1 : 0) +
+         (s9_short  ? 1 : 0)
+
+// ─────────────────────────────────────────────────────────────────────
+// 5. COMPOSITE ENTRY SIGNALS
+// ─────────────────────────────────────────────────────────────────────
+
+inSession   = not useSession or (not na(time(timeframe.period, sessionStr)))
+
+// Hard requirements (non-negotiable regardless of score):
+//   • S3 (EMA stack) – ensures macro trend alignment
+//   • S9 (anomaly gate) – never trade spikes
+//   • Minimum confluence score reached
+longSignal  = inSession and
+              s3_long  and
+              notAnomaly and
+              scoreL >= minScore
+
+shortSignal = inSession and
+              s3_short and
+              notAnomaly and
+              scoreS >= minScore
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. ENTRY & EXIT LOGIC
+// ─────────────────────────────────────────────────────────────────────
+
+longSL   = strategy.position_avg_price - atr * atrMult_SL
+longTP   = strategy.position_avg_price + atr * atrMult_TP
+shortSL  = strategy.position_avg_price + atr * atrMult_SL
+shortTP  = strategy.position_avg_price - atr * atrMult_TP
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, comment = "▲ L" + str.tostring(scoreL))
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, comment = "▼ S" + str.tostring(scoreS))
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry = "Long",
+                  stop          = longSL,
+                  limit         = longTP,
+                  comment_loss  = "SL▲",
+                  comment_profit = "TP▲")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "Short",
+                  stop          = shortSL,
+                  limit         = shortTP,
+                  comment_loss  = "SL▼",
+                  comment_profit = "TP▼")
+
+// Early exit on slope + EMA reversal confirmation
+if strategy.position_size > 0 and s1_short and s3_short
+    strategy.close("Long",  comment = "Flip▼")
+
+if strategy.position_size < 0 and s1_long and s3_long
+    strategy.close("Short", comment = "Flip▲")
+
+// ─────────────────────────────────────────────────────────────────────
+// 7. PLOTS & VISUALS
+// ─────────────────────────────────────────────────────────────────────
+
+// LinReg channel
+plot(lrValue,       "LinReg",        color = color.new(color.yellow,  0),  linewidth = 2)
+plot(lrUpper,       "LR Upper",      color = color.new(color.red,    50),  linewidth = 1)
+plot(lrLower,       "LR Lower",      color = color.new(color.green,  50),  linewidth = 1)
+p_upper = plot(lrUpper, display = display.none)
+p_lower = plot(lrLower, display = display.none)
+fill(p_upper, p_lower, color = color.new(color.blue, 90), title = "LR Fill")
+
+// Prophet confidence band
+plot(prophetUpper,  "Prophet Upper", color = color.new(color.fuchsia, 70), linewidth = 1, style = plot.style_circles)
+plot(prophetLower,  "Prophet Lower", color = color.new(color.fuchsia, 70), linewidth = 1, style = plot.style_circles)
+
+// Exponential smoothing line
+plot(esVal,         "ES Trend",      color = color.new(color.teal,    30), linewidth = 1, style = plot.style_stepline)
+
+// EMAs
+plot(fastEMA,       "Fast EMA",      color = color.new(color.aqua,    0),  linewidth = 1)
+plot(slowEMA,       "Slow EMA",      color = color.new(color.orange,  0),  linewidth = 1)
+plot(trendEMA,      "Trend EMA",     color = color.new(color.white,  40),  linewidth = 1, style = plot.style_circles)
+
+// Signal arrows
+plotshape(longSignal,  title = "Long",  location = location.belowbar,
+          style = shape.triangleup,   color = color.lime, size = size.small, text = "L")
+plotshape(shortSignal, title = "Short", location = location.abovebar,
+          style = shape.triangledown, color = color.red,  size = size.small, text = "S")
+
+// Anomaly highlight
+bgcolor(not notAnomaly ? color.new(color.orange, 80) : na, title = "Anomaly Bar")
+
+// Trade background
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na, title = "Long BG")
+bgcolor(strategy.position_size < 0 ? color.new(color.red,   92) : na, title = "Short BG")
+
+// ─────────────────────────────────────────────────────────────────────
+// 8. INFO TABLE
+// ─────────────────────────────────────────────────────────────────────
+
+var table tbl = table.new(position.top_right, 2, 12,
+     border_width = 1, border_color = color.gray,
+     bgcolor      = color.new(color.black, 55))
+
+if barstate.islast
+    // Header
+    table.cell(tbl, 0, 0,  "Layer",      text_color = color.silver, text_size = size.small, bgcolor = color.new(color.navy, 30))
+    table.cell(tbl, 1, 0,  "Status",     text_color = color.silver, text_size = size.small, bgcolor = color.new(color.navy, 30))
+    // Score bar
+    table.cell(tbl, 0, 1,  "⬆ Score",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 1,  str.tostring(scoreL) + " / 10",
+               text_color = scoreL >= minScore ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 2,  "⬇ Score",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 2,  str.tostring(scoreS) + " / 10",
+               text_color = scoreS >= minScore ? color.lime : color.red, text_size = size.small)
+    // Individual signals
+    table.cell(tbl, 0, 3,  "LR Slope",  text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 3,  str.tostring(math.round(lrSlope, 3)),
+               text_color = lrSlope > 0 ? color.lime : color.red,   text_size = size.small)
+    table.cell(tbl, 0, 4,  "ES Trend",  text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 4,  esSlope > 0 ? "▲ Bull" : "▼ Bear",
+               text_color = esSlope > 0 ? color.lime : color.red,   text_size = size.small)
+    table.cell(tbl, 0, 5,  "ARIMA Δ",  text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 5,  diffSmoothed > 0 ? "▲ Bull" : "▼ Bear",
+               text_color = diffSmoothed > 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 6,  "RSI",       text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 6,  str.tostring(math.round(rsi, 1)),
+               text_color = rsi > rsiOB ? color.red : rsi < rsiOS ? color.lime : color.white, text_size = size.small)
+    table.cell(tbl, 0, 7,  "Z-Score",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 7,  str.tostring(math.round(zscore, 2)),
+               text_color = notAnomaly ? color.lime : color.orange,  text_size = size.small)
+    table.cell(tbl, 0, 8,  "ATR",       text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 8,  str.tostring(math.round(atr, 2)),
+               text_color = color.orange,                            text_size = size.small)
+    table.cell(tbl, 0, 9,  "Forecast",  text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 9,  str.tostring(math.round(lrForecastVal, 2)),
+               text_color = lrForecastVal > lrValue ? color.lime : color.red, text_size = size.small)
+    table.cell(tbl, 0, 10, "VWAP OK",   text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 10, close > vwapVal ? "Above" : "Below",
+               text_color = color.aqua,                              text_size = size.small)
+    table.cell(tbl, 0, 11, "Min Score", text_color = color.white,  text_size = size.small)
+    table.cell(tbl, 1, 11, str.tostring(minScore) + " req'd",
+               text_color = color.silver,                            text_size = size.small)

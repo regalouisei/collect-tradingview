@@ -1,0 +1,177 @@
+//@version=6
+indicator("RSI Divergence Pro — Price Overlay (High-Prob) [v6]", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// === Inputs ===
+rsiLen          = input.int(10, "RSI Period", minval=2)
+phLeft          = input.int(5, "Pivot High Left", minval=1)
+phRight         = input.int(5, "Pivot High Right", minval=1)
+plLeft          = input.int(5, "Pivot Low Left", minval=1)
+plRight         = input.int(5, "Pivot Low Right", minval=1)
+
+rsiOb           = input.int(60, "RSI Overbought Threshold (bearish filter)", minval=50, maxval=100)
+rsiOs           = input.int(40, "RSI Oversold Threshold (bullish filter)", minval=0, maxval=50)
+minRSIDiff      = input.float(8.0, "Min RSI Divergence (pts)", minval=0.1)
+
+atrLen          = input.int(14, "ATR Length", minval=1)
+atrMult         = input.float(0.50, "Min Price Move vs ATR", minval=0.1)
+
+minBarsBetween  = input.int(5, "Min Bars Between Pivots", minval=1)
+maxBarsBetween  = input.int(150, "Max Bars Between Pivots", minval=5)
+
+showHidden      = input.bool(false, "Enable Hidden Divergence (trend continuation)", tooltip="Classic divergences = reversal. Hidden divergences = continuation.")
+keepLastN       = input.int(200, "Keep Last N Lines/Labels (cleanup)", minval=20, maxval=1000)
+
+// === Core Series ===
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(atrLen)
+
+// === Pivot detection (attach lines to true peaks/valleys) ===
+ph = ta.pivothigh(high, phLeft, phRight)
+pl = ta.pivotlow(low,  plLeft, plRight)
+
+// Arrays to store pivots
+var int[]   highBars  = array.new_int()
+var float[] highPx    = array.new_float()
+var float[] highRsi   = array.new_float()
+
+var int[]   lowBars   = array.new_int()
+var float[] lowPx     = array.new_float()
+var float[] lowRsi    = array.new_float()
+
+// Drawn objects + meta
+var line[]  divLines  = array.new_line()
+var label[] divLabs   = array.new_label()
+var bool[]  divIsBear = array.new_bool()   // bearish=true, bullish=false
+var int[]   divX2     = array.new_int()    // x2 (bar_index) of each line
+
+// Per-bar alert flag
+var bool drewThisBar = false
+drewThisBar := false
+
+// ---- Safe cleanup (guards against empty arrays) ----
+safeCleanup() =>
+    // Determine how many elements exceed keepLastN across any tracked array
+    maxSize = math.max(math.max(array.size(divLines), array.size(divLabs)), math.max(array.size(divIsBear), array.size(divX2)))
+    over = maxSize - keepLastN
+    if over > 0
+        for _ = 0 to over - 1
+            // Remove one element from each array if present
+            if array.size(divLines) > 0
+                ln = array.shift(divLines)
+                line.delete(ln)
+            if array.size(divLabs) > 0
+                lb = array.shift(divLabs)
+                label.delete(lb)
+            if array.size(divIsBear) > 0
+                array.shift(divIsBear)
+            if array.size(divX2) > 0
+                array.shift(divX2)
+
+// Strength model (0–100), interpretable and bounded
+calcStrength(isBearish, p1, p2, r1, r2) =>
+    divRSI    = math.abs(r2 - r1)
+    pxDelta   = math.abs(p2 - p1)
+    volFactor = math.min(1.0, pxDelta / atr)
+    rsiFactor = math.min(1.0, divRSI / 20.0) // 20 RSI pts ≈ strong divergence
+    obosRaw   = isBearish ? (r2 - 50.0) / math.max(1.0, (rsiOb - 50.0)) : (50.0 - r2) / math.max(1.0, (50.0 - rsiOs))
+    obosFactor = math.max(0.0, math.min(1.0, obosRaw))
+    strengthF = 100.0 * (0.6 * rsiFactor + 0.3 * volFactor + 0.1 * obosFactor)
+    math.round(strengthF)
+
+// Draw line + label, record meta, return true to signal a draw happened
+drawPriceLineAndLabel(isBearish, b1, y1, b2, y2, strength) =>
+    col  = isBearish ? color.new(color.red, 0) : color.new(color.green, 0)
+    ln   = line.new(x1=b1, y1=y1, x2=b2, y2=y2, xloc=xloc.bar_index, extend=extend.none, color=col, width=2)
+    array.push(divLines, ln)
+    array.push(divIsBear, isBearish)
+    array.push(divX2, b2)
+
+    txt  = (isBearish ? "Bearish Div" : "Bullish Div") + "\nStrength: " + str.tostring(strength) + "%"
+    yAdj = isBearish ? (y2 + atr * 0.5) : (y2 - atr * 0.5)
+    lb   = label.new(x=b2, y=yAdj, text=txt, style=isBearish ? label.style_label_down : label.style_label_up, textcolor=color.white, color=col, size=size.small)
+    array.push(divLabs, lb)
+    true
+
+// === Process Pivot Highs (Bearish classic or hidden) ===
+if not na(ph)
+    bH = bar_index - phRight
+    pH = high[phRight]
+    rH = rsi[phRight]
+    array.push(highBars, bH)
+    array.push(highPx,   pH)
+    array.push(highRsi,  rH)
+
+    if array.size(highBars) >= 2
+        b1 = array.get(highBars, array.size(highBars) - 2)
+        b2 = array.get(highBars, array.size(highBars) - 1)
+        p1 = array.get(highPx,   array.size(highPx)   - 2)
+        p2 = array.get(highPx,   array.size(highPx)   - 1)
+        r1 = array.get(highRsi,  array.size(highRsi)  - 2)
+        r2 = array.get(highRsi,  array.size(highRsi)  - 1)
+
+        barsSep = b2 - b1
+        sepOK   = (barsSep >= minBarsBetween) and (barsSep <= maxBarsBetween)
+
+        divRSI  = math.abs(r2 - r1)
+        rsiOK   = (r2 >= rsiOb) and (divRSI >= minRSIDiff)
+
+        pxDelta = math.abs(p2 - p1)
+        atrOK   = (pxDelta / atr) >= atrMult
+
+        isBearClassic = (p2 > p1) and (r2 < r1)
+        isBearHidden  = showHidden and (p2 < p1) and (r2 > r1)
+
+        isSignal = sepOK and rsiOK and atrOK and (isBearClassic or isBearHidden)
+        if isSignal
+            strength = calcStrength(true, p1, p2, r1, r2)
+            didDraw = drawPriceLineAndLabel(true, b1, p1, b2, p2, strength)
+            if didDraw
+                drewThisBar := true
+                safeCleanup()
+
+// === Process Pivot Lows (Bullish classic or hidden) ===
+if not na(pl)
+    bL = bar_index - plRight
+    pL = low[plRight]
+    rL = rsi[plRight]
+    array.push(lowBars, bL)
+    array.push(lowPx,   pL)
+    array.push(lowRsi,  rL)
+
+    if array.size(lowBars) >= 2
+        b1 = array.get(lowBars, array.size(lowBars) - 2)
+        b2 = array.get(lowBars, array.size(lowBars) - 1)
+        p1 = array.get(lowPx,   array.size(lowPx)   - 2)
+        p2 = array.get(lowPx,   array.size(lowPx)   - 1)
+        r1 = array.get(lowRsi,  array.size(lowRsi)  - 2)
+        r2 = array.get(lowRsi,  array.size(lowRsi)  - 1)
+
+        barsSep = b2 - b1
+        sepOK   = (barsSep >= minBarsBetween) and (barsSep <= maxBarsBetween)
+
+        divRSI  = math.abs(r2 - r1)
+        rsiOK   = (r2 <= rsiOs) and (divRSI >= minRSIDiff)
+
+        pxDelta = math.abs(p2 - p1)
+        atrOK   = (pxDelta / atr) >= atrMult
+
+        isBullClassic = (p2 < p1) and (r2 > r1)
+        isBullHidden  = showHidden and (p2 > p1) and (r2 < r1)
+
+        isSignal = sepOK and rsiOK and atrOK and (isBullClassic or isBullHidden)
+        if isSignal
+            strength = calcStrength(false, p1, p2, r1, r2)
+            didDraw = drawPriceLineAndLabel(false, b1, p1, b2, p2, strength)
+            if didDraw
+                drewThisBar := true
+                safeCleanup()
+
+// === Alerts (use per-bar flag + last type; no array size tricks) ===
+hasAny    = array.size(divIsBear) > 0
+lastIsBear = hasAny ? array.get(divIsBear, array.size(divIsBear) - 1) : false
+
+bearAlert = drewThisBar and lastIsBear
+bullAlert = drewThisBar and not lastIsBear
+
+alertcondition(bearAlert, "Bearish RSI Divergence (High-Prob)", "Bearish RSI divergence detected (high-prob filters passed).")
+alertcondition(bullAlert, "Bullish RSI Divergence (High-Prob)", "Bullish RSI divergence detected (high-prob filters passed).")

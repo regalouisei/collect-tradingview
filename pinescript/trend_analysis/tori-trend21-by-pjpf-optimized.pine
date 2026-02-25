@@ -1,0 +1,145 @@
+//@version=6
+indicator("Tori Trend2.1 by PJPF - Optimized", overlay=true, max_lines_count=500)
+
+// --- Memory Management ---
+max_bars_back(low, 5000)
+max_bars_back(high, 5000)
+max_bars_back(time, 5000)
+
+// --- Inputs ---
+lookbackInput  = input.int(5000, "Historical Lookback (Max 5000)", minval=100, maxval=5000)
+bullColor      = input.color(color.lime, "Support Lines")
+bearColor      = input.color(color.red, "Resistance Lines")
+lineWidth      = input.int(2, "Line Width", minval=1)
+tolerancePips  = input.int(3, "Breach Tolerance (Pips)", minval=0)
+showMarkers    = input.bool(true, "Show Hand-off Markers")
+showTable      = input.bool(true, "Show Status Box")
+
+// --- Internal Variables ---
+float breachBuffer = tolerancePips * syminfo.mintick * 10
+int actualLookback = math.min(last_bar_index - 10, lookbackInput - 10)
+
+// --- Containers ---
+var line[] supportLines = array.new_line()
+var line[] resistLines  = array.new_line()
+
+// Alert Flags
+bool newSupportLink = false
+bool newResistLink  = false
+bool priceBreach    = false
+
+if barstate.islast
+    // Cleanup
+    if array.size(supportLines) > 0
+        for i = 0 to array.size(supportLines) - 1
+            line.delete(array.get(supportLines, i))
+        array.clear(supportLines)
+    if array.size(resistLines) > 0
+        for i = 0 to array.size(resistLines) - 1
+            line.delete(array.get(resistLines, i))
+        array.clear(resistLines)
+
+    // 1. Identify Reversal Points
+    int[] bullPivots = array.new_int()
+    int[] bearPivots = array.new_int()
+    
+    int s1_Off = 0
+    int r1_Off = 0
+    float minVal = low[0]
+    float maxVal = high[0]
+
+    for i = 1 to actualLookback
+        if low[i] <= minVal
+            minVal := low[i]
+            s1_Off := i
+        if high[i] >= maxVal
+            maxVal := high[i]
+            r1_Off := i
+        
+        if low[i] < low[i+1] and low[i] < low[i-1]
+            array.push(bullPivots, i)
+        if high[i] > high[i+1] and high[i] > high[i-1]
+            array.push(bearPivots, i)
+
+    // 2. Bullish Chaining (Higher Lows Only)
+    if s1_Off != 0
+        int cur_S1_Idx = bar_index - s1_Off
+        float cur_S1_Price = minVal
+        
+        for i = array.size(bullPivots) - 1 to 0
+            int s2_Off = array.get(bullPivots, i)
+            if s2_Off < s1_Off and s2_Off < (bar_index - cur_S1_Idx)
+                int s2_Idx = bar_index - s2_Off
+                float s2_Price = low[s2_Off]
+                
+                if s2_Price > cur_S1_Price
+                    float slope = (s2_Price - cur_S1_Price) / (s2_Idx - cur_S1_Idx)
+                    bool broken = false
+                    for k = 0 to s1_Off
+                        if (bar_index - k) <= cur_S1_Idx
+                            continue
+                        if low[k] < (cur_S1_Price + (slope * ((bar_index - k) - cur_S1_Idx))) - breachBuffer
+                            broken := true
+                            break
+                    
+                    if not broken
+                        ln = line.new(time[bar_index - cur_S1_Idx], cur_S1_Price, time[s2_Off], s2_Price, xloc=xloc.bar_time, extend=extend.right, color=bullColor, width=lineWidth)
+                        array.push(supportLines, ln)
+                        if showMarkers
+                            label.new(bar_index - s2_Off, low[s2_Off], "S", color=bullColor, style=label.style_triangleup, textcolor=color.black, size=size.tiny, yloc=yloc.belowbar)
+                        
+                        // Set Alert Flag if this is the very latest pivot
+                        if s2_Off <= 1
+                            newSupportLink := true
+                            
+                        cur_S1_Idx := s2_Idx
+                        cur_S1_Price := s2_Price
+
+    // 3. Bearish Chaining (Lower Highs Only)
+    if r1_Off != 0
+        int cur_R1_Idx = bar_index - r1_Off
+        float cur_R1_Price = maxVal
+        
+        for i = array.size(bearPivots) - 1 to 0
+            int r2_Off = array.get(bearPivots, i)
+            if r2_Off < r1_Off and r2_Off < (bar_index - cur_R1_Idx)
+                int r2_Idx = bar_index - r2_Off
+                float r2_Price = high[r2_Off]
+                
+                if r2_Price < cur_R1_Price
+                    float slope = (r2_Price - cur_R1_Price) / (r2_Idx - cur_R1_Idx)
+                    bool broken = false
+                    for k = 0 to r1_Off
+                        if (bar_index - k) <= cur_R1_Idx
+                            continue
+                        if high[k] > (cur_R1_Price + (slope * ((bar_index - k) - cur_R1_Idx))) + breachBuffer
+                            broken := true
+                            break
+                    
+                    if not broken
+                        ln = line.new(time[bar_index - cur_R1_Idx], cur_R1_Price, time[r2_Off], r2_Price, xloc=xloc.bar_time, extend=extend.right, color=bearColor, width=lineWidth)
+                        array.push(resistLines, ln)
+                        if showMarkers
+                            label.new(bar_index - r2_Off, high[r2_Off], "R", color=bearColor, style=label.style_triangledown, textcolor=color.white, size=size.tiny, yloc=yloc.abovebar)
+                        
+                        if r2_Off <= 1
+                            newResistLink := true
+
+                        cur_R1_Idx := r2_Idx
+                        cur_R1_Price := r2_Price
+
+    // --- ALERT TRIGGERS ---
+    if newSupportLink
+        alert("New Support Trendline Formed!", alert.freq_once_per_bar)
+    if newResistLink
+        alert("New Resistance Trendline Formed!", alert.freq_once_per_bar)
+
+    // 4. Status Box
+    if showTable
+        var table dBox = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 15), frame_color=color.gray, frame_width=2)
+        table.cell(dBox, 0, 0, "SCAN DEPTH:", text_color=color.white, text_size=size.normal, text_halign=text.align_left)
+        table.cell(dBox, 1, 0, str.tostring(actualLookback), text_color=color.aqua, text_size=size.large, text_halign=text.align_right)
+        table.cell(dBox, 0, 1, "TREND LINES:", text_color=color.gray, text_size=size.normal, text_halign=text.align_left)
+        table.cell(dBox, 1, 1, str.tostring(array.size(supportLines) + array.size(resistLines)), text_color=color.yellow, text_size=size.normal, text_halign=text.align_right)
+        table.cell(dBox, 0, 2, "BULL: " + str.tostring(array.size(supportLines)), text_color=bullColor, text_size=size.small)
+        table.cell(dBox, 1, 2, "BEAR: " + str.tostring(array.size(resistLines)), text_color=bearColor, text_size=size.small)

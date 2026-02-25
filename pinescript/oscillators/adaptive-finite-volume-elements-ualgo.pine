@@ -1,0 +1,171 @@
+// This Pine Script™ code is subject to the terms of the Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © UAlgo
+
+//@version=6
+indicator("Adaptive Finite Volume Elements [UAlgo]", overlay=false, precision=2)
+
+// =============================================================================
+// 1. DATA STRUCTURES (TYPES)
+// =============================================================================
+
+// Data structure: Holds all properties of a single pivot point (high or low).
+type Pivot
+    float val   // Indicator value
+    float price // Price at that moment (High or Low)
+    int   idx   // Bar index
+
+// Data structure: The main engine managing all indicator logic and memory.
+type AFVE_Engine
+    float cutoff_factor
+    // Pivot memory (Arrays)
+    array<Pivot> high_pivots
+    array<Pivot> low_pivots
+    // Visual settings
+    color c_bull
+    color c_bear
+    color c_neutral
+
+// =============================================================================
+// 2. METHODS (LOGIC)
+// =============================================================================
+
+// Constructor-like method to initialize the engine
+method init(AFVE_Engine id, float cut) =>
+    id.cutoff_factor := cut
+    id.high_pivots := array.new<Pivot>()
+    id.low_pivots := array.new<Pivot>()
+    id.c_bull := color.new(#00E676, 0)
+    id.c_bear := color.new(#FF5252, 0)
+    id.c_neutral := color.new(#9E9E9E, 50)
+
+// Calculation Method: Adaptive FVE Formula
+// 'period' and 'smooth' must be simple ints, so passed as arguments instead of struct members.
+method calculate(AFVE_Engine id, int period, int smooth) =>
+    // 1. Core Components
+    float tp = hlc3
+    float mf = close - (high + low) / 2 + tp - tp[1]
+    
+    // 2. Adaptation (Adaptive Cutoff)
+    // Using ATR instead of fixed %. Expands and contracts based on volatility.
+    float volatility = ta.atr(period)
+    float cutoff = volatility * id.cutoff_factor
+    
+    // 3. Volume Flow Decision
+    float v_flow = 0.0
+    if mf > cutoff
+        v_flow := volume
+    else if mf < -cutoff
+        v_flow := -volume
+    else
+        v_flow := 0.0 // Ignore Noise
+    
+    // 4. Summation and Normalization
+    float fve_raw = math.sum(v_flow, period) / math.sum(volume, period) * 100
+    
+    // 5. Smoothing (Optional but recommended)
+    float fve_final = smooth > 1 ? ta.ema(fve_raw, smooth) : fve_raw
+    fve_final
+
+// Pivot Management and Divergence Scanning Method
+method update_pivots_and_check(AFVE_Engine id, float current_fve) =>
+    // Pivot Detection (Left 2, Right 1 bar rule for faster detection)
+    // Pivot High
+    float ph = ta.pivothigh(current_fve, 2, 1)
+    if not na(ph)
+        // Create new pivot object (Offset is now 1)
+        Pivot p = Pivot.new(current_fve[1], high[1], bar_index[1])
+        id.high_pivots.unshift(p) // Add to array
+        if id.high_pivots.size() > 5 // Memory cleanup (max 5 past pivots)
+            id.high_pivots.pop()
+            
+        // Bearish Divergence Check (Price High Rising, FVE High Falling)
+        if id.high_pivots.size() >= 2
+            Pivot p0 = id.high_pivots.get(0) // Latest pivot
+            Pivot p1 = id.high_pivots.get(1) // Previous pivot
+            
+            if p0.price > p1.price and p0.val < p1.val
+                // Label Drawing
+                label.new(p0.idx, p0.val, text="▼\nBear Div", color=color.new(color.white, 100), style=label.style_label_down, textcolor=id.c_bear, size=size.small)
+                // Indicator Line (Solid)
+                line.new(p1.idx, p1.val, p0.idx, p0.val, color=id.c_bear, width=1)
+                // Price Line (Dashed, on Main Chart)
+                line.new(p1.idx, p1.price, p0.idx, p0.price, color=id.c_bear, width=1, style=line.style_dashed, force_overlay=true)
+
+    // Pivot Low
+    float pl = ta.pivotlow(current_fve, 2, 1)
+    if not na(pl)
+        Pivot p = Pivot.new(current_fve[1], low[1], bar_index[1])
+        id.low_pivots.unshift(p)
+        if id.low_pivots.size() > 5
+            id.low_pivots.pop()
+            
+        // Bullish Divergence Check (Price Low Falling, FVE Low Rising)
+        if id.low_pivots.size() >= 2
+            Pivot p0 = id.low_pivots.get(0)
+            Pivot p1 = id.low_pivots.get(1)
+            
+            if p0.price < p1.price and p0.val > p1.val
+                // Label Drawing
+                label.new(p0.idx, p0.val, text="Bull Div\n▲", color=color.new(color.white, 100), style=label.style_label_up, textcolor=id.c_bull, size=size.small)
+                // Indicator Line (Solid)
+                line.new(p1.idx, p1.val, p0.idx, p0.val, color=id.c_bull, width=1)
+                // Price Line (Dashed, on Main Chart)
+                line.new(p1.idx, p1.price, p0.idx, p0.price, color=id.c_bull, width=1, style=line.style_dashed, force_overlay=true)
+
+// Coloring Method
+method get_color(AFVE_Engine id, float val) =>
+    val > 0 ? (val > val[1] ? id.c_bull : color.new(id.c_bull, 40)) : (val < val[1] ? id.c_bear : color.new(id.c_bear, 40))
+
+// =============================================================================
+// 3. MAIN EXECUTION
+// =============================================================================
+
+// User Inputs
+int   i_period   = input.int(22, "Period", minval=5)
+float i_cutoff   = input.float(0.3, "Cutoff Factor (ATR Multiplier)", step=0.1, tooltip="Higher values reduce noise but increase lag.")
+int   i_smooth   = input.int(3, "Smoothness", minval=1)
+int   i_sig_len  = input.int(9, "Signal Line Length", group="Reversal Settings")
+float i_rev_trsh = input.float(20.0, "Reversal Threshold (+/-)", group="Reversal Settings", tooltip="Level at which the market is considered overbought/oversold.")
+
+// Type (Object) Initialization
+// Using 'var' keyword to create the object only on the first bar and persist it in memory.
+var AFVE_Engine engine = AFVE_Engine.new()
+if barstate.isfirst
+    engine.init(i_cutoff)
+
+// Ana Döngü
+// Passing period and smooth variables directly to the method
+float fve_value = engine.calculate(i_period, i_smooth)
+
+// Reversal Logic (Signal Line Cross in Extreme Zones)
+float signal_line = ta.sma(fve_value, i_sig_len)
+bool is_oversold  = signal_line < -i_rev_trsh
+bool is_overbought= signal_line > i_rev_trsh
+bool bull_rev     = ta.crossover(fve_value, signal_line) and is_oversold
+bool bear_rev     = ta.crossunder(fve_value, signal_line) and is_overbought
+
+// Visualization
+color dynamic_color = engine.get_color(fve_value)
+plot(fve_value, "AFVE Line", color=dynamic_color, linewidth=2)
+plot(signal_line, "Signal Line", color=color.new(color.gray, 60), display=display.all)
+plot(0, "Zero Line", color=color.gray, display=display.all)
+// Threshold Lines
+plot(i_rev_trsh, "OB Threshold", color=color.new(color.gray, 80), style=plot.style_circles)
+plot(-i_rev_trsh, "OS Threshold", color=color.new(color.gray, 80), style=plot.style_circles)
+
+// Area Fill (Big Beluga Style Gradient)
+// We split the FVE into positive and negative components for precise gradient filling
+p_bull = plot(fve_value > 0 ? fve_value : 0, "Bull Fill Limit", display=display.none)
+p_bear = plot(fve_value < 0 ? fve_value : 0, "Bear Fill Limit", display=display.none)
+p_zero = plot(0, "Zero Fill Limit", display=display.none)
+
+fill(p_bull, p_zero, top_value=60, bottom_value=0, top_color=color.new(engine.c_bull, 20), bottom_color=color.new(engine.c_bull, 100))
+
+fill(p_bear, p_zero, top_value=0, bottom_value=-60, top_color=color.new(engine.c_bear, 100), bottom_color=color.new(engine.c_bear, 20))
+
+// Reversal Shapes
+plotchar(bull_rev ? fve_value - 15 : na, "Bullish Reversal", "▲", location.absolute, color=engine.c_bull, textcolor=engine.c_bull, size=size.tiny)
+plotchar(bear_rev ? fve_value + 15 : na, "Bearish Reversal", "▼", location.absolute, color=engine.c_bear, textcolor=engine.c_bear, size=size.tiny)
+
+// Divergence Check and Labeling
+engine.update_pivots_and_check(fve_value)

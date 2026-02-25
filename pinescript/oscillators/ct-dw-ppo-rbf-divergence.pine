@@ -1,0 +1,223 @@
+//@version=6
+indicator("[CT] D&W PPO + RBF + Divergence", shorttitle="[CT] PPO RBF DIV", overlay=false, precision=4, max_lines_count=500, max_labels_count=500)
+
+//────────────────────────────────────────────────────────────────────
+// PPO Inputs (original behavior)
+//────────────────────────────────────────────────────────────────────
+L1 = input.int(60, "L1 (W)", minval=1)
+L2 = input.int(130, "L2 (W)", minval=1)
+L3 = input.int(12, "L3 (D)", minval=1)
+L4 = input.int(26, "L4 (D)", minval=1)
+
+showW     = input.bool(false, "Show W line?")
+histWidth = input.int(3, "Histogram thickness", minval=1, maxval=10)
+
+groupColors = "PPO Colors"
+colBull = input.color(color.lime, "Bull (R > W)", group=groupColors)
+colBear = input.color(color.red, "Bear (R < W)", group=groupColors)
+
+//────────────────────────────────────────────────────────────────────
+// RBF on PRICE chart (upper chart)
+//────────────────────────────────────────────────────────────────────
+groupRbf = "RBF (Price Chart)"
+showRbfPrice   = input.bool(true, "Show RBF on Price Chart?", group=groupRbf)
+rbfSrcPrice    = input.source(close, "Source", group=groupRbf)
+kLen           = input.int(5, "Kernel Length", minval=1, group=groupRbf)
+gammaAdj       = input.float(0.10, "Gamma Adj", minval=0.01, step=0.01, group=groupRbf)
+
+useBand        = input.bool(true, "Use ATR Trail Band?", group=groupRbf)
+bandLen        = input.int(14, "ATR Length", minval=1, group=groupRbf)
+bandFactor     = input.float(1.70, "ATR Factor", minval=0.10, step=0.01, group=groupRbf)
+
+useAccel       = input.bool(false, "Use Adaptive Band Boost?", group=groupRbf)
+accelLookback  = input.int(200, "Boost Normalization Lookback", minval=20, group=groupRbf)
+accelMult      = input.float(5.0, "Boost Multiplier", minval=0.0, step=0.1, group=groupRbf)
+
+rbfWidth       = input.int(2, "Line Width", minval=1, maxval=5, group=groupRbf)
+rbfBullCol     = input.color(color.new(color.lime, 0), "Bull Color", group=groupRbf, inline="rbfc")
+rbfBearCol     = input.color(color.new(color.red, 0), "Bear Color", group=groupRbf, inline="rbfc")
+
+//────────────────────────────────────────────────────────────────────
+// Price Bars coloring (single control so there is no conflict)
+//────────────────────────────────────────────────────────────────────
+groupBars = "Price Bars"
+barColorMode = input.string("Off", "Color price bars by", options=["Off","PPO","RBF"], group=groupBars)
+
+//────────────────────────────────────────────────────────────────────
+// Divergence (regular + hidden) with pivot source toggle
+//────────────────────────────────────────────────────────────────────
+groupDiv = "Divergence"
+showDiv       = input.bool(false, "Show Divergence?", group=groupDiv)
+divOn         = input.string("Histogram", "Divergence Source", options=["Histogram","R"], group=groupDiv)
+pivotKey      = input.string("Oscillator pivots", "Key off pivots", options=["Oscillator pivots","Price pivots"], group=groupDiv)
+showRegular   = input.bool(true, "Show Regular Divergence", group=groupDiv)
+showHidden    = input.bool(true, "Show Hidden Divergence", group=groupDiv)
+pL            = input.int(5, "Pivot Left", minval=1, group=groupDiv)
+pR            = input.int(5, "Pivot Right", minval=1, group=groupDiv)
+markOnPrice   = input.bool(false, "Mark on Price Chart?", group=groupDiv)
+
+groupDivCol = "Divergence Colors"
+regBullCol = input.color(color.new(color.lime, 0), "Regular Bull", group=groupDivCol)
+regBearCol = input.color(color.new(color.red, 0), "Regular Bear", group=groupDivCol)
+hidBullCol = input.color(color.new(color.teal, 0), "Hidden Bull", group=groupDivCol)
+hidBearCol = input.color(color.new(color.orange, 0), "Hidden Bear", group=groupDivCol)
+
+//────────────────────────────────────────────────────────────────────
+// PPO CALCS (unchanged)
+//────────────────────────────────────────────────────────────────────
+e1 = ta.ema(close, L1)
+e2 = ta.ema(close, L2)
+e3 = ta.ema(close, L3)
+e4 = ta.ema(close, L4)
+
+W = ((e1 - e2) / e2) * 100.0
+D = ((e3 - e4) / e2) * 100.0
+R = W + D
+
+hist = R - W
+histCol = hist >= 0 ? colBull : colBear
+
+//────────────────────────────────────────────────────────────────────
+// RBF HELPERS
+//────────────────────────────────────────────────────────────────────
+f_variance(series float s, int length) =>
+    m = ta.sma(s, length)
+    var_sum = 0.0
+    for i = 0 to length - 1
+        var_sum := var_sum + math.pow(s[i] - m, 2)
+    var_sum / length
+
+f_rbfKernel(series float s, int length, float gamma_factor) =>
+    v = f_variance(s, length)
+    v := v <= 0.0 ? 1e-9 : v
+    g = gamma_factor / (2.0 * v)
+    wsum = 0.0
+    ksum = 0.0
+    for i = 0 to length - 1
+        dist = math.pow(s - s[i], 2)
+        w = math.exp(-g * dist)
+        ksum := ksum + w * s[i]
+        wsum := wsum + w
+    ksum / math.max(1e-9, wsum)
+
+//────────────────────────────────────────────────────────────────────
+// RBF PRICE TRAIL LINE (upper chart)
+//────────────────────────────────────────────────────────────────────
+rbfBasePrice = f_rbfKernel(rbfSrcPrice, kLen, gammaAdj)
+
+dP = math.abs(rbfSrcPrice - rbfSrcPrice[1])
+dPmax = ta.highest(dP, accelLookback)
+accel = dPmax == 0.0 ? 0.0 : dP / dPmax
+boost = useAccel ? (1.0 + accel * accelMult) : 1.0
+
+band = ta.atr(bandLen) * bandFactor * boost
+
+var float rbfTrail = na
+rbfTrail := nz(rbfTrail[1], rbfBasePrice)
+
+upper = rbfBasePrice + band
+lower = rbfBasePrice - band
+
+if useBand
+    if lower > rbfTrail
+        rbfTrail := lower
+    if upper < rbfTrail
+        rbfTrail := upper
+else
+    rbfTrail := rbfBasePrice
+
+rbfBull = close > rbfTrail
+rbfCol  = rbfBull ? rbfBullCol : rbfBearCol
+
+plot(showRbfPrice ? rbfTrail : na, title="RBF Price Trail", color=rbfCol, linewidth=rbfWidth, force_overlay=true)
+
+//────────────────────────────────────────────────────────────────────
+// Divergence logic (regular + hidden), pivot key toggle
+//────────────────────────────────────────────────────────────────────
+divSrc = divOn == "R" ? R : hist
+usePricePivots = pivotKey == "Price pivots"
+
+oscPL = ta.pivotlow(divSrc, pL, pR)
+oscPH = ta.pivothigh(divSrc, pL, pR)
+
+prPL  = ta.pivotlow(low, pL, pR)
+prPH  = ta.pivothigh(high, pL, pR)
+
+lowEvent  = showDiv and (usePricePivots ? not na(prPL) : not na(oscPL))
+highEvent = showDiv and (usePricePivots ? not na(prPH) : not na(oscPH))
+
+curIdxL   = bar_index - pR
+curPriceL = low[pR]
+curOscL   = usePricePivots ? divSrc[pR] : oscPL
+
+curIdxH   = bar_index - pR
+curPriceH = high[pR]
+curOscH   = usePricePivots ? divSrc[pR] : oscPH
+
+var float prevOscL = na
+var float prevPriceL = na
+var int prevIdxL = na
+
+var float prevOscH = na
+var float prevPriceH = na
+var int prevIdxH = na
+
+var bool markRegBull = false
+var bool markHidBull = false
+var bool markRegBear = false
+var bool markHidBear = false
+
+markRegBull := false
+markHidBull := false
+markRegBear := false
+markHidBear := false
+
+if lowEvent and not na(curOscL)
+    if not na(prevOscL) and not na(prevPriceL)
+        regBull = showRegular and (curPriceL < prevPriceL) and (curOscL > prevOscL)
+        hidBull = showHidden and (curPriceL > prevPriceL) and (curOscL < prevOscL)
+        if regBull
+            line.new(prevIdxL, prevOscL, curIdxL, curOscL, xloc=xloc.bar_index, extend=extend.none, color=regBullCol, width=2, style=line.style_solid)
+            label.new(curIdxL, curOscL, "Bull", xloc=xloc.bar_index, style=label.style_label_up, textcolor=color.white, color=regBullCol)
+            markRegBull := true
+        if hidBull
+            line.new(prevIdxL, prevOscL, curIdxL, curOscL, xloc=xloc.bar_index, extend=extend.none, color=hidBullCol, width=2, style=line.style_dashed)
+            label.new(curIdxL, curOscL, "H Bull", xloc=xloc.bar_index, style=label.style_label_up, textcolor=color.white, color=hidBullCol)
+            markHidBull := true
+    prevOscL := curOscL
+    prevPriceL := curPriceL
+    prevIdxL := curIdxL
+
+if highEvent and not na(curOscH)
+    if not na(prevOscH) and not na(prevPriceH)
+        regBear = showRegular and (curPriceH > prevPriceH) and (curOscH < prevOscH)
+        hidBear = showHidden and (curPriceH < prevPriceH) and (curOscH > prevOscH)
+        if regBear
+            line.new(prevIdxH, prevOscH, curIdxH, curOscH, xloc=xloc.bar_index, extend=extend.none, color=regBearCol, width=2, style=line.style_solid)
+            label.new(curIdxH, curOscH, "Bear", xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=regBearCol)
+            markRegBear := true
+        if hidBear
+            line.new(prevIdxH, prevOscH, curIdxH, curOscH, xloc=xloc.bar_index, extend=extend.none, color=hidBearCol, width=2, style=line.style_dashed)
+            label.new(curIdxH, curOscH, "H Bear", xloc=xloc.bar_index, style=label.style_label_down, textcolor=color.white, color=hidBearCol)
+            markHidBear := true
+    prevOscH := curOscH
+    prevPriceH := curPriceH
+    prevIdxH := curIdxH
+
+plotshape(markOnPrice and markRegBull, title="Reg Bull Div (price)", style=shape.triangleup, location=location.belowbar, color=regBullCol, size=size.tiny, offset=-pR, force_overlay=true)
+plotshape(markOnPrice and markHidBull, title="Hid Bull Div (price)", style=shape.circle, location=location.belowbar, color=hidBullCol, size=size.tiny, offset=-pR, force_overlay=true)
+plotshape(markOnPrice and markRegBear, title="Reg Bear Div (price)", style=shape.triangledown, location=location.abovebar, color=regBearCol, size=size.tiny, offset=-pR, force_overlay=true)
+plotshape(markOnPrice and markHidBear, title="Hid Bear Div (price)", style=shape.circle, location=location.abovebar, color=hidBearCol, size=size.tiny, offset=-pR, force_overlay=true)
+
+//────────────────────────────────────────────────────────────────────
+// PPO PLOTS (lower pane)
+//────────────────────────────────────────────────────────────────────
+hline(0, "Zero (R = W)", color=color.new(color.gray, 70))
+plot(hist, title="R - W", style=plot.style_columns, color=histCol, linewidth=histWidth, histbase=0)
+plot(showW ? W : na, title="W", color=color.new(color.gray, 0), linewidth=2)
+
+//────────────────────────────────────────────────────────────────────
+// Price bar coloring (single source, no conflicts)
+//────────────────────────────────────────────────────────────────────
+barCol = barColorMode == "PPO" ? histCol : barColorMode == "RBF" ? rbfCol : na
+barcolor(barCol)

@@ -1,0 +1,339 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+//@version=6
+indicator("BK AK-Zenith🌟", shorttitle="🌟", overlay=false)
+import TradingView/ta/9
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+string GRP_CORE = "══════ Core Settings ══════"
+bool   useAdaptive  = input.bool(true, "Adaptive Period (Auto-Detect Market Rhythm)", group=GRP_CORE)
+int    fixedLength  = input.int(14, "Fixed Length (if Adaptive off)", minval=5, maxval=50, group=GRP_CORE)
+int    medianLen    = input.int(144, "Frequency Detection Length", minval=20, maxval=200, group=GRP_CORE)
+bool   smooth       = input.bool(true, "Enable Smoothing", group=GRP_CORE)
+int    smoothLen    = input.int(11, "Smoothing Length", minval=1, maxval=20, group=GRP_CORE)
+
+string GRP_LEVELS = "══════ Signal Levels ══════"
+int    peakLevel      = input.int(80, "Peak Level", minval=60, maxval=95, group=GRP_LEVELS)
+int    valleyLevel    = input.int(20, "Valley Level", minval=5, maxval=40, group=GRP_LEVELS)
+int    cooldown       = input.int(10, "Signal Cooldown Bars", minval=0, maxval=200, group=GRP_LEVELS)
+int    signalPivotLen = input.int(5, "Signal Pivot Strength (cuts spam)", minval=1, maxval=25, group=GRP_LEVELS)
+
+string GRP_SIGS = "══════ Signal Sizing ══════"
+string arrowSizeOpt = input.string("Tiny", "BUY/SELL Arrow Size", options=["Tiny","Small","Normal"], group=GRP_SIGS)
+
+string GRP_DIV = "══════ Divergence ══════"
+bool   showBullDiv  = input.bool(true, "Show Bullish Divergence", group=GRP_DIV)
+bool   showBearDiv  = input.bool(true, "Show Bearish Divergence", group=GRP_DIV)
+int    divPivotLen  = input.int(15, "Divergence Pivot Length", minval=5, maxval=50, group=GRP_DIV)
+
+string GRP_VIS = "══════ Visuals ══════"
+color  bullColor    = input.color(#00E676, "Bull Color", group=GRP_VIS)
+color  bearColor    = input.color(#FF5252, "Bear Color", group=GRP_VIS)
+color  neutColor    = input.color(#9E9E9E, "Neutral Color", group=GRP_VIS)
+bool   showSignals  = input.bool(true, "Show BUY/SELL Signals", group=GRP_VIS)
+bool   showMomentum = input.bool(true, "Show Momentum Diamonds", group=GRP_VIS)
+int    momLen       = input.int(3, "Momentum Flip Lookback", minval=1, maxval=20, group=GRP_VIS)
+
+string GRP_TABLE = "══════ Table Settings ══════"
+string tableStyle   = input.string("Meter", "Table Style", options=["Text", "Meter", "Off"], group=GRP_TABLE)
+string tablePos     = input.string("Middle Left", "Table Position",
+     options=["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"], group=GRP_TABLE)
+string tableSize    = input.string("Tiny", "Table Size", options=["Tiny", "Small", "Normal"], group=GRP_TABLE)
+
+// MA LINE (added)
+string GRP_MA = "══════ MA Line ══════"
+bool   showOscMA     = input.bool(true, "Show Oscillator MA", group=GRP_MA)
+string oscMAType     = input.string("WMA", "MA Type", options=["WMA","SMA","EMA","HMA"], group=GRP_MA)
+int    oscMALen      = input.int(5, "MA Length", minval=1, maxval=200, group=GRP_MA)
+bool   showMACrosses = input.bool(false, "Show MA Cross Dots", group=GRP_MA)
+bool   maColorSlope  = input.bool(false, "Color MA by Slope", group=GRP_MA)
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_tablePos(_pos) =>
+    switch _pos
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+
+f_tableSize(_size) =>
+    switch _size
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+
+f_atan2(y, x) =>
+    x > 0 ? math.atan(y / x) :
+     x < 0 and y >= 0 ? math.atan(y / x) + math.pi :
+     x < 0 and y < 0  ? math.atan(y / x) - math.pi :
+     y > 0 ? math.pi / 2 :
+     y < 0 ? -math.pi / 2 : 0.0
+
+// MA helper (added)
+f_ma(_src, _len, _type) =>
+    switch _type
+        "SMA" => ta.sma(_src, _len)
+        "EMA" => ta.ema(_src, _len)
+        "WMA" => ta.wma(_src, _len)
+        "HMA" => ta.hma(_src, _len)
+        => ta.ema(_src, _len)
+
+// KEEP ta.rma2 dependency (as requested)
+pine_rsi(x, y) =>
+    u = math.max(x - x[1], 0)
+    d = math.max(x[1] - x, 0)
+    rs = ta.rma2(u, y) / ta.rma2(d, y)
+    100 - 100 / (1 + rs)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ADAPTIVE PERIOD (Hilbert-style)  ✅ MEDIAN (matches source)
+// ══════════════════════════════════════════════════════════════════════════════
+
+priceSmooth = (close + close[1] + close[2] + close[3]) / 4
+detrender   = 0.0962 * priceSmooth + 0.5769 * priceSmooth[2] - 0.5769 * priceSmooth[4] - 0.0962 * priceSmooth[6]
+
+I1 = detrender[3]
+Q1 = 0.0962 * detrender + 0.5769 * detrender[2] - 0.5769 * detrender[4] - 0.0962 * detrender[6]
+
+I2 = I1 - Q1[3]
+Q2 = Q1 + I1[3]
+
+Re = I2 * nz(I2[1]) + Q2 * nz(Q2[1])
+Im = I2 * nz(Q2[1]) - Q2 * nz(I2[1])
+
+phaseAngle = math.todegrees(f_atan2(Im, Re))
+phaseAngle := phaseAngle < 0 ? phaseAngle + 360 : phaseAngle
+phaseAngleClamped = math.max(phaseAngle, 1.0)
+
+hilbertPeriod   = 360 / phaseAngleClamped
+marketFrequency = ta.median(hilbertPeriod, medianLen)
+adaptivePeriod  = int(math.max(5, math.min(50, marketFrequency / 2)))
+
+int period = useAdaptive ? adaptivePeriod : fixedLength
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ OSCILLATOR
+// ══════════════════════════════════════════════════════════════════════════════
+
+float rsiRaw = pine_rsi(close, period)
+float osc    = smooth ? ta.hma(rsiRaw, smoothLen) : rsiRaw
+
+bool momRising     = osc > osc[1]
+bool inPeakZone    = osc >= peakLevel
+bool inValleyZone  = osc <= valleyLevel
+
+// MA calculations (added)
+float oscMA = f_ma(osc, oscMALen, oscMAType)
+bool  maUp  = oscMA > oscMA[1]
+color maCol = maColorSlope ? (maUp ? bullColor : bearColor) : neutColor
+bool  maBullCross = ta.crossover(osc, oscMA)
+bool  maBearCross = ta.crossunder(osc, oscMA)
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ DIVERGENCE (pivot-based)
+// ══════════════════════════════════════════════════════════════════════════════
+
+plFound = not na(ta.pivotlow(osc, divPivotLen, 1))
+phFound = not na(ta.pivothigh(osc, divPivotLen, 1))
+
+_inRange(cond) =>
+    bars = ta.barssince(cond)
+    bars >= 0 and bars <= 80
+
+oscHL   = osc[1] > ta.valuewhen(plFound, osc[1], 1) and _inRange(plFound[1])
+priceLL = low[1] < ta.valuewhen(plFound, low[1], 1)
+bullDivCond = showBullDiv and plFound and priceLL and oscHL
+
+oscLH   = osc[1] < ta.valuewhen(phFound, osc[1], 1) and _inRange(phFound[1])
+priceHH = high[1] > ta.valuewhen(phFound, high[1], 1)
+bearDivCond = showBearDiv and phFound and priceHH and oscLH
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ SIGNALS (pivot-based + cooldown)
+// ══════════════════════════════════════════════════════════════════════════════
+
+float sigPH = ta.pivothigh(osc, signalPivotLen, signalPivotLen)
+float sigPL = ta.pivotlow(osc,  signalPivotLen, signalPivotLen)
+
+bool sigPHFound = not na(sigPH)
+bool sigPLFound = not na(sigPL)
+
+int sigCenterBar = bar_index - signalPivotLen
+
+var int lastPeakCenter   = na
+var int lastValleyCenter = na
+
+bool peakCooldownOK   = cooldown == 0 or na(lastPeakCenter)   or (sigCenterBar - lastPeakCenter   >= cooldown)
+bool valleyCooldownOK = cooldown == 0 or na(lastValleyCenter) or (sigCenterBar - lastValleyCenter >= cooldown)
+
+bool peakSignal   = showSignals and sigPHFound and sigPH >= peakLevel and peakCooldownOK
+bool valleySignal = showSignals and sigPLFound and sigPL <= valleyLevel and valleyCooldownOK
+
+if peakSignal
+    lastPeakCenter := sigCenterBar
+if valleySignal
+    lastValleyCenter := sigCenterBar
+
+bool momUp = ta.rising(osc, momLen)
+bool bullMomentum = showMomentum and momUp and not momUp[1] and not inPeakZone and not inValleyZone
+bool bearMomentum = showMomentum and (not momUp) and momUp[1] and not inPeakZone and not inValleyZone
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ PLOTTING (peak highlight + level highlight + top/bottom fills)
+// ══════════════════════════════════════════════════════════════════════════════
+
+color oscColor = momRising ? bullColor : bearColor
+
+oscPlot = plot(osc, "Zenith", color=color.new(oscColor, 40), linewidth=2)
+
+// MA plot + cross dots (added)
+plot(showOscMA ? oscMA : na, "Osc MA", color=color.new(maCol, 0), linewidth=1)
+plotchar(showMACrosses and maBullCross ? osc : na, title="MA Bull Cross", char="•", location=location.absolute, color=bullColor, size=size.tiny)
+plotchar(showMACrosses and maBearCross ? osc : na, title="MA Bear Cross", char="•", location=location.absolute, color=bearColor, size=size.tiny)
+
+// BG-style glow fill
+oscPrev = plot(osc[1], "Zenith Prev", color=color.new(oscColor, 100), linewidth=1, display=display.none)
+fill(oscPlot, oscPrev, color=color.new(oscColor, 80), title="Osc Glow Fill")
+
+// Peak/Valley highlight line — thickness 2
+plot((inPeakZone or inValleyZone) ? osc : na, "Extreme Highlight", color=oscColor, linewidth=2, style=plot.style_linebr)
+
+// Horizontal level lines — linewidth 1
+pPeak = plot(peakLevel, "Peak Level",
+     color=color.from_gradient(osc, 50, 100, color.new(neutColor, 70), color.new(bearColor, 0)),
+     linewidth=1)
+
+pValley = plot(valleyLevel, "Valley Level",
+     color=color.from_gradient(osc, 0, 50, color.new(bullColor, 0), color.new(neutColor, 70)),
+     linewidth=1)
+
+plot(50, "Mid", color=color.new(neutColor, 65), linewidth=1)
+
+// Top/Bottom background fills
+pTop = plot(100, "Top", color=color.new(neutColor, 100), display=display.none)
+pBot = plot(0,   "Bottom", color=color.new(neutColor, 100), display=display.none)
+fill(pPeak, pTop,    color=color.new(bearColor, 88), title="Top Peak Fill")
+fill(pBot,  pValley, color=color.new(bullColor, 88), title="Bottom Valley Fill")
+
+bgcolor(inPeakZone ? color.new(bearColor, 92) : na, title="Peak Zone BG")
+bgcolor(inValleyZone ? color.new(bullColor, 92) : na, title="Valley Zone BG")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ SIGNAL PLOTTING (NO BUY/SELL TEXT)
+// ══════════════════════════════════════════════════════════════════════════════
+
+sellVal = peakSignal   ? sigPH : na
+buyVal  = valleySignal ? sigPL : na
+
+// SELL (no text)
+plotchar(arrowSizeOpt == "Tiny"   ? sellVal : na, title="SELL Tiny",   char="▼", location=location.absolute, color=bearColor, size=size.tiny,   offset=-signalPivotLen)
+plotchar(arrowSizeOpt == "Small"  ? sellVal : na, title="SELL Small",  char="▼", location=location.absolute, color=bearColor, size=size.small,  offset=-signalPivotLen)
+plotchar(arrowSizeOpt == "Normal" ? sellVal : na, title="SELL Normal", char="▼", location=location.absolute, color=bearColor, size=size.normal, offset=-signalPivotLen)
+
+// BUY (no text)
+plotchar(arrowSizeOpt == "Tiny"   ? buyVal : na, title="BUY Tiny",   char="▲", location=location.absolute, color=bullColor, size=size.tiny,   offset=-signalPivotLen)
+plotchar(arrowSizeOpt == "Small"  ? buyVal : na, title="BUY Small",  char="▲", location=location.absolute, color=bullColor, size=size.small,  offset=-signalPivotLen)
+plotchar(arrowSizeOpt == "Normal" ? buyVal : na, title="BUY Normal", char="▲", location=location.absolute, color=bullColor, size=size.normal, offset=-signalPivotLen)
+
+// Momentum diamonds
+plotchar(bullMomentum ? osc : na, title="Bull Momentum", char="◇", location=location.absolute, color=bullColor, size=size.tiny)
+plotchar(bearMomentum ? osc : na, title="Bear Momentum", char="◇", location=location.absolute, color=bearColor, size=size.tiny)
+
+// Divergence markers — no text
+plotchar(bullDivCond ? osc[1] : na, title="Bull Div", char="⚡", location=location.absolute, color=bullColor, size=size.tiny, offset=-1)
+plotchar(bearDivCond ? osc[1] : na, title="Bear Div", char="⚡", location=location.absolute, color=bearColor, size=size.tiny, offset=-1)
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ TABLES (smaller meter)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table textTbl  = na
+var table meterTbl = na
+
+if barstate.islast
+    if tableStyle != "Text" and not na(textTbl)
+        table.delete(textTbl)
+        textTbl := na
+    if tableStyle != "Meter" and not na(meterTbl)
+        table.delete(meterTbl)
+        meterTbl := na
+
+// TEXT TABLE
+if tableStyle == "Text" and barstate.islast
+    if na(textTbl)
+        textTbl := table.new(f_tablePos(tablePos), 2, 5, bgcolor=color.new(color.black, 70), border_width=1)
+
+    tSize = f_tableSize(tableSize)
+
+    string zoneTxt = inPeakZone ? "PEAK" : inValleyZone ? "VALLEY" : osc > 65 ? "HIGH" : osc < 35 ? "LOW" : "NEUTRAL"
+    color zoneCol  = inPeakZone ? bearColor : inValleyZone ? bullColor : neutColor
+
+    string momTxt  = momRising ? "▲ RISING" : "▼ FALLING"
+    color momCol   = momRising ? bullColor : bearColor
+
+    string actionTxt = inPeakZone ? "SELL ZONE" : inValleyZone ? "BUY ZONE" : osc > 50 ? "BULL BIAS" : "BEAR BIAS"
+    color actionCol  = inPeakZone ? bearColor : inValleyZone ? bullColor : osc > 50 ? bullColor : bearColor
+
+    table.cell(textTbl, 0, 0, "LEVEL", text_color=neutColor, text_size=tSize)
+    table.cell(textTbl, 1, 0, str.tostring(osc, "#.#"), text_color=oscColor, text_size=tSize)
+    table.cell(textTbl, 0, 1, "ZONE", text_color=neutColor, text_size=tSize)
+    table.cell(textTbl, 1, 1, zoneTxt, text_color=zoneCol, text_size=tSize)
+    table.cell(textTbl, 0, 2, "MOMENTUM", text_color=neutColor, text_size=tSize)
+    table.cell(textTbl, 1, 2, momTxt, text_color=momCol, text_size=tSize)
+    table.cell(textTbl, 0, 3, "ACTION", text_color=neutColor, text_size=tSize)
+    table.cell(textTbl, 1, 3, actionTxt, text_color=actionCol, text_size=tSize)
+    table.cell(textTbl, 0, 4, "PERIOD", text_color=neutColor, text_size=tSize)
+    table.cell(textTbl, 1, 4, str.tostring(period), text_color=color.white, text_size=tSize)
+
+// SMALLER METER TABLE (6 cols x 2 rows)
+if tableStyle == "Meter" and barstate.islast
+    if na(meterTbl)
+        meterTbl := table.new(f_tablePos(tablePos), 6, 2, bgcolor=color.new(color.black, 80), border_width=0)
+
+    tSize = f_tableSize(tableSize)
+
+    string headerTxt = (inPeakZone ? "🔴 SELL ZONE" : inValleyZone ? "🟢 BUY ZONE" : osc > 50 ? "▲ BULLISH" : "▼ BEARISH") +
+         "  |  " + str.tostring(osc, "#.#") + "  |  P:" + str.tostring(period)
+
+    color headerCol  = inPeakZone ? bearColor : inValleyZone ? bullColor : osc > 50 ? bullColor : bearColor
+    table.cell(meterTbl, 0, 0, headerTxt, text_color=headerCol, text_size=tSize, bgcolor=color.new(color.black, 70))
+    table.merge_cells(meterTbl, 0, 0, 5, 0)
+
+    bool bullState = inValleyZone ? true : inPeakZone ? false : osc > 50
+    bool bearState = not bullState
+
+    int half = 3
+    float intensity = math.abs(osc - 50) / 50.0
+    int lit = int(math.round(intensity * half))
+    lit := math.min(math.max(lit, 0), half)
+
+    for c = 0 to 5
+        table.cell(meterTbl, c, 1, "", bgcolor=color.new(color.black, 85))
+
+    if bearState and lit > 0
+        for i = 0 to (lit - 1)
+            table.cell(meterTbl, 2 - i, 1, "", bgcolor=color.new(bearColor, 10))
+
+    if bullState and lit > 0
+        for i = 0 to (lit - 1)
+            table.cell(meterTbl, 3 + i, 1, "", bgcolor=color.new(bullColor, 10))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ███ ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(peakSignal, "SELL Signal", "🔴 SELL - Peak Zone Pivot")
+alertcondition(valleySignal, "BUY Signal", "🟢 BUY - Valley Zone Pivot")
+alertcondition(bullDivCond, "Bullish Divergence", "⚡ Bullish Divergence Detected")
+alertcondition(bearDivCond, "Bearish Divergence", "⚡ Bearish Divergence Detected")
+alertcondition(inPeakZone and not inPeakZone[1], "Entering Peak Zone", "⚠️ Entering Peak Zone")
+alertcondition(inValleyZone and not inValleyZone[1], "Entering Valley Zone", "⚠️ Entering Valley Zone")

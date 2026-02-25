@@ -1,0 +1,398 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CodaPro.ai LLC
+//@version=6
+indicator("MANTA Cross + Relative Strength [Confirmed]", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MANTA INDEX SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+grpManta = "MANTA Index"
+mantaSmoothing = input.int(6, "MANTA Smoothing", minval=1, maxval=20, group=grpManta)
+
+grpWeights = "Market Cap Weights"
+wNVDA = input.float(31.5, "NVDA %", minval=0, maxval=100, step=0.5, group=grpWeights)
+wAAPL = input.float(28.0, "AAPL %", minval=0, maxval=100, step=0.5, group=grpWeights)
+wAMZN = input.float(17.5, "AMZN %", minval=0, maxval=100, step=0.5, group=grpWeights)
+wMETA = input.float(11.9, "META %", minval=0, maxval=100, step=0.5, group=grpWeights)
+wTSLA = input.float(11.1, "TSLA %", minval=0, maxval=100, step=0.5, group=grpWeights)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSS SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+grpCross = "Cross Settings"
+confirmBars    = input.int(3, "Confirmation Bars", minval=1, maxval=5, group=grpCross, tooltip="Bars stock must stay above/below MANTA after cross.")
+whipsawFilter  = input.int(3, "Whipsaw Cooldown Bars", minval=0, maxval=20, group=grpCross, tooltip="After exit, wait this many bars before next trade.")
+minSeparation  = input.float(0.0, "Min % Separation", minval=0.0, maxval=5.0, step=0.1, group=grpCross, tooltip="Stock must be this % away from MANTA to confirm.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+grpTM = "Trade Management"
+enableTM       = input.bool(true, "Enable Trade Management Overlay", group=grpTM)
+useTrailingStop = input.bool(true, "Use Trailing Stop", group=grpTM, tooltip="Trail stop below MANTA line instead of fixed SL.")
+fixedTpPct     = input.float(4.0, "Take Profit %", minval=0.5, maxval=30.0, step=0.5, group=grpTM)
+fixedSlPct     = input.float(6.0, "Fixed SL % (if no trail)", minval=1.0, maxval=15.0, step=0.5, group=grpTM)
+trailOffset    = input.float(1.4, "Trail Offset Below MANTA %", minval=0.0, maxval=3.0, step=0.1, group=grpTM, tooltip="Trailing stop sits this % below the MANTA line.")
+maxBarsInput   = input.int(100, "Max Bars in Trade", minval=10, maxval=500, group=grpTM)
+minHoldBars    = input.int(2, "Min Hold Bars", minval=1, maxval=10, group=grpTM, tooltip="Min bars before exit allowed. Prevents whipsaw exits.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PDT PROTECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+grpPDT = "PDT Protection"
+enablePDT       = input.bool(true, "Enable PDT Protection", group=grpPDT)
+maxTradesPerWeek = input.int(3, "Max Trades Per Week", minval=1, maxval=10, group=grpPDT)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3D MOMENTUM MATRIX
+// ═══════════════════════════════════════════════════════════════════════════════
+grpMatrix = "3D Momentum Matrix"
+showMatrix     = input.bool(true, "Show Momentum Matrix", group=grpMatrix)
+matrixDepth    = input.int(3, "Matrix Depth", minval=1, maxval=5, tooltip="Number of ribbon layers. Higher = more 3D depth.", group=grpMatrix)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════════════════
+grpVisual = "Visuals"
+showDashboard  = input.bool(true, "Show Dashboard", group=grpVisual)
+showLabels     = input.bool(true, "Show Trade Labels", group=grpVisual)
+showMantaFill  = input.bool(true, "Show Relative Strength Fill", group=grpVisual)
+mantaColor     = input.color(#00FFFF, "MANTA Line", group=grpVisual)
+bullColor      = input.color(#00FF88, "Bull Color", group=grpVisual)
+bearColor      = input.color(#FF4466, "Bear Color", group=grpVisual)
+tpLabelColor   = input.color(color.new(#00BCD4, 0), "TP Label Color", group=grpVisual)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUILD MANTA LINE
+// ═══════════════════════════════════════════════════════════════════════════════
+f_get(sym) =>
+    request.security(sym, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+float pNVDA = f_get("NVDA")
+float pAAPL = f_get("AAPL")
+float pAMZN = f_get("AMZN")
+float pMETA = f_get("META")
+float pTSLA = f_get("TSLA")
+
+float totalW = wNVDA + wAAPL + wAMZN + wMETA + wTSLA
+float wN = totalW > 0 ? wNVDA / totalW : 0.2
+float wA = totalW > 0 ? wAAPL / totalW : 0.2
+float wZ = totalW > 0 ? wAMZN / totalW : 0.2
+float wM = totalW > 0 ? wMETA / totalW : 0.2
+float wT = totalW > 0 ? wTSLA / totalW : 0.2
+
+float sma50NVDA = ta.sma(pNVDA, 50), float sma50AAPL = ta.sma(pAAPL, 50)
+float sma50AMZN = ta.sma(pAMZN, 50), float sma50META = ta.sma(pMETA, 50)
+float sma50TSLA = ta.sma(pTSLA, 50)
+
+float retNVDA = sma50NVDA != 0 ? (pNVDA - sma50NVDA) / sma50NVDA : 0
+float retAAPL = sma50AAPL != 0 ? (pAAPL - sma50AAPL) / sma50AAPL : 0
+float retAMZN = sma50AMZN != 0 ? (pAMZN - sma50AMZN) / sma50AMZN : 0
+float retMETA = sma50META != 0 ? (pMETA - sma50META) / sma50META : 0
+float retTSLA = sma50TSLA != 0 ? (pTSLA - sma50TSLA) / sma50TSLA : 0
+
+float mantaReturn = (retNVDA * wN) + (retAAPL * wA) + (retAMZN * wZ) + (retMETA * wM) + (retTSLA * wT)
+float mantaSmoothed = ta.ema(mantaReturn, mantaSmoothing)
+
+float chartSMA50 = ta.sma(close, 50)
+float mantaPrice = chartSMA50 * (1 + mantaSmoothed)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3D MOMENTUM MATRIX — EMA ribbon layers around MANTA
+// ═══════════════════════════════════════════════════════════════════════════════
+float mEma1 = ta.ema(mantaPrice, 3)
+float mEma2 = ta.ema(mantaPrice, 8)
+float mEma3 = ta.ema(mantaPrice, 14)
+float mEma4 = ta.ema(mantaPrice, 21)
+float mEma5 = ta.ema(mantaPrice, 34)
+
+bool isBull = close > mantaPrice
+bool show1 = showMatrix and matrixDepth >= 1
+bool show2 = showMatrix and matrixDepth >= 2
+bool show3 = showMatrix and matrixDepth >= 3
+bool show4 = showMatrix and matrixDepth >= 4
+bool show5 = showMatrix and matrixDepth >= 5
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSS DETECTION + CONFIRMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+bool priceAboveManta = close > mantaPrice
+bool priceBelowManta = close < mantaPrice
+float separationPct = mantaPrice != 0 ? math.abs(close - mantaPrice) / mantaPrice * 100 : 0
+bool enoughSeparation = separationPct >= minSeparation
+
+var int barsAbove = 0
+var int barsBelow = 0
+if priceAboveManta
+    barsAbove := barsAbove + 1
+    barsBelow := 0
+else if priceBelowManta
+    barsBelow := barsBelow + 1
+    barsAbove := 0
+else
+    barsAbove := 0
+    barsBelow := 0
+
+bool confirmedAbove = barsAbove == confirmBars and enoughSeparation
+bool confirmedBelow = barsBelow == confirmBars and enoughSeparation
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PDT TRACKING (visual — counts trades in rolling 5-bar window)
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<int> tradeEntryBars = array.new_int(0)
+
+if array.size(tradeEntryBars) > 0
+    while array.size(tradeEntryBars) > 0 and (bar_index - array.get(tradeEntryBars, 0)) > 5
+        array.shift(tradeEntryBars)
+
+int tradesThisWeek = array.size(tradeEntryBars)
+bool pdtAllowed = enablePDT ? tradesThisWeek < maxTradesPerWeek : true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE STATE MACHINE (visual — no strategy block)
+// ═══════════════════════════════════════════════════════════════════════════════
+var int tradeDir = 0
+var float entryPrice = na
+var float tpLevel = na
+var float slLevel = na
+var int entryBar = 0
+var int exitBar = -999
+var line tpLine = na
+var line slLine = na
+
+bool isFlat = tradeDir == 0
+bool cooldownOK = (bar_index - exitBar) >= whipsawFilter
+int barsHeld = tradeDir != 0 ? bar_index - entryBar : 0
+bool minHoldMet = barsHeld >= minHoldBars
+
+// ──── SIGNALS ────
+bool longSignal  = confirmedAbove and isFlat and cooldownOK and pdtAllowed and barstate.isconfirmed and enableTM
+bool shortSignal = confirmedBelow and isFlat and cooldownOK and pdtAllowed and barstate.isconfirmed and enableTM
+
+bool longRaw  = confirmedAbove and barstate.isconfirmed
+bool shortRaw = confirmedBelow and barstate.isconfirmed
+
+// ──── ENTRIES ────
+if longSignal
+    tradeDir := 1
+    entryPrice := close
+    tpLevel := close * (1 + fixedTpPct / 100)
+    slLevel := useTrailingStop ? mantaPrice * (1 - trailOffset / 100) : close * (1 - fixedSlPct / 100)
+    entryBar := bar_index
+    array.push(tradeEntryBars, bar_index)
+    if not na(tpLine)
+        line.delete(tpLine)
+    if not na(slLine)
+        line.delete(slLine)
+    tpLine := line.new(bar_index, tpLevel, bar_index + maxBarsInput, tpLevel, color=color.new(#00BCD4, 30), style=line.style_dashed, width=1)
+    slLine := line.new(bar_index, slLevel, bar_index + maxBarsInput, slLevel, color=color.new(bearColor, 30), style=line.style_dashed, width=1)
+
+if shortSignal
+    tradeDir := -1
+    entryPrice := close
+    tpLevel := close * (1 - fixedTpPct / 100)
+    slLevel := useTrailingStop ? mantaPrice * (1 + trailOffset / 100) : close * (1 + fixedSlPct / 100)
+    entryBar := bar_index
+    array.push(tradeEntryBars, bar_index)
+    if not na(tpLine)
+        line.delete(tpLine)
+    if not na(slLine)
+        line.delete(slLine)
+    tpLine := line.new(bar_index, tpLevel, bar_index + maxBarsInput, tpLevel, color=color.new(#00BCD4, 30), style=line.style_dashed, width=1)
+    slLine := line.new(bar_index, slLevel, bar_index + maxBarsInput, slLevel, color=color.new(bearColor, 30), style=line.style_dashed, width=1)
+
+// ──── TRAILING STOP UPDATE ────
+if tradeDir == 1 and useTrailingStop and not na(slLevel)
+    float newTrailSL = mantaPrice * (1 - trailOffset / 100)
+    if newTrailSL > slLevel
+        slLevel := newTrailSL
+        if not na(slLine)
+            line.delete(slLine)
+        slLine := line.new(bar_index, slLevel, bar_index + maxBarsInput, slLevel, color=color.new(bearColor, 30), style=line.style_dashed, width=1)
+
+if tradeDir == -1 and useTrailingStop and not na(slLevel)
+    float newTrailSL = mantaPrice * (1 + trailOffset / 100)
+    if newTrailSL < slLevel
+        slLevel := newTrailSL
+        if not na(slLine)
+            line.delete(slLine)
+        slLine := line.new(bar_index, slLevel, bar_index + maxBarsInput, slLevel, color=color.new(bearColor, 30), style=line.style_dashed, width=1)
+
+// ──── EXIT LOGIC ────
+string exitReason = ""
+
+if tradeDir == 1 and not na(tpLevel) and barstate.isconfirmed
+    if high >= tpLevel
+        exitReason := "TP HIT"
+    else if low <= slLevel
+        exitReason := "SL HIT"
+    else if barsHeld >= maxBarsInput
+        exitReason := "MAX BARS"
+    else if priceBelowManta and minHoldMet
+        exitReason := "CROSS BACK"
+
+if tradeDir == -1 and not na(tpLevel) and barstate.isconfirmed
+    if low <= tpLevel
+        exitReason := "TP HIT"
+    else if high >= slLevel
+        exitReason := "SL HIT"
+    else if barsHeld >= maxBarsInput
+        exitReason := "MAX BARS"
+    else if priceAboveManta and minHoldMet
+        exitReason := "CROSS BACK"
+
+// ──── PROCESS EXIT ────
+if exitReason != ""
+    exitBar := bar_index
+    if not na(tpLine)
+        line.delete(tpLine)
+        tpLine := na
+    if not na(slLine)
+        line.delete(slLine)
+        slLine := na
+    bool isTP = str.contains(exitReason, "TP")
+    bool isCross = str.contains(exitReason, "CROSS")
+    color lblColor = isTP ? tpLabelColor : isCross ? color.new(#FFD700, 0) : color.new(#555555, 40)
+    color txtColor = isTP ? color.white : isCross ? color.white : color.new(#ffffff, 30)
+    string lblSize = isTP ? size.normal : isCross ? size.normal : size.tiny
+    string lblText = isCross ? "BLOCKED" : exitReason
+    if showLabels
+        label.new(bar_index, tradeDir == 1 ? low : high,
+             lblText,
+             style=tradeDir == 1 ? label.style_label_up : label.style_label_down,
+             color=lblColor, textcolor=txtColor, size=lblSize)
+    tradeDir := 0
+    entryPrice := na
+    tpLevel := na
+    slLevel := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+barcolor(color.new(color.gray, 80))
+
+// MANTA core line
+pManta = plot(mantaPrice, "MANTA", color=mantaColor, linewidth=3)
+
+// 3D Matrix layers
+pM1 = plot(show1 ? mEma1 : na, "Matrix L1", color.new(#FFFFFF, 85), linewidth=1)
+pM2 = plot(show2 ? mEma2 : na, "Matrix L2", color.new(#FFFFFF, 90), linewidth=1)
+pM3 = plot(show3 ? mEma3 : na, "Matrix L3", color.new(#FFFFFF, 93), linewidth=1)
+pM4 = plot(show4 ? mEma4 : na, "Matrix L4", color.new(#FFFFFF, 95), linewidth=1)
+pM5 = plot(show5 ? mEma5 : na, "Matrix L5", color.new(#FFFFFF, 97), linewidth=1)
+
+// 3D fills — graduated transparency for depth
+fill(pManta, pM1, show1 and isBull ? color.new(bullColor, 55) : show1 and not isBull ? color.new(bearColor, 55) : na, title="Matrix Fill L1")
+fill(pM1, pM2, show2 and isBull ? color.new(bullColor, 68) : show2 and not isBull ? color.new(bearColor, 68) : na, title="Matrix Fill L2")
+fill(pM2, pM3, show3 and isBull ? color.new(bullColor, 78) : show3 and not isBull ? color.new(bearColor, 78) : na, title="Matrix Fill L3")
+fill(pM3, pM4, show4 and isBull ? color.new(bullColor, 85) : show4 and not isBull ? color.new(bearColor, 85) : na, title="Matrix Fill L4")
+fill(pM4, pM5, show5 and isBull ? color.new(bullColor, 90) : show5 and not isBull ? color.new(bearColor, 90) : na, title="Matrix Fill L5")
+
+// Relative strength fill between price and MANTA
+pClose = plot(close, "Price", color.new(color.white, 100), display=display.none)
+fill(pManta, pClose, showMantaFill ? (isBull ? color.new(bullColor, 88) : color.new(bearColor, 88)) : na, title="Relative Strength Fill")
+
+// Trend background
+bgcolor(priceAboveManta ? color.new(bullColor, 97) : color.new(bearColor, 97), title="Trend BG")
+
+// ──── SIGNAL FLAGS ────
+bool showLong  = enableTM ? longSignal : longRaw
+bool showShort = enableTM ? shortSignal : shortRaw
+
+plotshape(showLong, "Long", shape.triangleup, location.belowbar, bullColor, size=size.normal)
+plotshape(showShort, "Short", shape.triangledown, location.abovebar, bearColor, size=size.normal)
+
+// Entry labels
+if longSignal and showLabels
+    label.new(bar_index, low, "LONG\nSep: " + str.tostring(separationPct, "#.#") + "%",
+         style=label.style_label_up, color=color.new(bullColor, 80), textcolor=bullColor, size=size.small)
+if shortSignal and showLabels
+    label.new(bar_index, high, "SHORT\nSep: " + str.tostring(separationPct, "#.#") + "%",
+         style=label.style_label_down, color=color.new(bearColor, 80), textcolor=bearColor, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 3, 10, bgcolor=color.new(#0a0a14, 75), border_width=2, border_color=color.new(mantaColor, 60))
+
+    // Header
+    table.cell(dash, 0, 0, "MANTA CROSS", text_color=mantaColor, text_size=size.normal, bgcolor=color.new(#002233, 70))
+    table.cell(dash, 1, 0, "Price", text_color=color.gray, text_size=size.small, bgcolor=color.new(#002233, 70))
+    table.cell(dash, 2, 0, "Weight", text_color=color.gray, text_size=size.small, bgcolor=color.new(#002233, 70))
+
+    float sma20NVDA = ta.sma(pNVDA, 20), float sma20AAPL = ta.sma(pAAPL, 20)
+    float sma20AMZN = ta.sma(pAMZN, 20), float sma20META = ta.sma(pMETA, 20)
+    float sma20TSLA = ta.sma(pTSLA, 20)
+
+    // M.A.N.T.A. stocks
+    table.cell(dash, 0, 1, "META", text_color=#0668E1, text_size=size.small)
+    table.cell(dash, 1, 1, "$" + str.tostring(pMETA, "#.##"), text_color=pMETA > sma20META ? bullColor : bearColor, text_size=size.small)
+    table.cell(dash, 2, 1, str.tostring(wMETA, "#.#") + "%", text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 2, "AMZN", text_color=#FF9900, text_size=size.small)
+    table.cell(dash, 1, 2, "$" + str.tostring(pAMZN, "#.##"), text_color=pAMZN > sma20AMZN ? bullColor : bearColor, text_size=size.small)
+    table.cell(dash, 2, 2, str.tostring(wAMZN, "#.#") + "%", text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 3, "NVDA", text_color=#76B900, text_size=size.small)
+    table.cell(dash, 1, 3, "$" + str.tostring(pNVDA, "#.##"), text_color=pNVDA > sma20NVDA ? bullColor : bearColor, text_size=size.small)
+    table.cell(dash, 2, 3, str.tostring(wNVDA, "#.#") + "%", text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 4, "TSLA", text_color=#CC0000, text_size=size.small)
+    table.cell(dash, 1, 4, "$" + str.tostring(pTSLA, "#.##"), text_color=pTSLA > sma20TSLA ? bullColor : bearColor, text_size=size.small)
+    table.cell(dash, 2, 4, str.tostring(wTSLA, "#.#") + "%", text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 5, "AAPL", text_color=#A2AAAD, text_size=size.small)
+    table.cell(dash, 1, 5, "$" + str.tostring(pAAPL, "#.##"), text_color=pAAPL > sma20AAPL ? bullColor : bearColor, text_size=size.small)
+    table.cell(dash, 2, 5, str.tostring(wAAPL, "#.#") + "%", text_color=color.gray, text_size=size.small)
+
+    // MANTA Price
+    table.cell(dash, 0, 6, "MANTA", text_color=mantaColor, text_size=size.normal, bgcolor=color.new(#002233, 70))
+    table.cell(dash, 1, 6, "$" + str.tostring(mantaPrice, "#.##"), text_color=mantaColor, text_size=size.normal, bgcolor=color.new(#002233, 70))
+    table.cell(dash, 2, 6, "", bgcolor=color.new(#002233, 70))
+
+    // Cross Status
+    string crossStatus = priceAboveManta ? "ABOVE" : "BELOW"
+    color crossClr = priceAboveManta ? bullColor : bearColor
+    table.cell(dash, 0, 7, syminfo.ticker, text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 7, crossStatus, text_color=crossClr, text_size=size.small)
+    table.cell(dash, 2, 7, str.tostring(separationPct, "#.##") + "%", text_color=crossClr, text_size=size.small)
+
+    // Confirmation
+    bool confirmed = (priceAboveManta and barsAbove >= confirmBars) or (priceBelowManta and barsBelow >= confirmBars)
+    string barsText = priceAboveManta ? str.tostring(barsAbove) + " bars" : str.tostring(barsBelow) + " bars"
+    table.cell(dash, 0, 8, "Confirm", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 8, barsText, text_color=crossClr, text_size=size.small)
+    table.cell(dash, 2, 8, confirmed ? "YES" : str.tostring(confirmBars) + " needed", text_color=confirmed ? bullColor : #FFD700, text_size=size.small)
+
+    // PDT Status
+    color pdtClr = tradesThisWeek >= maxTradesPerWeek ? bearColor : tradesThisWeek >= maxTradesPerWeek - 1 ? #FFD700 : bullColor
+    string pdtStatus = tradesThisWeek >= maxTradesPerWeek ? "MAXED" : str.tostring(maxTradesPerWeek - tradesThisWeek) + " left"
+    table.cell(dash, 0, 9, "PDT", text_color=color.gray, text_size=size.small, bgcolor=color.new(#1a0033, 60))
+    table.cell(dash, 1, 9, str.tostring(tradesThisWeek) + "/" + str.tostring(maxTradesPerWeek), text_color=pdtClr, text_size=size.small, bgcolor=color.new(#1a0033, 60))
+    table.cell(dash, 2, 9, pdtStatus, text_color=pdtClr, text_size=size.small, bgcolor=color.new(#1a0033, 60))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATUS LINE
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(separationPct, "Sep%", display=display.status_line, color=mantaColor, editable=false)
+plot(float(barsAbove), "Bars Above", display=display.status_line, color=bullColor, editable=false)
+plot(float(barsBelow), "Bars Below", display=display.status_line, color=bearColor, editable=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(longSignal or longRaw, "Confirmed Long", "MANTA Cross confirmed above composite")
+alertcondition(shortSignal or shortRaw, "Confirmed Short", "MANTA Cross confirmed below composite")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISCLAIMER
+// ═══════════════════════════════════════════════════════════════════════════════
+// This tool was created using the CodaPro.ai Pine Script AI engine — designed to
+// produce robust trading overlays, educational visuals, and automation-ready
+// alerts. It is provided strictly for educational and informational purposes
+// and does not constitute financial advice. Past performance does not guarantee
+// future results. Always backtest and demo before applying to real capital.
+// Use at your own risk. Created by Aris | CodaPro.ai Engine
+// ═══════════════════════════════════════════════════════════════════════════════

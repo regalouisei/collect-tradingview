@@ -1,0 +1,116 @@
+//@version=6
+strategy("RRinv 10-50 v.1", 
+         overlay = true, 
+         pyramiding = 0, 
+         default_qty_type = strategy.percent_of_equity, 
+         default_qty_value = 100, 
+         commission_type = strategy.commission.percent, 
+         commission_value = 0.1)
+
+// ── INPUTS ─────────────────────────────────────
+shortPeriod           = input.int(9,   "Short EMA",  minval = 1, group = "Main Settings")
+longPeriod            = input.int(21,  "Long EMA",   minval = 1, group = "Main Settings")
+lookbackDays          = input.int(72,  "Re-Entry Lookback Days", minval = 5, maxval = 1000, group = "Re-Entry Settings")
+
+exitOnCross           = input.bool(true,  "Exit on Death Cross", group = "Risk Management")
+tpPercent             = input.float(30.0, "Take Profit %", minval = 0.1, group = "Risk Management")
+slPercent             = input.float(20.0, "Stop Loss %", minval = 0.1, group = "Risk Management")
+trailPercent          = input.float(20.0, "Trailing Stop %", minval = 0.1, group = "Risk Management")
+useReEntrySpecialStop = input.bool(true,  "Enable 7.7% Re-Entry Special Stop", group = "Risk Management")
+reEntrySpecialStopPct = input.float(7.7, "Re-Entry Special Stop %", minval = 0.1, group = "Risk Management")
+
+showEMAs              = input.bool(true, "Show EMAs", group = "Visuals")
+showLabels            = input.bool(true, "Show Labels", group = "Visuals")
+
+// ── EMAs ───────────────────────────────────────
+shortEMA = ta.ema(close, shortPeriod)
+longEMA  = ta.ema(close, longPeriod)
+
+plot(showEMAs ? shortEMA : na, "Short EMA", color = #2962FF, linewidth = 2)
+plot(showEMAs ? longEMA  : na, "Long EMA",  color = #F50057, linewidth = 2)
+
+stillBullish = shortEMA > longEMA
+
+// ── MAIN SETUP = Actual crossover day ──────────
+mainSetup = ta.crossover(shortEMA, longEMA) and stillBullish
+
+// ── RE-ENTRY LEVEL (called every bar) ──────────
+int safeLookback = math.min(lookbackDays, bar_index + 1)
+float highestHigh = ta.highest(high, safeLookback)
+
+var float reEntryLevel = na
+exitedThisBar = strategy.position_size[1] > 0 and strategy.position_size == 0
+if exitedThisBar
+    reEntryLevel := highestHigh
+
+reEntryTrigger = not na(reEntryLevel) and close > reEntryLevel and stillBullish and strategy.position_size == 0
+
+// ── STRICT 1-DAY CONFIRMATION (Buy on 2nd day if still bullish) ───────────
+confirmedMainBuy = mainSetup[1] and stillBullish
+confirmedReEntry = reEntryTrigger[1] and close > reEntryLevel and stillBullish and strategy.position_size == 0
+
+enterLong = (confirmedMainBuy or confirmedReEntry) and strategy.position_size == 0
+
+// ── ENTRY ──────────────────────────────────────
+var bool inReEntryPosition = false
+if enterLong
+    strategy.entry("Long", strategy.long)
+    inReEntryPosition := confirmedReEntry
+
+// ── RE-ENTRY SPECIAL STOP ──────────────────────
+var float lastSellPrice = na
+var float reEntrySpecialStopLevel = na
+
+if exitedThisBar
+    lastSellPrice := close
+
+if enterLong and confirmedReEntry and useReEntrySpecialStop and not na(lastSellPrice)
+    reEntrySpecialStopLevel := lastSellPrice * (1 - reEntrySpecialStopPct / 100)
+
+if strategy.position_size > 0 and inReEntryPosition and not na(reEntrySpecialStopLevel) and useReEntrySpecialStop
+    if low <= reEntrySpecialStopLevel
+        strategy.close("Long", comment = "Re-Entry Special Stop")
+
+// ── NORMAL RISK MANAGEMENT ─────────────────────
+var float highestHighSinceEntry = na
+var float tpLevel = na
+var float initialSL = na
+
+if strategy.position_size > 0
+    if strategy.position_size[1] <= 0
+        highestHighSinceEntry := high
+        tpLevel := strategy.position_avg_price * (1 + tpPercent / 100)
+        initialSL := strategy.position_avg_price * (1 - slPercent / 100)
+    else
+        highestHighSinceEntry := math.max(highestHighSinceEntry, high)
+    
+    trailLevel = highestHighSinceEntry * (1 - trailPercent / 100)
+    strategy.exit("TP/SL/Trail Exit", from_entry = "Long", limit = tpLevel, stop = math.max(initialSL, trailLevel))
+
+// ── DEATH CROSS EXIT ───────────────────────────
+deathCross = ta.crossunder(shortEMA, longEMA)
+if exitOnCross and deathCross and strategy.position_size > 0
+    strategy.close("Long", comment = "Death Cross")
+
+// ── RESET WHEN FLAT ────────────────────────────
+if strategy.position_size == 0
+    highestHighSinceEntry := na
+    tpLevel := na
+    initialSL := na
+    inReEntryPosition := false
+    reEntrySpecialStopLevel := na
+
+// ── VISUALS ────────────────────────────────────
+plot(reEntryLevel, "Re-Entry Level", color = color.orange, style = plot.style_linebr, linewidth = 2)
+plot(useReEntrySpecialStop and not na(reEntrySpecialStopLevel) ? reEntrySpecialStopLevel : na, "Re-Entry Special Stop", color = color.red, style = plot.style_linebr, linewidth = 2)
+
+plotshape(showLabels and mainSetup,           title = "Main Setup", location = location.belowbar, color = color.yellow, style = shape.circle, size = size.small, text = "S")
+plotshape(showLabels and reEntryTrigger,      title = "Re Trigger", location = location.belowbar, color = color.aqua,   style = shape.circle, size = size.small, text = "R")
+plotshape(showLabels and enterLong,           title = "BUY",        location = location.belowbar, color = #00FF88,    style = shape.triangleup, size = size.normal, text = "BUY")
+plotshape(showLabels and deathCross and strategy.position_size[1] > 0, title = "SELL", location = location.abovebar, color = #FF5252, style = shape.triangledown, size = size.normal, text = "SELL")
+
+// ── INFO TABLE ─────────────────────────────────
+var table info = table.new(position.top_right, 1, 2, bgcolor = color.new(color.black, 80))
+if barstate.islast
+    table.cell(info, 0, 0, "Lookback", text_color = color.white)
+    table.cell(info, 0, 1, str.tostring(lookbackDays) + " days", text_color = color.orange)

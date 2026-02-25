@@ -1,0 +1,119 @@
+//@version=6
+indicator('Quantum Confluence [Trendilo + BSP] v3', shorttitle="Quant_Conf_v3", overlay=false)
+
+// =============================================================================
+// 1. SETTINGS
+// =============================================================================
+group_trend = "Trendilo (Price Momentum)"
+src         = input.source(close, title='Source', group=group_trend)
+smooth      = input.int(1, title='ROC Length', minval=1, group=group_trend)
+length      = input.int(50, title='Lookback Length', minval=1, group=group_trend)
+sens        = input.float(1.0, "Trendilo Sensitivity", minval=0.1, maxval=5.0, group=group_trend)
+bmult       = input.float(1.0, 'RMS Band Multiplier', group=group_trend)
+
+group_bsp   = "BSP (Volume Pressure)"
+bsp_len     = input.int(20, "BSP Adaptive Length", group=group_bsp)
+bsp_sens    = input.float(1.0, "BSP Sensitivity", group=group_bsp)
+
+// --- NEW: Custom Color Inputs ---
+group_col   = "Line & Histogram Colors"
+c_bull_neon = input.color(#00FFFF, "Bullish (Strong Confluence)", group=group_col)
+c_bull_fade = input.color(color.new(#00FFFF, 60), "Bullish (Weak/No Confluence)", group=group_col)
+c_bear_neon = input.color(#FF00FF, "Bearish (Strong Confluence)", group=group_col)
+c_bear_fade = input.color(color.new(#FF00FF, 60), "Bearish (Weak/No Confluence)", group=group_col)
+c_neutral   = input.color(color.gray, "RMS Bands & Zero Line", group=group_col)
+
+group_div       = "Divergences"
+show_reg        = input.bool(true, "Show Regular?", group=group_div)
+show_hid        = input.bool(true, "Show Hidden?", group=group_div)
+c_div_bull_reg  = input.color(#00FFFF, "Regular Bullish Color", group=group_div)
+c_div_bull_hid  = input.color(color.gray, "Hidden Bullish Color", group=group_div)
+c_div_bear_reg  = input.color(#FF00FF, "Regular Bearish Color", group=group_div)
+c_div_bear_hid  = input.color(color.gray, "Hidden Bearish Color", group=group_div)
+
+// =============================================================================
+// 2. ADAPTIVE ENGINE
+// =============================================================================
+get_ama(float val, int len, float s) =>
+    float change = math.abs(close - close[10])
+    float volatility = ta.sma(math.abs(close - close[1]), 10)
+    float er = volatility != 0 ? change / (volatility * 10) : 0
+    float alpha = math.pow(er * (2.0 / (len + 1)), s)
+    var float ama = val
+    ama := alpha * val + (1 - alpha) * nz(ama[1])
+    ama
+
+calc_z(val, len) => (val - ta.sma(val, len)) / math.max(ta.stdev(val, len), 0.0001)
+
+// =============================================================================
+// 3. BSP CALCULATIONS (The Histogram)
+// =============================================================================
+float raw_bp = (close - math.min(low, close)) * volume
+float raw_sp = (math.max(high, close) - close) * volume
+
+float adapt_bp = get_ama(raw_bp, bsp_len, bsp_sens)
+float adapt_sp = get_ama(raw_sp, bsp_len, bsp_sens)
+
+float z_bsp = calc_z(adapt_bp - adapt_sp, length)
+
+// =============================================================================
+// 4. TRENDILO CALCULATIONS (The Line)
+// =============================================================================
+float pch = ta.change(src, smooth) / src * 100
+float adapt_pch = get_ama(pch, length, sens)
+
+float z_trendilo = calc_z(adapt_pch, length)
+float rms = bmult * math.sqrt(math.sum(z_trendilo * z_trendilo, length) / length)
+
+// =============================================================================
+// 5. CONFLUENCE LOGIC
+// =============================================================================
+bool trend_bull = z_trendilo > rms
+bool trend_bear = z_trendilo < -rms
+
+bool bsp_bull = z_bsp > 0
+bool bsp_bear = z_bsp < 0
+
+// Assign user-selected colors
+color line_col = (trend_bull and bsp_bull) ? c_bull_neon : 
+                 (trend_bear and bsp_bear) ? c_bear_neon : 
+                 (z_trendilo > 0 ? c_bull_fade : c_bear_fade)
+
+// =============================================================================
+// 6. PLOTS
+// =============================================================================
+hline(0, color=c_neutral, linestyle=hline.style_solid)
+hline(2.0, color=color.new(c_neutral, 50), linestyle=hline.style_dashed)
+hline(-2.0, color=color.new(c_neutral, 50), linestyle=hline.style_dashed)
+
+// Plot BSP Histogram
+plot(z_bsp, "Net BSP (Z)", color=z_bsp > 0 ? color.new(c_bull_neon, 80) : color.new(c_bear_neon, 80), style=plot.style_columns)
+
+// Plot RMS Bands
+posrms = plot(rms, "Upper RMS", color=color.new(c_neutral, 70))
+negrms = plot(-rms, "Lower RMS", color=color.new(c_neutral, 70))
+
+// Plot Trendilo Line
+plot(z_trendilo, "Trendilo (Z)", color=line_col, linewidth=3)
+
+// =============================================================================
+// 7. DIVERGENCE ENGINE
+// =============================================================================
+int lb = 5
+float pl = ta.pivotlow(z_trendilo, lb, lb)
+float ph = ta.pivothigh(z_trendilo, lb, lb)
+
+float prev_pl_price = ta.valuewhen(not na(pl), low[lb], 1)
+float prev_pl_osc   = ta.valuewhen(not na(pl), z_trendilo[lb], 1)
+float prev_ph_price = ta.valuewhen(not na(ph), high[lb], 1)
+float prev_ph_osc   = ta.valuewhen(not na(ph), z_trendilo[lb], 1)
+
+bool reg_bull = not na(pl) and (low[lb] < prev_pl_price) and (z_trendilo[lb] > prev_pl_osc)
+bool hid_bull = not na(pl) and (low[lb] > prev_pl_price) and (z_trendilo[lb] < prev_pl_osc)
+bool reg_bear = not na(ph) and (high[lb] > prev_ph_price) and (z_trendilo[lb] < prev_ph_osc)
+bool hid_bear = not na(ph) and (high[lb] < prev_ph_price) and (z_trendilo[lb] > prev_ph_osc)
+
+plotshape(show_reg and reg_bull, "Reg Bull", shape.triangleup, location.bottom, c_div_bull_reg, size=size.tiny, offset=-lb)
+plotshape(show_hid and hid_bull, "Hid Bull", shape.triangleup, location.bottom, c_div_bull_hid, size=size.tiny, offset=-lb)
+plotshape(show_reg and reg_bear, "Reg Bear", shape.triangledown, location.top, c_div_bear_reg, size=size.tiny, offset=-lb)
+plotshape(show_hid and hid_bear, "Hid Bear", shape.triangledown, location.top, c_div_bear_hid, size=size.tiny, offset=-lb)

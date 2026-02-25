@@ -1,0 +1,237 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// © Liquidity Zones + FVG Indicator
+
+//@version=5
+indicator("Liquidity Zones + FVG", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+grpZones    = "Liquidity Zones"
+lookback    = input.int(10,    "Swing Lookback Period",   minval=3,  maxval=50,  group=grpZones)
+max_zones   = input.int(40,    "Max Zones Displayed",     minval=5,  maxval=100, group=grpZones)
+atr_mult    = input.float(0.3, "Zone Height (ATR mult)",  minval=0.05, maxval=1.0, step=0.05, group=grpZones)
+atr_len     = input.int(14,    "ATR Length",              minval=5,  maxval=50,  group=grpZones)
+show_bull   = input.bool(true, "Show Bullish Zones (support)", group=grpZones)
+show_bear   = input.bool(true, "Show Bearish Zones (resistance)", group=grpZones)
+touch_dist  = input.float(0.5, "Touch Detection (ATR mult)", minval=0.1, maxval=2.0, step=0.1, group=grpZones, tooltip="How close price must get to the zone to count as a touch")
+
+grpFVG      = "Fair Value Gaps"
+show_fvg    = input.bool(true, "Show FVG",                group=grpFVG)
+max_fvg     = input.int(15,    "Max FVG Displayed",       minval=1,  maxval=50,  group=grpFVG)
+fvg_bull_col = input.color(color.new(color.teal, 75), "Bullish FVG Color", group=grpFVG)
+fvg_bear_col = input.color(color.new(color.red, 75),  "Bearish FVG Color", group=grpFVG)
+
+// ─── TYPES ────────────────────────────────────────────────────────────────────
+type LiqZone
+    float   level
+    float   top
+    float   bot
+    bool    is_bull
+    int     touches
+    int     born_bar
+    box     bx
+    bool    broken
+
+type FVGZone
+    float   top
+    float   bot
+    bool    is_bull
+    int     born_bar
+    box     bx
+    label   lbl
+    bool    filled
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+var LiqZone[] zones        = array.new<LiqZone>()
+var LiqZone[] broken_zones = array.new<LiqZone>()
+var FVGZone[] fvgs         = array.new<FVGZone>()
+
+atr_val = ta.atr(atr_len)
+half_h  = nz(atr_val, 0.001) * atr_mult * 0.5
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+get_zone_color(int touches, bool is_bull) =>
+    if is_bull
+        switch
+            touches >= 4 => color.new(#00695C, 20)
+            touches == 3 => color.new(color.teal, 50)
+            touches == 2 => color.new(color.teal, 70)
+            =>              color.new(color.teal, 85)
+    else
+        switch
+            touches >= 4 => color.new(#B71C1C, 20)
+            touches == 3 => color.new(color.red, 50)
+            touches == 2 => color.new(color.red, 70)
+            =>              color.new(color.red, 85)
+
+get_border_color(int touches, bool is_bull) =>
+    if is_bull
+        switch
+            touches >= 3 => color.new(color.teal, 30)
+            =>              color.new(color.teal, 60)
+    else
+        switch
+            touches >= 3 => color.new(color.red, 30)
+            =>              color.new(color.red, 60)
+
+// Duplicate check
+is_duplicate(float lvl, bool bull, float threshold) =>
+    result = false
+    sz = array.size(zones)
+    if sz > 0
+        for i = 0 to sz - 1
+            z = array.get(zones, i)
+            if not z.broken and z.is_bull == bull and math.abs(z.level - lvl) < threshold
+                result := true
+                break
+    result
+
+// ─── SWING DETECTION ──────────────────────────────────────────────────────────
+swing_hi = ta.pivothigh(high, lookback, lookback)
+swing_lo = ta.pivotlow(low, lookback, lookback)
+
+bool atr_ready = not na(atr_val) and atr_val > 0
+
+// New swing high → bearish (resistance) zone
+if not na(swing_hi) and show_bear and atr_ready
+    lvl   = swing_hi
+    top_  = lvl + half_h
+    bot_  = lvl - half_h
+    born  = bar_index - lookback
+    if not is_duplicate(lvl, false, atr_val * 0.4)
+        bx_ = box.new(born, top_, bar_index, bot_, bgcolor=get_zone_color(1, false), border_color=get_border_color(1, false), border_width=1, border_style=line.style_solid)
+        array.push(zones, LiqZone.new(lvl, top_, bot_, false, 1, born, bx_, false))
+
+// New swing low → bullish (support) zone
+if not na(swing_lo) and show_bull and atr_ready
+    lvl   = swing_lo
+    top_  = lvl + half_h
+    bot_  = lvl - half_h
+    born  = bar_index - lookback
+    if not is_duplicate(lvl, true, atr_val * 0.4)
+        bx_ = box.new(born, top_, bar_index, bot_, bgcolor=get_zone_color(1, true), border_color=get_border_color(1, true), border_width=1, border_style=line.style_solid)
+        array.push(zones, LiqZone.new(lvl, top_, bot_, true, 1, born, bx_, false))
+
+// ─── UPDATE ZONES: touches, breakouts, visuals ────────────────────────────────
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        if i >= array.size(zones)
+            continue
+        z = array.get(zones, i)
+        
+        // Check breakout — triggers on wick (shadow) alone
+        broke = false
+        if z.is_bull
+            if low < z.bot
+                broke := true
+        else
+            if high > z.top
+                broke := true
+
+        if broke
+            // Trim rectangle: right edge stops at the breakout candle
+            box.set_right(z.bx, bar_index)
+            z.broken := true
+            // Move to broken_zones — box stays on chart, frozen in place
+            array.push(broken_zones, z)
+            array.remove(zones, i)
+            continue
+
+        // Check touch (wick into zone without close breaking through)
+        if atr_ready and bar_index > z.born_bar + lookback
+            touched = false
+            if z.is_bull
+                if low <= z.top + atr_val * touch_dist and low >= z.bot and close > z.bot
+                    touched := true
+            else
+                if high >= z.bot - atr_val * touch_dist and high <= z.top and close < z.top
+                    touched := true
+            if touched
+                z.touches += 1
+
+        // Extend right edge only for active zones
+        box.set_right(z.bx, bar_index + 5)
+        box.set_bgcolor(z.bx, get_zone_color(z.touches, z.is_bull))
+        box.set_border_color(z.bx, get_border_color(z.touches, z.is_bull))
+
+// ─── CAP BROKEN ZONES (prevent max_boxes overflow) ───────────────────────────
+while array.size(broken_zones) > max_zones
+    bz0 = array.get(broken_zones, 0)
+    box.delete(bz0.bx)
+    array.remove(broken_zones, 0)
+
+// ─── CAP ACTIVE ZONE COUNT ──────────────────────────────────────────────────
+while array.size(zones) > max_zones
+    z0 = array.get(zones, 0)
+    box.delete(z0.bx)
+    array.remove(zones, 0)
+
+// ─── FVG DETECTION ────────────────────────────────────────────────────────────
+if show_fvg and bar_index > 2 and atr_ready
+    // Bullish FVG: gap up — low[0] > high[2]
+    if low > high[2] and close[1] > open[1]
+        gap_top = low
+        gap_bot = high[2]
+        if gap_top - gap_bot > atr_val * 0.05
+            bx_ = box.new(bar_index - 1, gap_top, bar_index + 5, gap_bot, bgcolor=fvg_bull_col, border_color=color.new(color.teal, 50), border_width=1)
+            lbl_ = label.new(bar_index - 1, gap_top, "FVG", style=label.style_none, textcolor=color.new(color.teal, 30), size=size.small)
+            array.push(fvgs, FVGZone.new(gap_top, gap_bot, true, bar_index, bx_, lbl_, false))
+
+    // Bearish FVG: gap down — high[0] < low[2]
+    if high < low[2] and close[1] < open[1]
+        gap_top = low[2]
+        gap_bot = high
+        if gap_top - gap_bot > atr_val * 0.05
+            bx_ = box.new(bar_index - 1, gap_top, bar_index + 5, gap_bot, bgcolor=fvg_bear_col, border_color=color.new(color.red, 50), border_width=1)
+            lbl_ = label.new(bar_index - 1, gap_top, "FVG", style=label.style_none, textcolor=color.new(color.red, 30), size=size.small)
+            array.push(fvgs, FVGZone.new(gap_top, gap_bot, false, bar_index, bx_, lbl_, false))
+
+// ─── UPDATE FVG ZONES ─────────────────────────────────────────────────────────
+if show_fvg and array.size(fvgs) > 0
+    for i = array.size(fvgs) - 1 to 0
+        if i >= array.size(fvgs)
+            continue
+        fz = array.get(fvgs, i)
+
+        // Check mitigation
+        mitigated = false
+        if fz.is_bull
+            if close < fz.bot
+                mitigated := true
+        else
+            if close > fz.top
+                mitigated := true
+
+        if mitigated
+            box.delete(fz.bx)
+            label.delete(fz.lbl)
+            array.remove(fvgs, i)
+            continue
+
+        // Extend right edge
+        box.set_right(fz.bx, bar_index + 5)
+
+// Cap FVG count
+while array.size(fvgs) > max_fvg
+    fz0 = array.get(fvgs, 0)
+    box.delete(fz0.bx)
+    label.delete(fz0.lbl)
+    array.remove(fvgs, 0)
+
+// ─── INFO TABLE ───────────────────────────────────────────────────────────────
+var table infoTbl = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 80), border_color=color.new(color.gray, 60), border_width=1)
+if barstate.islast
+    active_bull = 0
+    active_bear = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            zi = array.get(zones, i)
+            if zi.is_bull
+                active_bull += 1
+            else
+                active_bear += 1
+    table.cell(infoTbl, 0, 0, "Bull Zones", text_color=color.teal, text_size=size.small)
+    table.cell(infoTbl, 1, 0, str.tostring(active_bull), text_color=color.white, text_size=size.small)
+    table.cell(infoTbl, 0, 1, "Bear Zones", text_color=color.red, text_size=size.small)
+    table.cell(infoTbl, 1, 1, str.tostring(active_bear), text_color=color.white, text_size=size.small)
+    table.cell(infoTbl, 0, 2, "Active FVG", text_color=color.orange, text_size=size.small)
+    table.cell(infoTbl, 1, 2, str.tostring(array.size(fvgs)), text_color=color.white, text_size=size.small)

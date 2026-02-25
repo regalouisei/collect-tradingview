@@ -1,0 +1,178 @@
+//@version=6
+indicator("Reversal Probability Meter PRO v2.3", overlay=false, precision=1)
+
+// ===== Helper Functions ===== //
+clamp(x, minv, maxv) => math.max(minv, math.min(x, maxv))
+safeDiv(num, den) => den != 0 ? num / den : 0
+sigmoid(x) => 100 / (1 + math.exp(-0.08 * (x - 50)))
+
+// ===== INPUTS ===== //
+rsiLen         = input.int(14, "RSI Length")
+emaFastLen     = input.int(50, "Fast EMA (Bias)")
+emaSlowLen     = input.int(200, "Slow EMA (Bias)")
+atrLen         = input.int(14, "ATR Length")
+zoneLook       = input.int(30, "Zone Lookback Bars")
+htfTF          = input.timeframe("15", "Higher Timeframe")
+volMult        = input.float(1.5, "ATR Spike Multiplier")
+sensitivity    = input.string("Normal", "Sensitivity Mode", options=["Aggressive", "Normal", "Conservative"])
+showPanel      = input.bool(true, "Show Info Panel")
+showOscillator = input.bool(true, "Show Histogram Oscillator")
+
+// 🎯 Alert threshold and mode
+alertThreshold = input.float(85.0, "Alert Probability Threshold", step=0.1, minval=0, maxval=100)
+alertMode = input.string("Normal", "Alert Mode", options=["Normal", "Strict"],
+     tooltip="Normal = triggers when ≥3 confirmations + threshold.\nStrict = triggers only when all confirmations are met.")
+
+// 🎨 Custom Colors
+bullBaseColor  = input.color(color.lime, "Bullish Base Color")
+bearBaseColor  = input.color(color.red, "Bearish Base Color")
+
+// ===== CORE CALCULATIONS ===== //
+rsi     = ta.rsi(close, rsiLen)
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+atr     = ta.atr(atrLen)
+atrAvg  = ta.sma(atr, 50)
+distEMA = close - emaFast
+
+// ===== SENSITIVITY ===== //
+float sensMult = switch sensitivity
+    "Aggressive" => 1.4
+    "Normal" => 1.0
+    "Conservative" => 0.7
+
+// ===== HIGHER TIMEFRAME TREND ===== //
+emaFastH = request.security(syminfo.tickerid, htfTF, ta.ema(close, emaFastLen))
+emaSlowH = request.security(syminfo.tickerid, htfTF, ta.ema(close, emaSlowLen))
+trendUpH = emaFastH > emaSlowH
+trendDnH = emaFastH < emaSlowH
+trendStrengthHTF = math.abs(safeDiv(emaFastH - emaSlowH, emaSlowH))
+
+// ===== ZONE CONTEXT ===== //
+swingHigh = ta.highest(high, zoneLook)
+swingLow  = ta.lowest(low, zoneLook)
+zoneRange = math.max(swingHigh - swingLow, 1e-10)
+zonePos   = (close - swingLow) / zoneRange * 100
+inDemand  = zonePos < 35
+inSupply  = zonePos > 65
+zoneTxt   = inDemand ? "DEMAND" : inSupply ? "SUPPLY" : "MID"
+zoneCol   = inDemand ? color.new(color.lime, 30) : inSupply ? color.new(color.red, 30) : color.new(color.gray, 70)
+
+// ===== MOMENTUM ===== //
+rsiSlope  = ta.ema(rsi - rsi[1], 3)
+roc3 = ta.roc(close, 3)
+pressure = ta.ema(rsiSlope * 0.6 + roc3 * 0.4, 3)
+acceleration = ta.ema(math.abs(roc3) * 100, 3)
+burst = acceleration > ta.sma(acceleration, 20) * 1.5
+volSpikeATR = atr > atrAvg * volMult
+
+// ===== VOLUME SPIKE ===== //
+volAvg = ta.sma(volume, 20)
+volSpike = volume > volAvg * 1.3
+
+// ===== CANDLE CONFIRMATION ===== //
+bullEngulf = close > open and open < close[1] and close > open[1] and close[1] < open[1]
+bullPin = (low - close) / (high - low) > 0.6 and close > open
+bearEngulf = close < open and open > close[1] and close < open[1] and close[1] > open[1]
+bearPin = (high - close) / (high - low) > 0.6 and close < open
+
+// ===== BASE SCORES ===== //
+rsiScoreBull  = clamp((50 - math.min(rsi, 50)) * 1.3 * sensMult, 0, 50)
+rsiScoreBear  = clamp((math.max(rsi, 50) - 50) * 1.3 * sensMult, 0, 50)
+zoneScoreBull = inDemand ? 30 : 10
+zoneScoreBear = inSupply ? 30 : 10
+atrScore      = atr > atrAvg * 1.2 ? 15 : atr < atrAvg * 0.8 ? 5 : 10
+distScore     = clamp(math.abs(safeDiv(distEMA, atr)) * 8, 0, 20)
+
+// ===== RAW SCORE AGGREGATION ===== //
+rawBull = rsiScoreBull + zoneScoreBull + atrScore + distScore
+rawBear = rsiScoreBear + zoneScoreBear + atrScore + distScore
+
+if (rsi < 35 or bullEngulf or bullPin) and pressure > 0
+    rawBull += 30 * sensMult
+if (rsi > 65 or bearEngulf or bearPin) and pressure < 0
+    rawBear += 30 * sensMult
+if volSpikeATR and inDemand
+    rawBull += 15
+if volSpikeATR and inSupply
+    rawBear += 15
+if burst and pressure > 0
+    rawBull += 10
+if burst and pressure < 0
+    rawBear += 10
+
+// ===== HIGHER TIMEFRAME WEIGHT ===== //
+htfWeight = burst ? 1.0 : trendStrengthHTF > 0.015 ? 0.8 : 0.9
+if trendUpH
+    rawBear := rawBear * htfWeight
+if trendDnH
+    rawBull := rawBull * htfWeight
+
+// ===== NORMALIZATION ===== //
+total = math.max(rawBull + rawBear, 1e-10)
+bullLinear = (rawBull / total) * 100
+bearLinear = 100 - bullLinear
+bullProb = clamp(sigmoid(bullLinear), 0, 100)
+bearProb = 100 - bullProb
+
+// ===== CONDITIONS ===== //
+bullZoneCond = inDemand
+bearZoneCond = inSupply
+bullPattern  = bullEngulf or bullPin
+bearPattern  = bearEngulf or bearPin
+bullVolCond  = volSpike or volSpikeATR
+bearVolCond  = volSpike or volSpikeATR
+bullDirCond  = close > open
+bearDirCond  = close < open
+bullThresholdCond = bullProb >= alertThreshold
+bearThresholdCond = bearProb >= alertThreshold
+
+// ===== ALERT MODES ===== //
+// STRICT → all confirmations required
+bullValidStrict = bullThresholdCond and bullZoneCond and bullPattern and bullVolCond and bullDirCond and barstate.isconfirmed
+bearValidStrict = bearThresholdCond and bearZoneCond and bearPattern and bearVolCond and bearDirCond and barstate.isconfirmed
+
+// NORMAL → ≥3 confirmations required + threshold
+bullCondCount = (bullZoneCond ? 1 : 0) + (bullPattern ? 1 : 0) + (bullVolCond ? 1 : 0) + (bullDirCond ? 1 : 0) + (bullThresholdCond ? 1 : 0)
+bearCondCount = (bearZoneCond ? 1 : 0) + (bearPattern ? 1 : 0) + (bearVolCond ? 1 : 0) + (bearDirCond ? 1 : 0) + (bearThresholdCond ? 1 : 0)
+
+bullValidNormal = bullCondCount >= 3 and bullThresholdCond and barstate.isconfirmed
+bearValidNormal = bearCondCount >= 3 and bearThresholdCond and barstate.isconfirmed
+
+// final mode selection
+bullValid = alertMode == "Strict" ? bullValidStrict : bullValidNormal
+bearValid = alertMode == "Strict" ? bearValidStrict : bearValidNormal
+
+// ===== SIGNAL STRENGTH ===== //
+signalType = bullProb > bearProb ? "BULL" : bearProb > bullProb ? "BEAR" : "NONE"
+signalStrength = signalType == "BULL" ? bullProb : signalType == "BEAR" ? bearProb : na
+signalText = not na(signalStrength) ? str.tostring(math.round(signalStrength)) + "%" : "-"
+
+// ===== ALERTS ===== //
+alertcondition(bullValid, title="Bullish Smart Reversal", message="✅ Bullish Smart Reversal confirmed on {{ticker}} | Probability above threshold.")
+alertcondition(bearValid, title="Bearish Smart Reversal", message="🔻 Bearish Smart Reversal confirmed on {{ticker}} | Probability above threshold.")
+
+// ===== INFO PANEL ===== //
+if showPanel
+    var table panel = table.new(position.top_right, 4, 2, border_width=1)
+    bullCol = bullProb >= 90 ? color.new(color.lime, 0) : bullProb >= 75 ? color.new(color.yellow, 0) : color.new(color.gray, 60)
+    bearCol = bearProb >= 90 ? color.new(color.red, 0)  : bearProb >= 75 ? color.new(color.orange, 0) : color.new(color.gray, 60)
+    strengthCol = signalType == "BULL" ? bullBaseColor : signalType == "BEAR" ? bearBaseColor : color.new(color.gray, 70)
+
+    table.cell(panel, 0, 0, "BULL %", bgcolor=color.new(color.black, 0), text_color=color.white)
+    table.cell(panel, 0, 1, str.tostring(math.round(bullProb)) + "%", bgcolor=bullCol, text_color=color.white)
+    table.cell(panel, 1, 0, "BEAR %", bgcolor=color.new(color.black, 0), text_color=color.white)
+    table.cell(panel, 1, 1, str.tostring(math.round(bearProb)) + "%", bgcolor=bearCol, text_color=color.white)
+    table.cell(panel, 2, 0, "ZONE", bgcolor=color.new(color.black, 0), text_color=color.white)
+    table.cell(panel, 2, 1, zoneTxt, bgcolor=zoneCol, text_color=color.white)
+    table.cell(panel, 3, 0, "SIGNAL STRENGTH", bgcolor=color.new(color.black, 0), text_color=color.white)
+    table.cell(panel, 3, 1, signalText, bgcolor=strengthCol, text_color=color.white)
+
+// ===== HISTOGRAM ===== //
+strength = bullProb - bearProb
+strengthClamped = clamp(strength, -100, 100)
+bullGradient = color.from_gradient(math.abs(strengthClamped), 0, 100, color.new(bullBaseColor, 85), color.new(bullBaseColor, 0))
+bearGradient = color.from_gradient(math.abs(strengthClamped), 0, 100, color.new(bearBaseColor, 85), color.new(bearBaseColor, 0))
+histColor = strengthClamped > 0 ? bullGradient : strengthClamped < 0 ? bearGradient : color.new(color.gray, 80)
+plot(showOscillator ? strengthClamped : na, title="Reversal Momentum", style=plot.style_histogram, color=histColor, linewidth=3)
+hline(0, "Neutral", color=color.new(color.gray, 70))

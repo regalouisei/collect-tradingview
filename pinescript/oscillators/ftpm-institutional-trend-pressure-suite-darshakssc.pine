@@ -1,0 +1,226 @@
+//@version=6
+indicator("FTPM – Institutional Trend Pressure Suite (Dashboard Size Toggle)", overlay = false, max_labels_count = 500, max_boxes_count = 500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// USER INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━
+fractBars   = input.int(2, "Fractal Sensitivity", minval = 1, maxval = 10)
+bodyWeight  = input.float(1.0,"Body Weight", minval = 0.1, maxval = 5)
+dispWeight  = input.float(1.0,"Displacement Weight", minval = 0.1, maxval = 5)
+smoothLen   = input.int(5, "Smoothing Length", minval = 1, maxval = 50)
+decayFactor = input.float(0.98, "Trend Decay (0.80–1.00)", minval = 0.80, maxval = 1.00)
+
+showShifts      = input.bool(true,  "Show Pressure Shifts")
+showDivergence  = input.bool(true,  "Show Divergences")
+showMTF         = input.bool(true,  "Show Higher Timeframe Pressure")
+showDashboard   = input.bool(true,  "Show Dashboard Panel")
+divBars         = input.int(5, "Divergence Length", minval = 2, maxval = 20)
+htfTf           = input.timeframe("60", "HTF (MTF)")
+
+// ⭐ SIZE TOGGLE
+dashSize = input.string("Medium", "Dashboard Size",
+     options = ["Full", "Medium", "Thin"])
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// FRACTALS (Non-repainting)
+//━━━━━━━━━━━━━━━━━━━━━━━
+ph = ta.pivothigh(high, fractBars, fractBars)
+pl = ta.pivotlow(low,  fractBars, fractBars)
+
+bullFractal = not na(pl)
+bearFractal = not na(ph)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// BODY + DISPLACEMENT
+//━━━━━━━━━━━━━━━━━━━━━━━
+rangeBar     = high - low
+bodyStrength = rangeBar > 0 ? math.abs(close - open) / rangeBar : 0.0
+
+displacement = math.abs(close - close[1])
+dispNorm     = ta.sma(displacement, smoothLen)
+dispStrength = dispNorm > 0 ? displacement / dispNorm : 0.0
+
+eventStrength = math.min(bodyStrength * bodyWeight + dispStrength * dispWeight, 1.0)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// TREND PRESSURE ENGINE
+//━━━━━━━━━━━━━━━━━━━━━━━
+var float trendRaw = 0.0
+
+if bullFractal
+    trendRaw += eventStrength
+else if bearFractal
+    trendRaw -= eventStrength
+else
+    trendRaw *= decayFactor
+
+trendRaw := math.max(-1.0, math.min(1.0, trendRaw))
+normPressure = ((trendRaw + 1.0) / 2.0) * 100
+pressure     = ta.sma(normPressure, smoothLen)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// PRESSURE PLOT
+//━━━━━━━━━━━━━━━━━━━━━━━
+plot(pressure, "Trend Pressure", color = pressure > 50 ? color.green : color.red, linewidth = 2)
+hline(70, "Bull Zone", color = color.new(color.green, 70))
+hline(30, "Bear Zone", color = color.new(color.red, 70))
+hline(50, "Neutral",   color = color.new(color.gray, 80))
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// PRESSURE SHIFTS
+//━━━━━━━━━━━━━━━━━━━━━━━
+bullShift = showShifts and barstate.isconfirmed and pressure[1] < 55 and pressure > 55
+bearShift = showShifts and barstate.isconfirmed and pressure[1] > 45 and pressure < 45
+
+if bullShift
+    label.new(bar_index, pressure, "Bullish Shift", style=label.style_label_down, color=color.green, textcolor=color.white, size=size.tiny)
+
+if bearShift
+    label.new(bar_index, pressure, "Bearish Shift", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// HIGHER TIMEFRAME CONFIRMATION
+//━━━━━━━━━━━━━━━━━━━━━━━
+htfPressure = showMTF ? request.security(syminfo.tickerid, htfTf, pressure, lookahead = barmerge.lookahead_off) : na
+
+mtfBullAlign = showMTF and pressure > 55 and htfPressure > 55
+mtfBearAlign = showMTF and pressure < 45 and htfPressure < 45
+
+plot(showMTF ? htfPressure : na, "HTF Pressure", color=color.new(color.blue, 60), linewidth=1)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// DIVERGENCE ENGINE
+//━━━━━━━━━━━━━━━━━━━━━━━
+pricePh = ta.pivothigh(close, divBars, divBars)
+pricePl = ta.pivotlow(close,  divBars, divBars)
+pressPh = ta.pivothigh(pressure, divBars, divBars)
+pressPl = ta.pivotlow(pressure,  divBars, divBars)
+
+var float lastPricePh = na
+var float lastPressPh = na
+var float lastPricePl = na
+var float lastPressPl = na
+
+var bool bullDivSignal = false
+var bool bearDivSignal = false
+
+bullDivSignal := false
+bearDivSignal := false
+
+if not na(pricePh) and not na(pressPh)
+    if not na(lastPricePh) and not na(lastPressPh) and showDivergence
+        if pricePh > lastPricePh and pressPh < lastPressPh
+            bearDivSignal := true
+            label.new(bar_index - divBars, pressPh, "Bear Div",style=label.style_label_down, color=color.red, textcolor=color.white, size=size.tiny)
+    lastPricePh := pricePh
+    lastPressPh := pressPh
+
+if not na(pricePl) and not na(pressPl)
+    if not na(lastPricePl) and not na(lastPressPl) and showDivergence
+        if pricePl < lastPricePl and pressPl > lastPressPl
+            bullDivSignal := true
+            label.new(bar_index - divBars, pressPl, "Bull Div",style=label.style_label_up, color=color.green, textcolor=color.white, size=size.tiny)
+    lastPricePl := pricePl
+    lastPressPl := pressPl
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME FLAGS
+//━━━━━━━━━━━━━━━━━━━━━━━
+regime =
+     pressure > 70 ? "BULL REGIME" :
+     pressure < 30 ? "BEAR REGIME" :
+     "NEUTRAL"
+
+pressureDirection =
+     pressure > pressure[1] ? "↑ Increasing" :
+     pressure < pressure[1] ? "↓ Decreasing" :
+     "→ Stable"
+
+htfFlag =
+     not showMTF ? "HTF NA" :
+     htfPressure > 70 ? "HTF ↑" :
+     htfPressure < 30 ? "HTF ↓" :
+     "HTF →"
+
+alignFlag =
+     mtfBullAlign ? "Bull Align" :
+     mtfBearAlign ? "Bear Align" :
+     "No Align"
+
+divFlag =
+     bullDivSignal ? "Bull Div" :
+     bearDivSignal ? "Bear Div" :
+     "No Div"
+
+confidence =
+     (mtfBullAlign and pressure > 55 and pressureDirection == "↑ Increasing") ? "Bull Strong" :
+     (mtfBearAlign and pressure < 45 and pressureDirection == "↓ Decreasing") ? "Bear Strong" :
+     "Low"
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// ⭐ DASHBOARD SIZE CONTROL
+//━━━━━━━━━━━━━━━━━━━━━━━
+var box   panel     = na
+var label panelText = na
+
+if showDashboard and barstate.islast
+    if not na(panel)
+        box.delete(panel)
+    if not na(panelText)
+        label.delete(panelText)
+
+    // Default values
+    int w = 20       // width in bars
+    float yTop = 92  // top
+    float yBottom = 86 // bottom
+
+    // FULL SIZE (tallest)
+    if dashSize == "Full"
+        yTop := 100
+        yBottom := 80
+
+    // MEDIUM SIZE
+    if dashSize == "Medium"
+        yTop := 95
+        yBottom := 85
+
+    // THIN SIZE
+    if dashSize == "Thin"
+        yTop := 92
+        yBottom := 88
+
+    int x1 = bar_index - w
+    int x2 = bar_index + w
+
+    panel := box.new(
+         x1, yTop, x2, yBottom,
+         border_color = color.new(color.white, 40),
+         border_width = 1,
+         bgcolor      = color.new(color.black, 70))
+
+    // FULL ORIGINAL RESTORED DASHBOARD TEXT
+    dashTxt =
+         "FTPM INSTITUTIONAL PANEL\n" +
+         "Regime:       " + regime + "\n" +
+         "Pressure:     " + str.tostring(math.round(pressure)) + " (" + pressureDirection + ")\n" +
+         "HTF Regime:   " + htfFlag + "\n" +
+         "Alignment:    " + alignFlag + "\n" +
+         "Divergence:   " + divFlag + "\n" +
+         "Confidence:   " + confidence
+
+    panelText := label.new(
+         x1 + 1, yTop - 1,
+         dashTxt,
+         xloc=xloc.bar_index,
+         yloc=yloc.price,
+         style=label.style_label_left,
+         textcolor=color.white,
+         size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS
+//━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(bullShift,    "Bullish Pressure Shift", "Informational only.")
+alertcondition(bearShift,    "Bearish Pressure Shift", "Informational only.")
+alertcondition(mtfBullAlign, "Bullish MTF Align",      "Informational only.")
+alertcondition(mtfBearAlign, "Bearish MTF Align",      "Informational only.")

@@ -1,0 +1,765 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BullByte
+
+//@version=6
+indicator("Momentum Decay Field [BullByte]", "MDF[BullByte]", overlay=true, max_boxes_count=100, max_bars_back=2000)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+//  MOMENTUM DECAY FIELD [MDF]
+//  Author: BullByte
+//
+//  ─────────────────────────────────────────────────────────────────────────
+//  CONCEPT
+//  ─────────────────────────────────────────────────────────────────────────
+//  Every price impulse carries kinetic energy. That energy does not last
+//  forever — it decays exponentially, modeled after radioactive half-life
+//  physics from nuclear science.
+//
+//  The indicator wraps price in a living energy field (aura) that:
+//    - EXPANDS when a fresh impulse injects energy into the market
+//    - CONTRACTS as energy decays bar by bar through exponential decay
+//    - MORPHS COLOR as momentum transitions from charged to depleted
+//    - MARKS EXHAUSTION when residual energy drops below threshold
+//    - DETECTS DIVERGENCE when new price extremes carry weaker energy
+//    - REMEMBERS past exhaustion zones as future reference levels
+//
+//  Core Formula:
+//    E(t) = E0 * exp(-lambda * t)
+//    where lambda = ln(2) / Half-Life
+//
+//  ─────────────────────────────────────────────────────────────────────────
+//  FEATURES
+//  ─────────────────────────────────────────────────────────────────────────
+//  [1] Exponential decay physics engine with adaptive half-life
+//  [2] Multi-layer energy field overlay with gradient color morphing
+//  [3] Impulse detection weighted by velocity and relative volume
+//  [4] Exhaustion detection with cooldown and anti-repeat filtering
+//  [5] Energy divergence — weaker impulse energy at new price extremes
+//  [6] Exhaustion memory zones rendered as visible filled rectangles
+//  [7] Advanced dashboard with projected decay curve and ETA countdown
+//  [8] Three visual modes: Clean (signals only), Standard, Full
+//  [9] Optional color theme toggle for monochrome preference
+//  [10] Six configurable alert conditions for automation
+//
+//  ─────────────────────────────────────────────────────────────────────────
+//  HOW TO READ
+//  ─────────────────────────────────────────────────────────────────────────
+//  Bright wide field    — Strong active momentum, energy is high
+//  Dimming thin field   — Momentum fading, energy is decaying
+//  Amber/gray field     — Momentum nearly spent
+//  Diamond marker       — Impulse event detected, energy injected
+//  EXH marker           — Energy depleted, exhaustion zone reached
+//  WEAK marker          — New price extreme driven by weaker energy
+//  Colored rectangles   — Previous exhaustion zones stored in memory
+//
+//  ─────────────────────────────────────────────────────────────────────────
+//  VISUAL MODES
+//  ─────────────────────────────────────────────────────────────────────────
+//  Clean:    Signals and dashboard only — no energy field bands
+//  Standard: Inner and mid field layers with energy spine
+//  Full:     All three field tiers with candle tinting
+//
+//  ─────────────────────────────────────────────────────────────────────────
+//  IMPORTANT
+//  ─────────────────────────────────────────────────────────────────────────
+//  This is an informational tool that visualizes the energy state of
+//  momentum to support decision-making. It does NOT produce buy or sell
+//  signals. Combine it with your own analysis and risk management.
+//
+//  NO REPAINT — all calculations use confirmed bar data only
+//  NO LAG — energy measurement begins from the impulse bar itself
+//  NO OSCILLATOR — everything is rendered directly on the price chart
+//
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+//  DISCLAIMER
+//  Trading financial instruments involves substantial risk of loss.
+//  Past energy states do not guarantee future price behavior. The author
+//  assumes no responsibility for any losses incurred through use of this
+//  tool. Always employ proper risk management and never risk capital you
+//  cannot afford to lose.
+//
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+// =============================================================================
+// SECTION 1: USER INPUTS
+// =============================================================================
+
+// Impulse Detection — controls what qualifies as a momentum impulse
+string G_IMP    = "Impulse Detection"
+int    i_impLen = input.int(14, "Impulse Lookback", minval=5, maxval=50, group=G_IMP,
+                  tooltip="ATR period used as baseline for impulse qualification. Lower values make detection more sensitive to smaller moves.")
+float  i_impMul = input.float(1.8, "Impulse Threshold (x ATR)", minval=1.0, maxval=5.0, step=0.1, group=G_IMP,
+                  tooltip="Minimum candle magnitude as a multiple of ATR to qualify as an impulse. Higher values filter for only the strongest moves.")
+int    i_velLen = input.int(3, "Velocity Window", minval=1, maxval=10, group=G_IMP,
+                  tooltip="Number of bars over which directional velocity is measured. Shorter windows respond faster to sudden moves.")
+
+// Decay Physics — controls how energy diminishes over time
+string G_DECAY  = "Decay Physics"
+int    i_halfLf = input.int(8, "Base Half-Life (bars)", minval=2, maxval=50, group=G_DECAY,
+                  tooltip="Number of bars for energy to decay to 50 percent of its initial value. Longer half-life means momentum persists longer on the chart.")
+bool   i_adapHL = input.bool(true, "Adaptive Half-Life", group=G_DECAY,
+                  tooltip="When enabled, stronger impulses automatically receive a longer half-life, allowing powerful moves to sustain their energy field longer.")
+float  i_exhThr = input.float(0.08, "Exhaustion Threshold", minval=0.01, maxval=0.3, step=0.01, group=G_DECAY,
+                  tooltip="Energy ratio below which momentum is declared exhausted. Lower values require more complete depletion before the EXH marker appears.")
+
+// Volume Weighting — optional volume confirmation for impulse energy
+string G_VOL    = "Volume Weighting"
+bool   i_useVol = input.bool(true, "Enable Volume Weighting", group=G_VOL,
+                  tooltip="When enabled, impulse energy is scaled by relative volume. High volume amplifies energy, low volume dampens it.")
+int    i_volLen = input.int(20, "Volume Average Period", minval=5, maxval=100, group=G_VOL,
+                  tooltip="Lookback period for the rolling average volume baseline used in relative volume calculation.")
+
+// Visual Settings — controls appearance and rendering layers
+string G_VIS    = "Visual Settings"
+string i_vMode  = input.string("Standard", "Visual Mode", options=["Clean","Standard","Full"], group=G_VIS,
+                  tooltip="Clean: signals and dashboard only, no energy field. Standard: inner and mid field with spine. Full: all layers with candle tinting.")
+float  i_maxW   = input.float(2.0, "Max Field Width (x ATR)", minval=0.5, maxval=6.0, step=0.1, group=G_VIS,
+                  tooltip="Maximum width of the energy aura at full energy, expressed as a multiple of ATR. Only applies in Standard and Full modes.")
+int    i_fieldT = input.int(80, "Field Base Opacity (%)", minval=10, maxval=100, group=G_VIS,
+                  tooltip="Controls the maximum visibility of the innermost field layer. Higher values produce a more vivid aura.")
+bool   i_theme  = input.bool(true, "Enable Color Theme", group=G_VIS,
+                  tooltip="When disabled, the energy field uses a neutral monochrome palette regardless of impulse direction.")
+string i_bullCS = input.string("Lime", "Bullish Energy Color", options=["Cyan","Lime","Blue","Teal"], group=G_VIS)
+string i_bearCS = input.string("Magenta", "Bearish Energy Color", options=["Magenta","Red","Orange","Coral"], group=G_VIS)
+
+// Signal Filtering — controls marker visibility and cooldown behavior
+string G_SIG    = "Signal Filtering"
+bool   i_shSig  = input.bool(true, "Show Exhaustion Markers", group=G_SIG)
+bool   i_shImp  = input.bool(true, "Show Impulse Markers", group=G_SIG)
+int    i_cdBars = input.int(8, "Signal Cooldown (bars)", minval=1, maxval=50, group=G_SIG,
+                  tooltip="Minimum number of bars required between consecutive signals. Prevents marker clustering during volatile periods.")
+
+// Exhaustion Memory — stores previous exhaustion locations as visible zones
+string G_MEM    = "Exhaustion Memory"
+bool   i_shMem  = input.bool(true, "Show Exhaustion Zones", group=G_MEM,
+                  tooltip="Marks the price range where momentum previously exhausted as colored rectangles. These zones often act as future support or resistance areas and fade over time.")
+int    i_memCnt = input.int(5, "Max Zones Displayed", minval=1, maxval=15, group=G_MEM,
+                  tooltip="Maximum number of exhaustion zones visible on the chart. Most recent zones are shown first. Increase this value to see more historical exhaustion levels.")
+int    i_memFde = input.int(80, "Zone Fade Period (bars)", minval=10, maxval=300, group=G_MEM,
+                  tooltip="Number of bars over which a zone gradually becomes transparent. After this period the zone is removed from the chart entirely. Shorter values keep the chart cleaner.")
+
+// Energy Divergence — detects weakening momentum beneath new price extremes
+string G_DIV    = "Energy Divergence"
+bool   i_shDiv  = input.bool(true, "Detect Energy Divergence", group=G_DIV,
+                  tooltip="Flags instances where price makes a new high or low but the impulse energy behind it is notably weaker than the previous impulse in that direction.")
+
+// Dashboard — information panel showing current energy state and statistics
+string G_DASH   = "Dashboard"
+bool   i_shDash = input.bool(true, "Show Dashboard", group=G_DASH)
+string i_dashPs = input.string("Top Right", "Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=G_DASH)
+string i_dashSz = input.string("Small", "Text Size", options=["Tiny","Small","Normal"], group=G_DASH)
+
+
+// =============================================================================
+// SECTION 2: COLOR ENGINE
+// =============================================================================
+
+// Resolves a color theme name to its corresponding RGB value
+f_themeColor(_name) =>
+    switch _name
+        "Cyan"    => color.rgb(70, 185, 215)
+        "Lime"    => color.rgb(65, 195, 115)
+        "Blue"    => color.rgb(60, 130, 195)
+        "Teal"    => color.rgb(55, 170, 155)
+        "Magenta" => color.rgb(195, 75, 165)
+        "Red"     => color.rgb(195, 80, 80)
+        "Orange"  => color.rgb(205, 145, 60)
+        "Coral"   => color.rgb(200, 115, 95)
+        => color.rgb(140, 140, 155)
+
+// Directional colors switch to monochrome when theme is disabled
+color C_BULL    = i_theme ? f_themeColor(i_bullCS) : color.rgb(180, 185, 200)
+color C_BEAR    = i_theme ? f_themeColor(i_bearCS) : color.rgb(180, 185, 200)
+color C_NEUTRAL = color.rgb(110, 110, 130)
+
+// Fixed accent colors for signals — always visible regardless of theme
+color C_EXHAUST = color.rgb(255, 195, 0)
+color C_DIV_COL = color.rgb(255, 120, 0)
+
+// Dashboard palette — fully opaque to ensure identical rendering on both
+// light and dark chart backgrounds by creating its own visual context
+color C_PNL_BG  = color.rgb(12, 14, 28, 0)
+color C_PNL_HD  = color.rgb(8, 10, 22, 0)
+color C_PNL_BD  = color.rgb(30, 80, 140)
+color C_PNL_SEP = color.rgb(25, 65, 120)
+color C_TXT_BR  = color.rgb(222, 224, 238)
+color C_TXT_DM  = color.rgb(120, 122, 142)
+
+// Morphs field color through three stages as energy decays:
+// High energy  = bright directional (cyan/magenta)
+// Mid energy   = warm amber (universal warning tone)
+// Low energy   = cool gray (momentum spent)
+f_morphColor(_baseCol, _eNorm) =>
+    _warm = color.rgb(255, 180, 40)
+    _cold = i_theme ? color.rgb(80, 80, 100) : color.rgb(130, 130, 145)
+    _eNorm > 0.55 ? color.from_gradient(_eNorm, 0.55, 1.0, _warm, _baseCol) :
+     _eNorm > 0.2 ? color.from_gradient(_eNorm, 0.2, 0.55, _cold, _warm) : _cold
+
+// Applies transparency with value clamped to the valid 0-100 range
+f_alpha(_col, _a) =>
+    color.new(_col, math.round(math.max(0, math.min(100, _a))))
+
+
+// =============================================================================
+// SECTION 3: IMPULSE DETECTION ENGINE
+// =============================================================================
+
+// ATR normalizes all measurements across instruments and timeframes
+float atr = ta.atr(i_impLen)
+
+// Velocity measures directional speed — filters slow drift from true impulse
+float velocity = math.abs(close - close[i_velLen]) / math.max(i_velLen, 1)
+float avgVel   = ta.sma(velocity, i_impLen)
+
+// Relative volume compares current bar against rolling average
+float volAvg = ta.sma(volume, i_volLen)
+float relVol = i_useVol and volAvg > 0 ? volume / volAvg : 1.0
+
+// Body ratio ensures candle has directional conviction, not indecision
+float bodySize  = math.abs(close - open)
+float bodyRatio = (high - low) > 0 ? bodySize / (high - low) : 0.0
+
+// Bullish impulse: strong upward candle exceeding body, range and conviction thresholds
+bool bullImpulse = close > open and
+                   bodySize > atr * i_impMul * 0.5 and
+                   (high - low) > atr * i_impMul * 0.7 and
+                   bodyRatio > 0.45
+
+// Bearish impulse: strong downward candle exceeding body, range and conviction thresholds
+bool bearImpulse = close < open and
+                   bodySize > atr * i_impMul * 0.5 and
+                   (high - low) > atr * i_impMul * 0.7 and
+                   bodyRatio > 0.45
+
+bool isImpulse = bullImpulse or bearImpulse
+int  impDir    = bullImpulse ? 1 : bearImpulse ? -1 : 0
+
+
+// =============================================================================
+// SECTION 4: ENERGY CALCULATION ENGINE
+// =============================================================================
+
+// Velocity boost rewards faster directional moves with more energy
+float velBoost = avgVel > 0 ? math.min(velocity / avgVel, 3.0) : 1.0
+
+// Volume boost confirms institutional participation behind the impulse
+float volBoost = math.min(math.max(relVol, 0.5), 3.0)
+
+// Initial energy combines normalized body magnitude with velocity and volume
+// Capped at 5.0 to prevent outliers from dominating the energy field
+float rawE0 = (bodySize / math.max(atr, 1e-10)) * velBoost * volBoost
+float newE0 = math.min(rawE0, 5.0)
+
+// Decay constant from half-life: lambda = ln(2) / half_life
+f_lambda(_hl) => math.log(2) / math.max(_hl, 1)
+
+// Core exponential decay: energy remaining at time t after impulse
+f_decay(_E0, _lam, _t) => _E0 * math.exp(-_lam * _t)
+
+
+// =============================================================================
+// SECTION 5: PERSISTENT STATE VARIABLES
+// =============================================================================
+
+// Energy lifecycle state tracked across all bars
+var float E0        = 0.0       // Initial energy of the active impulse cycle
+var float lam       = 0.0       // Decay constant for the current cycle
+var int   barsSince = 0         // Bars elapsed since the last impulse event
+var int   dir       = 0         // Active direction: 1 bullish, -1 bearish
+var bool  isExh     = false     // Whether the current cycle has exhausted
+var float impPrice  = 0.0       // Price level at the last impulse bar
+
+// Previous impulse data for energy divergence comparison
+var float prevE0Bull = 0.0      // E0 of the previous bullish impulse
+var float prevE0Bear = 0.0      // E0 of the previous bearish impulse
+var float prevHigh   = 0.0      // Price high at the previous bullish impulse
+var float prevLow    = 0.0      // Price low at the previous bearish impulse
+
+// Signal timing prevents clustering and same-direction repetition
+var int lastSigBar = -9999      // Bar index of the last exhaustion signal
+var int lastImpBar = -9999      // Bar index of the last impulse marker
+var int lastExhDir = 0          // Direction of the last exhaustion event
+
+// Lifetime counters for dashboard statistics
+var int totalImpulses = 0
+var int totalExhausts = 0
+var int totalDivs     = 0
+
+// Cooldown gates computed from previous bar state
+bool impCooldownOk = (bar_index - lastImpBar) >= math.round(i_cdBars * 0.5)
+bool exhCooldownOk = (bar_index - lastSigBar) >= i_cdBars
+
+
+// =============================================================================
+// SECTION 6: ENERGY DIVERGENCE DETECTION
+// =============================================================================
+
+// Checked BEFORE the state machine updates so the comparison uses the
+// previous cycle values. A divergence occurs when price achieves a new
+// extreme but the energy driving it is weaker than the previous impulse
+// in that direction — revealing hidden momentum weakness.
+//
+// When divergence fires on the same bar as an impulse, the impulse marker
+// is suppressed because the WEAK label already communicates both events.
+
+bool bullDivergence = false
+bool bearDivergence = false
+
+if i_shDiv and isImpulse and impCooldownOk
+    if bullImpulse and prevE0Bull > 0
+        if high > prevHigh and newE0 < prevE0Bull * 0.75
+            bullDivergence := true
+            totalDivs     += 1
+    if bearImpulse and prevE0Bear > 0
+        if low < prevLow and newE0 < prevE0Bear * 0.75
+            bearDivergence := true
+            totalDivs     += 1
+
+
+// =============================================================================
+// SECTION 7: STATE MACHINE — ENERGY LIFECYCLE
+// =============================================================================
+
+if isImpulse and impCooldownOk
+    // Stronger impulses persist longer when adaptive half-life is enabled
+    float adaptHL = i_adapHL ? i_halfLf * math.max(0.6, math.min(newE0 / 2.0, 2.2)) : float(i_halfLf)
+
+    if impDir == dir and not isExh
+        // Same direction while active: stack energy with diminishing returns
+        E0       := math.min(E0 * 0.4 + newE0 * 0.8, 5.0)
+        lam      := f_lambda(adaptHL)
+        barsSince := 0
+    else
+        // New direction or post-exhaustion: store previous values for
+        // divergence comparison then begin a fresh energy cycle
+        if bullImpulse
+            prevE0Bull := newE0
+            prevHigh   := high
+        if bearImpulse
+            prevE0Bear := newE0
+            prevLow    := low
+
+        E0        := newE0
+        lam       := f_lambda(adaptHL)
+        dir       := impDir
+        barsSince := 0
+        isExh     := false
+        impPrice  := close
+
+    lastImpBar    := bar_index
+    totalImpulses += 1
+else
+    barsSince += 1
+
+// Current energy level computed from the decay function on every bar
+float curEnergy   = f_decay(E0, lam, barsSince)
+float energyRatio = E0 > 0 ? curEnergy / E0 : 0.0
+float energyNorm  = math.max(0.0, math.min(1.0, curEnergy / 3.0))
+
+// Exhaustion triggers when energy ratio drops below threshold with guards:
+// minimum E0 filters noise, minimum bars prevents premature firing, and
+// anti-repeat blocks same-direction repetition without context change
+bool justExhausted = false
+if energyRatio < i_exhThr and not isExh and E0 > 0.5 and barsSince > 3 and exhCooldownOk
+    if dir != lastExhDir or (bar_index - lastSigBar) > i_cdBars * 3
+        isExh          := true
+        justExhausted  := true
+        lastSigBar     := bar_index
+        lastExhDir     := dir
+        totalExhausts  += 1
+
+
+// =============================================================================
+// SECTION 8: DECAY ETA — PREDICTED BARS TO EXHAUSTION
+// =============================================================================
+
+// Solves the decay equation for remaining time until energy reaches
+// the exhaustion threshold: t = (ln(ratio) - ln(threshold)) / lambda
+
+float decayETA = 0.0
+if lam > 0 and energyRatio > i_exhThr and E0 > 0
+    decayETA := (math.log(energyRatio) - math.log(i_exhThr)) / lam
+
+
+// =============================================================================
+// SECTION 9: VISUAL MODE FLAGS
+// =============================================================================
+
+// Clean mode disables ALL field rendering — only signals and dashboard remain
+// Standard and Full modes progressively add more visual layers
+bool showField = i_vMode != "Clean"
+bool showMid   = showField and (i_vMode == "Standard" or i_vMode == "Full")
+bool showOuter = showField and i_vMode == "Full"
+bool showTint  = showField and i_vMode == "Full"
+bool showSpine = showField and (i_vMode == "Standard" or i_vMode == "Full")
+
+
+// =============================================================================
+// SECTION 10: ENERGY FIELD RENDERING
+// =============================================================================
+
+// Field color morphs through directional, amber, and gray stages
+color dirColor   = dir == 1 ? C_BULL : dir == -1 ? C_BEAR : C_NEUTRAL
+color fieldColor = f_morphColor(dirColor, energyNorm)
+
+// Field width scales with energy — high energy produces wide aura
+float fieldWidth = atr * i_maxW * energyNorm
+bool  fieldOn    = energyNorm > 0.03
+
+// Three-tier boundary system — each checks both fieldOn and its mode flag
+// In Clean mode, showField is false so all boundaries resolve to na
+float innerUp = fieldOn and showField ? high + fieldWidth * 0.18 : na
+float innerDn = fieldOn and showField ? low  - fieldWidth * 0.18 : na
+float midUp   = fieldOn and showMid   ? high + fieldWidth * 0.45 : na
+float midDn   = fieldOn and showMid   ? low  - fieldWidth * 0.45 : na
+float outerUp = fieldOn and showOuter ? high + fieldWidth * 0.78 : na
+float outerDn = fieldOn and showOuter ? low  - fieldWidth * 0.78 : na
+
+// Alpha gradient: inner layers most visible, outer progressively transparent
+float a_inner = 100.0 - i_fieldT * energyNorm
+float a_mid   = a_inner + 16.0
+float a_outer = a_mid + 16.0
+
+// Invisible anchor plots used only as fill boundaries
+// display.none prevents any values from appearing in the status line
+p_h    = plot(high,    "hl", color=na, display=display.none, editable=false)
+p_l    = plot(low,     "ll", color=na, display=display.none, editable=false)
+p_inU  = plot(innerUp, "iU", color=na, display=display.none, editable=false)
+p_inD  = plot(innerDn, "iD", color=na, display=display.none, editable=false)
+p_midU = plot(midUp,   "mU", color=na, display=display.none, editable=false)
+p_midD = plot(midDn,   "mD", color=na, display=display.none, editable=false)
+p_outU = plot(outerUp, "oU", color=na, display=display.none, editable=false)
+p_outD = plot(outerDn, "oD", color=na, display=display.none, editable=false)
+
+// Gradient fills create the energy aura when boundaries are not na
+fill(p_h,    p_inU,  color=f_alpha(fieldColor, a_inner), title="Inner Upper Field")
+fill(p_l,    p_inD,  color=f_alpha(fieldColor, a_inner), title="Inner Lower Field")
+fill(p_inU,  p_midU, color=f_alpha(fieldColor, a_mid),   title="Mid Upper Field")
+fill(p_inD,  p_midD, color=f_alpha(fieldColor, a_mid),   title="Mid Lower Field")
+fill(p_midU, p_outU, color=f_alpha(fieldColor, a_outer), title="Outer Upper Field")
+fill(p_midD, p_outD, color=f_alpha(fieldColor, a_outer), title="Outer Lower Field")
+
+// Energy spine — central line through price visible in Standard and Full
+color spineCol = showSpine and energyNorm > 0.12 ?
+                 f_alpha(fieldColor, 25 + math.round((1.0 - energyNorm) * 40.0)) : na
+plot(showSpine and energyNorm > 0.12 ? hlc3 : na, "Spine",
+     color=spineCol, linewidth=2, style=plot.style_linebr, display=display.pane)
+
+// Candle tinting in Full mode reflects energy state on candle bodies
+color tintColor = na
+if showTint
+    tintColor := energyNorm > 0.5  ? f_alpha(fieldColor, 12) :
+                 energyNorm > 0.2  ? f_alpha(fieldColor, 40) :
+                 energyNorm > 0.08 ? f_alpha(C_NEUTRAL, 55) : na
+barcolor(tintColor)
+
+
+// =============================================================================
+// SECTION 11: SIGNAL MARKERS
+// =============================================================================
+
+// Impulse markers are suppressed when divergence fires on the same bar
+// because the WEAK label already communicates that an impulse occurred
+bool showBullImp = i_shImp and bullImpulse and impCooldownOk and not bullDivergence
+bool showBearImp = i_shImp and bearImpulse and impCooldownOk and not bearDivergence
+bool showBullExh = i_shSig and justExhausted and dir == 1
+bool showBearExh = i_shSig and justExhausted and dir == -1
+bool showBullDiv = i_shDiv and bullDivergence
+bool showBearDiv = i_shDiv and bearDivergence
+
+// Impulse markers — diamond shape at the impulse bar
+plotshape(showBullImp, "Bullish Impulse", shape.diamond, location.belowbar,
+         f_alpha(C_BULL, 5), size=size.small, display=display.pane)
+plotshape(showBearImp, "Bearish Impulse", shape.diamond, location.abovebar,
+         f_alpha(C_BEAR, 5), size=size.small, display=display.pane)
+
+// Exhaustion markers — momentum energy fully depleted
+plotshape(showBullExh, "Bullish Exhaustion", shape.xcross, location.abovebar,
+         C_EXHAUST, size=size.small, text="EXH", textcolor=C_EXHAUST, display=display.pane)
+plotshape(showBearExh, "Bearish Exhaustion", shape.xcross, location.belowbar,
+         C_EXHAUST, size=size.small, text="EXH", textcolor=C_EXHAUST, display=display.pane)
+
+// Energy divergence — price at new extreme but impulse energy is weaker
+plotshape(showBullDiv, "Bullish Divergence", shape.triangledown, location.abovebar,
+         C_DIV_COL, size=size.small, text="WEAK", textcolor=C_DIV_COL, display=display.pane)
+plotshape(showBearDiv, "Bearish Divergence", shape.triangleup, location.belowbar,
+         C_DIV_COL, size=size.small, text="WEAK", textcolor=C_DIV_COL, display=display.pane)
+
+
+// =============================================================================
+// SECTION 12: EXHAUSTION MEMORY ZONES
+// =============================================================================
+
+// When momentum exhausts at a price level, that level often becomes
+// significant for future price action. The memory system stores these
+// locations as colored rectangles (boxes) that gradually fade with age.
+//
+// MEMORY MANAGEMENT uses three-stage pruning:
+//   Stage 1: Age-based removal of zones older than twice the fade period
+//   Stage 2: Count-based cap prevents unbounded array growth
+//   Stage 3: Drawing guard ensures box count stays within platform limits
+
+type ExhZone
+    int   barIdx
+    float priceHigh
+    float priceLow
+    int   zoneDir
+
+var array<ExhZone> exhZones = array.new<ExhZone>()
+var array<box>     memBoxes = array.new<box>()
+
+// Store new exhaustion zone when one is detected
+if justExhausted and i_shMem
+    array.push(exhZones, ExhZone.new(bar_index, high, low, dir))
+
+// Stage 1: Remove zones that have aged beyond twice the fade period
+// These are fully invisible and consume memory without purpose
+int zSize = array.size(exhZones)
+if zSize > 0
+    for idx = zSize - 1 to 0
+        ExhZone zAge = array.get(exhZones, idx)
+        if bar_index - zAge.barIdx > i_memFde * 2
+            array.remove(exhZones, idx)
+
+// Stage 2: Cap array size to prevent unbounded growth on long charts
+int zoneCap = math.max(i_memCnt * 2, 10)
+while array.size(exhZones) > zoneCap
+    array.shift(exhZones)
+
+// Render zones as semi-transparent filled rectangles on the last bar
+if i_shMem and barstate.islast
+    // Clear all previous zone boxes before redrawing
+    while array.size(memBoxes) > 0
+        box.delete(array.pop(memBoxes))
+
+    int totalZones  = array.size(exhZones)
+    int renderCount = math.min(totalZones, i_memCnt)
+
+    // Only proceed if there are zones to render
+    if renderCount > 0
+        int startAt     = math.max(0, totalZones - renderCount)
+        int boxesDrawn  = 0
+        int maxBoxes    = 80
+
+        for i = startAt to totalZones - 1
+            // Stop if drawing budget is exhausted
+            if boxesDrawn >= maxBoxes
+                break
+
+            ExhZone z = array.get(exhZones, i)
+            int age   = bar_index - z.barIdx
+
+            if age < i_memFde
+                // Fade ratio runs from 1.0 (fresh zone) to 0.0 (fully aged)
+                float fadeR = 1.0 - (float(age) / float(i_memFde))
+
+                // Ensure zone has minimum visible height even on small-range bars
+                float minH  = nz(atr, 1.0) * 0.25
+                float zMid  = (z.priceHigh + z.priceLow) / 2.0
+                float zHalf = math.max((z.priceHigh - z.priceLow) / 2.0, minH / 2.0)
+                float zTop  = zMid + zHalf
+                float zBot  = zMid - zHalf
+
+                // Colors: fresh zones are more opaque, aged zones more transparent
+                int   bgAlph = math.round(92 - fadeR * 28)
+                int   bdAlph = math.round(78 - fadeR * 40)
+                color bgCol  = z.zoneDir == 1 ? f_alpha(C_BULL, bgAlph) : f_alpha(C_BEAR, bgAlph)
+                color bdCol  = z.zoneDir == 1 ? f_alpha(C_BULL, bdAlph) : f_alpha(C_BEAR, bdAlph)
+                color txCol  = f_alpha(C_TXT_BR, math.round(100 - fadeR * 70))
+
+                // Zone label embedded inside the box
+                string zTxt = z.zoneDir == 1 ? "BULL EXH" : "BEAR EXH"
+
+                // Render the zone as a filled rectangle extending from origin to right edge
+                array.push(memBoxes, box.new(z.barIdx, zTop, bar_index + 10, zBot,
+                           border_color=bdCol, border_width=1,
+                           bgcolor=bgCol, text=zTxt, text_size=size.tiny,
+                           text_color=txCol, text_halign=text.align_right,
+                           text_valign=text.align_center))
+                boxesDrawn += 1
+
+
+// =============================================================================
+// SECTION 13: DASHBOARD
+// =============================================================================
+
+// Fully opaque dark panel ensures consistent readability on both light and
+// dark chart themes. Every cell specifies its own background color so no
+// cell ever inherits transparency from the chart environment.
+
+f_dashPos(_p) =>
+    switch _p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_dashSz(_s) =>
+    switch _s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.small
+
+var table dash = i_shDash ? table.new(f_dashPos(i_dashPs), 3, 13,
+                 bgcolor=C_PNL_BG, border_color=C_PNL_BD,
+                 border_width=1, frame_color=C_PNL_BD, frame_width=2) : na
+
+if i_shDash and barstate.islast and not na(dash)
+    tSz = f_dashSz(i_dashSz)
+
+    // Phase classification based on current normalized energy
+    string phase = energyNorm > 0.7      ? "CHARGED"  :
+                   energyNorm > 0.45     ? "ACTIVE"   :
+                   energyNorm > 0.2      ? "DECAYING" :
+                   energyNorm > i_exhThr ? "FADING"   : "DEPLETED"
+
+    color phaseCol = energyNorm > 0.7      ? color.rgb(0, 255, 130)  :
+                     energyNorm > 0.45     ? color.rgb(60, 200, 255) :
+                     energyNorm > 0.2      ? color.rgb(255, 200, 40) :
+                     energyNorm > i_exhThr ? color.rgb(255, 130, 40) :
+                     color.rgb(255, 60, 60)
+
+    // Row 0 — Header
+    table.cell(dash, 0, 0, "MOMENTUM DECAY FIELD[BullByte]", text_color=fieldColor,
+               text_size=tSz, bgcolor=C_PNL_HD, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 0, 2, 0)
+
+    // Row 1 — Separator
+    table.cell(dash, 0, 1, "─────────────────────────────", text_color=C_PNL_SEP,
+               text_size=size.tiny, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.merge_cells(dash, 0, 1, 2, 1)
+
+    // Row 2 — Energy bar with percentage readout
+    int filled = math.round(energyNorm * 16)
+    string eBar = ""
+    for k = 0 to 15
+        eBar += k < filled ? "█" : "░"
+
+    table.cell(dash, 0, 2, "ENERGY", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 2, eBar, text_color=phaseCol, text_size=size.tiny,
+               text_halign=text.align_center, bgcolor=color.rgb(10, 10, 20, 0))
+    table.cell(dash, 2, 2, str.tostring(math.round(energyNorm * 100)) + "%",
+               text_color=phaseCol, text_size=tSz, text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 3 — Phase state and directional bias
+    string dirStr = dir == 1 ? "BULL" : dir == -1 ? "BEAR" : "FLAT"
+    color  dirCol = dir == 1 ? C_BULL : dir == -1 ? C_BEAR : C_NEUTRAL
+
+    table.cell(dash, 0, 3, "PHASE", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 3, phase, text_color=phaseCol, text_size=tSz,
+               text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 3, dirStr, text_color=dirCol, text_size=tSz,
+               text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 4 — Separator
+    table.cell(dash, 0, 4, "─────────────────────────────", text_color=C_PNL_SEP,
+               text_size=size.tiny, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.merge_cells(dash, 0, 4, 2, 4)
+
+    // Row 5 — Initial energy magnitude and strength classification
+    string e0Cls = E0 > 3.5 ? "Extreme" : E0 > 2.5 ? "Strong" : E0 > 1.5 ? "Moderate" : "Light"
+    color  e0Col = E0 > 3.5 ? color.rgb(0, 255, 130)  : E0 > 2.5 ? color.rgb(60, 200, 255) :
+                   E0 > 1.5 ? color.rgb(255, 200, 40) : color.rgb(255, 130, 40)
+
+    table.cell(dash, 0, 5, "E0 INITIAL", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 5, str.tostring(math.round(E0, 2)), text_color=C_TXT_BR,
+               text_size=tSz, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 5, e0Cls, text_color=e0Col, text_size=size.tiny,
+               text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 6 — Half-life duration and bars elapsed since last impulse
+    float curHL = lam > 0 ? math.log(2) / lam : 0
+    table.cell(dash, 0, 6, "HALF-LIFE", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 6, str.tostring(math.round(curHL, 1)) + " bars",
+               text_color=C_TXT_BR, text_size=tSz, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 6, "ELP " + str.tostring(barsSince), text_color=C_TXT_DM,
+               text_size=size.tiny, text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 7 — Predicted bars until exhaustion with visual countdown
+    string etaStr = decayETA > 0 ? str.tostring(math.round(decayETA, 1)) + " bars" : isExh ? "EXHAUSTED" : "--"
+    color  etaCol = decayETA > 8 ? C_TXT_BR       : decayETA > 3 ? color.rgb(255, 200, 40) : decayETA > 0 ? color.rgb(255, 130, 40) : isExh        ? color.rgb(255, 60, 60)  : C_TXT_DM
+
+    int etaBlks = decayETA > 0 ? math.round(math.min(decayETA / 20.0, 1.0) * 8) : 0
+    string etaVis = ""
+    for k = 0 to 7
+        etaVis += k < etaBlks ? "▮" : "▯"
+
+    table.cell(dash, 0, 7, "ETA TO EXH", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 7, etaStr, text_color=etaCol, text_size=tSz,
+               text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 7, etaVis, text_color=etaCol, text_size=size.tiny,
+               text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 8 — Separator
+    table.cell(dash, 0, 8, "─────────────────────────────", text_color=C_PNL_SEP,
+               text_size=size.tiny, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.merge_cells(dash, 0, 8, 2, 8)
+
+    // Row 9 — Decay curve sparkline projected across three half-lives
+    // Each character represents a future time step showing how energy
+    // will diminish, giving a visual forecast of the decay trajectory
+    float stepHL = lam > 0 ? math.log(2) / lam : 10.0
+    float stepSz = (stepHL * 3.0) / 20.0
+
+    string spark = ""
+    for k = 0 to 19
+        float sE = f_decay(curEnergy, lam, float(k) * stepSz)
+        float sN = math.max(0.0, math.min(1.0, sE / 3.0))
+        spark += sN > 0.82 ? "▇" : sN > 0.66 ? "▆" : sN > 0.52 ? "▅" :
+                 sN > 0.38 ? "▄" : sN > 0.25 ? "▃" : sN > 0.13 ? "▂" :
+                 sN > 0.04 ? "▁" : "·"
+
+    table.cell(dash, 0, 9, "DECAY CURVE", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 9, spark, text_color=phaseCol, text_size=size.tiny,
+               text_halign=text.align_center, bgcolor=color.rgb(8, 8, 16, 0))
+    table.cell(dash, 2, 9, "NOW >>", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 10 — Separator
+    table.cell(dash, 0, 10, "─────────────────────────────", text_color=C_PNL_SEP,
+               text_size=size.tiny, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.merge_cells(dash, 0, 10, 2, 10)
+
+    // Row 11 — Statistics labels
+    table.cell(dash, 0, 11, "IMPULSES", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 11, "EXHAUSTIONS", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 11, "DIVERGENCES", text_color=C_TXT_DM, text_size=size.tiny,
+               text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+    // Row 12 — Statistics values
+    table.cell(dash, 0, 12, str.tostring(totalImpulses), text_color=C_TXT_BR,
+               text_size=tSz, text_halign=text.align_left, bgcolor=C_PNL_BG)
+    table.cell(dash, 1, 12, str.tostring(totalExhausts), text_color=C_EXHAUST,
+               text_size=tSz, text_halign=text.align_center, bgcolor=C_PNL_BG)
+    table.cell(dash, 2, 12, str.tostring(totalDivs), text_color=C_DIV_COL,
+               text_size=tSz, text_halign=text.align_right, bgcolor=C_PNL_BG)
+
+
+// =============================================================================
+// SECTION 14: ALERT CONDITIONS
+// =============================================================================
+
+alertcondition(bullImpulse and impCooldownOk,    "Bullish Impulse",    "MDF: Bullish impulse detected. Energy field activated.")
+alertcondition(bearImpulse and impCooldownOk,    "Bearish Impulse",    "MDF: Bearish impulse detected. Energy field activated.")
+alertcondition(justExhausted and dir == 1,       "Bullish Exhaustion", "MDF: Bullish momentum energy exhausted.")
+alertcondition(justExhausted and dir == -1,      "Bearish Exhaustion", "MDF: Bearish momentum energy exhausted.")
+alertcondition(justExhausted,                    "Any Exhaustion",     "MDF: Momentum energy has fully depleted.")
+alertcondition(bullDivergence or bearDivergence, "Energy Divergence",  "MDF: Energy divergence at new price extreme.")
+
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// END OF SCRIPT — Momentum Decay Field [MDF] by BullByte
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

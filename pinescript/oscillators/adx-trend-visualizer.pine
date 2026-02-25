@@ -1,0 +1,270 @@
+//@version=5
+indicator('ADX Trend Visualizer')
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Inputs
+// ═══════════════════════════════════════════════════════════════════════════════
+len = input.int(14, 'ADX Length')
+adxSmooth = input.int(7, 'ADX Smoothing')
+trendThreshold = input.int(25, 'Trend Strength Threshold', minval=10, maxval=50)
+
+// 필터 설정
+minADXFilter = input.int(20, 'Minimum ADX for Signals', minval=5, maxval=30, tooltip='ADX가 이 값 이상일 때만 신호 발생', group='Filters')
+useVolumeFilter = input.bool(false, 'Use Volume Filter', tooltip='거래량 증가 시에만 신호 발생', group='Filters')
+volumeMultiplier = input.float(1.5, 'Volume Multiplier', minval=1.0, maxval=3.0, step=0.1, group='Filters')
+volumeMAPeriod = input.int(20, 'Volume MA Period', minval=5, maxval=100, group='Filters')
+
+// 표시 설정
+showBackground = input.bool(true, 'Show Background Color', group='Display')
+showTrendLine = input.bool(true, 'Show Trend Line', group='Display')
+showADXLine = input.bool(false, 'Show ADX Reference Line', group='Display')
+showDI = input.bool(false, 'Show DI Lines', group='Display')
+showBarColor = input.bool(false, 'Show Trend Bar Colors', group='Display')
+barColorTransparency = input.int(0, 'Bar Color Transparency', minval=0, maxval=100, group='Display')
+
+// 🆕 라인 색상 및 투명도 설정
+trendLineTransparency = input.int(0, 'Trend Line Transparency', minval=0, maxval=100, group='Line Colors')
+adxLineColor = input.color(color.new(color.blue, 70), 'ADX Reference Line Color', group='Line Colors')
+diPlusColor = input.color(color.new(color.green, 60), 'DI+ Line Color', group='Line Colors')
+diMinusColor = input.color(color.new(color.red, 60), 'DI- Line Color', group='Line Colors')
+bgop = input.int(80, 'BG Opacity', minval=5, maxval=100, group='Line Colors')
+// 테이블 설정
+showTable = input.bool(true, 'Show Status Table', group='Table')
+tableSize = input.string('Normal', 'Table Size', options=['Tiny', 'Small', 'Normal', 'Large', 'Huge'], group='Table')
+tablePosition = input.string('Top Right', 'Table Position', options=['Top Left', 'Top Center', 'Top Right', 'Middle Left', 'Middle Center', 'Middle Right', 'Bottom Left', 'Bottom Center', 'Bottom Right'], group='Table')
+
+// 알림 설정
+enableAlerts = input.bool(true, 'Enable Alerts', group='Alerts')
+alert_bullish = input.bool(true, 'Bullish Trend Change', group='Alerts')
+alert_bearish = input.bool(true, 'Bearish Trend Change', group='Alerts')
+alert_strong = input.bool(true, 'Strong Trend Start', group='Alerts')
+alert_weak = input.bool(true, 'Trend Weakening', group='Alerts')
+alert_adx_rising = input.bool(true, 'ADX Strengthening', group='Alerts')
+alert_adx_falling = input.bool(true, 'ADX Weakening', group='Alerts')
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADX Calculation
+// ═══════════════════════════════════════════════════════════════════════════════
+TrueRange = math.max(math.max(high - low, math.abs(high - nz(close[1]))), math.abs(low - nz(close[1])))
+DirectionalMovementPlus = high - nz(high[1]) > nz(low[1]) - low ? math.max(high - nz(high[1]), 0) : 0
+DirectionalMovementMinus = nz(low[1]) - low > high - nz(high[1]) ? math.max(nz(low[1]) - low, 0) : 0
+
+SmoothedTrueRange = 0.0
+SmoothedTrueRange := nz(SmoothedTrueRange[1]) - nz(SmoothedTrueRange[1]) / len + TrueRange
+
+SmoothedDirectionalMovementPlus = 0.0
+SmoothedDirectionalMovementPlus := nz(SmoothedDirectionalMovementPlus[1]) - nz(SmoothedDirectionalMovementPlus[1]) / len + DirectionalMovementPlus
+
+SmoothedDirectionalMovementMinus = 0.0
+SmoothedDirectionalMovementMinus := nz(SmoothedDirectionalMovementMinus[1]) - nz(SmoothedDirectionalMovementMinus[1]) / len + DirectionalMovementMinus
+
+DIPlus = SmoothedDirectionalMovementPlus / SmoothedTrueRange * 100
+DIMinus = SmoothedDirectionalMovementMinus / SmoothedTrueRange * 100
+DX = math.abs(DIPlus - DIMinus) / (DIPlus + DIMinus) * 100
+ADX = ta.sma(DX, len)
+ADXs = ta.sma(DX, adxSmooth)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Filters
+// ═══════════════════════════════════════════════════════════════════════════════
+volumeMA = ta.sma(volume, volumeMAPeriod)
+volumeIncreased = volume > volumeMA * volumeMultiplier
+volumeCondition = useVolumeFilter ? volumeIncreased : true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Trend Analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+trendDirection = DIPlus > DIMinus ? 1 : -1
+isStrongTrend = ADX > trendThreshold * 1.5
+isModerateTrend = ADX > trendThreshold and ADX <= trendThreshold * 1.5
+isWeakTrend = ADX <= trendThreshold
+
+// ADX 움직임
+adxRising = ADX > ADX[1]
+adxFalling = ADX < ADX[1]
+adxRisingTrend = ADX > ADX[1] and ADX[1] > ADX[2] and ADX[2] > ADX[3]
+adxFallingTrend = ADX < ADX[1] and ADX[1] < ADX[2] and ADX[2] < ADX[3]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Signal Detection (중복 신호 제거)
+// ═══════════════════════════════════════════════════════════════════════════════
+var bool wasADXRising = false
+var bool wasADXFalling = false
+var bool lastBullish = false
+var bool lastBearish = false
+var bool lastStrong = false
+var bool lastWeak = false
+
+trendChanged = ta.change(trendDirection)
+trendBullish = trendChanged and trendDirection > 0 and not lastBullish and ADX >= minADXFilter and volumeCondition
+trendBearish = trendChanged and trendDirection < 0 and not lastBearish and ADX >= minADXFilter and volumeCondition
+strongTrendStart = ta.crossover(ADX, trendThreshold * 1.5) and not lastStrong and ADX >= minADXFilter and volumeCondition
+trendWeakening = ta.crossunder(ADX, trendThreshold) and not lastWeak
+adxStartRising = adxRisingTrend and not wasADXRising and ADX >= minADXFilter
+adxStartFalling = adxFallingTrend and not wasADXFalling
+
+// 상태 업데이트
+if trendBullish
+    lastBullish := true
+    lastBearish := false
+if trendBearish
+    lastBearish := true
+    lastBullish := false
+if strongTrendStart
+    lastStrong := true
+if trendWeakening
+    lastWeak := true
+if ADX > trendThreshold
+    lastWeak := false
+if ADX < trendThreshold * 1.5
+    lastStrong := false
+if adxRisingTrend
+    wasADXRising := true
+    wasADXFalling := false
+if adxFallingTrend
+    wasADXFalling := true
+    wasADXRising := false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Colors
+// ═══════════════════════════════════════════════════════════════════════════════
+getTrendColor() =>
+    baseColor = if trendDirection > 0
+        if isStrongTrend
+            color.rgb(0, 255, 0)
+        else if isModerateTrend
+            color.rgb(100, 200, 100)
+        else
+            color.rgb(150, 255, 150)
+    else
+        if isStrongTrend
+            color.rgb(255, 0, 0)
+        else if isModerateTrend
+            color.rgb(200, 100, 100)
+        else
+            color.rgb(255, 150, 150)
+    
+    color.new(baseColor, trendLineTransparency)
+
+trendColor = getTrendColor()
+
+bgColor = showBackground ? 
+     (trendDirection > 0 and isStrongTrend ? color.new(color.green, bgop) : 
+      trendDirection < 0 and isStrongTrend ? color.new(color.red, bgop) : 
+      color.new(color.gray, 95)) : na
+
+barTrendColor = trendDirection > 0 ? color.new(color.green, barColorTransparency) : color.new(color.red, barColorTransparency)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Plotting
+// ═══════════════════════════════════════════════════════════════════════════════
+// 메인 트렌드 라인
+trendValue = trendDirection * ADX
+plot(showTrendLine ? trendValue : na, 'Trend Line', color=trendColor, linewidth=3)
+
+// ADX 참고 라인
+plot(showADXLine ? ADX : na, 'ADX+', color=adxLineColor, linewidth=1)
+plot(showADXLine ? -ADX : na, 'ADX-', color=adxLineColor, linewidth=1)
+
+// DI 라인
+plot(showDI ? DIPlus : na, 'DI+', color=diPlusColor, linewidth=1)
+plot(showDI ? DIMinus : na, 'DI-', color=diMinusColor, linewidth=1)
+
+// 기준선
+hline(0, 'Zero', color=color.new(color.gray, 50), linestyle=hline.style_solid, linewidth=2)
+hline(trendThreshold, 'Threshold', color=color.new(color.orange, 70), linestyle=hline.style_dashed)
+hline(-trendThreshold, 'Threshold', color=color.new(color.orange, 70), linestyle=hline.style_dashed)
+hline(trendThreshold * 1.5, 'Strong', color=color.new(color.yellow, 70), linestyle=hline.style_dotted)
+hline(-trendThreshold * 1.5, 'Strong', color=color.new(color.yellow, 70), linestyle=hline.style_dotted)
+
+// 배경색
+bgcolor(bgColor)
+
+// 캔들 컬러
+barcolor(showBarColor ? barTrendColor : na, title='Trend Bar Color')
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Status Table
+// ═══════════════════════════════════════════════════════════════════════════════
+getTableSize() =>
+    switch tableSize
+        'Tiny' => size.tiny
+        'Small' => size.small
+        'Normal' => size.normal
+        'Large' => size.large
+        'Huge' => size.huge
+        => size.normal
+
+getTablePosition() =>
+    switch tablePosition
+        'Top Left' => position.top_left
+        'Top Center' => position.top_center
+        'Top Right' => position.top_right
+        'Middle Left' => position.middle_left
+        'Middle Center' => position.middle_center
+        'Middle Right' => position.middle_right
+        'Bottom Left' => position.bottom_left
+        'Bottom Center' => position.bottom_center
+        'Bottom Right' => position.bottom_right
+        => position.top_right
+
+var table statusTable = table.new(getTablePosition(), 2, 4, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast and showTable
+    trendText = trendDirection > 0 ? '▲ UPTREND' : '▼ DOWNTREND'
+    trendColorDisplay = trendDirection > 0 ? color.lime : color.red
+    
+    strengthText = isStrongTrend ? 'STRONG' : isModerateTrend ? 'MODERATE' : 'WEAK'
+    strengthColor = isStrongTrend ? color.yellow : isModerateTrend ? color.orange : color.gray
+    
+    adxStatusText = adxRisingTrend ? '↑↑ Rising' : adxFallingTrend ? '↓↓ Falling' : adxRising ? '↑ Up' : adxFalling ? '↓ Down' : '→ Flat'
+    adxStatusColor = adxRisingTrend ? color.lime : adxFallingTrend ? color.red : color.gray
+    
+    cellSize = getTableSize()
+    
+    table.cell(statusTable, 0, 0, 'Trend:', text_color=color.white, text_size=cellSize)
+    table.cell(statusTable, 1, 0, trendText, text_color=trendColorDisplay, text_size=cellSize)
+    
+    table.cell(statusTable, 0, 1, 'Strength:', text_color=color.white, text_size=cellSize)
+    table.cell(statusTable, 1, 1, strengthText, text_color=strengthColor, text_size=cellSize)
+    
+    table.cell(statusTable, 0, 2, 'ADX:', text_color=color.white, text_size=cellSize)
+    table.cell(statusTable, 1, 2, str.tostring(math.round(ADX, 1)), text_color=color.white, text_size=cellSize)
+    
+    table.cell(statusTable, 0, 3, 'Status:', text_color=color.white, text_size=cellSize)
+    table.cell(statusTable, 1, 3, adxStatusText, text_color=adxStatusColor, text_size=cellSize)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Alerts
+// ═══════════════════════════════════════════════════════════════════════════════
+var string alertMsg = ""
+alertMsg := ""
+
+string currentTF = timeframe.period
+string adxValue = str.tostring(math.round(ADX, 1))
+
+if trendBullish and alert_bullish
+    alertMsg += "Bullish Trend Change\n   ADX: " + adxValue + "\n"
+
+if trendBearish and alert_bearish
+    alertMsg += "Bearish Trend Change\n   ADX: " + adxValue + "\n"
+
+if strongTrendStart and alert_strong
+    strengthType = trendDirection > 0 ? "Uptrend" : "Downtrend"
+    alertMsg += "Strong " + strengthType + " Started\n   ADX: " + adxValue + "\n"
+
+if trendWeakening and alert_weak
+    alertMsg += "Trend Weakening\n   ADX: " + adxValue + "\n"
+
+if adxStartRising and alert_adx_rising
+    trendType = trendDirection > 0 ? "Bullish" : "Bearish"
+    alertMsg += "ADX Strengthening (" + trendType + ")\n   ADX: " + adxValue + " ↑↑\n"
+
+if adxStartFalling and alert_adx_falling
+    alertMsg += "ADX Weakening\n   ADX: " + adxValue + " ↓↓\n"
+
+if useVolumeFilter and volumeIncreased and alertMsg != ""
+    alertMsg += "Volume: " + str.tostring(math.round(volume / volumeMA, 2)) + "x\n"
+
+if enableAlerts and alertMsg != ""
+    alert("[ADX Trend](" + currentTF + ") [L=" + str.tostring(len) + " | ADX=" + adxValue + "]\n" + alertMsg, alert.freq_once_per_bar)

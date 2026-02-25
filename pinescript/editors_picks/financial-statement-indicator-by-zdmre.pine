@@ -1,0 +1,553 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © zdmre - Enhanced Version
+
+//@version=6
+indicator('Financial Statement Indicator PRO by zdmre', format = format.volume, max_labels_count = 500)
+
+// ═════════════════════════════════════════════════════════════════════
+// INPUT SETTINGS
+// ═════════════════════════════════════════════════════════════════════
+
+// Basic Settings
+period = input.string('FY', 'Financial Period', options = ['FQ', 'FY'], tooltip = 'FQ: Financial Quarter\nFY: Financial Year')
+plotdata = input.string('EPS', 'Plot Data', options = ['Revenue', 'Gross Margin', 'Operating Margin', 'Net Margin', 'EPS', 'P/E', 'Total Asset', 'Total Equity', 'D/E', 'ROE', 'ROIC', 'Free Cash Flow'])
+int datasize = input.int(8, 'Data Size', minval = 2, maxval = 24, tooltip = 'Number of periods to display') + 2
+
+// Table Display Settings
+tableGroup = 'Table Display'
+opt_textsize = input.string(size.small, 'Text Size', options = [size.auto, size.tiny, size.small, size.normal, size.large, size.huge], group = tableGroup)
+opt_textcolor = input(color.white, 'Header Text Color', group = tableGroup)
+opt_datatextcolor = input(color.black, 'Data Text Color', group = tableGroup)
+opt_panelbgcolor = input(color.rgb(33, 150, 243), 'Header Background', group = tableGroup)
+opt_cellbgcolor = input(color.rgb(255, 152, 0), 'Warning Cell Color', group = tableGroup)
+is_opt_pos = input.string(position.middle_left, 'Table Position', options = [position.top_left, position.top_center, position.top_right, position.middle_left, position.middle_center, position.middle_right, position.bottom_left, position.bottom_center, position.bottom_right], group = tableGroup)
+
+// Table Visibility
+t_1 = input.bool(true, title = 'TABLE-1: Profitability & Valuation', group = tableGroup)
+t_2 = input.bool(true, title = 'TABLE-2: Financial Health', group = tableGroup)
+t_3 = input.bool(true, title = 'TABLE-3: Performance Metrics', group = tableGroup)
+t_4 = input.bool(true, title = 'TABLE-4: Advanced Analytics', group = tableGroup)
+
+// Color Filtering
+colorGroup = 'Value Filters (Color Coding)'
+showValueFilter = input(true, title = 'Enable Value-Based Coloring', group = colorGroup, tooltip = 'When enabled, cells are colored based on threshold values below')
+
+// Profitability Filters
+profitGroup = 'Profitability Thresholds'
+grossmar_val = input.float(30, title = 'Gross Margin %', group = profitGroup, tooltip = 'Ideal: >30%')
+opmar_val = input.float(15, title = 'Operating Margin %', group = profitGroup, tooltip = 'Ideal: >15%')
+netmar_val = input.float(10, title = 'Net Margin %', group = profitGroup, tooltip = 'Ideal: >10%')
+epsval = input.float(0, title = 'EPS Minimum', group = profitGroup, tooltip = 'Ideal: >0 and growing')
+
+// Valuation Filters
+valuationGroup = 'Valuation Thresholds'
+peval = input.float(20, title = 'P/E Maximum', group = valuationGroup, tooltip = 'Ideal: 0 < P/E < 20')
+pbval = input.float(3, title = 'P/B Maximum', group = valuationGroup, tooltip = 'Ideal: 0 < P/B < 3')
+pegval = input.float(1, title = 'PEG Maximum', group = valuationGroup, tooltip = 'Ideal: <1')
+peforw = input.float(15, title = 'P/E Forward Maximum', group = valuationGroup, tooltip = 'Ideal: <15')
+
+// Financial Health Filters
+healthGroup = 'Financial Health Thresholds'
+deval = input.float(0.5, title = 'D/E Maximum', group = healthGroup, tooltip = 'Ideal: <0.5 (conservative) or <1.0 (moderate)')
+currentratio_val = input.float(1.5, title = 'Current Ratio Minimum', group = healthGroup, tooltip = 'Ideal: >1.5')
+qrval = input.float(1, title = 'Quick Ratio Minimum', group = healthGroup, tooltip = 'Ideal: >1.0')
+
+// Performance Filters
+perfGroup = 'Performance Thresholds'
+roeval = input.float(15, title = 'ROE Minimum %', group = perfGroup, tooltip = 'Ideal: >15%')
+roaval = input.float(7, title = 'ROA Minimum %', group = perfGroup, tooltip = 'Ideal: >7%')
+roicval = input.float(10, title = 'ROIC Minimum %', group = perfGroup, tooltip = 'Ideal: >10%')
+roepbval = input.float(3, title = 'ROE/PB Minimum', group = perfGroup, tooltip = 'Ideal: >3')
+
+// Advanced Analytics Filters
+advGroup = 'Advanced Analytics Thresholds'
+altmanval = input.float(3.0, title = 'Altman Z-Score Safe Zone', group = advGroup, tooltip = 'Safe: >3.0, Grey: 1.8-3.0, Distress: <1.8')
+beneishval = input.float(-1.78, title = 'Beneish M-Score', group = advGroup, tooltip = 'Likely Manipulator: >-1.78')
+springateval = input.float(0.862, title = 'Springate Score', group = advGroup, tooltip = 'Healthy: >0.862')
+zmijval = input.float(0.5, title = 'Zmijewski Score', group = advGroup, tooltip = 'Healthy: <0.5')
+piotroski_val = input.float(7, title = 'Piotroski F-Score Minimum', group = advGroup, tooltip = 'Strong: 7-9, Average: 4-6, Weak: 0-3')
+sgr = input.float(10, title = 'Sustainable Growth Rate %', group = advGroup, tooltip = 'Ideal: >10%')
+dyieldval = input.float(2, title = 'Dividend Yield Minimum %', group = advGroup, tooltip = 'Income investors: >2%')
+
+// Beta Calculation
+betaGroup = 'Beta Calculation'
+symbolMarket = input.symbol('SPX', 'Beta Benchmark', group = betaGroup, tooltip = 'Compare against market index')
+lengthbeta = input.int(252, 'Beta Period (days)', minval = 20, maxval = 500, group = betaGroup)
+
+// ═════════════════════════════════════════════════════════════════════
+// FINANCIAL DATA RETRIEVAL
+// ═════════════════════════════════════════════════════════════════════
+
+get_Fin_data(_finID, _period) =>
+    request.financial(symbol = syminfo.tickerid, financial_id = _finID, period = _period, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+
+// Timestamp
+symtemp = 'ESD_FACTSET:' + syminfo.prefix + ';' + syminfo.ticker
+earningsPublishTimeYear = request.security(symtemp + ';EARNINGS', '3M', time, lookahead = barmerge.lookahead_on)
+
+// Income Statement Metrics
+revenue = get_Fin_data('TOTAL_REVENUE', period)
+grossprofit = get_Fin_data('GROSS_PROFIT', period)
+grossmar = get_Fin_data('GROSS_MARGIN', period)
+opmar = get_Fin_data('OPERATING_MARGIN', period)
+netmar = get_Fin_data('NET_MARGIN', period)
+eps = get_Fin_data('EARNINGS_PER_SHARE', period)
+epsest = get_Fin_data('EARNINGS_ESTIMATE', period)
+pe = close / get_Fin_data('EARNINGS_PER_SHARE', 'TTM')
+ebitda = get_Fin_data('EBITDA', period)
+
+// Balance Sheet Metrics
+curasst = get_Fin_data('TOTAL_CURRENT_ASSETS', period)
+curliab = get_Fin_data('TOTAL_CURRENT_LIABILITIES', period)
+ttasst = get_Fin_data('TOTAL_ASSETS', period)
+tteq = get_Fin_data('TOTAL_EQUITY', period)
+tdebt = get_Fin_data('TOTAL_DEBT', period)
+ltdebt = get_Fin_data('LONG_TERM_DEBT', period)
+pb = close / get_Fin_data('BOOK_VALUE_PER_SHARE', period)
+de = tdebt / tteq
+currentratio = curasst / curliab
+workingcap = curasst - curliab
+
+// Cash Flow & Performance
+fcf = get_Fin_data('FREE_CASH_FLOW', period)
+capex = get_Fin_data('CAPITAL_EXPENDITURE', period)
+roe = get_Fin_data('RETURN_ON_EQUITY', period)
+roepb = get_Fin_data('RETURN_ON_EQUITY_ADJUST_TO_BOOK', period)
+roa = get_Fin_data('RETURN_ON_ASSETS', period)
+roic = get_Fin_data('RETURN_ON_INVESTED_CAPITAL', period)
+qr = get_Fin_data('QUICK_RATIO', period)
+
+// Advanced Metrics
+altman = get_Fin_data('ALTMAN_Z_SCORE', period)
+beneish = get_Fin_data('BENEISH_M_SCORE', period)
+piotroski = get_Fin_data('PIOTROSKI_F_SCORE', period)
+peg = get_Fin_data('PEG_RATIO', period)
+peforward = get_Fin_data('PRICE_EARNINGS_FORWARD', period)
+springate = get_Fin_data('SPRINGATE_SCORE', period)
+sgrowthrate = get_Fin_data('SUSTAINABLE_GROWTH_RATE', period)
+zmij = get_Fin_data('ZMIJEWSKI_SCORE', period)
+dyield = get_Fin_data('DIVIDENDS_YIELD', period)
+
+// Beta Calculation
+symov = request.security(symbolMarket, 'D', close)
+retass = (close - close[1]) / close
+retsym = (symov - symov[1]) / symov
+asstd = ta.stdev(retass, lengthbeta)
+marktstd = ta.stdev(retsym, lengthbeta)
+Beta = ta.correlation(retass, retsym, lengthbeta) * asstd / marktstd
+
+// Plot Data Selection
+datatoplot = plotdata == 'EPS' ? eps : plotdata == 'Revenue' ? revenue : plotdata == 'Gross Margin' ? grossmar : plotdata == 'Operating Margin' ? opmar : plotdata == 'Net Margin' ? netmar : plotdata == 'P/E' ? pe : plotdata == 'ROE' ? roe : plotdata == 'Total Equity' ? tteq : plotdata == 'Total Asset' ? ttasst : plotdata == 'D/E' ? de : plotdata == 'ROIC' ? roic : plotdata == 'Free Cash Flow' ? fcf : na
+
+// ═════════════════════════════════════════════════════════════════════
+// DATA ARRAYS
+// ═════════════════════════════════════════════════════════════════════
+
+// Date Arrays
+var date = array.new_int(datasize)
+var datem_ = array.new_int(datasize)
+
+// Table 1: Profitability & Valuation
+var t1_01 = array.new_float(datasize) // Revenue
+var t1_02 = array.new_float(datasize) // Gross Margin
+var t1_03 = array.new_float(datasize) // Operating Margin
+var t1_04 = array.new_float(datasize) // Net Margin
+var t1_05 = array.new_float(datasize) // EPS
+var t1_06 = array.new_float(datasize) // EPS Estimate
+var t1_07 = array.new_float(datasize) // P/E Ratio
+var t1_08 = array.new_float(datasize) // EBITDA
+
+// Table 2: Financial Health
+var t2_01 = array.new_float(datasize) // Current Assets
+var t2_02 = array.new_float(datasize) // Current Liabilities
+var t2_03 = array.new_float(datasize) // Working Capital
+var t2_04 = array.new_float(datasize) // Current Ratio
+var t2_05 = array.new_float(datasize) // Quick Ratio
+var t2_06 = array.new_float(datasize) // Total Debt
+var t2_07 = array.new_float(datasize) // D/E Ratio
+
+// Table 3: Performance Metrics
+var t3_01 = array.new_float(datasize) // Total Assets
+var t3_02 = array.new_float(datasize) // Total Equity
+var t3_03 = array.new_float(datasize) // P/B Ratio
+var t3_04 = array.new_float(datasize) // ROE
+var t3_05 = array.new_float(datasize) // ROA
+var t3_06 = array.new_float(datasize) // ROIC
+var t3_07 = array.new_float(datasize) // ROE/PB
+var t3_08 = array.new_float(datasize) // Beta
+
+// Table 4: Advanced Analytics
+var t4_01 = array.new_float(datasize) // Free Cash Flow
+var t4_02 = array.new_float(datasize) // Altman Z-Score
+var t4_03 = array.new_float(datasize) // Piotroski F-Score
+var t4_04 = array.new_float(datasize) // Beneish M-Score
+var t4_05 = array.new_float(datasize) // PEG Ratio
+var t4_06 = array.new_float(datasize) // P/E Forward
+var t4_07 = array.new_float(datasize) // SGR
+var t4_08 = array.new_float(datasize) // Dividend Yield
+var t4_09 = array.new_float(datasize) // Springate
+var t4_10 = array.new_float(datasize) // Zmijewski
+
+// ═════════════════════════════════════════════════════════════════════
+// DATA POPULATION
+// ═════════════════════════════════════════════════════════════════════
+
+if not na(datatoplot)
+    // Plot label
+    label.new(bar_index, datatoplot, text = str.tostring(plotdata == 'EPS' ? datatoplot : plotdata == 'Revenue' ? datatoplot / 1000000 : datatoplot, plotdata == 'EPS' ? '#,##0.00' : plotdata == 'Revenue' ? '#,##0' + 'M' : '#,##0.00'), size = opt_textsize, textcolor = color.white)
+
+    // Update date arrays
+    array.push(date, earningsPublishTimeYear)
+    array.push(datem_, time)
+    array.shift(date)
+    array.shift(datem_)
+
+    // Table 1: Profitability & Valuation
+    array.push(t1_01, revenue)
+    array.push(t1_02, grossmar)
+    array.push(t1_03, opmar)
+    array.push(t1_04, netmar)
+    array.push(t1_05, eps)
+    array.push(t1_06, epsest)
+    array.push(t1_07, pe)
+    array.push(t1_08, ebitda)
+    array.shift(t1_01)
+    array.shift(t1_02)
+    array.shift(t1_03)
+    array.shift(t1_04)
+    array.shift(t1_05)
+    array.shift(t1_06)
+    array.shift(t1_07)
+    array.shift(t1_08)
+
+    // Table 2: Financial Health
+    array.push(t2_01, curasst)
+    array.push(t2_02, curliab)
+    array.push(t2_03, workingcap)
+    array.push(t2_04, currentratio)
+    array.push(t2_05, qr)
+    array.push(t2_06, tdebt)
+    array.push(t2_07, de)
+    array.shift(t2_01)
+    array.shift(t2_02)
+    array.shift(t2_03)
+    array.shift(t2_04)
+    array.shift(t2_05)
+    array.shift(t2_06)
+    array.shift(t2_07)
+
+    // Table 3: Performance Metrics
+    array.push(t3_01, ttasst)
+    array.push(t3_02, tteq)
+    array.push(t3_03, pb)
+    array.push(t3_04, roe)
+    array.push(t3_05, roa)
+    array.push(t3_06, roic)
+    array.push(t3_07, roepb)
+    array.push(t3_08, Beta)
+    array.shift(t3_01)
+    array.shift(t3_02)
+    array.shift(t3_03)
+    array.shift(t3_04)
+    array.shift(t3_05)
+    array.shift(t3_06)
+    array.shift(t3_07)
+    array.shift(t3_08)
+
+    // Table 4: Advanced Analytics
+    array.push(t4_01, fcf)
+    array.push(t4_02, altman)
+    array.push(t4_03, piotroski)
+    array.push(t4_04, beneish)
+    array.push(t4_05, peg)
+    array.push(t4_06, peforward)
+    array.push(t4_07, sgrowthrate)
+    array.push(t4_08, dyield)
+    array.push(t4_09, springate)
+    array.push(t4_10, zmij)
+    array.shift(t4_01)
+    array.shift(t4_02)
+    array.shift(t4_03)
+    array.shift(t4_04)
+    array.shift(t4_05)
+    array.shift(t4_06)
+    array.shift(t4_07)
+    array.shift(t4_08)
+    array.shift(t4_09)
+    array.shift(t4_10)
+
+// ═════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════
+
+// Color helper functions
+get_trend_color(val, prev_val, higher_is_better) =>
+    if na(val)
+        opt_datatextcolor
+    else
+        if higher_is_better
+            val <= prev_val ? #FF6961 : color.lime
+        else
+            val >= prev_val ? #FF6961 : color.lime
+
+get_threshold_color(val, threshold, lower_is_better) =>
+    if na(val)
+        opt_datatextcolor
+    else
+        if lower_is_better
+            val >= threshold ? #FF6961 : color.lime
+        else
+            val <= threshold ? #FF6961 : color.lime
+
+get_range_color(val, min_val, max_val) =>
+    if na(val)
+        opt_datatextcolor
+    else
+        val > min_val and val < max_val ? color.lime : #FF6961
+
+// Piotroski color gradient
+get_piotroski_color(val) =>
+    if na(val)
+        opt_datatextcolor
+    else
+        val <= 0 ? #c0392b : color.lime
+        val <= 1 ? #ec7063 : color.lime
+        val <= 2 ? #e67e22 : color.lime
+        val <= 3 ? #fad7a0 : color.lime
+        val <= 4 ? #85c1e9 : color.lime
+        val <= 5 ? #a9cce3 : color.lime
+        val <= 6 ? #a9dfbf : color.lime
+        val <= 7 ? #7dcea0 : color.lime
+        val <= 8 ? #52be80 : color.lime
+
+// Altman Z-Score color
+get_altman_color(val) =>
+    if na(val)
+        opt_datatextcolor
+    else
+        val < 1.8 ? #FF6961 : color.lime
+        val < 3.0 ? color.orange : color.lime
+
+// ═════════════════════════════════════════════════════════════════════
+// TABLE CREATION
+// ═════════════════════════════════════════════════════════════════════
+
+var tbis = table.new(is_opt_pos, 35, datasize, frame_color = color.black, frame_width = 1, border_width = 1, border_color = color.black)
+headerColor = color.new(opt_panelbgcolor, 0)
+
+// Create headers
+if barstate.isfirst
+    table.cell(tbis, 0, 0, text = '', bgcolor = headerColor)
+    table.merge_cells(tbis, 0, 0, 1, 0)
+
+    if t_1
+        table.cell(tbis, 2, 0, text = 'Profitability & Valuation', bgcolor = headerColor, text_color = color.white, text_size = opt_textsize)
+        table.merge_cells(tbis, 2, 0, 9, 0)
+
+    if t_2
+        table.cell(tbis, 11, 0, text = 'Financial Health', bgcolor = headerColor, text_color = color.white, text_size = opt_textsize)
+        table.merge_cells(tbis, 11, 0, 17, 0)
+
+    if t_3
+        table.cell(tbis, 19, 0, text = 'Performance Metrics', bgcolor = headerColor, text_color = color.white, text_size = opt_textsize)
+        table.merge_cells(tbis, 19, 0, 26, 0)
+
+    if t_4
+        table.cell(tbis, 28, 0, text = 'Advanced Analytics', bgcolor = headerColor, text_color = color.white, text_size = opt_textsize)
+        table.merge_cells(tbis, 28, 0, 34, 0)
+
+// Create vertical separators
+if barstate.islast and t_1 and (t_2 or t_3 or t_4)
+    table.cell(tbis, 10, 0, '', bgcolor = color.black)
+    table.merge_cells(tbis, 10, 0, 10, datasize - 1)
+
+if barstate.islast and t_2 and (t_3 or t_4)
+    table.cell(tbis, 18, 0, '', bgcolor = color.black)
+    table.merge_cells(tbis, 18, 0, 18, datasize - 1)
+
+if barstate.islast and t_3 and t_4
+    table.cell(tbis, 27, 0, '', bgcolor = color.black)
+    table.merge_cells(tbis, 27, 0, 27, datasize - 1)
+
+// Column Headers
+if barstate.islast and t_1
+    table.cell(tbis, 0, 1, '', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 1, 1, 'Period', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 2, 1, 'Revenue', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 3, 1, 'Gross\nMargin %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(grossmar_val) + '%')
+    table.cell(tbis, 4, 1, 'Op\nMargin %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(opmar_val) + '%')
+    table.cell(tbis, 5, 1, 'Net\nMargin %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(netmar_val) + '%')
+    table.cell(tbis, 6, 1, 'EPS', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(epsval))
+    table.cell(tbis, 7, 1, 'EPS\nEst', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 8, 1, 'P/E', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(peval))
+    table.cell(tbis, 9, 1, 'EBITDA', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+
+if barstate.islast and t_2
+    table.cell(tbis, 0, 1, '', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 1, 1, 'Period', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 11, 1, 'Current\nAssets', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 12, 1, 'Current\nLiab', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 13, 1, 'Working\nCapital', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 14, 1, 'Current\nRatio', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(currentratio_val))
+    table.cell(tbis, 15, 1, 'Quick\nRatio', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(qrval))
+    table.cell(tbis, 16, 1, 'Total\nDebt', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 17, 1, 'D/E', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(deval))
+
+if barstate.islast and t_3
+    table.cell(tbis, 0, 1, '', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 1, 1, 'Period', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 19, 1, 'Total\nAssets', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 20, 1, 'Total\nEquity', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 21, 1, 'P/B', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(pbval))
+    table.cell(tbis, 22, 1, 'ROE %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(roeval) + '%')
+    table.cell(tbis, 23, 1, 'ROA %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(roaval) + '%')
+    table.cell(tbis, 24, 1, 'ROIC %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(roicval) + '%')
+    table.cell(tbis, 25, 1, 'ROE/PB', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(roepbval))
+    table.cell(tbis, 26, 1, 'β', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'vs ' + symbolMarket)
+
+if barstate.islast and t_4
+    table.cell(tbis, 0, 1, '', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 1, 1, 'Period', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 28, 1, 'Free\nCash Flow', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+    table.cell(tbis, 29, 1, 'Altman\nZ-Score', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Safe: >' + str.tostring(altmanval))
+    table.cell(tbis, 30, 1, 'Piotroski\nF-Score', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Strong: 7-9')
+    table.cell(tbis, 31, 1, 'Beneish\nM-Score', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(beneishval))
+    table.cell(tbis, 32, 1, 'PEG', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(pegval))
+    table.cell(tbis, 33, 1, 'Div\nYield %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(dyieldval) + '%')
+    table.cell(tbis, 34, 1, 'SGR %', bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor, tooltip = 'Threshold: ' + str.tostring(sgr) + '%')
+
+// ═════════════════════════════════════════════════════════════════════
+// POPULATE TABLE DATA
+// ═════════════════════════════════════════════════════════════════════
+
+for i = 2 to datasize - 1 by 1
+    // Index and Period columns
+    if barstate.islast and (t_1 or t_2 or t_3 or t_4)
+        table.cell(tbis, 0, i, str.tostring(i), bgcolor = opt_panelbgcolor, text_size = opt_textsize)
+        table.cell(tbis, 1, i, str.format('{0, date, Y}', array.get(date, i)) + str.format('{0, date, MMM}', array.get(datem_, i)), bgcolor = opt_panelbgcolor, text_size = opt_textsize, text_color = opt_textcolor)
+
+    // TABLE 1: Profitability & Valuation
+    if barstate.islast and t_1
+        val = array.get(t1_01, i)
+        prev_val = array.get(t1_01, i - 1)
+        table.cell(tbis, 2, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_02, i)
+        prev_val := array.get(t1_02, i - 1)
+        table.cell(tbis, 3, i, str.tostring(val, '#,##0') + '%', text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, grossmar_val, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_03, i)
+        prev_val := array.get(t1_03, i - 1)
+        table.cell(tbis, 4, i, str.tostring(val, '#,##0') + '%', text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, opmar_val, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_04, i)
+        prev_val := array.get(t1_04, i - 1)
+        table.cell(tbis, 5, i, str.tostring(val, '#,##0') + '%', text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, netmar_val, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_05, i)
+        prev_val := array.get(t1_05, i - 1)
+        table.cell(tbis, 6, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, epsval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_06, i)
+        prev_val := array.get(t1_06, i - 1)
+        table.cell(tbis, 7, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, epsval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t1_07, i)
+        table.cell(tbis, 8, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_range_color(val, 0, peval) : na(val) ? opt_datatextcolor : val <= 0 ? #FF6961 : get_trend_color(val, array.get(t1_07, i - 1), false))
+
+        val := array.get(t1_08, i)
+        prev_val := array.get(t1_08, i - 1)
+        table.cell(tbis, 9, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+    // TABLE 2: Financial Health
+    if barstate.islast and t_2
+        val = array.get(t2_01, i)
+        prev_val = array.get(t2_01, i - 1)
+        table.cell(tbis, 11, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t2_02, i)
+        prev_val := array.get(t2_02, i - 1)
+        table.cell(tbis, 12, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, false))
+
+        val := array.get(t2_03, i)
+        prev_val := array.get(t2_03, i - 1)
+        table.cell(tbis, 13, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t2_04, i)
+        prev_val := array.get(t2_04, i - 1)
+        table.cell(tbis, 14, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, currentratio_val, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t2_05, i)
+        prev_val := array.get(t2_05, i - 1)
+        table.cell(tbis, 15, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, qrval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t2_06, i)
+        prev_val := array.get(t2_06, i - 1)
+        table.cell(tbis, 16, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, false))
+
+        val := array.get(t2_07, i)
+        prev_val := array.get(t2_07, i - 1)
+        table.cell(tbis, 17, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? na(val) ? opt_datatextcolor : val < 0 ? #FF6961 : get_threshold_color(val, deval, true) : na(val) ? opt_datatextcolor : val < 0 ? #FF6961 : get_trend_color(val, prev_val, false))
+
+    // TABLE 3: Performance Metrics
+    if barstate.islast and t_3
+        val = array.get(t3_01, i)
+        prev_val = array.get(t3_01, i - 1)
+        table.cell(tbis, 19, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_02, i)
+        prev_val := array.get(t3_02, i - 1)
+        table.cell(tbis, 20, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_03, i)
+        table.cell(tbis, 21, i, str.tostring(val, '#,##0.0'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_range_color(val, 0, pbval) : na(val) ? opt_datatextcolor : val <= 0 ? #FF6961 : get_trend_color(val, array.get(t3_03, i - 1), false))
+
+        val := array.get(t3_04, i)
+        prev_val := array.get(t3_04, i - 1)
+        table.cell(tbis, 22, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, roeval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_05, i)
+        prev_val := array.get(t3_05, i - 1)
+        table.cell(tbis, 23, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, roaval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_06, i)
+        prev_val := array.get(t3_06, i - 1)
+        table.cell(tbis, 24, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, roicval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_07, i)
+        prev_val := array.get(t3_07, i - 1)
+        table.cell(tbis, 25, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, roepbval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t3_08, i)
+        prev_val := array.get(t3_08, i - 1)
+        table.cell(tbis, 26, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? na(val) ? opt_datatextcolor : math.abs(val) >= 1 ? #d14dff : #00ffff : na(val) ? opt_datatextcolor : math.abs(val) >= math.abs(prev_val) ? #d14dff : #00ffff)
+
+    // TABLE 4: Advanced Analytics
+    if barstate.islast and t_4
+        val = array.get(t4_01, i)
+        prev_val = array.get(t4_01, i - 1)
+        table.cell(tbis, 28, i, str.tostring(val / 1000000, '#,##0M'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = get_trend_color(val, prev_val, true))
+
+        val := array.get(t4_02, i)
+        table.cell(tbis, 29, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_altman_color(val) : get_trend_color(val, array.get(t4_02, i - 1), true))
+
+        val := array.get(t4_03, i)
+        table.cell(tbis, 30, i, str.tostring(val, '#,##0'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_piotroski_color(val) : get_trend_color(val, array.get(t4_03, i - 1), true))
+
+        val := array.get(t4_04, i)
+        prev_val := array.get(t4_04, i - 1)
+        table.cell(tbis, 31, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, beneishval, true) : get_trend_color(val, prev_val, false))
+
+        val := array.get(t4_05, i)
+        table.cell(tbis, 32, i, str.tostring(val, '#,##0.00'), text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? na(val) ? opt_datatextcolor : val < 0 or val >= pegval ? #FF6961 : color.lime : na(val) ? opt_datatextcolor : val > 1 or get_trend_color(val, array.get(t4_05, i - 1), false) == #FF6961 ? #FF6961 : color.lime)
+
+        val := array.get(t4_08, i)
+        prev_val := array.get(t4_08, i - 1)
+        table.cell(tbis, 33, i, str.tostring(val, '#,##0.00') + '%', text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, dyieldval, false) : get_trend_color(val, prev_val, true))
+
+        val := array.get(t4_07, i)
+        prev_val := array.get(t4_07, i - 1)
+        table.cell(tbis, 34, i, str.tostring(val, '#,##0.00') + '%', text_size = opt_textsize, text_color = opt_datatextcolor, bgcolor = showValueFilter ? get_threshold_color(val, sgr, false) : get_trend_color(val, prev_val, true))
+
+// Plot the selected data
+plot(datatoplot, style = plot.style_stepline_diamond, linewidth = 4, join = true, color = color.yellow, title = 'Selected Metric')

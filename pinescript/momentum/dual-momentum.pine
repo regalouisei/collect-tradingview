@@ -1,0 +1,306 @@
+//@version=6
+indicator("DM", overlay=false)
+
+// === SYMBOLS ===
+sym1 = input.symbol(defval = "NASDAQ:QQQ", title = "Symbol 1", group = "Symbols",
+                    tooltip = "First asset for momentum rotation")
+sym2 = input.symbol(defval = "AMEX:SPY", title = "Symbol 2", group = "Symbols",
+                    tooltip = "Second asset for momentum rotation")
+sym3 = input.symbol(defval = "OANDA:XAUUSD", title = "Symbol 3", group = "Symbols",
+                    tooltip = "Third asset for momentum rotation")
+
+// === MOMENTUM SETTINGS ===
+mon1 = input.int(defval = 1, minval = 1, title = "Month 1", group = "Momentum",
+                 tooltip = "First lookback period for momentum calculation (default: 1 month)")
+mon2 = input.int(defval = 3, minval = 1, title = "Month 3", group = "Momentum",
+                 tooltip = "Second lookback period for momentum calculation (default: 3 months)")
+mon3 = input.int(defval = 6, minval = 1, title = "Month 6", group = "Momentum",
+                 tooltip = "Third lookback period for momentum calculation (default: 6 months)")
+absThr = input.float(defval = 0.0, title = "Absolute Momentum Threshold (Cash if <=)", step = 0.1, group = "Momentum",
+                     tooltip = "If best momentum is below or equal to this value, move to cash. 0% means only stay invested when momentum is positive.")
+
+// === STOP LOSS SETTINGS ===
+stopMode = input.string("Dual Stop (Recommended)", "Stop Loss Mode", 
+                        options = ["Fixed Only", "Trailing Only", "Dual Stop (Recommended)"],
+                        tooltip = "Fixed Only: Stop never moves, set at entry\nTrailing Only: Stop trails upward as price rises\nDual Stop: Uses both, takes the higher (more protective) level",
+                        group = "Stop Loss")
+
+atrLen  = input.int(14, "ATR Length", minval = 1, group = "Stop Loss",
+                    tooltip = "Number of periods for ATR calculation. Standard is 14.")
+atrMult = input.float(3.0, "ATR Stop Multiplier", step = 0.1, 
+                      tooltip = "Distance below entry/highest price for stop (in ATR units). Higher = wider stop, fewer exits. Recommended: 2.5-3.5 for monthly rotation.",
+                      group = "Stop Loss")
+atrTF   = input.timeframe("D", "ATR/Stop Timeframe", group = "Stop Loss",
+                          tooltip = "Timeframe for ATR calculation and stop monitoring. Daily (D) is standard for monthly rotation strategies.")
+
+trailFreq = input.string("Daily", "Trail Update Frequency", options = ["Daily", "Weekly", "On Month End"], 
+                         tooltip = "How often the trailing stop updates:\nDaily = Most responsive\nWeekly = Medium\nOn Month End = Conservative",
+                         group = "Stop Loss")
+
+// Minimum hold period to prevent premature exits
+minHoldDays = input.int(3, "Minimum Hold Days", minval = 1, maxval = 30, group = "Stop Loss",
+                        tooltip = "Won't exit via stop for this many days after entry. Prevents whipsaws from immediate noise. Recommended: 3-7 days.")
+
+// === DISPLAY SETTINGS ===
+col1 = input.color(defval = color.orange, title = "Symbol 1 Color", group = "Display",
+                   tooltip = "Color for Symbol 1 on chart")
+col2 = input.color(defval = color.blue, title = "Symbol 2 Color", group = "Display",
+                   tooltip = "Color for Symbol 2 on chart")
+col3 = input.color(defval = color.green, title = "Symbol 3 Color", group = "Display",
+                   tooltip = "Color for Symbol 3 on chart")
+col0 = input.color(defval = color.red, title = "Cash Color", group = "Display",
+                   tooltip = "Color when in cash position")
+linewidth1 = input.int(defval = 4, minval = 1, maxval = 4, title = "Line Width", group = "Display",
+                       tooltip = "Thickness of the position indicator line (1-4)")
+
+// Momentum calculation function
+funct1() =>
+    var montharray = array.new_float()
+    var float mom = 0.0
+    newmonth = month != month[1]
+    if newmonth
+        array.unshift(montharray, close[1])
+        if array.size(montharray) > math.max(mon1, mon2, mon3)
+            month0 = close[1]
+            month1 = array.get(montharray, mon1)
+            month2 = array.get(montharray, mon2)
+            month3 = array.get(montharray, mon3)
+            avg1 = (month0 / month1 - 1) * 100
+            avg2 = (month0 / month2 - 1) * 100
+            avg3 = (month0 / month3 - 1) * 100
+            mom := (avg1 + avg2 + avg3) / 3
+    [mom, close[1]]
+
+// Prevent repainting
+[mom1, close1] = request.security(sym1, "M", funct1(), lookahead=barmerge.lookahead_off)
+[mom2, close2] = request.security(sym2, "M", funct1(), lookahead=barmerge.lookahead_off)
+[mom3, close3] = request.security(sym3, "M", funct1(), lookahead=barmerge.lookahead_off)
+
+// Lows + ATR + Prices
+low1 = request.security(sym1, atrTF, low, lookahead=barmerge.lookahead_off)
+low2 = request.security(sym2, atrTF, low, lookahead=barmerge.lookahead_off)
+low3 = request.security(sym3, atrTF, low, lookahead=barmerge.lookahead_off)
+atr1 = request.security(sym1, atrTF, ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+atr2 = request.security(sym2, atrTF, ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+atr3 = request.security(sym3, atrTF, ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+currentPrice1 = request.security(sym1, atrTF, close, lookahead=barmerge.lookahead_off)
+currentPrice2 = request.security(sym2, atrTF, close, lookahead=barmerge.lookahead_off)
+currentPrice3 = request.security(sym3, atrTF, close, lookahead=barmerge.lookahead_off)
+
+// State variables
+var float  maxmom   = 0.0
+var string maxsym   = ""
+var int    maxint   = 0
+var float  maxentry = na
+var color  maxcol   = color.white
+var float  entryATR = na
+var float  lastExitPnL = na  // Track last exit P&L for display
+
+// DUAL STOP SYSTEM
+var float  fixedStop = na      // Fixed ATR stop from entry (never moves)
+var float  trailingStop = na   // Trailing stop (moves up only)
+var float  activeStop = na     // The one actually being used (higher of the two)
+var float  highestPrice = na   // For trailing calculation
+var int    entryBarIndex = 0   // Track when position was entered (for minimum hold)
+
+// Track previous state
+var int prevMaxint = 0
+var string prevMaxsym = ""
+
+// Detect update events
+dayChange = dayofweek != dayofweek[1]
+weekChange = weekofyear != weekofyear[1]
+monthChange = month != month[1]
+
+trailUpdate = trailFreq == "Daily" ? dayChange : 
+              trailFreq == "Weekly" ? weekChange : 
+              monthChange
+
+// Monthly rebalance
+if monthChange
+    maxmom := math.max(mom1, mom2, mom3)
+    
+    if maxmom <= absThr
+        // Switch to Cash
+        // Calculate P&L before exiting (if we were in a position)
+        if maxint != 0 and not na(maxentry)
+            exitPnL = (close[1] - maxentry) / maxentry * 100
+            lastExitPnL := exitPnL
+        
+        maxint := 0
+        maxsym := "Cash"
+        maxcol := col0
+        maxentry := na
+        entryATR := na
+        fixedStop := na
+        trailingStop := na
+        activeStop := na
+        highestPrice := na
+        // Label below at y=0 for cash
+        label.new(bar_index, 0, text="Cash", style=label.style_label_up, color=col0, textcolor=color.white)
+    else
+        // Select highest momentum asset
+        maxsym := maxmom == mom1 ? sym1 : maxmom == mom2 ? sym2 : sym3
+        maxint := maxmom == mom1 ? 1 : maxmom == mom2 ? 2 : 3
+        maxentry := maxint == 1 ? close1 : maxint == 2 ? close2 : close3
+        maxcol := maxint == 1 ? col1 : maxint == 2 ? col2 : col3
+        
+        // Lock ATR and set stops at entry
+        entryATR := maxint == 1 ? atr1 : maxint == 2 ? atr2 : atr3
+        
+        // Initialize both stops at same level
+        fixedStop := maxentry - (atrMult * entryATR)      // This never moves
+        trailingStop := maxentry - (atrMult * entryATR)   // This will trail up
+        activeStop := fixedStop                            // Start with fixed
+        highestPrice := maxentry
+        
+        // Record entry time for minimum hold period
+        entryBarIndex := bar_index
+
+// Pick active asset data
+maxlow = maxint == 1 ? low1 : maxint == 2 ? low2 : maxint == 3 ? low3 : na
+currentPrice = maxint == 1 ? currentPrice1 : maxint == 2 ? currentPrice2 : maxint == 3 ? currentPrice3 : na
+
+// DUAL STOP LOGIC
+if maxint != 0 and not na(maxentry) and not na(entryATR) and not na(currentPrice)
+    
+    // Update highest price
+    if currentPrice > highestPrice
+        highestPrice := currentPrice
+    
+    // Update trailing stop (only on specified frequency)
+    if trailUpdate and (stopMode == "Trailing Only" or stopMode == "Dual Stop (Recommended)")
+        newTrailingStop = highestPrice - (atrMult * entryATR)
+        
+        // Trailing stop only moves up
+        if newTrailingStop > trailingStop
+            trailingStop := newTrailingStop
+    
+    // Determine which stop is active based on mode
+    if stopMode == "Fixed Only"
+        activeStop := fixedStop
+    else if stopMode == "Trailing Only"
+        activeStop := trailingStop
+    else  // Dual Stop
+        // Use whichever stop is HIGHER (more protective)
+        activeStop := math.max(fixedStop, trailingStop)
+
+// Check if stop is hit
+if maxint != 0 and not na(activeStop) and not na(maxlow)
+    if maxlow <= activeStop
+        if not monthChange
+            // Calculate how many bars held
+            barsHeld = bar_index - entryBarIndex
+            
+            // Only exit if minimum hold period has passed
+            if barsHeld >= minHoldDays
+                // Calculate P&L
+                exitPrice = activeStop
+                pnlPercent = (exitPrice - maxentry) / maxentry * 100
+                lastExitPnL := pnlPercent  // Store for table display
+                
+                maxint := 0
+                maxsym := "Cash"
+                maxcol := col0
+                maxentry := na
+                entryATR := na
+                fixedStop := na
+                trailingStop := na
+                activeStop := na
+                highestPrice := na
+                entryBarIndex := 0
+                
+                // Simple label without P&L (now shown in table)
+                label.new(bar_index, 0, text="Back to Cash", style=label.style_label_up, color=col0, textcolor=color.white)
+
+// Buy label when selection changes
+if maxsym != prevMaxsym and maxint != 0
+    // Extract symbol name without exchange (e.g., "NASDAQ:QQQ" -> "QQQ")
+    symbolParts = str.split(maxsym, ":")
+    symbolName = array.size(symbolParts) > 1 ? array.get(symbolParts, 1) : maxsym
+    labelText = "BUY " + symbolName
+    // Labels at y=1 (above the line) for buys
+    label.new(bar_index, 1, text=labelText, style=label.style_label_down, 
+              color=maxcol, textcolor=color.white)
+
+// Update previous state
+prevMaxint := maxint
+prevMaxsym := maxsym
+
+// Plot - all symbols at y=1, differentiated by color only
+// 0 for cash, 1 for any asset position
+plotValue = maxint == 0 ? 0 : 1
+plot(plotValue, color=maxcol, style=plot.style_stepline, linewidth=math.max(1, linewidth1), title="Position")
+
+// Simplified state table - only essential info
+var table stateTable = table.new(position.top_right, 2, 6, border_width=1)
+
+if barstate.islast
+    // Row 1: Current Asset
+    table.cell(stateTable, 0, 0, "Current Asset:", text_color=color.white, bgcolor=color.gray)
+    table.cell(stateTable, 1, 0, maxsym, bgcolor=maxcol, text_color=color.white)
+    
+    // Row 2: Momentum
+    table.cell(stateTable, 0, 1, "Momentum:", text_color=color.white, bgcolor=color.gray)
+    table.cell(stateTable, 1, 1, str.tostring(maxmom, "#.##") + "%", text_color=color.white, bgcolor=color.gray)
+    
+    // Row 3: Entry Price
+    table.cell(stateTable, 0, 2, "Entry Price:", text_color=color.white, bgcolor=color.gray)
+    entryText = na(maxentry) ? "N/A" : str.tostring(maxentry, "#.####")
+    table.cell(stateTable, 1, 2, entryText, text_color=color.white, bgcolor=color.gray)
+    
+    // Row 4: Current Price with P&L
+    table.cell(stateTable, 0, 3, "Current Price:", text_color=color.white, bgcolor=color.gray)
+    if not na(currentPrice) and maxint != 0
+        pnl = (currentPrice - maxentry) / maxentry * 100
+        pnlColor = pnl >= 0 ? color.green : color.red
+        pnlSign = pnl >= 0 ? "+" : ""
+        currentText = str.tostring(currentPrice, "#.####") + " (" + pnlSign + str.tostring(pnl, "#.##") + "%)"
+        table.cell(stateTable, 1, 3, currentText, text_color=pnlColor, bgcolor=color.gray)
+    else
+        table.cell(stateTable, 1, 3, "N/A", text_color=color.white, bgcolor=color.gray)
+    
+    // Row 5: Active Stop (with indicator of which type)
+    table.cell(stateTable, 0, 4, "Active Stop:", text_color=color.white, bgcolor=color.blue)
+    if not na(activeStop)
+        // Determine which stop is active
+        whichActive = ""
+        if stopMode == "Dual Stop (Recommended)" and not na(fixedStop) and not na(trailingStop)
+            whichActive := activeStop == fixedStop ? " [Fixed]" : " [Trail]"
+        else if stopMode == "Fixed Only"
+            whichActive := " [Fixed]"
+        else if stopMode == "Trailing Only"
+            whichActive := " [Trail]"
+        activeText = str.tostring(activeStop, "#.####") + whichActive
+        table.cell(stateTable, 1, 4, activeText, text_color=color.white, bgcolor=color.blue)
+    else
+        table.cell(stateTable, 1, 4, "N/A", text_color=color.white, bgcolor=color.gray)
+    
+    // Row 6: Last Trade P&L
+    table.cell(stateTable, 0, 5, "Last Trade:", text_color=color.white, bgcolor=color.gray)
+    if not na(lastExitPnL)
+        pnlColor = lastExitPnL >= 0 ? color.green : color.red
+        pnlSign = lastExitPnL >= 0 ? "+" : ""
+        pnlText = pnlSign + str.tostring(lastExitPnL, "#.##") + "%"
+        table.cell(stateTable, 1, 5, pnlText, text_color=pnlColor, bgcolor=color.gray)
+    else
+        table.cell(stateTable, 1, 5, "N/A", text_color=color.white, bgcolor=color.gray)
+
+// Visual indicator
+indicatorColor = stopMode == "Fixed Only" ? color.red : 
+                 stopMode == "Trailing Only" ? color.blue : 
+                 color.purple  // Dual mode
+bgcolor(maxint != 0 ? color.new(indicatorColor, 95) : na, title="Stop Mode Active")
+
+// === ALERTS ===
+// Alert when entering a new position
+newPosition = maxsym != prevMaxsym and maxint != 0
+alertcondition(newPosition, "New Position", "New BUY signal - Check indicator for details")
+
+// Alert when moving to cash (stop hit or negative momentum)
+moveToCash = maxsym != prevMaxsym and maxsym == "Cash"
+alertcondition(moveToCash, "Exit to Cash", "EXIT to Cash - Position closed")
+
+// Alert when stop is trailing up (profit protection activating)
+stopTrailed = not na(trailingStop) and trailingStop > trailingStop[1] and maxint != 0
+alertcondition(stopTrailed, "Stop Trailed Up", "Stop trailing UP - Protecting profits")

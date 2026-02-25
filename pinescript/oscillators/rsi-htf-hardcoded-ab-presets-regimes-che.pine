@@ -1,0 +1,429 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © chervolino
+//@version=6
+indicator(title="RSI HTF Hardcoded (A/B Presets) + Regimes [CHE]", shorttitle="RSI HTF", overlay=false, scale=scale.right, max_bars_back=5000, max_lines_count=500, max_labels_count=500)
+
+// ——— SECTION: Constants & Enums
+string GROUP_INPUTS = "Inputs"
+string GROUP_DISPLAY = "Display"
+string GROUP_FILTER = "Filter"
+int MS_IN_MIN = 60 * 1000
+int MS_IN_HOUR = MS_IN_MIN * 60
+int MS_IN_DAY = MS_IN_HOUR * 24
+
+// ——— SECTION: Inputs (grouped; tooltips; one-row via inline)
+src_input = input.source(close, "Source", group=GROUP_INPUTS, inline="core", tooltip="Input data for RSI.")
+preset_input = input.string("A(14/14)", "Preset", options=["A(14/14)","B(14/9)","C(21/21)","D(7/7)"], group=GROUP_INPUTS, inline="core", tooltip="Preset A=RSI14/SMA14, B=RSI14/SMA9, C=RSI21/SMA21, D=RSI7/SMA7.")
+target_bucket_input = input.string("Auto", "Target Bucket", options=["Auto","60","240","1D","3D","7D","1M","3M","12M"], group=GROUP_INPUTS, inline="core", tooltip="Auto chooses a target bucket based on chart timeframe (same step logic as the MACD script).")
+table_x_input = input.string("right", "Table X", options=["left","center","right"], group=GROUP_DISPLAY, inline="tbl", tooltip="Horizontal anchor for info table.")
+table_y_input = input.string("top", "Table Y", options=["top","middle","bottom"], group=GROUP_DISPLAY, inline="tbl", tooltip="Vertical anchor for info table.")
+table_size_input = input.string("normal", "Table Size", options=["tiny","small","normal","large"], group=GROUP_DISPLAY, inline="tbl", tooltip="Text size for the info table.")
+is_dark_mode_input = input.bool(true, "Dark Mode", group=GROUP_DISPLAY, inline="tbl", tooltip="Toggle dark/light table theme.")
+show_table_input = input.bool(true, "Show Table", group=GROUP_DISPLAY, inline="tbl", tooltip="Show or hide the info table.")
+eps_input = input.float(1.0, "Epsilon (dead-band)", step=0.1, group=GROUP_FILTER, inline="flt", tooltip="Dead-band for classification around RSI=50 and around (RSI-SMA).")
+accept_bars_input = input.int(3, "Acceptance bars (n)", minval=1, group=GROUP_FILTER, inline="flt", tooltip="Regime becomes valid after n consecutive bars.")
+
+// ——— SECTION: Persistent Vars → Runtime Vars
+var table info_table = na
+
+// ——— SECTION: Helpers (pure, no side effects)
+size_from_str(s) =>
+ s == "tiny"  ? size.tiny  :
+ s == "small" ? size.small :
+ s == "large" ? size.large : size.normal
+
+pos_from_xy(x, y) =>
+    x == "left" and y == "top"    ? position.top_left    :x == "left" and y == "middle" ? position.middle_left : x == "left" and y == "bottom" ? position.bottom_left : x == "center" and y == "top"    ? position.top_center    : x == "center" and y == "middle" ? position.middle_center :x == "center" and y == "bottom" ? position.bottom_center : y == "top"    ? position.top_right :y == "middle" ? position.middle_right : position.bottom_right
+
+tf_label_current() =>
+    string out = timeframe.period
+    if timeframe.isseconds
+        out := str.tostring(timeframe.multiplier) + "s"
+    else if timeframe.isminutes
+        out := str.tostring(timeframe.multiplier) + "m"
+    else if timeframe.isdaily
+        out := str.tostring(timeframe.multiplier) + "D"
+    else if timeframe.isweekly
+        out := str.tostring(timeframe.multiplier) + "W"
+    else if timeframe.ismonthly
+        out := str.tostring(timeframe.multiplier) + "M"
+    out
+
+autotimeframe() =>
+    int tf_in_sec = timeframe.in_seconds(timeframe.period)
+    int tf_in_ms = tf_in_sec * 1000
+    string step = "12M"
+    if tf_in_ms <= MS_IN_MIN
+        step := "60"
+    else if tf_in_ms <= MS_IN_MIN * 5
+        step := "240"
+    else if tf_in_ms <= MS_IN_HOUR
+        step := "1D"
+    else if tf_in_ms <= MS_IN_HOUR * 4
+        step := "3D"
+    else if tf_in_ms <= MS_IN_HOUR * 12
+        step := "7D"
+    else if tf_in_ms <= MS_IN_DAY
+        step := "1M"
+    else if tf_in_ms <= MS_IN_DAY * 7
+        step := "3M"
+    step
+
+regime_desc(r) =>
+    r == 0 ? "Neutral (within dead-band)" : r == 1 ? "Bullish (RSI>50, Diff>0)" : r == 2 ? "Weak Bull (RSI>50, Diff<0)" : r == 3 ? "Bearish (RSI<50, Diff<0)" : r == 4 ? "Weak Bear (RSI<50, Diff>0)" : "Invalid"
+
+as_float(cond) =>
+    cond ? 1.0 : 0.0
+
+resolve_lengths_rsi(preset_str, bucket_override) =>
+    string bucket = bucket_override == "Auto" ? autotimeframe() : bucket_override
+    int r_base = 14
+    int s_base = 14
+    string tag = ""
+    if preset_str == "A(14/14)"
+        r_base := 14
+        s_base := 14
+        tag := "A(14/14) "
+    else if preset_str == "B(14/9)"
+        r_base := 14
+        s_base := 9
+        tag := "B(14/9) "
+    else if preset_str == "C(21/21)"
+        r_base := 21
+        s_base := 21
+        tag := "C(21/21) "
+    else
+        r_base := 7
+        s_base := 7
+        tag := "D(7/7) "
+    int mult = 1
+    if bucket == "60"
+        if timeframe.isminutes and timeframe.multiplier == 1
+            mult := 60
+            tag += "1m->60m"
+        else if timeframe.isminutes and timeframe.multiplier == 2
+            mult := 30
+            tag += "2m->60m"
+        else if timeframe.isminutes and timeframe.multiplier == 3
+            mult := 20
+            tag += "3m->60m"
+        else if timeframe.isminutes and timeframe.multiplier == 4
+            mult := 15
+            tag += "4m->60m"
+        else if timeframe.isminutes and timeframe.multiplier == 5
+            mult := 12
+            tag += "5m->60m"
+        else
+            mult := 1
+            tag += tf_label_current() + "->60m"
+    else if bucket == "240"
+        if timeframe.isminutes and timeframe.multiplier == 2
+            mult := 120
+            tag += "2m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 3
+            mult := 80
+            tag += "3m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 4
+            mult := 60
+            tag += "4m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 5
+            mult := 48
+            tag += "5m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 6
+            mult := 40
+            tag += "6m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 8
+            mult := 30
+            tag += "8m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 10
+            mult := 24
+            tag += "10m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 12
+            mult := 20
+            tag += "12m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 15
+            mult := 16
+            tag += "15m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 20
+            mult := 12
+            tag += "20m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 30
+            mult := 8
+            tag += "30m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 45
+            mult := 5
+            tag += "45m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 60
+            mult := 4
+            tag += "60m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 90
+            mult := 2
+            tag += "90m->240m"
+        else if timeframe.isminutes and timeframe.multiplier == 120
+            mult := 2
+            tag += "120m->240m"
+        else
+            mult := 1
+            tag += tf_label_current() + "->240m"
+    else if bucket == "1D"
+        if timeframe.isminutes and timeframe.multiplier == 6
+            mult := 240
+            tag += "6m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 7
+            mult := 206
+            tag += "7m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 8
+            mult := 180
+            tag += "8m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 9
+            mult := 160
+            tag += "9m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 10
+            mult := 144
+            tag += "10m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 12
+            mult := 120
+            tag += "12m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 15
+            mult := 96
+            tag += "15m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 20
+            mult := 72
+            tag += "20m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 30
+            mult := 48
+            tag += "30m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 45
+            mult := 32
+            tag += "45m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 60
+            mult := 24
+            tag += "60m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 90
+            mult := 16
+            tag += "90m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 120
+            mult := 12
+            tag += "120m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 180
+            mult := 8
+            tag += "180m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 240
+            mult := 6
+            tag += "240m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 360
+            mult := 4
+            tag += "360m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 480
+            mult := 3
+            tag += "480m->1D"
+        else if timeframe.isminutes and timeframe.multiplier == 720
+            mult := 2
+            tag += "720m->1D"
+        else if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 1
+            tag += "1D->1D"
+        else
+            mult := 1
+            tag += tf_label_current() + "->1D"
+    else if bucket == "3D"
+        if timeframe.isminutes and timeframe.multiplier == 90
+            mult := 48
+            tag += "90m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 120
+            mult := 36
+            tag += "120m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 180
+            mult := 24
+            tag += "180m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 240
+            mult := 18
+            tag += "240m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 360
+            mult := 12
+            tag += "360m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 480
+            mult := 9
+            tag += "480m->3D"
+        else if timeframe.isminutes and timeframe.multiplier == 720
+            mult := 6
+            tag += "720m->3D"
+        else if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 3
+            tag += "1D->3D"
+        else if timeframe.isdaily and timeframe.multiplier == 3
+            mult := 1
+            tag += "3D->3D"
+        else
+            mult := 1
+            tag += tf_label_current() + "->3D"
+    else if bucket == "7D"
+        if timeframe.isminutes and timeframe.multiplier == 360
+            mult := 28
+            tag += "360m->7D"
+        else if timeframe.isminutes and timeframe.multiplier == 480
+            mult := 21
+            tag += "480m->7D"
+        else if timeframe.isminutes and timeframe.multiplier == 720
+            mult := 14
+            tag += "720m->7D"
+        else if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 7
+            tag += "1D->7D"
+        else if timeframe.isweekly and timeframe.multiplier == 1
+            mult := 1
+            tag += "1W->7D"
+        else
+            mult := 1
+            tag += tf_label_current() + "->7D"
+    else if bucket == "1M"
+        if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 30
+            tag += "1D->1M"
+        else if timeframe.isdaily and timeframe.multiplier == 2
+            mult := 15
+            tag += "2D->1M"
+        else if timeframe.isdaily and timeframe.multiplier == 3
+            mult := 10
+            tag += "3D->1M"
+        else if timeframe.isdaily and timeframe.multiplier == 5
+            mult := 6
+            tag += "5D->1M"
+        else if timeframe.isweekly and timeframe.multiplier == 1
+            mult := 4
+            tag += "1W->1M"
+        else if timeframe.ismonthly and timeframe.multiplier == 1
+            mult := 1
+            tag += "1M->1M"
+        else
+            mult := 1
+            tag += tf_label_current() + "->1M"
+    else if bucket == "3M"
+        if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 90
+            tag += "1D->3M"
+        else if timeframe.isdaily and timeframe.multiplier == 2
+            mult := 45
+            tag += "2D->3M"
+        else if timeframe.isdaily and timeframe.multiplier == 3
+            mult := 30
+            tag += "3D->3M"
+        else if timeframe.isweekly and timeframe.multiplier == 1
+            mult := 13
+            tag += "1W->3M"
+        else if timeframe.ismonthly and timeframe.multiplier == 1
+            mult := 3
+            tag += "1M->3M"
+        else if timeframe.ismonthly and timeframe.multiplier == 3
+            mult := 1
+            tag += "3M->3M"
+        else
+            mult := 1
+            tag += tf_label_current() + "->3M"
+    else
+        if timeframe.ismonthly and timeframe.multiplier == 1
+            mult := 12
+            tag += "1M->12M"
+        else if timeframe.ismonthly and timeframe.multiplier == 3
+            mult := 4
+            tag += "3M->12M"
+        else if timeframe.ismonthly and timeframe.multiplier == 6
+            mult := 2
+            tag += "6M->12M"
+        else if timeframe.ismonthly and timeframe.multiplier == 12
+            mult := 1
+            tag += "12M->12M"
+        else if timeframe.isweekly and timeframe.multiplier == 1
+            mult := 52
+            tag += "1W->12M"
+        else if timeframe.isdaily and timeframe.multiplier == 1
+            mult := 360
+            tag += "1D->12M"
+        else
+            mult := 1
+            tag += tf_label_current() + "->12M"
+    int r_len = r_base * mult
+    int s_len = s_base * mult
+    if r_len < 1
+        r_len := 1
+    if s_len < 1
+        s_len := 1
+    [r_len, s_len, tag]
+
+// ——— SECTION: Core Calculations
+pos = pos_from_xy(table_x_input, table_y_input)
+tsize = size_from_str(table_size_input)
+bg_color = is_dark_mode_input ? color.new(color.black, 20) : color.new(color.white, 20)
+header_bg = is_dark_mode_input ? color.new(color.blue, 50) : color.new(color.gray, 50)
+text_color = is_dark_mode_input ? color.white : color.black
+border_color = color.gray
+
+[rsi_len, sma_len, tf_tag] = resolve_lengths_rsi(preset_input, target_bucket_input)
+rsi_val = ta.rsi(src_input, rsi_len)
+sma_val = ta.sma(rsi_val, sma_len)
+diff = rsi_val - sma_val
+
+is_pos = (rsi_val - 50.0) > eps_input
+is_neg = (rsi_val - 50.0) < -eps_input
+is_hpos = diff > eps_input
+is_hneg = diff < -eps_input
+
+raw_regime = is_pos and is_hpos ? 1 : is_pos and is_hneg ? 2 : is_neg and is_hneg ? 3 : is_neg and is_hpos ? 4 : 0
+r1_ok = math.sum(as_float(raw_regime == 1), accept_bars_input) == accept_bars_input
+r2_ok = math.sum(as_float(raw_regime == 2), accept_bars_input) == accept_bars_input
+r3_ok = math.sum(as_float(raw_regime == 3), accept_bars_input) == accept_bars_input
+r4_ok = math.sum(as_float(raw_regime == 4), accept_bars_input) == accept_bars_input
+flt_regime = r1_ok ? 1 : r2_ok ? 2 : r3_ok ? 3 : r4_ok ? 4 : 0
+changed = flt_regime != nz(flt_regime[1], 0)
+
+is_hist_up = diff >= 0
+is_hist_rising = na(diff[1]) ? true : diff > diff[1]
+hist_color = is_hist_up ? (is_hist_rising ? color.new(#26A69A, 0) : color.new(#B2DFDB, 0)) : (is_hist_rising ? color.new(#FFCDD2, 0) : color.new(#FF5252, 0))
+
+// ——— SECTION: Rendering/UI (GLOBAL ONLY; single-line calls)
+alertcondition(changed, title="Regime changed", message="RSI regime changed")
+
+plot(rsi_val, title="RSI (hard-resolved)", color=#2962FF)
+plot(sma_val, title="SMA(RSI) (hard-resolved)", color=#FF6D00)
+// plot(sma_val, title="SMA(RSI) (hard-resolved)", color=sma_val> sma_val[1]?#FF6D00:color.white)
+// ——— SECTION: Table Lifecycle (create/delete/re-create) + Updates (only when visible)
+if not show_table_input and not na(info_table) and barstate.islast
+    table.delete(info_table)
+    info_table := na
+
+if show_table_input and na(info_table) and barstate.islast
+    info_table := table.new(pos, 2, 6, bgcolor=bg_color, border_width=1, border_color=border_color)
+    table.cell(info_table, 0, 0, "Parameter", bgcolor=header_bg, text_color=color.white, text_size=tsize)
+    table.cell(info_table, 1, 0, "Value", bgcolor=header_bg, text_color=color.white, text_size=tsize)
+    table.cell(info_table, 0, 1, "Preset", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 1, 1, "", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 0, 2, "TF", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 1, 2, "", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 0, 3, "Lengths (RSI/SMA)", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 1, 3, "", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 0, 4, "Regime", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 1, 4, "", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 0, 5, "Epsilon/n", text_color=text_color, text_size=tsize)
+    table.cell(info_table, 1, 5, "", text_color=text_color, text_size=tsize)
+
+if show_table_input and not na(info_table) and barstate.islast
+    table.set_position(info_table, pos)
+    table.cell_set_bgcolor(info_table, 0, 0, header_bg)
+    table.cell_set_bgcolor(info_table, 1, 0, header_bg)
+    table.cell_set_text_color(info_table, 0, 0, color.white)
+    table.cell_set_text_color(info_table, 1, 0, color.white)
+    table.cell_set_text_color(info_table, 0, 1, text_color)
+    table.cell_set_text_color(info_table, 1, 1, text_color)
+    table.cell_set_text_color(info_table, 0, 2, text_color)
+    table.cell_set_text_color(info_table, 1, 2, text_color)
+    table.cell_set_text_color(info_table, 0, 3, text_color)
+    table.cell_set_text_color(info_table, 1, 3, text_color)
+    table.cell_set_text_color(info_table, 0, 4, text_color)
+    table.cell_set_text_color(info_table, 1, 4, text_color)
+    table.cell_set_text_color(info_table, 0, 5, text_color)
+    table.cell_set_text_color(info_table, 1, 5, text_color)
+    table.cell_set_text(info_table, 1, 1, preset_input)
+    table.cell_set_text(info_table, 1, 2, tf_tag)
+    table.cell_set_text(info_table, 1, 3, str.tostring(rsi_len) + "/" + str.tostring(sma_len))
+    table.cell_set_text(info_table, 1, 4, str.tostring(flt_regime) + ": " + regime_desc(flt_regime))
+    table.cell_set_text(info_table, 1, 5, str.tostring(eps_input) + " / " + str.tostring(accept_bars_input))

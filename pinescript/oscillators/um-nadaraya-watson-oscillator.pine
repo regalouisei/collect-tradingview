@@ -1,0 +1,199 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © UnderwearMillionaire
+
+//@version=6
+indicator("UM NWE Oscillator", "NWE Osc", overlay = false, max_bars_back = 500)
+
+// Description
+//  This is a different take on the Nadaraya-Watson Estimator from both Jdhorty and LuxAlgo.  Both great scripts, check them out.  Think of this script as a measure of trend direction, direction change, 
+//  and trend acceleration or deceleration.
+//  It is not a Moving Average, but you could think of it as loosely as an intelligent adaptive regression curve with the focus on trend direction.  The Gaussian calculations prefer and adds more weight the most recent bars. 
+//  The end result is the oscillator is more responsive with less lag and less prone to pure price noise.  
+//
+// How it Works
+// The indicator was added to the chart twice; once with an MA, once without.  The oscillator indicates trend change by crossing up through the zero line or down through the zero line.  Once the indicator turns positive, 
+// we are in a positive trend until it crosses below zero and then the trend turns negative.
+// I implemented a Moving Average overlay for addtional signal determination;  if the configured MA (EMA, SMA, WMA, or Nadaraya Watson Estimator) trends higher it is green. When trending down, it is red.
+// The indicator also changes the color of the price bars; when the indicator below zero and red, the price bars are red.  When the indicator is above zero and green, the price bars are green.
+// I marked up the chart and indicator to identify LONG, SHORT, and divergences between price and oscillator.   
+// There are also up and down arrows the can be turned on within the oscillator to indicate direction change.
+
+
+// Default Settings
+// The default settings are 16 for Bandwidth and a WMA with 110.  This is shown in the chart example.
+// The directional arrows are off by default.  The Pric bars are colored green or red to match the oscillator also by default.
+// All settings are user-configurable including bandwidth, MA type, MA length, bar coloring, and arrows.
+
+
+// Suggested Settings and uses
+// I personally like the 30 min chart with a bandwidth of 16 and a WMA of 110.
+// The bandwidth 8 and 8 period EMA or WMA also work well on 6 hour and daily charts.
+// Add this to your chart arsenal and use your favorite indicators for confirmation.
+// This indicator works well on the 30 minute chart for inverse ETFs as well (SQQQ, SOXS, TZA)
+// Also, the oscillator is good for identifying divergences between price and and indicator.
+// Experiment with settings and adapt them to your trading style.
+
+// Alerts
+// If you right click the indicator, and select add alert, I have configured 4 standard alerts: A bullish cross above zero,  A bearish cross below zero,
+// An MA bullish turned to trend higher, (green), and an MA bearish turned to trend lower (red).
+
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+h          = input.float(16.0,  "Bandwidth", minval = 0)
+src        = input.source(close, "Source")
+upCss      = input.color(color.teal, "Up Color",   inline = "c1", group = "Style")
+dnCss      = input.color(color.red,  "Down Color", inline = "c1", group = "Style")
+showArrows = input.bool(false, "Show Direction Arrows?")
+
+sigMaType  = input.string("WMA", "Signal Type", options = ["EMA","SMA","WMA","NWE"])
+sigMaLen   = input.int(110, "Signal MA Length", minval = 1)
+
+// NWE-only inputs for signal
+groupNWE   = "Nadaraya–Watson (Signal)"
+nweLen     = input.int(7, "NWE Window Length", minval = 1, group = groupNWE)
+nweH       = input.float(6.0, "NWE Bandwidth (h)", minval = 0.1, group = groupNWE)
+nweRes     = input.int(6, "NWE Resolution", minval = 1, group = groupNWE)
+
+//------------------------------------------------------------------------------
+// Gaussian kernel
+//------------------------------------------------------------------------------
+gauss(x, h) =>
+    math.exp(-(math.pow(x, 2) / (h * h * 2)))
+
+//------------------------------------------------------------------------------
+// Precompute kernel weights for 0..499 lag
+//------------------------------------------------------------------------------
+var coefs = array.new_float(0)
+var den   = 0.0
+
+if barstate.isfirst
+    for i = 0 to 499
+        w = gauss(i, h)
+        array.push(coefs, w)
+    den := array.sum(coefs)
+
+//------------------------------------------------------------------------------
+// Endpoint estimator (non-repainting smoother)
+//------------------------------------------------------------------------------
+float out = na
+
+if bar_index >= 499 and den != 0.0
+    sumEst = 0.0
+    for i = 0 to 499
+        sumEst += src[i] * array.get(coefs, i)
+    out := sumEst / den
+
+//------------------------------------------------------------------------------
+// Oscillator (slope of smoother)
+//------------------------------------------------------------------------------
+osc = not na(out) and not na(out[1]) ? out - out[1] : na
+
+plot(osc, title = "NWE Oscillator", color = osc > 0 ? upCss : osc < 0 ? dnCss : color.new(color.gray, 70), linewidth = 2)
+
+//------------------------------------------------------------------------------
+// Nadaraya–Watson estimator function (non-repainting, uses past bars only)
+//------------------------------------------------------------------------------
+nweSignal(srcSeries, winLen, hNwe, res) =>
+    // Require enough history
+    if bar_index < winLen
+        na
+    else
+        float num = 0.0
+        float den2 = 0.0
+        // Simple 1D Gaussian kernel regression on past window
+        for i = 0 to winLen - 1
+            // Scale distance by "res" so the 3 params are actually used
+            x = (i / res)
+            w = math.exp(-math.pow(x, 2) / (2.0 * hNwe * hNwe))
+            val = srcSeries[i]
+            if not na(val)
+                num += val * w
+                den2 += w
+        den2 != 0.0 ? num / den2 : na
+
+//------------------------------------------------------------------------------
+// Signal of oscillator: EMA / SMA / WMA / NWE
+//------------------------------------------------------------------------------
+sig =
+     sigMaType == "EMA" ? ta.ema(osc, sigMaLen) :
+     sigMaType == "SMA" ? ta.sma(osc, sigMaLen) :
+     sigMaType == "WMA" ? ta.wma(osc, sigMaLen) :
+                          nweSignal(osc, nweLen, nweH, nweRes)
+
+sigUp   = sig > nz(sig[1], sig)
+sigDown = sig < nz(sig[1], sig)
+
+sigColor = sigUp ? upCss : sigDown ? dnCss : color.new(color.gray, 70)
+
+plot(sig, title = "Signal", color = sigColor, linewidth = 1)
+
+//------------------------------------------------------------------------------
+// Transparent fills vs zero line
+//------------------------------------------------------------------------------
+zeroLine = plot(0.0, title = "Zero", color = color.new(color.gray, 100), display = display.none)
+
+pos = osc > 0 ? osc : 0.0
+neg = osc < 0 ? osc : 0.0
+
+pPos = plot(pos, title = "Pos Area", color = color.new(upCss, 100), display = display.none)
+pNeg = plot(neg, title = "Neg Area", color = color.new(dnCss, 100), display = display.none)
+
+fill(pPos, zeroLine, color = color.new(upCss, 90))
+fill(pNeg, zeroLine, color = color.new(dnCss, 90))
+
+//------------------------------------------------------------------------------
+// Direction-flip arrows (optional)
+//------------------------------------------------------------------------------
+bullFlip = osc > 0 and nz(osc[1]) <= 0
+bearFlip = osc < 0 and nz(osc[1]) >= 0
+
+if showArrows and bullFlip
+    label.new(bar_index, osc, "▲", style = label.style_label_up, textcolor = upCss, color = color.new(color.white, 100), textalign = text.align_center)
+
+if showArrows and bearFlip
+    label.new(bar_index, osc, "▼", style = label.style_label_down, textcolor = dnCss, color = color.new(color.white, 100), textalign = text.align_center)
+
+//------------------------------------------------------------------------------
+// Price bars on main chart
+//------------------------------------------------------------------------------
+estUp   = osc > 0
+estDown = osc < 0
+
+barcolor(estUp ? upCss : estDown ? dnCss : na)
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+
+// 1) Bullish 0-cross up (oscillator crosses above zero)
+bullishZeroCross = ta.crossover(osc, 0.0)
+
+// 2) Bearish 0-cross down (oscillator crosses below zero)
+bearishZeroCross = ta.crossunder(osc, 0.0)
+
+// 3) Bullish MA (signal) direction change: signal turns from down/flat to up
+bullishSigFlip = not na(sig) and not na(sig[1]) and sigUp and not (sig[1] > sig[2])
+
+// Simpler & more robust version (recommended if you prefer):
+// bullishSigFlip = not na(sig) and not na(sig[1]) and sigUp and not sigUp[1]
+
+// 4) Bearish MA (signal) direction change: signal turns from up/flat to down
+bearishSigFlip = not na(sig) and not na(sig[1]) and sigDown and not (sig[1] < sig[2])
+
+// Simpler & more robust version (recommended if you prefer):
+// bearishSigFlip = not na(sig) and not na(sig[1]) and sigDown and not sigDown[1]
+
+// Alert conditions
+alertcondition(bullishZeroCross, title = "NWE Osc Bullish Zero Cross Up",
+     message = "{{ticker}} | {{interval}} NWE Osc Bullish Zero Cross Up")
+
+alertcondition(bearishZeroCross, title = "NWE Osc Bearish Zero Cross Down",
+     message = "{{ticker}} | {{interval}} NWE Osc Bearish Zero Cross Down")
+
+alertcondition(bullishSigFlip, title = "NWE Osc Bullish MA Direction Change",
+     message = "{{ticker}} | {{interval}} NWE Osc Bullish MA Direction Change (Signal Turns Up)")
+
+alertcondition(bearishSigFlip, title = "NWE Osc Bearish MA Direction Change",
+     message = "{{ticker}} | {{interval}} NWE Osc Bearish MA Direction Change (Signal Turns Down)")

@@ -1,0 +1,180 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DarkPoolCrypto
+
+//@version=6
+indicator("MacroTide Elasticity System", overlay=false, precision=2)
+
+// =============================================================================
+// 1. SETTINGS & UI CONFIGURATION
+// =============================================================================
+
+// Group: Main Calculation Settings
+grp_calc = "Calculations"
+i_src = input.source(close, "Source Price", group=grp_calc, 
+     tooltip="Determines the price data source used for calculations. 'Close' is standard for daily charts.")
+
+i_len = input.int(21, "Lookback Period", minval=5, maxval=365, group=grp_calc, 
+     tooltip="The lookback window for the Volume Weighted Moving Average (VWMA) base. \n\nSuggested Settings:\n• Swing: 21\n• Long-Term/Macro: 50 or 100")
+
+i_smooth = input.int(3, "Signal Smoothing", minval=1, maxval=20, group=grp_calc, 
+     tooltip="Applies a Simple Moving Average (SMA) smoothing factor to the final Elasticity Oscillator to filter out minor market noise.")
+
+// Group: Volatility & Elasticity
+grp_vol = "Elasticity Physics"
+i_mult = input.float(2.0, "StdDev Multiplier", minval=0.1, step=0.1, group=grp_vol, 
+     tooltip="Controls the width of the deviation bands. Higher values require more extreme price elasticity to reach overbought/oversold levels (e.g., a wider 'rubber band').")
+
+i_churn = input.float(1.5, "Absorption Volume Factor", minval=1.0, step=0.1, group=grp_vol, 
+     tooltip="The multiplier used to detect 'Churn' or Institutional Absorption. Detects bars where Volume is high (> Avg * Factor) but Price Range is compressed (< Avg Range).")
+
+// Group: Divergence Scanner
+grp_div = "Divergence Scanner"
+i_show_div = input.bool(true, "Show Divergences", group=grp_div, 
+     tooltip="Toggles the visibility of Bullish and Bearish divergence labels on the oscillator pane.")
+
+i_div_look = input.int(5, "Pivot Lookback", minval=1, group=grp_div, 
+     tooltip="The number of bars to the left and right required to confirm a pivot point. Higher values find more significant, longer-term pivots.")
+
+// Group: Visuals
+grp_vis = "Visual Customisation"
+i_show_swing = input.bool(false, "Show Swing Signals", group=grp_vis, 
+     tooltip="Toggles the visibility of the Triangle Swing Markers (Long/Short) on the oscillator pane. Default is OFF.")
+
+i_col_bar = input.bool(true, "Color Candles?", group=grp_vis, 
+     tooltip="If enabled, overrides the main chart candle colors to reflect the current Elasticity Trend state.")
+
+c_bull = input.color(color.new(#00E676, 0), "Bullish", group=grp_vis, inline="c1", 
+     tooltip="Color used for positive momentum and Bullish signals.")
+
+c_bear = input.color(color.new(#FF5252, 0), "Bearish", group=grp_vis, inline="c1", 
+     tooltip="Color used for negative momentum and Bearish signals.")
+
+c_absorb = input.color(color.new(#FFD700, 0), "Absorption", group=grp_vis, inline="c2", 
+     tooltip="Highlight color for bars exhibiting high-volume churn (absorption).")
+
+c_text = input.color(color.white, "Text", group=grp_vis, inline="c2", 
+     tooltip="Color for text labels (Divergences).")
+
+// =============================================================================
+// 2. MATH: VECTORIZED ELASTICITY
+// =============================================================================
+
+// Function: Vectorized Standard Deviation (O(1) Speed optimization)
+// Calculates StdDev relative to a VWMA basis without loop iteration.
+f_vw_stdev_optimized(src, len) =>
+    float vwma_base = ta.vwma(src, len)
+    float vwma_sq   = ta.vwma(math.pow(src, 2), len)
+    float variance  = vwma_sq - math.pow(vwma_base, 2)
+    math.sqrt(math.max(0, variance)) // Clamp to 0 to avoid NaN errors
+
+// Core Calculations
+float basis_vwma = ta.vwma(i_src, i_len)
+float deviation  = f_vw_stdev_optimized(i_src, i_len) * i_mult
+
+// Elasticity Score Calculation
+// Normalized to a 0-100 oscillator format centered at 50.
+float raw_score = 0.0
+if deviation != 0
+    raw_score := (i_src - basis_vwma) / deviation
+
+float osc = 50 + (raw_score * 25)
+osc := math.max(0, math.min(100, osc)) // Hard clamp to 0-100 range
+float signal = ta.sma(osc, i_smooth)
+
+// Absorption Logic
+// Definition: Volume > (Avg Vol * Churn) AND Range < Avg Range
+float vol_avg   = ta.sma(volume, i_len)
+float range_val = high - low
+float range_avg = ta.sma(range_val, i_len)
+bool is_absorb  = (volume > (vol_avg * i_churn)) and (range_val < range_avg)
+
+// =============================================================================
+// 3. MATH: DIVERGENCE ENGINE
+// =============================================================================
+
+// Pivot Detection
+pl = ta.pivotlow(signal, i_div_look, i_div_look)
+ph = ta.pivothigh(signal, i_div_look, i_div_look)
+
+// Bullish Divergence Detection
+var float last_pl_osc   = na
+var float last_pl_price = na
+bool div_bull = false
+
+if not na(pl)
+    // Check: Higher Low in Oscillator + Lower Low in Price
+    if not na(last_pl_osc) and (signal[i_div_look] > last_pl_osc) and (low[i_div_look] < last_pl_price)
+        div_bull := true
+    last_pl_osc   := signal[i_div_look]
+    last_pl_price := low[i_div_look]
+
+// Bearish Divergence Detection
+var float last_ph_osc   = na
+var float last_ph_price = na
+bool div_bear = false
+
+if not na(ph)
+    // Check: Lower High in Oscillator + Higher High in Price
+    if not na(last_ph_osc) and (signal[i_div_look] < last_ph_osc) and (high[i_div_look] > last_ph_price)
+        div_bear := true
+    last_ph_osc   := signal[i_div_look]
+    last_ph_price := high[i_div_look]
+
+// =============================================================================
+// 4. PLOTTING & VISUALS
+// =============================================================================
+
+// Dynamic Color Logic
+// Bullish if > 50 and rising, Bearish if < 50 and falling (with transparency for weak trends)
+color col_dyn = signal > 50 ? (signal > signal[1] ? c_bull : color.new(c_bull, 40)) : (signal < signal[1] ? c_bear : color.new(c_bear, 40))
+
+// Background Levels
+hline(80, "Overbought", color=color.new(c_bear, 50), linestyle=hline.style_dashed)
+hline(20, "Oversold",   color=color.new(c_bull, 50), linestyle=hline.style_dashed)
+hline(50, "Zero Line",  color=color.gray)
+
+// Main Signal Plot
+plot(signal, "MacroTide Signal", color=col_dyn, linewidth=2)
+
+// Absorption Events (Yellow Circles on the Oscillator)
+plot(is_absorb ? signal : na, "Absorption Event", color=c_absorb, style=plot.style_circles, linewidth=4)
+
+// Divergence Labels
+if i_show_div and div_bull
+    label.new(bar_index - i_div_look, signal[i_div_look] - 5, "DIV", 
+         color=color.new(c_bull, 100), textcolor=c_bull, style=label.style_label_up, size=size.small, text_formatting=text.format_bold, 
+         tooltip="Bullish Divergence: Price made Lower Low, Oscillator made Higher Low")
+
+if i_show_div and div_bear
+    label.new(bar_index - i_div_look, signal[i_div_look] + 5, "DIV", 
+         color=color.new(c_bear, 100), textcolor=c_bear, style=label.style_label_down, size=size.small, text_formatting=text.format_bold, 
+         tooltip="Bearish Divergence: Price made Higher High, Oscillator made Lower High")
+
+// Main Chart Candle Coloring
+barcolor(i_col_bar ? col_dyn : na, title="Trend Bar Color")
+
+// =============================================================================
+// 5. ALERTS & SIGNALS
+// =============================================================================
+bool confirmed = barstate.isconfirmed
+
+// Swing Signals (Crossing extreme zones)
+bool swing_long  = ta.crossover(signal, 20)  and confirmed
+bool swing_short = ta.crossunder(signal, 80) and confirmed
+
+// Visual Signal Markers (Controlled by i_show_swing)
+plotshape(i_show_swing and swing_long,  title="Macro Long",  style=shape.triangleup,   location=location.bottom, color=c_bull, size=size.small, offset=0)
+plotshape(i_show_swing and swing_short, title="Macro Short", style=shape.triangledown, location=location.top,    color=c_bear, size=size.small, offset=0)
+
+// Alert Conditions
+if swing_long
+    alert("MacroTide Long Trigger: Price Reclaiming Elasticity (Oversold Exit)", alert.freq_once_per_bar_close)
+
+if swing_short
+    alert("MacroTide Short Trigger: Price Snapping Back (Overbought Exit)", alert.freq_once_per_bar_close)
+
+if div_bull and confirmed
+    alert("MacroTide Bullish Divergence Detected", alert.freq_once_per_bar_close)
+
+if div_bear and confirmed
+    alert("MacroTide Bearish Divergence Detected", alert.freq_once_per_bar_close)

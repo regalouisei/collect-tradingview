@@ -1,0 +1,517 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BackQuant
+
+//@version=6
+indicator(
+ title="Options Max Pain Calculator [BackQuant]", 
+ shorttitle="Max Pain [BackQuant]", 
+ max_boxes_count=500,
+ max_lines_count=500, 
+ max_labels_count=100,
+ overlay=true
+ )
+// Input Groups
+const string calc       = "Calculation Settings"
+const string strikes_g  = "Strike Price Settings"
+const string volume_g   = "Volume and Open Interest"
+const string vols       = "Volatility and Greeks"
+const string mm         = "Market Maker Parameters"
+const string visuals    = "Visual Settings"
+const string analysis   = "Analysis Settings"
+const string theme_g    = "Theme and Colors"
+const string zones      = "Pin Zone Settings"
+
+// Calculation Settings
+int nStrikes = input.int(20, "Number of Strikes", minval=1, tooltip="Total number of strike levels to model", group=calc)
+int expiry_days = input.int(7, "Days to Expiration", minval=1, maxval=60, tooltip="Calendar days until option expiry", group=calc)
+float market_hours_per_day = input.float(6.5, "Trading Hours per Day", minval=1, maxval=24, step=0.5, tooltip="Used for time conversions, does not affect modeling", group=calc)
+
+// Strike Price Settings
+float strike_range_pct = input.float(10, "Strike Range %", minval=5, maxval=20, step=1, tooltip="Range around current price in percent", group=strikes_g)
+float strike_increment = input.float(2.0, "Strike Increment $", minval=1.0, maxval=10.0, step=0.5, tooltip="Distance between generated strikes", group=strikes_g)
+bool use_round_strikes = input.bool(true, "Use Round Strike Levels", tooltip="Rounds strikes to nearest 5s or 0s", group=strikes_g)
+int major_strike_interval = input.int(10, "Major Strike Interval", minval=5, maxval=50, step=5, tooltip="Interval for showing major strike levels", group=strikes_g)
+
+// Volume and Open Interest
+int avg_daily_volume = input.int(1000000, "Average Daily Volume", minval=100000, tooltip="Baseline underlying trading volume", group=volume_g)
+float put_call_ratio = input.float(1.2, "Put/Call Volume Ratio", minval=0.1, maxval=5.0, step=0.1, tooltip="Relative weighting of put to call volumes", group=volume_g)
+
+// Volatility and Greeks
+float implied_vol = input.float(30.0, "Implied Volatility %", minval=5, maxval=150, step=1, tooltip="Baseline volatility assumption for Greeks", group=vols) / 100
+
+// Market Maker Parameters
+float mm_inventory_factor = input.float(0.7, "Inventory Factor", minval=0.1, maxval=2.0, step=0.1, tooltip="Market maker position scaling", group=mm)
+float gamma_hedging_strength = input.float(1.0, "Gamma Hedging Strength", minval=0.1, maxval=3.0, step=0.1, tooltip="Degree of gamma hedging effect modeled", group=mm)
+float dealer_short_gamma_bias = input.float(0.6, "Dealer Short Gamma Bias", minval=0.1, maxval=1.5, step=0.1, tooltip="Bias toward short gamma positioning", group=mm)
+
+// Visual Settings
+bool show_max_pain_line = input.bool(true, "Show Max Pain Line", group=visuals)
+bool show_strike_levels = input.bool(true, "Show Major Strike Levels", group=visuals)
+bool show_pain_heatmap = input.bool(true, "Show Pain Heatmap", group=visuals)
+bool show_gamma_exposure = input.bool(true, "Show Gamma Exposure Profile", group=visuals)
+bool show_pin_zones = input.bool(true, "Show Pin Risk Zones", group=visuals)
+int heatmap_transparency = input.int(40, "Heatmap Transparency", minval=0, maxval=100, tooltip="Adjust heatmap visibility", group=visuals)
+int pinzone_transparency = input.int(80, "Pin Zone Transparency", minval=0, maxval=100, tooltip="Adjust pin zone shading", group=visuals)
+
+// Analysis Settings
+string update_frequency = input.string("Daily", "Update Frequency", options=["Every Bar","Daily"], tooltip="How often to update calculations", group=analysis)
+bool include_weekly = input.bool(true, "Include Weekly Options Effects", tooltip="Boosts OI if expiry is weekly", group=analysis)
+string model_complexity = input.string("Advanced", "Model Complexity", options=["Simple","Standard","Advanced"], tooltip="Controls modeling detail and features", group=analysis)
+
+// Theme and Colors
+string theme = input.string("Dark", "Theme", options=["Dark","Light"], tooltip="Switch chart color scheme", group=theme_g)
+
+// Pin Zone Settings
+float pin_zone_pct = input.float(2.0, "Pin Zone %", minval=0.5, maxval=5.0, step=0.5, tooltip="Defines percentage width around max pain considered a pin zone", group=zones)
+
+max_pain_color  = #ff0000
+support_color   = #00ff00
+resistance_color= #00ffff
+gamma_color     = color.purple
+heatmap_hot     = color.red
+heatmap_cold    = color.blue
+
+// Effective palette
+panel_bg = theme == "Dark" ? color.rgb(18,22,28, 100) : color.white
+panel_fg = theme == "Dark" ? color.white : color.black
+head_bg  = theme == "Dark" ? color.rgb(20,40,80, 100) : color.rgb(230,235,245)
+head_fg  = theme == "Dark" ? color.white : color.black
+
+
+// Feature gates
+draw_strikes = show_strike_levels and (model_complexity == "Standard" or model_complexity == "Advanced")
+draw_pin     = show_pin_zones     and (model_complexity == "Standard" or model_complexity == "Advanced")
+draw_heat    = show_pain_heatmap  and model_complexity == "Advanced"
+draw_gamma   = show_gamma_exposure and model_complexity == "Advanced"
+
+// Calculation Start
+time_to_expiry = expiry_days / 365.25
+current_price = close
+strike_range = current_price * strike_range_pct / 100
+min_strike = current_price - strike_range
+max_strike = current_price + strike_range
+
+round_strike(strike) =>
+    if use_round_strikes
+        if strike >= 100
+            math.round(strike / 5) * 5
+        else if strike >= 20
+            math.round(strike / 2.5) * 2.5
+        else
+            math.round(strike)
+    else
+        math.round(strike / strike_increment) * strike_increment
+
+var strikes = array.new<float>()
+var call_oi_data = array.new<float>()
+var put_oi_data = array.new<float>()
+var gamma_data = array.new<float>()
+
+generate_strikes(nStrikes) =>
+    array.clear(strikes)
+    max_strikes = nStrikes
+    actual_increment = math.max(strike_increment, (max_strike - min_strike) / max_strikes)
+    
+    s = min_strike
+    count = 0
+    while s <= max_strike and count < max_strikes
+        rs = round_strike(s)
+        if array.size(strikes) == 0 or rs != array.get(strikes, array.size(strikes) - 1)
+            array.push(strikes, rs)
+            count += 1
+        s += actual_increment
+
+// Black-Scholes helpers
+bs_gamma_simple(S, K, T, vol) =>
+    if T <= 0 or vol <= 0
+        0.0
+    else
+        d1 = (math.log(S/K) + 0.5 * vol * vol * T) / (vol * math.sqrt(T))
+        math.exp(-0.5 * d1 * d1) / (S * vol * math.sqrt(2 * math.pi * T))
+
+// volume estimation
+estimate_oi_simple(strike, is_call) =>
+    distance_pct = math.abs(strike - current_price) / current_price
+    base_factor = 1 / (1 + distance_pct * 8)
+    decay_factor = math.pow(0.8, distance_pct * 15)
+    
+    base_volume = avg_daily_volume * base_factor * decay_factor * 0.02
+    mm_position = base_volume * mm_inventory_factor * dealer_short_gamma_bias
+    
+    total_oi = base_volume + mm_position
+    if not is_call
+        total_oi *= put_call_ratio
+    
+    weekly_mult = include_weekly and expiry_days <= 7 ? 1.2 : 1.0
+    total_oi * weekly_mult
+
+// all data for strikes
+populate_strike_data() =>
+    array.clear(call_oi_data)
+    array.clear(put_oi_data)
+    array.clear(gamma_data)
+    
+    strike_count = array.size(strikes)
+    i = 0
+    while i < strike_count and i < nStrikes
+        K = array.get(strikes, i)
+        
+        call_oi = estimate_oi_simple(K, true)
+        put_oi = estimate_oi_simple(K, false)
+        gamma_val = bs_gamma_simple(current_price, K, time_to_expiry, implied_vol)
+        gamma_exp = (call_oi - put_oi) * gamma_val * gamma_hedging_strength * 100
+        
+        array.push(call_oi_data, call_oi)
+        array.push(put_oi_data, put_oi)
+        array.push(gamma_data, gamma_exp)
+        
+        i += 1
+
+// Direct max pain calculation 
+calculate_max_pain_direct() =>
+    best_strike = current_price
+    min_pain = 1e20
+    
+    strike_count = array.size(strikes)
+    test_points = math.min(strike_count, nStrikes) 
+    
+    i = 0
+    while i < test_points
+        test_strike = array.get(strikes, i)
+        total_pain = 0.0
+        
+        // Calculate pain at this strike
+        j = 0
+        while j < strike_count
+            K = array.get(strikes, j)
+            call_oi = array.get(call_oi_data, j)
+            put_oi = array.get(put_oi_data, j)
+            
+            if test_strike < K  // Call pain
+                total_pain += call_oi * (K - test_strike)
+            if test_strike > K  // Put pain  
+                total_pain += put_oi * (test_strike - K)
+            
+            j += 1
+        
+        if total_pain < min_pain
+            min_pain := total_pain
+            best_strike := test_strike
+        
+        i += 1
+    
+    best_strike
+
+// Update
+var float max_pain_level = na
+var bool data_calculated = false
+
+should_update = barstate.islast or (update_frequency == "Every Bar") or(update_frequency == "Daily" and not data_calculated) 
+
+if should_update
+    generate_strikes(nStrikes)
+    populate_strike_data()
+    max_pain_level := calculate_max_pain_direct()
+    data_calculated := true
+
+// Plotting
+var int base_x = 0
+if barstate.islast
+    base_x := bar_index
+
+// Max Pain Line 
+var line max_pain_line = na
+if show_max_pain_line and not na(max_pain_level) and barstate.islast
+    line.delete(max_pain_line)
+    max_pain_line := line.new(base_x - 50, max_pain_level, base_x + 10, max_pain_level, color=max_pain_color, width=3, extend=extend.none)
+
+if draw_strikes and barstate.islast and array.size(strikes) > 0
+    i = 0
+    while i < math.min(array.size(strikes), 20)
+        K = array.get(strikes, i)
+        if math.round(K) % major_strike_interval == 0
+            lvl_col = K > current_price ? resistance_color : support_color
+            line.new(base_x - 20, K, base_x + 5, K, color=color.new(lvl_col, 30), width=1, style=line.style_dotted)
+        i += 1
+
+// Pin Zone
+if draw_pin and not na(max_pain_level) and barstate.islast
+    pin_range = current_price * pin_zone_pct / 100.0
+    upper_pin = max_pain_level + pin_range
+    lower_pin = max_pain_level - pin_range
+    box.new(base_x - 30, lower_pin, base_x + 10, upper_pin, bgcolor=color.new(max_pain_color, pinzone_transparency), border_color=max_pain_color)
+
+// GAMMA EXPOSURE 
+if draw_gamma and barstate.islast and array.size(gamma_data) > 0
+    max_gamma = 0.0
+    total_long_gamma = 0.0
+    total_short_gamma = 0.0
+    
+    i = 0
+    while i < array.size(gamma_data)
+        gamma_val = array.get(gamma_data, i)
+        abs_gamma = math.abs(gamma_val)
+        max_gamma := math.max(max_gamma, abs_gamma)
+        
+        if gamma_val > 0
+            total_long_gamma += gamma_val
+        else
+            total_short_gamma += math.abs(gamma_val)
+        i += 1
+    
+    if max_gamma > 0
+        gamma_start_x = base_x + 15
+        
+        // Create gamma profile bars
+        i = 0
+        while i < math.min(array.size(gamma_data), 15)
+            K = array.get(strikes, i)
+            gamma_val = array.get(gamma_data, i)
+            
+            if math.abs(gamma_val) > max_gamma * 0.05
+                normalized = gamma_val / max_gamma * 12
+                bar_length = int(math.abs(normalized))
+                
+                if bar_length > 0
+                    is_positive = gamma_val > 0
+                    base_color = is_positive ? color.rgb(0, 200, 100) : color.rgb(255, 80, 80)
+                    intensity = math.abs(gamma_val) / max_gamma
+                    alpha_level = int(20 + intensity * 40)
+                    
+                    line.new(
+                         x1=gamma_start_x, 
+                         y1=K,
+                         x2=gamma_start_x + (is_positive ? bar_length : -bar_length), 
+                         y2=K,
+                         color=color.new(base_color, alpha_level),
+                         width=8,
+                         style=line.style_solid)
+                    
+                    if math.abs(gamma_val) > max_gamma * 0.4
+                        label_x = gamma_start_x + (is_positive ? bar_length + 2 : -bar_length - 2)
+                        label_style = is_positive ? label.style_label_left : label.style_label_right
+                        
+                        label.new(
+                             x=label_x,
+                             y=K,
+                             text=str.tostring(K, "#.##"),
+                             color=color.new(base_color, 80),
+                             textcolor=color.white,
+                             style=label_style,
+                             size=size.tiny)
+            i += 1
+        
+        // Gamma titles and legends
+        title_price = max_strike - (max_strike - min_strike) * 0.1
+        label.new(
+             x=gamma_start_x,
+             y=title_price,
+             text="GAMMA\nEXPOSURE",
+             color=color.new(color.purple, 80),
+             textcolor=color.white,
+             style=label.style_label_center,
+             size=size.small)
+        
+        // Zero line
+        line.new(
+             x1=gamma_start_x - 2,
+             y1=min_strike,
+             x2=gamma_start_x - 2,
+             y2=max_strike,
+             color=color.new(color.gray, 60),
+             width=1,
+             style=line.style_dashed)
+        
+        // Net gamma stats
+        net_gamma = total_long_gamma - total_short_gamma
+        gamma_bias = net_gamma > 0 ? "LONG" : "SHORT"
+        gamma_bias_color = net_gamma > 0 ? color.green : color.red
+        
+        stats_price = min_strike + (max_strike - min_strike) * 0.15
+        label.new(
+             x=gamma_start_x + 8,
+             y=stats_price,
+             text="NET: " + gamma_bias + "\n" + str.tostring(math.abs(net_gamma), "#.#"),
+             color=color.new(gamma_bias_color, 70),
+             textcolor=color.white,
+             style=label.style_label_left,
+             size=size.tiny)
+        
+        // Gamma flip detection
+        gamma_flip_found = false
+        gamma_flip_price = current_price
+        
+        ix = 0
+        while ix < array.size(gamma_data) - 1 and not gamma_flip_found
+            current_gamma = array.get(gamma_data, ix)
+            next_gamma = array.get(gamma_data, ix + 1)
+            
+            if (current_gamma > 0 and next_gamma < 0) or (current_gamma < 0 and next_gamma > 0)
+                gamma_flip_price := array.get(strikes, ix)
+                gamma_flip_found := true
+            ix += 1
+        
+        if gamma_flip_found and math.abs(gamma_flip_price - current_price) < strike_range
+            line.new(
+                 x1=base_x - 10,
+                 y1=gamma_flip_price,
+                 x2=gamma_start_x + 20,
+                 y2=gamma_flip_price,
+                 color=color.new(color.yellow, 40),
+                 width=2,
+                 style=line.style_dotted)
+            
+            label.new(
+                 x=base_x - 12,
+                 y=gamma_flip_price,
+                 text="Γ FLIP",
+                 color=color.new(color.yellow, 60),
+                 textcolor=color.black,
+                 style=label.style_label_right,
+                 size=size.tiny)
+
+// Heatmap
+if draw_heat and barstate.islast and array.size(strikes) > 0
+    heatmap_start_x = base_x + 35 
+    
+    heatmap_levels = 12
+    price_step = (max_strike - min_strike) / heatmap_levels
+    
+    pain_values = array.new<float>()
+    test_prices = array.new<float>()
+    
+    // Calculate pain at each level
+    level = 0
+    while level < heatmap_levels
+        test_price = min_strike + level * price_step
+        array.push(test_prices, test_price)
+        
+        total_pain = 0.0
+        strike_idx = 0
+        while strike_idx < array.size(strikes)
+            K = array.get(strikes, strike_idx)
+            call_oi = array.get(call_oi_data, strike_idx)
+            put_oi = array.get(put_oi_data, strike_idx)
+            
+            if test_price < K
+                total_pain += call_oi * (K - test_price)
+            if test_price > K
+                total_pain += put_oi * (test_price - K)
+            strike_idx += 1
+        
+        array.push(pain_values, total_pain)
+        level += 1
+    
+    min_pain = array.min(pain_values)
+    max_pain = array.max(pain_values)
+    pain_range = max_pain - min_pain
+    
+    // Create heatmap 
+    if pain_range > 0
+        level = 0
+        while level < heatmap_levels
+            current_price_level = array.get(test_prices, level)
+            current_pain = array.get(pain_values, level)
+            
+            normalized_pain = 1.0 - ((current_pain - min_pain) / pain_range)
+            gradient_color = color.from_gradient(normalized_pain, 0, 1, color.rgb(0, 100, 200), color.rgb(255, 50, 50))
+            
+            box_bottom = current_price_level
+            box_top = level < heatmap_levels - 1 ? array.get(test_prices, level + 1) : current_price_level + price_step
+            
+            box.new(
+                 left=heatmap_start_x, 
+                 top=box_top,
+                 right=heatmap_start_x + 10,
+                 bottom=box_bottom,
+                 bgcolor=color.new(gradient_color, heatmap_transparency),
+                 border_color=color.new(gradient_color, math.min(heatmap_transparency + 20, 90)),
+                 border_width=1)
+            
+            level += 1
+        
+        // Heatmap labels
+        legend_x = heatmap_start_x + 12
+        
+        // Find max pain level
+        max_pain_idx = 0
+        min_pain_value = array.get(pain_values, 0)
+        check_idx = 1
+        while check_idx < array.size(pain_values)
+            if array.get(pain_values, check_idx) < min_pain_value
+                min_pain_value := array.get(pain_values, check_idx)
+                max_pain_idx := check_idx
+            check_idx += 1
+        
+        max_pain_price = array.get(test_prices, max_pain_idx)
+        
+        label.new(
+             x=legend_x, 
+             y=max_pain_price, 
+             text="MAX PAIN\nZONE", 
+             color=color.new(color.red, 20), 
+             textcolor=color.white,
+             style=label.style_label_left, 
+             size=size.small)
+        
+        // Heatmap title
+        heatmap_title_price = min_strike + (max_strike - min_strike) * 0.9
+        label.new(
+             x=heatmap_start_x + 5, 
+             y=heatmap_title_price, 
+             text="PAIN\nHEATMAP", 
+             color=color.new(color.gray, 80), 
+             textcolor=color.white,
+             style=label.style_label_center, 
+             size=size.tiny)
+        
+        // Gradient legend
+        legend_levels = 3
+        legend_idx = 0
+        while legend_idx < legend_levels
+            legend_pain_norm = legend_idx / (legend_levels - 1)
+            legend_color = color.from_gradient(legend_pain_norm, 0, 1, color.rgb(0, 100, 200), color.rgb(255, 50, 50))
+            legend_price = min_strike + legend_idx * (max_strike - min_strike) / (legend_levels - 1)
+            legend_text = legend_idx == 0 ? "HIGH\nPAIN" : legend_idx == legend_levels - 1 ? "LOW\nPAIN" : ""
+            
+            if legend_text != ""
+                label.new(
+                     x=heatmap_start_x + 15, 
+                     y=legend_price, 
+                     text=legend_text, 
+                     color=color.new(legend_color, 70), 
+                     textcolor=color.white,
+                     style=label.style_label_left, 
+                     size=size.tiny)
+            legend_idx += 1
+
+var table main_table = table.new(position.top_right, 2, 8, bgcolor=panel_bg, border_width=1, border_color=color.new(color.gray, 60), frame_color = color.white, frame_width = 1)
+
+if barstate.islast
+    table.cell(main_table, 0, 0, "Max Pain Analysis", bgcolor=head_bg, text_color=head_fg)
+    table.cell(main_table, 1, 0, "Values", bgcolor=head_bg, text_color=head_fg)
+
+    table.cell(main_table, 0, 1, "Current Price", text_color=panel_fg)
+    table.cell(main_table, 1, 1, str.tostring(current_price, "#.##"), text_color=panel_fg)
+
+    table.cell(main_table, 0, 2, "Max Pain Level", text_color=panel_fg)
+    table.cell(main_table, 1, 2, str.tostring(max_pain_level, "#.##"), text_color=max_pain_color)
+
+    distance_to_pain = not na(max_pain_level) ? ((max_pain_level - current_price) / current_price) * 100.0 : 0.0
+    dist_color = math.abs(distance_to_pain) > 5 ? color.red : color.green
+    table.cell(main_table, 0, 3, "Distance to Pain", text_color=panel_fg)
+    table.cell(main_table, 1, 3, str.tostring(distance_to_pain, "#.##") + "%", text_color=dist_color)
+
+    table.cell(main_table, 0, 4, "Days to Expiry", text_color=panel_fg)
+    table.cell(main_table, 1, 4, str.tostring(expiry_days), text_color=panel_fg)
+
+    table.cell(main_table, 0, 5, "Strike Count", text_color=panel_fg)
+    table.cell(main_table, 1, 5, str.tostring(array.size(strikes)), text_color=panel_fg)
+
+    pin_prob = math.abs(distance_to_pain) < 2 ? "HIGH" : math.abs(distance_to_pain) < 5 ? "MEDIUM" : "LOW"
+    pin_color = pin_prob == "HIGH" ? color.red : pin_prob == "MEDIUM" ? color.orange : color.green
+    table.cell(main_table, 0, 6, "Pin Risk", text_color=panel_fg)
+    table.cell(main_table, 1, 6, pin_prob, text_color=pin_color)
+
+    table.cell(main_table, 0, 7, "Model", text_color=panel_fg)
+    table.cell(main_table, 1, 7, model_complexity, text_color=panel_fg)

@@ -1,0 +1,2052 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+// ORB Dashboard [Czernio]
+// ══════════════════════════════════════════════════════════════════════════════
+// Original Author: Czernio
+// Trading Strategy: TLFX (Opening Range Breakout)
+// Version: 3.0
+// Last Updated: February 2024
+//
+// OPEN SOURCE - Free to use, modify, and share
+// REQUIREMENT: You must credit Czernio as the original author in any derivative works
+//
+// ══════════════════════════════════════════════════════════════════════════════
+// LICENSE: CC BY-NC-SA 4.0
+// ══════════════════════════════════════════════════════════════════════════════
+// This work is licensed under a Creative Commons Attribution-NonCommercial-
+// ShareAlike 4.0 International License.
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// You are free to:
+// - Share: copy and redistribute the material
+// - Adapt: remix, transform, and build upon the material
+//
+// Under the following terms:
+// - Attribution: You must give appropriate credit to Czernio
+// - NonCommercial: You may not use this for commercial purposes
+// - ShareAlike: Derivatives must use the same license
+//
+// ══════════════════════════════════════════════════════════════════════════════
+// CREDITS & COMPONENTS
+// ══════════════════════════════════════════════════════════════════════════════
+// Trading Strategy: TLFX Opening Range Breakout
+// ORB Visualization Concepts: LuxAlgo (CC BY-NC-SA 4.0)
+//    https://www.tradingview.com/script/...
+// News Integration: toodegrees - Live Economic Calendar (MPL 2.0)
+//    https://www.tradingview.com/script/JjgkjuMY/
+//
+// ══════════════════════════════════════════════════════════════════════════════
+
+import toodegrees/forex_factory_utility/16 as ffUtil
+import toodegrees/forex_factory_decoding/39 as ffDec
+
+indicator("ORB Dashboard v2 [Czernio]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 1: INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── ORB Time ──────────────────────────────────────────────────────────────────
+g_time = "⏰ ORB Time"
+range_start_hour   = input.int(15,    "Start Hour (24h)", 0, 23,  group=g_time)
+range_start_minute = input.int(30,    "Start Minute",     0, 59,  group=g_time)
+range_end_hour     = input.int(15,    "End Hour (24h)",   0, 23,  group=g_time)
+range_end_minute   = input.int(45,    "End Minute",       0, 59,  group=g_time)
+orb_tracking_hours = input.float(6.5, "ORB Tracking Duration (Hours)", 0.5, 8.0, 0.5, group=g_time,
+     tooltip="Duration for tracking ORB after range end. Affects: (1) Visual drawing of ORB lines/targets and (2) Strategy signal display in dashboard")
+timezone_input     = input.string("Europe/Berlin", "Timezone",
+     options=["UTC","Europe/Berlin","Europe/London","Europe/Zurich",
+              "America/New_York","America/Chicago","America/Los_Angeles",
+              "Asia/Tokyo","Asia/Hong_Kong","Asia/Singapore","Australia/Sydney"],
+     group=g_time)
+
+// ── Volatility Filter ─────────────────────────────────────────────────────────
+g_filter       = "📊 Volatility Filter (ORB/ATR Ratio)"
+no_trade_below = input.float(15.0, "Min. Volatility %", 0, 100, group=g_filter)
+no_trade_above = input.float(60.0, "Max. Volatility %", 0, 100, group=g_filter)
+
+// ── ATR Settings ──────────────────────────────────────────────────────────────
+g_atr      = "📊 ATR Settings"
+atr_length = input.int(3,      "ATR Period",  1,   group=g_atr)
+atr_method = input.string("RMA", "ATR Method", options=["RMA","SMA","EMA","WMA"], group=g_atr)
+
+// ── Bollinger Bands ───────────────────────────────────────────────────────────
+g_bb       = "📈 Bollinger Bands"
+bb_length  = input.int(200,   "BB Period",    1,   group=g_bb)
+bb_neutral = input.float(0.5, "Neutral Zone", 0.1, group=g_bb)
+bb_strong  = input.float(1.5, "Strong Zone",  0.1, group=g_bb)
+show_bb_lines      = input.bool(false, "Show BB Lines in Chart", group=g_bb)
+show_bb_labels     = input.bool(true, "Show BB Labels", group=g_bb)
+bb_label_offset    = input.int(10, "BB Label Offset (Bars)", minval=0, maxval=20, group=g_bb,
+     tooltip="Distance in bars from the current bar where labels appear")
+bb_vis_timeframe   = input.timeframe("60", "BB Calculation Timeframe", group=g_bb,
+     tooltip="Timeframe for BB visualization only (does NOT affect strategy signals)")
+bb_line_width      = input.int(1, "Line Width", minval=1, maxval=5, group=g_bb)
+bb_basis_color     = input.color(#2962FF, "Basis Color", group=g_bb)
+bb_upper_color     = input.color(#089981, "Upper Bands Color (Bullish)", group=g_bb)
+bb_lower_color     = input.color(#F23645, "Lower Bands Color (Bearish)", group=g_bb)
+bb_fill_color      = input.color(color.new(#2196F3, 100), "Fill Color", group=g_bb)
+
+// ── ORB Visualization ─────────────────────────────────────────────────────────
+g_visual        = "🎨 ORB Visualization"
+show_orb_box    = input.bool(true,  "Show ORB Box", group=g_visual,
+     tooltip="Gray shaded box during the ORB period (e.g. 15:30–15:45)")
+show_hist       = input.bool(false, "Show Historical Sessions", group=g_visual,
+     tooltip="Shows ORB box and lines from previous sessions in the chart")
+orb_box_color   = input.color(color.new(color.gray, 75), "Box Color", group=g_visual)
+show_orb_lines  = input.bool(true,  "Show ORH / ORL Lines", group=g_visual,
+     tooltip="Horizontal lines at ORB High and Low after ORB ends, extend until tracking end")
+show_orb_mid    = input.bool(false, "Show ORB Middle (ORM)", group=g_visual,
+     tooltip="Dashed line at the midpoint of the ORB range")
+orb_line_color  = input.color(#787b86, "ORH / ORL Line Color", group=g_visual)
+show_labels     = input.bool(true,  "Show Labels (ORH / ORL / Targets)", group=g_visual,
+     tooltip="Hides all labels on lines")
+show_targets    = input.bool(true,  "Show Target Lines", group=g_visual)
+target_pct      = input.float(100.0, "Target Size % of ORB Range", minval=1.0, group=g_visual,
+     tooltip="100% = next target is 1x ORB range from entry")
+target_display  = input.string("Adaptive", "Target Display",
+     options=["Adaptive","Extended"], group=g_visual,
+     tooltip="Adaptive: Displays and hides targets adaptively based on the current price.\nExtended: Extends all targets to the current bar and does not hide any targets after generation.")
+target_style    = input.string("___", "Target Line Style",
+     options=["___","- - -",". . ."], group=g_visual)
+target_color_up = input.color(color.new(#089981, 40), "Target Color Bull", group=g_visual)
+target_color_dn = input.color(color.new(#f23645, 40), "Target Color Bear", group=g_visual)
+txt_size_vis    = str.lower(input.string("Small", "Label Size",
+     options=["Tiny","Small","Normal","Large","Huge"], group=g_visual))
+sd1_level   = input.string("Disabled", "SD Line 1", inline="sd1", group=g_visual,
+     options=["Disabled","0.25 SD","0.5 SD","0.75 SD","1 SD"])
+sd1_color   = input.color(#787b86, "", inline="sd1", group=g_visual)
+sd2_level   = input.string("Disabled", "SD Line 2", inline="sd2", group=g_visual,
+     options=["Disabled","0.25 SD","0.5 SD","0.75 SD","1 SD"])
+sd2_color   = input.color(#787b86, "", inline="sd2", group=g_visual)
+
+// ── Dashboard & Debug ─────────────────────────────────────────────────────────
+g_display             = "🖥️ Dashboard & Debug"
+strategy_text         = "Strat. by TLFX"
+show_filter_details   = input.bool(true,  "Show Filter Details",   group=g_display)
+show_journal_infos    = input.bool(false, "Show Journal Infos",    group=g_display)
+show_extended_journal = input.bool(false, "Show Extended Journal", group=g_display,
+     tooltip="Shows additional technical analysis in the journal")
+show_rules_dashboard  = input.bool(false, "Show Strategy Rules",   group=g_display)
+show_general_rules    = input.bool(true,  "  ↳ Show General Rules", group=g_display,
+     tooltip="Shows General Rules (holiday, news definitions) at the top of the Rules Dashboard")
+strategy_type         = input.string("Base", "  ↳ Strategy Type",
+     options=["Base","Sub"],
+     tooltip="Base: Base Breakout + Base Reversal\nSub: Sub Breakout + Rebreak + Reversal + FORB",
+     group=g_display)
+show_debug         = input.bool(false,        "DEBUG MODE",              group=g_display)
+dashboard_position = input.string("Top Right", "Main Dashboard Position",
+     options=["Top Left","Top Right","Bottom Left","Bottom Right","Middle Left","Middle Right"],
+     group=g_display)
+rules_position     = input.string("Bottom Left", "Rules Dashboard Position",
+     options=["Top Left","Bottom Left","Middle Left"],
+     group=g_display)
+dashboard_size     = input.string("Small", "Size",
+     options=["Tiny","Small","Normal","Large","Huge"],
+     group=g_display)
+
+// ── Dashboard Colors ──────────────────────────────────────────────────────────
+g_colors              = "🎨 Dashboard Colors"
+user_color_trade      = input.color(color.green,  "Trade Allowed",      group=g_colors)
+user_color_no_trade   = input.color(color.red,    "No Trade",           group=g_colors)
+user_color_background = input.color(#34495E,      "Dashboard Background", group=g_colors)
+user_color_text       = input.color(#ECF0F1,      "Text Color",         group=g_colors)
+user_color_bb_bullish = input.color(color.green,  "BB Bullish",         group=g_colors)
+user_color_bb_bearish = input.color(color.red,    "BB Bearish",         group=g_colors)
+user_color_bb_neutral = input.color(color.gray,   "BB Neutral",         group=g_colors)
+user_color_reversal   = input.color(color.orange, "Reversal Trade",     group=g_colors)
+user_color_no_trade_text = input.color(color.red, "No Trade Text Color", group=g_colors,
+     tooltip="Text color for 'No Trade!' values. Change if you have difficulty reading red text.")
+dashboard_border_color = input.color(color.new(color.white, 100), "Dashboard Border Color", group=g_colors,
+     tooltip="Border/Frame color for all dashboards. Opacity: 0=visible, 100=hidden. Controls both grid lines between cells AND outer frame around table.")
+
+// ── News Table (by @toodegrees) ───────────────────────────────────────────────
+g_news           = "📰 News Table"
+show_news_table  = input.bool(false, "Show News Table", group=g_news)
+news_high_impact = input.bool(true,  "🔴 High",   group=g_news, inline="impact")
+news_med_impact  = input.bool(false, "🟠 Medium", group=g_news, inline="impact")
+news_low_impact  = input.bool(false, "🟡 Low",    group=g_news, inline="impact")
+news_holiday     = input.bool(true,  "⚪ Holidays",      group=g_news, inline="impact")
+news_table_type  = input.string("This Week", "News Time Range",
+     options=["Today","This Week"], group=g_news)
+news_table_pos   = input.string("Bottom Right", "News Table Position",
+     options=["Top Left","Top Right","Bottom Left","Bottom Right","Middle Left","Middle Right"], group=g_news)
+news_table_size  = input.string("Small", "News Table Size",
+     options=["Tiny","Small","Normal","Large","Huge"], group=g_news)
+
+// Timeframe check for news feature
+if show_news_table and timeframe.in_seconds(timeframe.period)>86400
+    runtime.error("News feature requires Daily timeframe or lower! Go to Daily or lower timeframe.")
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 2: HILFSFUNKTIONEN (Layout & Formatierung)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+get_dashboard_position() =>
+    switch dashboard_position
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        "Middle Left"  => position.middle_left
+        "Middle Right" => position.middle_right
+        => position.top_right
+
+get_rules_position() =>
+    switch rules_position
+        "Top Left"    => position.top_left
+        "Bottom Left" => position.bottom_left
+        "Middle Left" => position.middle_left
+        => position.bottom_left
+
+get_text_size() =>
+    switch dashboard_size
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.small
+
+get_header_size() =>
+    switch dashboard_size
+        "Tiny"   => size.small
+        "Small"  => size.normal
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.normal
+
+// Format string for price display based on instrument decimal places
+get_price_format() =>
+    decimal_places = switch syminfo.pricescale
+        100000 => 5   // EUR/USD etc.
+        10000  => 4   // Manche Forex-Paare
+        1000   => 3   // USD/JPY etc.
+        100    => 2   // Aktien, Indizes
+        10     => 1   // Rare cases
+        1      => 0   // Ganze Zahlen
+        => 2          // Fallback
+    switch decimal_places
+        0 => "#"
+        1 => "#.#"
+        2 => "#.##"
+        3 => "#.###"
+        4 => "#.####"
+        => "#.#####"
+
+
+// ── Visualisierungs-Hilfsfunktionen ──────────────────────────────────────────
+
+// Konvertiert den Linien-Stil Input in PineScript line.style_*
+get_line_style(s) =>
+    s == "- - -" ? line.style_dashed : s == ". . ." ? line.style_dotted : line.style_solid
+
+// Rounds a positive decimal number up to the next integer
+get_next_level(val) =>
+    (val - math.floor(val)) > 0 ? int(math.floor(val) + 1) : int(val)
+
+// UDT: Line + Label as pair (for ORH/ORL lines and targets)
+type VisLine
+    line  ln
+    label lab
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 3: TRADING-LOGIK-FUNKTIONEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// BB signal for a price point (based on frozen BB values)
+get_bb_signal(price, neu_upper, neu_lower, str_upper, str_lower) =>
+    if na(price) or na(neu_upper) or na(neu_lower) or na(str_upper) or na(str_lower)
+        "N/A"
+    else if price > str_upper
+        "STRONG BULLISH"
+    else if price < str_lower
+        "STRONG BEARISH"
+    else if price > neu_upper
+        "BULLISH"
+    else if price < neu_lower
+        "BEARISH"
+    else
+        "NEUTRAL"
+
+// Trend Filter: 2 of 3 non-neutral signals must agree.
+// N/A signals (not yet available) are ignored.
+get_trend_filter(ny_sig, orb_sig, trig_sig) =>
+    bullish_count = 0
+    bearish_count = 0
+    for sig in array.from(ny_sig, orb_sig, trig_sig)
+        if sig != "NEUTRAL" and sig != "N/A"
+            if str.contains(sig, "BULLISH")
+                bullish_count += 1
+            else if str.contains(sig, "BEARISH")
+                bearish_count += 1
+    bullish_count >= 2 ? "BULLISH" : bearish_count >= 2 ? "BEARISH" : "NEUTRAL"
+
+// Counts neutral signals among all available (non-N/A) signals
+count_neutral_signals(ny_sig, orb_sig, trig_sig) =>
+    neutral_count = 0
+    total_count   = 0
+    for sig in array.from(ny_sig, orb_sig, trig_sig)
+        if sig != "N/A"
+            total_count   += 1
+            if str.contains(sig, "NEUTRAL")
+                neutral_count += 1
+    [neutral_count, total_count]
+
+// Trade Signal: combines Volatility Check + BB Trend Filter
+// Priority: 1. Volatility  2. Neutral Signals  3. Trade Decision
+get_trade_signal(vol_ratio, ny_sig, orb_sig, trig_sig) =>
+    vol_ok = not na(vol_ratio) and vol_ratio >= no_trade_below and vol_ratio <= no_trade_above
+    if not vol_ok
+        ["No Trade", user_color_no_trade]
+    else
+        [neutral_count, total_signals] = count_neutral_signals(ny_sig, orb_sig, trig_sig)
+        if total_signals < 2
+            ["⏳", user_color_background]
+        else if neutral_count >= 2
+            ["No ORB Trade, only Reversal", user_color_reversal]
+        else
+            ["TRADE", user_color_trade]
+
+// ORB Direction (Vergleich 5M Open erste Kerze vs 5M Close letzte ORB-Kerze)
+get_orb_direction(orb_open, orb_close) =>
+    if na(orb_open) or na(orb_close)
+        "N/A"
+    else if orb_close > orb_open
+        "BULLISH ORB"
+    else if orb_close < orb_open
+        "BEARISH ORB"
+    else
+        "NEUTRAL ORB"
+
+// Trigger Bar Close Position als Vielfaches der ORB Range (Standard Deviations)
+// Bullish: (Close - ORB High) / ORB Range  |  Bearish: (ORB Low - Close) / ORB Range
+get_trigger_position(close_price, orb_high, orb_low, direction) =>
+    orb_range = orb_high - orb_low
+    if orb_range <= 0
+        "N/A"
+    else
+        dist_sd = direction == "BULLISH"
+             ? (close_price - orb_high) / orb_range
+             : (orb_low - close_price) / orb_range
+        dist_sd < 0.25 ? "< 0.25 SD" : dist_sd < 0.5 ? "0.25-0.5 SD" : "> 0.5 SD"
+
+// Explosive Rating: Trigger Bar size relative to previous day ATR
+get_explosive_rating(tb_range, atr_val) =>
+    if na(tb_range) or na(atr_val) or atr_val <= 0
+        "N/A"
+    else
+        ratio = tb_range / atr_val
+        ratio > 1.5 ? "EXPLOSIVE" : ratio > 1.0 ? "STRONG" : ratio > 0.5 ? "NORMAL" : "WEAK"
+
+// Journal: Kategorisierung der Kerzenanzahl bis Breakout
+get_breakout_category(bars) =>
+    bars <= 3 ? "1-3" : bars <= 6 ? "4-6" : bars <= 9 ? "7-9" : bars <= 12 ? "10-12" : "13+"
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 4: FARB-HILFSFUNKTIONEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+get_bb_color(signal) =>
+    switch signal
+        "BULLISH"        => user_color_bb_bullish
+        "STRONG BULLISH" => user_color_bb_bullish
+        "BEARISH"        => user_color_bb_bearish
+        "STRONG BEARISH" => user_color_bb_bearish
+        "NEUTRAL"        => user_color_bb_neutral
+        => user_color_background
+
+get_trigger_close_color(category) =>
+    switch category
+        "< 0.25 SD"   => user_color_trade    // Ideal: nah an ORB
+        "0.25-0.5 SD" => color.orange        // OK
+        "> 0.5 SD"    => user_color_no_trade  // No Trade!
+        => user_color_background
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 5: DATEN-ABRUF (Bollinger Bands & ATR)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Bollinger Bands from 1H timeframe (no look-ahead) - for signals
+bb_ema = request.security(syminfo.tickerid, "60", ta.ema(close, bb_length),   lookahead=barmerge.lookahead_off)
+bb_std = request.security(syminfo.tickerid, "60", ta.stdev(close, bb_length), lookahead=barmerge.lookahead_off)
+
+// Bollinger Bands for visualization (user-selectable timeframe, gaps_off for smooth lines)
+bb_vis_ema = request.security(syminfo.tickerid, bb_vis_timeframe, ta.ema(close, bb_length), 
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+bb_vis_std = request.security(syminfo.tickerid, bb_vis_timeframe, ta.stdev(close, bb_length), 
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+// ATR vom Daily Timeframe - [1] = Vortag (kein Look-ahead)
+get_daily_atr(length, method) =>
+    daily_tr = ta.tr(true)
+    switch method
+        "SMA" => ta.sma(daily_tr, length)
+        "EMA" => ta.ema(daily_tr, length)
+        "WMA" => ta.wma(daily_tr, length)
+        => ta.rma(daily_tr, length)
+
+atr_yesterday = request.security(syminfo.tickerid, "1D",
+     get_daily_atr(atr_length, atr_method), lookahead=barmerge.lookahead_off)[1]
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 6: ZEITBERECHNUNGEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+range_start_time      = timestamp(timezone_input, year, month, dayofmonth, range_start_hour,   range_start_minute, 0)
+range_end_time        = timestamp(timezone_input, year, month, dayofmonth, range_end_hour,     range_end_minute,   0)
+orb_tracking_end_time = range_end_time + int(orb_tracking_hours * 3600000)
+
+in_range = time >= range_start_time and time < range_end_time
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 7: STATE VARIABLEN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── ORB Range ─────────────────────────────────────────────────────────────────
+var float range_high = na
+var float range_low  = na
+var float range_size = na
+var float vol_ratio  = na   // ORB Volatility in % (ORB Range / ATR Yesterday × 100)
+var float orb_mid = na
+
+// ── Eingefrorene BB-Werte (werden einmalig am ORB-Start gesetzt) ──────────────
+var float frozen_bb_ema           = na
+var float frozen_bb_std           = na
+var float frozen_bb_neutral_upper = na
+var float frozen_bb_neutral_lower = na
+var float frozen_bb_strong_upper  = na
+var float frozen_bb_strong_lower  = na
+var bool  bb_values_frozen        = false
+
+// ── BB Signale (drei Messpunkte) ──────────────────────────────────────────────
+var string ny_open_bb_signal   = na  // Signal am 5M Open der ersten ORB-Kerze
+var string orb_close_bb_signal = na  // Signal am 5M Close der letzten ORB-Kerze
+var string trigger_bb_signal   = na  // Signal am 5M Close der ersten Breakout-Kerze
+
+// ── Daily Candle Data ─────────────────────────────────────────────────────────
+[d_open, d_close, d_open_prev, d_close_prev] = request.security(syminfo.tickerid, "D", [open, close, open[1], close[1]], lookahead=barmerge.lookahead_off)
+daily_candle_dir      = d_close > d_open ? "BULLISH" : d_close < d_open ? "BEARISH" : "NEUTRAL"
+prev_daily_candle_dir = d_close_prev > d_open_prev ? "BULLISH" : d_close_prev < d_open_prev ? "BEARISH" : "NEUTRAL"
+
+// ── Preis-Snapshots ───────────────────────────────────────────────────────────
+var float ny_open_5m       = na  // 5M Open first ORB candle (for BB Signal & ORB Direction)
+var float orb_end_5m_close = na  // 5M Close letzte ORB-Kerze
+var float trigger_5m_close = na  // 5M Close erste Breakout-Kerze (gesperrt nach erstem Wert)
+
+// ── Trigger Bar Tracking ──────────────────────────────────────────────────────
+var int    bars_since_orb      = 0      // Candles since ORB end (for Journal)
+var bool   breakout_detected   = false
+var string breakout_direction  = na
+var bool   trigger_close_locked = false // Verhindert Überschreiben nach erstem Breakout
+var bool   trigger_bar_locked   = false // Prevents overwriting TB size
+var string breakout_category    = na    // Journal: z.B. "1-3", "4-6" Kerzen
+var string trigger_position_cat = na    // Journal: z.B. "< 0.25 SD"
+var float  trigger_bar_high     = na
+var float  trigger_bar_low      = na
+var float  trigger_bar_range    = na
+
+// ── ORB Kerzen-Infos ──────────────────────────────────────────────────────────
+var string first_orb_candle_dir = na   // Richtung der ersten 5M ORB-Kerze
+var string last_orb_candle_dir  = na   // Richtung der letzten 5M ORB-Kerze
+var int    breakout_bar_time    = na   // Uhrzeit der Trigger Bar (Unix ms)
+
+// ── Visualisierung: ORB Box & Linien ─────────────────────────────────────────
+invis             = color.rgb(0, 0, 0, 100)  // Fully transparent (for label background)
+var box    orb_box    = na
+var VisLine orb_h_ln  = VisLine.new(na, na)  // ORH Linie + Label
+var VisLine orb_l_ln  = VisLine.new(na, na)  // ORL Linie + Label
+var line   orb_m_ln   = na                   // ORM Mittellinie (gestrichelt)
+var bool   vis_drawn  = false                // Verhindert mehrfaches Erstellen der Linien
+
+// ── Visualisierung: SD Linien ─────────────────────────────────────────────────
+var line   sd1_up_ln  = na   // SD Line 1 above ORH
+var line   sd1_dn_ln  = na   // SD Linie 1 unter ORL
+var label  sd1_up_lab = na
+var label  sd1_dn_lab = na
+var line   sd2_up_ln  = na   // SD Line 2 above ORH
+var line   sd2_dn_ln  = na   // SD Linie 2 unter ORL
+var label  sd2_up_lab = na
+var label  sd2_dn_lab = na
+var label  orb_m_lab  = na   // ORM Label (rechts, mitlaufend)
+
+// ── Visualisierung: Targets ───────────────────────────────────────────────────
+// Arrays store all Target VisLine objects (separate for Bull/Bear)
+var VisLine[] up_targets   = array.new<VisLine>()
+var VisLine[] down_targets = array.new<VisLine>()
+var int up_count   = 0   // Anzahl bereits gezeichneter Bull-Targets
+var int down_count = 0   // Anzahl bereits gezeichneter Bear-Targets
+// Tracking highest/lowest reached prices (for target calculation)
+var float up_high_track   = na
+var float down_low_track  = na
+
+// ── Visualisierung: BB Labels ─────────────────────────────────────────────────
+var label bb_strong_up_lab = na
+var label bb_neutral_up_lab = na
+var label bb_basis_lab = na
+var label bb_neutral_dn_lab = na
+var label bb_strong_dn_lab = na
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 8: TÄGLICHER RESET
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if ta.change(dayofmonth) != 0
+    // Range
+    range_high := na
+    range_low  := na
+    range_size := na
+    vol_ratio  := na
+    orb_mid := na
+
+    // Eingefrorene BB-Werte
+    frozen_bb_ema           := na
+    frozen_bb_std           := na
+    frozen_bb_neutral_upper := na
+    frozen_bb_neutral_lower := na
+    frozen_bb_strong_upper  := na
+    frozen_bb_strong_lower  := na
+    bb_values_frozen        := false
+
+    // Signale & Snapshots
+    ny_open_bb_signal   := na
+    orb_close_bb_signal := na
+    trigger_bb_signal   := na
+    ny_open_5m          := na
+    orb_end_5m_close    := na
+    trigger_5m_close    := na
+
+    // Trigger Bar
+    bars_since_orb       := 0
+    breakout_detected    := false
+    breakout_direction   := na
+    trigger_close_locked := false
+    trigger_bar_locked   := false
+    breakout_category    := na
+    trigger_position_cat := na
+    trigger_bar_high     := na
+    trigger_bar_low      := na
+    trigger_bar_range    := na
+
+    // First ORB-Candle
+    first_orb_candle_dir := na
+    // Letzte ORB-Candle   
+    last_orb_candle_dir  := na
+    //Breakout Time
+    breakout_bar_time    := na
+
+    // Visualisierung: Objekte aus Vortag behandeln
+    // Historical objects are only kept if BOTH show_hist=true AND show_orb_box=true
+    if not show_hist or not show_orb_box
+        if not na(orb_box)
+            box.delete(orb_box)
+        if not na(orb_h_ln.ln)
+            line.delete(orb_h_ln.ln)
+        if not na(orb_h_ln.lab)
+            label.delete(orb_h_ln.lab)
+        if not na(orb_l_ln.ln)
+            line.delete(orb_l_ln.ln)
+        if not na(orb_l_ln.lab)
+            label.delete(orb_l_ln.lab)
+        if not na(orb_m_ln)
+            line.delete(orb_m_ln)
+        if not na(orb_m_lab)
+            label.delete(orb_m_lab)
+        if not na(sd1_up_ln)
+            line.delete(sd1_up_ln)
+            label.delete(sd1_up_lab)
+        if not na(sd1_dn_ln)
+            line.delete(sd1_dn_ln)
+            label.delete(sd1_dn_lab)
+        if not na(sd2_up_ln)
+            line.delete(sd2_up_ln)
+            label.delete(sd2_up_lab)
+        if not na(sd2_dn_ln)
+            line.delete(sd2_dn_ln)
+            label.delete(sd2_dn_lab)
+        for t in up_targets
+            line.delete(t.ln)
+            label.delete(t.lab)
+        for t in down_targets
+            line.delete(t.ln)
+            label.delete(t.lab)
+        // Delete BB labels
+        if not na(bb_strong_up_lab)
+            label.delete(bb_strong_up_lab)
+        if not na(bb_neutral_up_lab)
+            label.delete(bb_neutral_up_lab)
+        if not na(bb_basis_lab)
+            label.delete(bb_basis_lab)
+        if not na(bb_neutral_dn_lab)
+            label.delete(bb_neutral_dn_lab)
+        if not na(bb_strong_dn_lab)
+            label.delete(bb_strong_dn_lab)
+
+    // Reset visualization state
+    orb_box        := na
+    orb_h_ln       := VisLine.new(na, na)
+    orb_l_ln       := VisLine.new(na, na)
+    orb_m_ln       := na
+    orb_m_lab      := na
+    vis_drawn      := false
+    sd1_up_ln  := na
+    sd1_dn_ln  := na
+    sd1_up_lab := na
+    sd1_dn_lab := na
+    sd2_up_ln  := na
+    sd2_dn_ln  := na
+    sd2_up_lab := na
+    sd2_dn_lab := na
+    array.clear(up_targets)
+    array.clear(down_targets)
+    up_count       := 0
+    down_count     := 0
+    up_high_track  := na
+    down_low_track := na
+    bb_strong_up_lab  := na
+    bb_neutral_up_lab := na
+    bb_basis_lab      := na
+    bb_neutral_dn_lab := na
+    bb_strong_dn_lab  := na
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 9: ORB CALCULATION (during ORB period)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if in_range
+    // BB-Werte am ORB-Start einmalig einfrieren
+    if not bb_values_frozen and not na(bb_ema) and not na(bb_std)
+        frozen_bb_ema           := bb_ema
+        frozen_bb_std           := bb_std
+        frozen_bb_neutral_upper := bb_ema + bb_std * bb_neutral
+        frozen_bb_neutral_lower := bb_ema - bb_std * bb_neutral
+        frozen_bb_strong_upper  := bb_ema + bb_std * bb_strong
+        frozen_bb_strong_lower  := bb_ema - bb_std * bb_strong
+        bb_values_frozen        := true
+
+    // 5M Open der ersten ORB-Kerze erfassen (15:30 Kerze)
+    if na(ny_open_5m) and bb_values_frozen and time >= range_start_time and time < range_start_time + 300000
+        ny_open_5m           := open
+        ny_open_bb_signal    := get_bb_signal(open,
+             frozen_bb_neutral_upper, frozen_bb_neutral_lower,
+             frozen_bb_strong_upper,  frozen_bb_strong_lower)
+        first_orb_candle_dir := close > open ? "BULLISH" : close < open ? "BEARISH" : "NEUTRAL"
+
+     // Letzte 5M ORB-Kerze (15:40–15:45 Kerze)
+    if time >= range_end_time - 300000
+        last_orb_candle_dir := close > open ? "BULLISH" : close < open ? "BEARISH" : "NEUTRAL"
+
+    // ORB Range aufbauen (High/Low/mid inklusive aller Wicks)
+    range_high := na(range_high) ? high : math.max(range_high, high)
+    range_low  := na(range_low)  ? low  : math.min(range_low,  low)
+    range_size := range_high - range_low
+    orb_mid := (range_high + range_low) / 2
+
+    // Live ATR Volatility Ratio
+    if not na(atr_yesterday) and atr_yesterday > 0
+        vol_ratio := (range_size / atr_yesterday) * 100
+
+    // 5M Close der letzten ORB-Kerze (letzte 5 Minuten der ORB)
+    if time >= range_end_time - 300000 and na(orb_end_5m_close)
+        orb_end_5m_close := close
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 10: POST-ORB LOGIK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if not in_range and not na(range_size) and time >= range_end_time and bb_values_frozen
+    // ORB Close BB Signal einmalig nach ORB-Ende setzen
+    if na(orb_close_bb_signal) and not na(orb_end_5m_close)
+        orb_close_bb_signal := get_bb_signal(orb_end_5m_close,
+             frozen_bb_neutral_upper, frozen_bb_neutral_lower,
+             frozen_bb_strong_upper,  frozen_bb_strong_lower)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 11: TRIGGER BAR TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// First candle that closes outside ORB range = Trigger Bar
+if not na(range_high) and not na(range_low) and time >= range_end_time and not breakout_detected
+    is_bull_break = close > range_high
+    is_bear_break = close < range_low
+
+    if is_bull_break or is_bear_break
+        bars_since_orb    += 1
+        breakout_detected := true
+        breakout_direction := is_bull_break ? "BULLISH" : "BEARISH"
+
+        // Lock Trigger Close and Trigger Bar size only once each
+        if not trigger_close_locked
+            trigger_5m_close     := close
+            trigger_close_locked := true
+
+        if not trigger_bar_locked
+            trigger_bar_high   := high
+            trigger_bar_low    := low
+            trigger_bar_range  := high - low
+            trigger_bar_locked := true
+
+        if na(breakout_bar_time)
+            breakout_bar_time := time
+
+        // Journal Metriken
+        breakout_category    := get_breakout_category(bars_since_orb)
+        trigger_position_cat := get_trigger_position(close, range_high, range_low, breakout_direction)
+
+        // BB Signal der Trigger Bar (mit gesperrtem Close)
+        if not na(trigger_5m_close)
+            trigger_bb_signal := get_bb_signal(trigger_5m_close,
+                 frozen_bb_neutral_upper, frozen_bb_neutral_lower,
+                 frozen_bb_strong_upper,  frozen_bb_strong_lower)
+    else
+        bars_since_orb += 1
+
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 12: ORB VISUALISIERUNG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Einmalige Ereignisse: ORB-Start und ORB-Ende pro Bar
+or_start = in_range and not in_range[1]
+or_end   = in_range[1] and not in_range
+
+// Step size for targets (points)
+tgt_step = na(range_size) ? na : range_size * target_pct / 100.0
+
+// ── ORB Box (during ORB period) ────────────────────────────────────────
+if show_orb_box and not na(range_high) and not na(range_low)
+    if or_start
+        // Neue Box beim ersten ORB-Balken erstellen
+        orb_box := box.new(bar_index, high, bar_index, low,
+             bgcolor=orb_box_color, border_color=color.new(color.white, 100))
+    else if in_range and not na(orb_box)
+        // Track box live while ORB is running
+        box.set_right(orb_box,  bar_index)
+        box.set_top(orb_box,    range_high)
+        box.set_bottom(orb_box, range_low)
+
+// ── ORH / ORL / ORM Linien & Labels (nach ORB-Ende) ─────────────────────────
+if show_orb_lines and or_end and not na(range_high) and not na(range_low) and not vis_drawn
+    orb_m = math.avg(range_high, range_low)
+
+    // ORH Linie (mit optionalem Label)
+    orb_h_ln := VisLine.new(
+         line.new(bar_index, range_high, bar_index, range_high,
+              color=orb_line_color, style=line.style_solid, width=1),
+         show_labels
+              ? label.new(bar_index, range_high, text="ORH",
+                   tooltip=str.tostring(range_high, format.mintick),
+                   style=label.style_label_left, color=invis,
+                   textcolor=orb_line_color, size=txt_size_vis)
+              : na)
+
+    // ORL Linie (mit optionalem Label)
+    orb_l_ln := VisLine.new(
+         line.new(bar_index, range_low, bar_index, range_low,
+              color=orb_line_color, style=line.style_solid, width=1),
+         show_labels
+              ? label.new(bar_index, range_low, text="ORL",
+                   tooltip=str.tostring(range_low, format.mintick),
+                   style=label.style_label_left, color=invis,
+                   textcolor=orb_line_color, size=txt_size_vis)
+              : na)
+
+    // ORM Mittellinie mit optionalem Label (gestrichelt, per Toggle aktivierbar)
+    if show_orb_mid
+        orb_m_ln := line.new(bar_index, orb_m, bar_index, orb_m,
+             color=orb_line_color, style=line.style_dashed, width=1)
+        if show_labels
+            orb_m_lab := label.new(bar_index, orb_m, text="ORM",
+                 tooltip=str.tostring(orb_m, format.mintick),
+                 style=label.style_label_left, color=invis,
+                 textcolor=orb_line_color, size=txt_size_vis)
+
+    vis_drawn := true
+
+// ── SD Linien (Dropdown-gesteuert, erscheinen nach ORB-Ende) ─────────────────
+// Hilfsfunktion: Dropdown-String → Prozentsatz der ORB Range
+sd_level_to_pct(lvl) =>
+    switch lvl
+        "0.25 SD" => 25.0
+        "0.5 SD"  => 50.0
+        "0.75 SD" => 75.0
+        "1 SD"    => 100.0
+        => 0.0   // "Disabled"
+
+if or_end and not na(range_high) and not na(range_low) and not na(range_size)
+    // SD Linie 1
+    sd1_pct = sd_level_to_pct(sd1_level)
+    if sd1_pct > 0
+        sd1_dist = range_size * sd1_pct / 100.0
+        sd1_up_ln := line.new(bar_index, range_high + sd1_dist,
+             bar_index, range_high + sd1_dist,
+             color=sd1_color, style=line.style_dashed, width=1)
+        sd1_dn_ln := line.new(bar_index, range_low - sd1_dist,
+             bar_index, range_low - sd1_dist,
+             color=sd1_color, style=line.style_dashed, width=1)
+        if show_labels
+            sd1_up_lab := label.new(bar_index, range_high + sd1_dist,
+                 text=sd1_level, style=label.style_label_left, color=invis,
+                 textcolor=sd1_color, size=txt_size_vis)
+            sd1_dn_lab := label.new(bar_index, range_low - sd1_dist,
+                 text=sd1_level, style=label.style_label_left, color=invis,
+                 textcolor=sd1_color, size=txt_size_vis)
+
+    // SD Linie 2
+    sd2_pct = sd_level_to_pct(sd2_level)
+    if sd2_pct > 0
+        sd2_dist = range_size * sd2_pct / 100.0
+        sd2_up_ln := line.new(bar_index, range_high + sd2_dist,
+             bar_index, range_high + sd2_dist,
+             color=sd2_color, style=line.style_dashed, width=1)
+        sd2_dn_ln := line.new(bar_index, range_low - sd2_dist,
+             bar_index, range_low - sd2_dist,
+             color=sd2_color, style=line.style_dashed, width=1)
+        if show_labels
+            sd2_up_lab := label.new(bar_index, range_high + sd2_dist,
+                 text=sd2_level, style=label.style_label_left, color=invis,
+                 textcolor=sd2_color, size=txt_size_vis)
+            sd2_dn_lab := label.new(bar_index, range_low - sd2_dist,
+                 text=sd2_level, style=label.style_label_left, color=invis,
+                 textcolor=sd2_color, size=txt_size_vis)
+
+// ── Extend all lines daily to the right until tracking end ──────────
+if not in_range and time <= orb_tracking_end_time
+    if show_orb_lines and not na(orb_h_ln.ln)
+        line.set_x2(orb_h_ln.ln, bar_index)
+        line.set_x2(orb_l_ln.ln, bar_index)
+        if show_labels and not na(orb_h_ln.lab)
+            label.set_x(orb_h_ln.lab, bar_index)
+        if show_labels and not na(orb_l_ln.lab)
+            label.set_x(orb_l_ln.lab, bar_index)
+    if show_orb_mid and not na(orb_m_ln)
+        line.set_x2(orb_m_ln, bar_index)
+        if show_labels and not na(orb_m_lab)
+            label.set_x(orb_m_lab, bar_index)
+    if not na(sd1_up_ln)
+        line.set_x2(sd1_up_ln, bar_index)
+        if show_labels and not na(sd1_up_lab)
+            label.set_x(sd1_up_lab, bar_index)
+    if not na(sd1_dn_ln)
+        line.set_x2(sd1_dn_ln, bar_index)
+        if show_labels and not na(sd1_dn_lab)
+            label.set_x(sd1_dn_lab, bar_index)
+    if not na(sd2_up_ln)
+        line.set_x2(sd2_up_ln, bar_index)
+        if show_labels and not na(sd2_up_lab)
+            label.set_x(sd2_up_lab, bar_index)
+    if not na(sd2_dn_ln)
+        line.set_x2(sd2_dn_ln, bar_index)
+        if show_labels and not na(sd2_dn_lab)
+            label.set_x(sd2_dn_lab, bar_index)
+
+// ── Target Linien ─────────────────────────────────────────────────────────────
+// Targets erscheinen nach ORB-Ende und zeigen nummerierte Kursziele
+if show_targets and not in_range and not na(range_high) and not na(range_low) and not na(tgt_step)
+         and tgt_step > 0 and time <= orb_tracking_end_time
+
+    // Tracking: highest/lowest reached price for level calculation
+    up_high_track  := na(up_high_track)  ? close : math.max(up_high_track,  high)
+    down_low_track := na(down_low_track) ? close : math.min(down_low_track, low)
+
+    // Wie viele Stufen wurden bisher erreicht?
+    up_max   = get_next_level((up_high_track  - range_high) / tgt_step)
+    down_max = get_next_level((range_low - down_low_track)  / tgt_step)
+
+    // Current level (for Adaptive mode)
+    up_cur   = math.max(0, get_next_level((close - range_high) / tgt_step))
+    down_cur = math.max(0, get_next_level((range_low - close)  / tgt_step))
+
+    // Neue Bull-Targets zeichnen (nur wenn noch nicht alle gezeichnet)
+    if up_count < up_max
+        for i = up_count + 1 to up_max
+            tgt_price = range_high + tgt_step * i
+            new_t = VisLine.new(
+                 line.new(bar_index - 1, tgt_price, bar_index, tgt_price,
+                      color=target_color_up, style=get_line_style(target_style)),
+                 show_labels
+                      ? label.new(bar_index, tgt_price, text=str.tostring(i) + " SD",
+                           tooltip=str.tostring(tgt_price, format.mintick),
+                           style=label.style_label_left, color=invis,
+                           textcolor=target_color_up, size=txt_size_vis)
+                      : na)
+            array.push(up_targets, new_t)
+        up_count := up_max
+
+    // Neue Bear-Targets zeichnen
+    if down_count < down_max
+        for i = down_count + 1 to down_max
+            tgt_price = range_low - tgt_step * i
+            new_t = VisLine.new(
+                 line.new(bar_index - 1, tgt_price, bar_index, tgt_price,
+                      color=target_color_dn, style=get_line_style(target_style)),
+                 show_labels
+                      ? label.new(bar_index, tgt_price, text=str.tostring(i) + " SD",
+                           tooltip=str.tostring(tgt_price, format.mintick),
+                           style=label.style_label_left, color=invis,
+                           textcolor=target_color_dn, size=txt_size_vis)
+                      : na)
+            array.push(down_targets, new_t)
+        down_count := down_max
+
+    // Extended: extend all lines to current bar
+    if target_display == "Extended"
+        for t in up_targets
+            line.set_x2(t.ln, bar_index)
+            if not na(t.lab)
+                label.set_x(t.lab, bar_index)
+        for t in down_targets
+            line.set_x2(t.ln, bar_index)
+            if not na(t.lab)
+                label.set_x(t.lab, bar_index)
+
+    // Adaptive: only keep the next 2 reachable levels visible
+    if target_display == "Adaptive"
+        for t in up_targets
+            tgt_y = line.get_y1(t.ln)
+            if tgt_y <= range_high + tgt_step * up_cur and tgt_y >= range_high + tgt_step * math.max(0, up_cur - 1)
+                line.set_x2(t.ln, bar_index + 1)
+                if not na(t.lab)
+                    label.set_x(t.lab, bar_index + 1)
+        for t in down_targets
+            tgt_y = line.get_y1(t.ln)
+            if tgt_y >= range_low - tgt_step * down_cur and tgt_y <= range_low - tgt_step * math.max(0, down_cur - 1)
+                line.set_x2(t.ln, bar_index + 1)
+                if not na(t.lab)
+                    label.set_x(t.lab, bar_index + 1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 13: MAIN DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    var table info_table = table.new(get_dashboard_position(), 2, 52,
+         bgcolor=user_color_background, 
+         border_color=dashboard_border_color, border_width=1,
+         frame_color=dashboard_border_color, frame_width=2)
+
+    current_row = 0
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    table.cell(info_table, 0, current_row, "═══ ORB Dashboard ═══",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, strategy_text,
+         text_color=user_color_text, text_size=get_text_size())
+    current_row += 1
+
+    // ── Filter Details ────────────────────────────────────────────────────────
+    if show_filter_details
+
+        // ORB Range
+        range_display = in_range and not na(range_size)
+             ? str.tostring(range_size, get_price_format()) + " pts (live)"
+             : not na(range_size) ? str.tostring(range_size, get_price_format()) + " pts" : "⏳"
+        table.cell(info_table, 0, current_row, "ORB Range:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, range_display,
+             text_color=user_color_text, text_size=get_text_size())
+        current_row += 1
+
+        // ATR Vortag
+        table.cell(info_table, 0, current_row, "ATR Prev. Day:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(atr_yesterday) ? "⏳" : str.tostring(atr_yesterday, get_price_format()),
+             text_color=user_color_text, text_size=get_text_size())
+        current_row += 1
+
+        // ORB Volatility %
+        ratio_display = na(vol_ratio) ? "⏳" : str.tostring(vol_ratio, "#.##") + "%"
+        ratio_color   = not na(vol_ratio) and vol_ratio >= no_trade_below and vol_ratio <= no_trade_above
+             ? user_color_trade : user_color_no_trade
+        table.cell(info_table, 0, current_row, "ORB Volatility:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, ratio_display,
+             text_color=user_color_text, bgcolor=ratio_color, text_size=get_text_size())
+        current_row += 1
+
+        // BB Signal: ORB Open (5M Open erste ORB-Kerze)
+        table.cell(info_table, 0, current_row, "ORB Open BB:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(ny_open_bb_signal) ? "⏳" : ny_open_bb_signal,
+             text_color=user_color_text, bgcolor=get_bb_color(ny_open_bb_signal),
+             text_size=get_text_size())
+        current_row += 1
+
+        // BB Signal: ORB Close (5M Close letzte ORB-Kerze)
+        table.cell(info_table, 0, current_row, "ORB Close BB:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(orb_close_bb_signal) ? "⏳" : orb_close_bb_signal,
+             text_color=user_color_text, bgcolor=get_bb_color(orb_close_bb_signal),
+             text_size=get_text_size())
+        current_row += 1
+
+        // BB Signal: Trigger Bar (5M Close erste Breakout-Kerze)
+        table.cell(info_table, 0, current_row, "Trigger Bar BB:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(trigger_bb_signal) ? "⏳" : trigger_bb_signal,
+             text_color=user_color_text, bgcolor=get_bb_color(trigger_bb_signal),
+             text_size=get_text_size())
+        current_row += 1
+
+    // ── Final Result ──────────────────────────────────────────────────────────
+    table.cell(info_table, 0, current_row, "━━━ FINAL RESULT ━━━",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, "",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    current_row += 1
+
+    // Prepare signals for calculations (N/A if not yet available)
+    ny_sig   = na(ny_open_bb_signal)   ? "N/A" : ny_open_bb_signal
+    orb_sig  = na(orb_close_bb_signal) ? "N/A" : orb_close_bb_signal
+    trig_sig = na(trigger_bb_signal)   ? "N/A" : trigger_bb_signal
+
+    // Trend Filter (2/3 Methode)
+    trend_result = not na(ny_open_bb_signal) and not na(orb_close_bb_signal)
+         ? get_trend_filter(ny_sig, orb_sig, trig_sig) : "⏳"
+    trend_color  = trend_result == "BULLISH" ? user_color_bb_bullish
+         : trend_result == "BEARISH" ? user_color_bb_bearish
+         : trend_result == "NEUTRAL" ? user_color_bb_neutral
+         : user_color_background
+
+    table.cell(info_table, 0, current_row, "Trend Filter (2/3):",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, trend_result,
+         text_color=user_color_text, bgcolor=trend_color, text_size=get_text_size())
+    current_row += 1
+
+    // Vol + Trend Trade Signal
+    current_ratio  = not na(range_size) and not na(atr_yesterday) and atr_yesterday > 0
+         ? (range_size / atr_yesterday) * 100 : vol_ratio
+    [final_text, final_color] = get_trade_signal(current_ratio, ny_sig, orb_sig, trig_sig)
+    final_display  = in_range ? final_text + " (live)" : final_text
+
+    table.cell(info_table, 0, current_row, "Vol + Trend:",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, final_display,
+         text_color=user_color_text, bgcolor=final_color, text_size=get_text_size())
+    current_row += 1
+
+    // News & Holidays (must be checked manually)
+    table.cell(info_table, 0, current_row, "News/Holidays:",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, "Check manually!",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    current_row += 1
+
+    // Trigger Bar Close Position
+    trigger_close_display = breakout_detected and not na(trigger_position_cat)
+         ? trigger_position_cat : "⏳"
+    table.cell(info_table, 0, current_row, "Trigger Bar Close:",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, trigger_close_display,
+         text_color=user_color_text,
+         bgcolor=get_trigger_close_color(trigger_close_display),
+         text_size=get_text_size())
+    current_row += 1
+
+    // Breakout Time
+    breakout_time_str = na(breakout_bar_time) ? "⏳"
+         : str.format_time(breakout_bar_time, "HH:mm", timezone_input)
+    table.cell(info_table, 0, current_row, "Breakout Time:",
+         text_color=user_color_text, text_size=get_text_size())
+    table.cell(info_table, 1, current_row, breakout_time_str,
+         text_color=user_color_text, text_size=get_text_size())
+    current_row += 1
+
+    // ── Journal Infos ─────────────────────────────────────────────────────────
+    if show_journal_infos
+        table.cell(info_table, 0, current_row, "═══ JOURNAL INFOS ═══",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        current_row += 1
+
+        // ORB Direction (5M Open erste Kerze vs 5M Close letzte ORB-Kerze)
+        orb_dir       = get_orb_direction(ny_open_5m, orb_end_5m_close)
+        orb_dir_color = str.contains(orb_dir, "BULLISH") ? user_color_bb_bullish
+             : str.contains(orb_dir, "BEARISH") ? user_color_bb_bearish : user_color_bb_neutral
+        table.cell(info_table, 0, current_row, "ORB Direction (15min):",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, orb_dir,
+             text_color=user_color_text, bgcolor=orb_dir_color, text_size=get_text_size())
+        current_row += 1
+
+        // Richtung der ersten 5M ORB-Kerze
+        first_color = str.contains(first_orb_candle_dir, "BULLISH") ? user_color_bb_bullish
+             : str.contains(first_orb_candle_dir, "BEARISH") ? user_color_bb_bearish : user_color_bb_neutral
+        table.cell(info_table, 0, current_row, "First ORB-candle:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(first_orb_candle_dir) ? "⏳" : first_orb_candle_dir,
+             text_color=user_color_text, bgcolor=first_color, text_size=get_text_size())
+        current_row += 1
+
+        // Richtung der letzten 5M ORB-Kerze
+        last_color = str.contains(last_orb_candle_dir, "BULLISH") ? user_color_bb_bullish
+             : str.contains(last_orb_candle_dir, "BEARISH") ? user_color_bb_bearish : user_color_bb_neutral
+        table.cell(info_table, 0, current_row, "Last ORB-candle:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(last_orb_candle_dir) ? "⏳" : last_orb_candle_dir,
+             text_color=user_color_text, bgcolor=last_color, text_size=get_text_size())
+        current_row += 1
+
+        // Anzahl Kerzen bis Breakout
+        bars_text = breakout_detected
+             ? str.tostring(bars_since_orb, "#")
+             : time <= range_end_time ? "ORB running..."
+             : time > orb_tracking_end_time
+                  ? "ORB Tracking ended (" + str.tostring(orb_tracking_hours, "#.#") + "h)"
+             : bars_since_orb == 0 ? "Waiting for 1st bar..."
+             : "No Breakout (candle " + str.tostring(bars_since_orb, "#") + ")"
+        table.cell(info_table, 0, current_row, "Candles until Breakout:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, bars_text,
+             text_color=user_color_text, text_size=get_text_size())
+        current_row += 1
+
+        // Breakout Richtung
+        dir_color = breakout_direction == "BULLISH" ? user_color_bb_bullish
+             : breakout_direction == "BEARISH" ? user_color_bb_bearish : user_color_background
+        table.cell(info_table, 0, current_row, "Breakout direction:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(breakout_direction) ? "⏳" : breakout_direction,
+             text_color=user_color_text, bgcolor=dir_color, text_size=get_text_size())
+        current_row += 1
+
+        // Trigger Bar Close Position
+        table.cell(info_table, 0, current_row, "Trigger Bar Close:",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(info_table, 1, current_row,
+             na(trigger_position_cat) ? "⏳" : trigger_position_cat,
+             text_color=user_color_text,
+             bgcolor=get_trigger_close_color(trigger_position_cat),
+             text_size=get_text_size())
+        current_row += 1
+
+        // ── Erweiterte Journal Infos ──────────────────────────────────────────
+        if show_extended_journal
+            table.cell(info_table, 0, current_row, "─── Extended Analysis ───",
+                 text_color=color.orange, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, "",
+                 text_color=user_color_text, text_size=get_text_size())
+            current_row += 1
+
+            // Trigger Bar size in points
+            table.cell(info_table, 0, current_row, "Trigger Bar size:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row,
+                 na(trigger_bar_range) ? "⏳" : str.tostring(trigger_bar_range, get_price_format()) + " pts",
+                 text_color=user_color_text, text_size=get_text_size())
+            current_row += 1
+
+            // TB vs ORB Range ratio
+            tb_orb_text = na(trigger_bar_range) or na(range_size) or range_size <= 0
+                 ? "⏳" : str.tostring(trigger_bar_range / range_size, "#.##") + "x"
+            table.cell(info_table, 0, current_row, "TB vs ORB:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, tb_orb_text,
+                 text_color=user_color_text, text_size=get_text_size())
+            current_row += 1
+
+            // TB vs ATR ratio
+            tb_atr_text = na(trigger_bar_range) or na(atr_yesterday) or atr_yesterday <= 0
+                 ? "⏳" : str.tostring(trigger_bar_range / atr_yesterday, "#.##") + "x"
+            table.cell(info_table, 0, current_row, "TB vs ATR:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, tb_atr_text,
+                 text_color=user_color_text, text_size=get_text_size())
+            current_row += 1
+
+            // Explosive Rating
+            exp_rating = get_explosive_rating(trigger_bar_range, atr_yesterday)
+            exp_color  = exp_rating == "EXPLOSIVE" ? color.red
+                 : exp_rating == "STRONG"   ? color.orange
+                 : exp_rating == "NORMAL"   ? user_color_trade
+                 : exp_rating == "WEAK"     ? color.gray
+                 : user_color_background
+            table.cell(info_table, 0, current_row, "Explosive Rating:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, exp_rating,
+                 text_color=user_color_text, bgcolor=exp_color, text_size=get_text_size())
+            current_row += 1
+
+            // Daily Candle at ORB Start
+            daily_color = daily_candle_dir == "BULLISH" ? user_color_bb_bullish
+                 : daily_candle_dir == "BEARISH" ? user_color_bb_bearish : user_color_bb_neutral
+            table.cell(info_table, 0, current_row, "Daily Candle:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, daily_candle_dir,
+                 text_color=user_color_text, bgcolor=daily_color, text_size=get_text_size())
+            current_row += 1
+
+            // Previous Daily Candle
+            prev_daily_color = prev_daily_candle_dir == "BULLISH" ? user_color_bb_bullish
+                 : prev_daily_candle_dir == "BEARISH" ? user_color_bb_bearish : user_color_bb_neutral
+            table.cell(info_table, 0, current_row, "Prev Daily Candle:",
+                 text_color=user_color_text, text_size=get_text_size())
+            table.cell(info_table, 1, current_row, prev_daily_candle_dir,
+                 text_color=user_color_text, bgcolor=prev_daily_color, text_size=get_text_size())
+            current_row += 1
+
+            // ── R/R Kalkulation ───────────────────────────────────────────────
+            if breakout_detected and not na(trigger_5m_close) and not na(orb_mid) and not na(range_size)
+                rr_entry = trigger_5m_close
+                rr_sl    = orb_mid
+                rr_risk  = math.abs(rr_entry - rr_sl)
+
+                // TP Levels (1 SD und 2 SD vom ORB Range)
+                rr_tp1 = breakout_direction == "BULLISH"
+                     ? range_high + range_size * 1.0
+                     : range_low  - range_size * 1.0
+                rr_tp2 = breakout_direction == "BULLISH"
+                     ? range_high + range_size * 2.0
+                     : range_low  - range_size * 2.0
+
+                rr_1sd = rr_risk > 0 ? math.abs(rr_tp1 - rr_entry) / rr_risk : na
+                rr_2sd = rr_risk > 0 ? math.abs(rr_tp2 - rr_entry) / rr_risk : na
+
+                rr_1sd_text = na(rr_1sd) ? "⏳" : str.tostring(rr_1sd, "#.##") + "R"
+                rr_2sd_text = na(rr_2sd) ? "⏳" : str.tostring(rr_2sd, "#.##") + "R"
+
+                // SL in Punkten
+                rr_sl_pts = str.tostring(rr_risk, get_price_format()) + " pts"
+
+                table.cell(info_table, 0, current_row, "─── R/R Analysis ───",
+                     text_color=color.orange, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, "",
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+                table.cell(info_table, 0, current_row, "SL (Entry→ORM):",
+                     text_color=user_color_text, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, rr_sl_pts,
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+                table.cell(info_table, 0, current_row, "R/R 1 SD:",
+                     text_color=user_color_text, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, rr_1sd_text,
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+                table.cell(info_table, 0, current_row, "R/R 2 SD:",
+                     text_color=user_color_text, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, rr_2sd_text,
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+            else
+                table.cell(info_table, 0, current_row, "─── R/R Analysis ───",
+                     text_color=color.orange, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, "",
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+                table.cell(info_table, 0, current_row, "R/R 1 SD / 2 SD:",
+                     text_color=user_color_text, text_size=get_text_size())
+                table.cell(info_table, 1, current_row, "⏳",
+                     text_color=user_color_text, text_size=get_text_size())
+                current_row += 1
+
+    // ── Debug Section ─────────────────────────────────────────────────────────
+    if show_debug
+        table.cell(info_table, 0, current_row, "═══ DEBUG - FROZEN BB ═══",
+             text_color=color.yellow, text_size=get_text_size())
+        table.cell(info_table, 1, current_row, "",
+             text_color=user_color_text, text_size=get_text_size())
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "BB Values Frozen:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, bb_values_frozen ? "✅ YES" : "❌ NO",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Trigger Close Locked:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, trigger_close_locked ? "🔒 LOCKED" : "🔓 UNLOCKED",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Frozen BB EMA:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(frozen_bb_ema) ? "N/A" : str.tostring(frozen_bb_ema, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Frozen Neutral Upper:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(frozen_bb_neutral_upper) ? "N/A" : str.tostring(frozen_bb_neutral_upper, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Frozen Neutral Lower:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(frozen_bb_neutral_lower) ? "N/A" : str.tostring(frozen_bb_neutral_lower, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        // Live vs Frozen Vergleich
+        table.cell(info_table, 0, current_row, "═══ LIVE vs FROZEN ═══",
+             text_color=color.orange, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, "",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        live_neu_upper = na(bb_ema) or na(bb_std) ? na : bb_ema + bb_std * bb_neutral
+        live_neu_lower = na(bb_ema) or na(bb_std) ? na : bb_ema - bb_std * bb_neutral
+
+        table.cell(info_table, 0, current_row, "LIVE Neutral Upper:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(live_neu_upper) ? "N/A" : str.tostring(live_neu_upper, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "LIVE Neutral Lower:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(live_neu_lower) ? "N/A" : str.tostring(live_neu_lower, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        // Preis-Snapshots
+        table.cell(info_table, 0, current_row, "NY Open (1st ORB 5M):",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(ny_open_5m) ? "N/A" : str.tostring(ny_open_5m, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "ORB High:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(range_high) ? "N/A" : str.tostring(range_high, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "ORB Low:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(range_low) ? "N/A" : str.tostring(range_low, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "ORB End 5M Close:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(orb_end_5m_close) ? "N/A" : str.tostring(orb_end_5m_close, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Trigger 5M Close:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(trigger_5m_close) ? "N/A" : str.tostring(trigger_5m_close, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Current 5M Close:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, str.tostring(close, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        // Trigger Bar Details
+        table.cell(info_table, 0, current_row, "═══ TRIGGER BAR ═══",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, "",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Trigger Bar Locked:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, trigger_bar_locked ? "🔒 LOCKED" : "🔓 UNLOCKED",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Triggerbar High:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(trigger_bar_high) ? "N/A" : str.tostring(trigger_bar_high, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Trigger Bar Low:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(trigger_bar_low) ? "N/A" : str.tostring(trigger_bar_low, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "Trigger Bar Range:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             na(trigger_bar_range) ? "N/A" : str.tostring(trigger_bar_range, get_price_format()),
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        // Time Status
+        time_status = time < range_start_time ? "Before ORB" : in_range ? "In ORB" : "After ORB"
+        table.cell(info_table, 0, current_row, "Time Status:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, time_status,
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        // Manueller Check mit eingefrorenen Werten
+        table.cell(info_table, 0, current_row, "Manual Check (FROZEN):",
+             text_color=color.lime, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, "",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        frozen_check = not na(ny_open_5m) and not na(frozen_bb_neutral_upper) and not na(frozen_bb_neutral_lower)
+             ? (ny_open_5m >= frozen_bb_neutral_lower and ny_open_5m <= frozen_bb_neutral_upper
+                  ? "IN NEUTRAL ✅"
+                  : ny_open_5m > frozen_bb_neutral_upper ? "ABOVE NEUTRAL (BULL)" : "BELOW NEUTRAL (BEAR)")
+             : "N/A"
+        table.cell(info_table, 0, current_row, "NY vs Frozen Neutral:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row, frozen_check,
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "NY - Frozen Upper:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             not na(ny_open_5m) and not na(frozen_bb_neutral_upper)
+             ? str.tostring(ny_open_5m - frozen_bb_neutral_upper, get_price_format()) : "N/A",
+             text_color=user_color_text, text_size=size.tiny)
+        current_row += 1
+
+        table.cell(info_table, 0, current_row, "NY - Frozen Lower:",
+             text_color=user_color_text, text_size=size.tiny)
+        table.cell(info_table, 1, current_row,
+             not na(ny_open_5m) and not na(frozen_bb_neutral_lower)
+             ? str.tostring(ny_open_5m - frozen_bb_neutral_lower, get_price_format()) : "N/A",
+             text_color=user_color_text, text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 14: STRATEGY RULES DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and show_rules_dashboard
+
+    var table rules_table = table.new(get_rules_position(), 4, 35,
+         bgcolor=user_color_background,
+         border_color=dashboard_border_color, border_width=1,
+         frame_color=dashboard_border_color, frame_width=2)
+
+    rr = 0
+
+    color_general = #2C3E50
+    color_rebreak = #8E44AD
+    color_forb    = #1A6B8A
+
+    // ── HEADER ────────────────────────────────────────────────────────────────
+    header_text = strategy_type == "Base" ? "Base Strategies" : "Sub-Strategies"
+    table.cell(rules_table, 0, rr, "=== STRATEGY RULES ===",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_header_size())
+    table.cell(rules_table, 1, rr, header_text,
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    table.cell(rules_table, 2, rr, "",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    table.cell(rules_table, 3, rr, "",
+         text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+    rr += 1
+
+    // ── GENERAL (optional) ────────────────────────────────────────────────────
+    if show_general_rules
+
+        table.cell(rules_table, 0, rr, "GENERAL",
+             text_color=user_color_text, bgcolor=color_general, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Range",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "First 15min NY Open",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Close all trades",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "22:00",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "US Bank Holiday",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trading!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Big News",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "NFP (no ADP), CPI (no PCE)\nPPI, RS, FOMC (no Minutes)",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Small News",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "PMI, Powell, UoM, JOLTS\nNo Unemployment claims",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BASE STRATEGIES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    if strategy_type == "Base"
+
+        table.cell(rules_table, 0, rr, "BASE: BREAKOUT",
+             text_color=user_color_text, bgcolor=user_color_trade, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "BASE: REVERSAL",
+             text_color=user_color_text, bgcolor=user_color_reversal, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Entry",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "Breakout of Range\n(no Candle Close needed)",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Condition",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "2nd BO after Stop Out",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "SL",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "Opposite Side of Range",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Direction",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "Opposite of initial BO",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "TP",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "Close EOD (22:00)",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Neutral Days",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Before 4:15pm",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Vol <15% or >60%",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "After 5:30pm",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "FOMC",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Vol >60%",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "FOMC",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  SUB-STRATEGIES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    if strategy_type == "Sub"
+
+        // PAAR 1: BREAKOUT | REBREAK
+        table.cell(rules_table, 0, rr, "SUB: BREAKOUT",
+             text_color=user_color_text, bgcolor=user_color_trade, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "SUB: REBREAK",
+             text_color=user_color_text, bgcolor=color_rebreak, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Entry",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "5m Close outside Range",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Condition",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "After (hyp.) SL of BO",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "SL / TP",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "50% ORB / 1 SD",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Only on",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "Big News Days",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Big News",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Strong Trend",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Small News*",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "100% Retracement",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Neutral Market",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!\n*exc. Neutral+Long BO",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "1 SD hit after BO",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Vol <15% or >50%",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "TB >0.25 SD",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "TB >0.5 SD",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "After 8pm",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        // Trennzeile
+        table.cell(rules_table, 0, rr, "─────────────────",
+             text_color=color.new(user_color_text, 70), bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "──────────────────",
+             text_color=color.new(user_color_text, 70), bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "─────────────────",
+             text_color=color.new(user_color_text, 70), bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "──────────────────",
+             text_color=color.new(user_color_text, 70), bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        // PAAR 2: REVERSAL | FORB
+        table.cell(rules_table, 0, rr, "SUB: REVERSAL",
+             text_color=user_color_text, bgcolor=user_color_reversal, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "SUB: FORB",
+             text_color=user_color_text, bgcolor=color_forb, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Condition",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "After (hyp.) SL of BO",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Entry / SL / TP",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "0.5 SD / 1 SD / -0.5 SD",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Only on",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "Neutral Days",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Only on",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "Big News and/or Neutral",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "Direction",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "Opposite of initial BO",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Note",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "Can trigger before TB Close",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "NO TRADE",
+             text_color=user_color_text, bgcolor=user_color_no_trade, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, bgcolor=user_color_background, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "TB >0.25 SD",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Retrace to -0.5 SD\nafter TB Close",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "1 SD hit after (hyp.) BO",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "Neutral + no Big News\n+ BO is Long",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        rr += 1
+
+        table.cell(rules_table, 0, rr, "After 8pm",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 1, rr, "No Trade!",
+             text_color=user_color_no_trade_text, text_size=get_text_size())
+        table.cell(rules_table, 2, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        table.cell(rules_table, 3, rr, "",
+             text_color=user_color_text, text_size=get_text_size())
+        rr += 1
+        
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 15: BOLLINGER BANDS VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Display BB bands in chart (user-selectable timeframe for smooth lines)
+// Verwendet bb_vis_ema und bb_vis_std (nicht die eingefrorenen Werte!)
+bb_vis_neutral_upper = bb_vis_ema + bb_vis_std * bb_neutral
+bb_vis_neutral_lower = bb_vis_ema - bb_vis_std * bb_neutral
+bb_vis_strong_upper  = bb_vis_ema + bb_vis_std * bb_strong
+bb_vis_strong_lower  = bb_vis_ema - bb_vis_std * bb_strong
+
+// Plot Strong Bands (±1.5 SD) - outer
+p_str_up = plot(show_bb_lines ? bb_vis_strong_upper : na, "Strong Upper", 
+     color=bb_upper_color, linewidth=bb_line_width, style=plot.style_line)
+p_str_dn = plot(show_bb_lines ? bb_vis_strong_lower : na, "Strong Lower", 
+     color=bb_lower_color, linewidth=bb_line_width, style=plot.style_line)
+
+// Plot Neutral Bands (±0.5 SD) - innen
+p_neu_up = plot(show_bb_lines ? bb_vis_neutral_upper : na, "Neutral Upper", 
+     color=bb_upper_color, linewidth=bb_line_width, style=plot.style_line)
+p_neu_dn = plot(show_bb_lines ? bb_vis_neutral_lower : na, "Neutral Lower", 
+     color=bb_lower_color, linewidth=bb_line_width, style=plot.style_line)
+
+// Plot Basis (EMA) - Mitte
+plot(show_bb_lines ? bb_vis_ema : na, "BB Basis", 
+     color=bb_basis_color, linewidth=bb_line_width+1, style=plot.style_line)
+
+// Fill zwischen Strong Bands (gesamte BB Zone)
+fill(p_str_up, p_str_dn, color=show_bb_lines ? bb_fill_color : na, title="BB Zone")
+
+// Labels mit Pfeilen am rechten Chart-Rand (optional, weiter rechts verschoben)
+if barstate.islast and show_bb_lines and show_bb_labels and not na(bb_vis_ema)
+    // Delete old labels (prevents stacking)
+    if not na(bb_strong_up_lab)
+        label.delete(bb_strong_up_lab)
+    if not na(bb_neutral_up_lab)
+        label.delete(bb_neutral_up_lab)
+    if not na(bb_basis_lab)
+        label.delete(bb_basis_lab)
+    if not na(bb_neutral_dn_lab)
+        label.delete(bb_neutral_dn_lab)
+    if not na(bb_strong_dn_lab)
+        label.delete(bb_strong_dn_lab)
+    
+    // Strong Upper: ↑ Strong Bullish
+    bb_strong_up_lab := label.new(bar_index + bb_label_offset, bb_vis_strong_upper, "↑ Strong Bullish", 
+         style=label.style_label_left, color=bb_upper_color, 
+         textcolor=color.white, size=size.small)
+    
+    // Neutral Upper: ↑ Bullish
+    bb_neutral_up_lab := label.new(bar_index + bb_label_offset, bb_vis_neutral_upper, "↑ Bullish", 
+         style=label.style_label_left, color=bb_upper_color, 
+         textcolor=color.white, size=size.small)
+    
+    // Basis: Neutral (mit beiden Pfeilen)
+    bb_basis_lab := label.new(bar_index + bb_label_offset, bb_vis_ema, "↕ Neutral", 
+         style=label.style_label_left, color=bb_basis_color, 
+         textcolor=color.white, size=size.small)
+    
+    // Neutral Lower: ↓ Bearish
+    bb_neutral_dn_lab := label.new(bar_index + bb_label_offset, bb_vis_neutral_lower, "↓ Bearish", 
+         style=label.style_label_left, color=bb_lower_color, 
+         textcolor=color.white, size=size.small)
+    
+    // Strong Lower: ↓ Strong Bearish
+    bb_strong_dn_lab := label.new(bar_index + bb_label_offset, bb_vis_strong_lower, "↓ Strong Bearish", 
+         style=label.style_label_left, color=bb_lower_color, 
+         textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SECTION 16: NEWS TABLE (by @toodegrees)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Convert timezone string to UTC offset (hours, minutes) for news display
+get_timezone_offset(tz_name) =>
+    hours = switch tz_name
+        "UTC"                   => 0
+        "Europe/Berlin"         => 1
+        "Europe/London"         => 0
+        "Europe/Zurich"         => 1
+        "America/New_York"      => -5
+        "America/Chicago"       => -6
+        "America/Los_Angeles"   => -8
+        "Asia/Tokyo"            => 9
+        "Asia/Hong_Kong"        => 8
+        "Asia/Singapore"        => 8
+        "Australia/Sydney"      => 10
+        => 0
+    minutes = 0  // All selected timezones have :00 offset
+    [hours, minutes]
+
+// News position helper
+get_news_position() =>
+    switch news_table_pos
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        "Middle Left"  => position.middle_left
+        "Middle Right" => position.middle_right
+        => position.bottom_right
+
+// Global variables for news
+var currWeek = array.new<ffUtil.News>()
+var currDay  = array.new<ffUtil.News>()
+var nextWeek = array.new<ffUtil.News>()
+
+// Day change detection (uses selected timezone from ORB settings)
+var mdnCheck = false
+if hour(time, timezone_input)==0 and hour(time[1], timezone_input)!=0 and not mdnCheck
+    mdnCheck := true
+newDay = mdnCheck ? hour(time, timezone_input)==0 and hour(time[1], timezone_input)!=0 : timeframe.change("D")
+
+// Request data function
+requestData() =>
+    [request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_1",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_2",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_3",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_4",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_5",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_6",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_7",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_8",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume)),
+     request.seed("seed_toodegrees_toogit","TOODEGREES_FOREX_FACTORY_SLOT_9",str.tostring(open)+","+str.tostring(high)+","+str.tostring(low)+","+str.tostring(close)+","+str.tostring(volume))]
+
+// Process data method
+method processData(ffUtil.News[] N, string S1, string S2, string S3, string S4, string S5, string S6, string S7, string S8, string S9) =>
+    ffDec.readNews(N,S1), ffDec.readNews(N,S2), ffDec.readNews(N,S3)
+    ffDec.readNews(N,S4), ffDec.readNews(N,S5), ffDec.readNews(N,S6)
+    ffDec.readNews(N,S7), ffDec.readNews(N,S8), ffDec.readNews(N,S9)
+
+// Import news data
+[slot1,slot2,slot3,slot4,slot5,slot6,slot7,slot8,slot9] = requestData()
+
+// Decode news first
+nextWeek.processData(slot1,slot2,slot3,slot4,slot5,slot6,slot7,slot8,slot9)
+
+// Save and filter news data
+if timeframe.change("W")
+    nextWeek := ffUtil.bubbleSort_News(nextWeek)
+    // Convert news times to selected timezone
+    [tz_h, tz_m] = get_timezone_offset(timezone_input)
+    nextWeek := ffUtil.adjustTimezone(nextWeek, tz_h, tz_m)
+    currWeek := nextWeek.copy()
+    // Auto currency filter + user-selected impact levels
+    currWeek := ffUtil.weekNews(currWeek, ffUtil.curFilter(true,false,false,false,false,false,false,false,false,false), 
+                                 ffUtil.impFilter(news_holiday,news_low_impact,news_med_impact,news_high_impact))
+    nextWeek.clear()
+    // Fill currDay when new week data arrives
+    currDay.clear()
+    currDay := ffUtil.todayNews(currWeek, currDay, false)
+
+// Update today's news on day change
+if newDay
+    currDay.clear()
+    currDay := ffUtil.todayNews(currWeek, currDay, false)
+
+// Ensure currDay is filled if empty (e.g. chart opened mid-week)
+if currDay.size() == 0 and currWeek.size() > 0
+    currDay := ffUtil.todayNews(currWeek, currDay, false)
+
+// Display news table (using dashboard colors)
+var news_table = ffUtil.newTable(get_news_position(), na)
+
+if show_news_table
+    if news_table_type == "Today"
+        if currDay.size()>0
+            // Use FF_Table with Dashboard colors
+            if newDay
+                news_table := ffUtil.FF_Table(currDay, get_news_position(), news_table_size, 
+                                               user_color_text, user_color_background, 
+                                               user_color_text, user_color_background, dashboard_border_color)
+            ffUtil.timeline(currDay, news_table, color.gray, 0, 0, true)
+        else
+            // No news for today
+            if barstate.islast
+                current_weekday = switch dayofweek(time, timezone_input)
+                    2 => "Mon"
+                    3 => "Tue"
+                    4 => "Wed"
+                    5 => "Thu"
+                    6 => "Fri"
+                    7 => "Sat"
+                    1 => "Sun"
+                    => ""
+                current_month = switch month(time, timezone_input)
+                    1 => "Jan"
+                    2 => "Feb"
+                    3 => "Mar"
+                    4 => "Apr"
+                    5 => "May"
+                    6 => "Jun"
+                    7 => "Jul"
+                    8 => "Aug"
+                    9 => "Sep"
+                    10 => "Oct"
+                    11 => "Nov"
+                    12 => "Dec"
+                    => ""
+                today = current_weekday + " " + current_month + " " + str.tostring(dayofmonth(time, timezone_input))
+                
+                news_table.delete()
+                news_table := table.new(get_news_position(), 1, 3, 
+                                        bgcolor=user_color_background, 
+                                        border_color=dashboard_border_color, 
+                                        border_width=1)
+                table.cell(news_table, 0, 0, "📅 " + today, 
+                           text_color=user_color_text, text_size=size.normal,
+                           bgcolor=user_color_background)
+                table.cell(news_table, 0, 1, "No News Today", 
+                           text_color=color.gray, text_size=size.small,
+                           bgcolor=color.new(color.white, 90))
+                table.cell(news_table, 0, 2, "(Selected Impact)", 
+                           text_color=color.gray, text_size=size.tiny,
+                           bgcolor=color.new(color.white, 90))
+    else  // This Week
+        if currWeek.size()>0
+            if timeframe.change("W")
+                news_table := ffUtil.FF_Table(currWeek, get_news_position(), news_table_size, 
+                                               user_color_text, user_color_background, 
+                                               user_color_text, user_color_background, dashboard_border_color)
+            ffUtil.timeline(currWeek, news_table, color.gray, 0, 0)
+else
+    if not show_news_table
+        news_table.delete()

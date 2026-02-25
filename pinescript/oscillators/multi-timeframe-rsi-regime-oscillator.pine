@@ -1,0 +1,315 @@
+//@version=6
+indicator("Multi-Timeframe RSI Regime Oscillator", 
+     overlay = false, 
+     max_bars_back = 1000,
+     format = format.price,
+     precision = 2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 1. TIMEFRAME & CONFIRMATION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+macroTF = input.timeframe("1W", "Macro Timeframe", 
+     tooltip = "The higher timeframe that determines the dominant market regime (bullish, bearish, or neutral). This acts as a directional gate: the micro layer is only active when the macro regime is resolved. Common choices: 1D for swing trading, 1W for position trading, 4H for intraday.")
+
+microTF = input.timeframe("240", "Micro Timeframe", 
+     tooltip = "The lower timeframe used for entry timing signals within the active macro regime. Only produces output when the macro gate permits. Common choices: 4H under daily macro, 1H under 4H macro, 15m under 1H macro.")
+
+confirmClose = input.bool(true, "Candle Close Confirmation", 
+     tooltip = "When enabled, higher-timeframe RSI values are only used after the candle has closed, preventing repainting. Disable for real-time responsiveness at the cost of signal stability. Recommended to keep enabled for reliable signal generation.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 2. MACRO SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+rsiLenMacro = input.int(14, "Macro RSI Length", minval = 2, 
+     group = "Macro Settings", 
+     tooltip = "Lookback period for the macro RSI calculation. Standard is 14. Shorter lengths (7-10) react faster to regime changes but produce more whipsaws. Longer lengths (21-30) provide smoother, more stable regime detection with later transitions.")
+
+upperMacro = input.int(50, "Macro Upper Threshold", minval = 1, maxval = 99, 
+     group = "Macro Settings", 
+     tooltip = "RSI level the macro must reach or exceed to declare a bullish regime. At 50, any RSI at or above 50 is bullish. Higher values (55-65) require stronger momentum confirmation before declaring a bull regime. When upper and lower are both set to 50, there is no neutral zone and the macro is always in a resolved directional state.")
+
+lowerMacro = input.int(50, "Macro Lower Threshold", minval = 1, maxval = 99, 
+     group = "Macro Settings", 
+     tooltip = "RSI level the macro must reach or fall below to declare a bearish regime. At 50, any RSI at or below 50 is bearish. Lower values (35-45) require deeper weakness before declaring a bear regime. Widening the gap between upper and lower thresholds (e.g., 60/40) creates a neutral zone where neither regime is active and the micro layer is suppressed.")
+
+macroBullCol = input.color(#FFFFFF, "Macro Bull Bar Color", 
+     group = "Macro Settings", 
+     tooltip = "Color of the macro oscillator bars when the macro regime is bullish (RSI at or above the upper threshold).")
+
+macroBearCol = input.color(#000000, "Macro Bear Bar Color", 
+     group = "Macro Settings", 
+     tooltip = "Color of the macro oscillator bars when the macro regime is bearish (RSI at or below the lower threshold).")
+
+macroBullOpa = input.int(100, "Macro Bull Opacity %", minval = 0, maxval = 100, 
+     group = "Macro Settings", 
+     tooltip = "Opacity of the macro bullish bars. 100 = fully visible, 0 = fully transparent. Reduce to let micro bars dominate visually while keeping macro context available.")
+
+macroBearOpa = input.int(100, "Macro Bear Opacity %", minval = 0, maxval = 100, 
+     group = "Macro Settings", 
+     tooltip = "Opacity of the macro bearish bars. 100 = fully visible, 0 = fully transparent.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 3. MICRO SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+rsiLenMicro = input.int(14, "Micro RSI Length", minval = 2, 
+     group = "Micro Settings", 
+     tooltip = "Lookback period for the micro RSI calculation. This RSI is only displayed when the macro regime is not neutral. Shorter lengths (7-10) capture faster pullback-to-continuation setups within the active regime.")
+
+upperMicro = input.int(50, "Micro Upper Threshold", minval = 1, maxval = 99, 
+     group = "Micro Settings", 
+     tooltip = "RSI level the micro must reach or exceed to generate bullish micro output (only active during a macro bull regime). Confirms momentum alignment between timeframes. Higher values (65-70) filter for stronger micro momentum, producing fewer but higher-conviction signals.")
+
+lowerMicro = input.int(50, "Micro Lower Threshold", minval = 1, maxval = 99, 
+     group = "Micro Settings", 
+     tooltip = "RSI level the micro must reach or fall below to generate bearish micro output (only active during a macro bear regime). Lower values (30-35) require deeper micro weakness for signal generation.")
+
+microBullCol = input.color(#00FF00, "Micro Bull Bar Color", 
+     group = "Micro Settings", 
+     tooltip = "Color of the micro oscillator bars when micro RSI is above its upper threshold and the macro regime is bullish.")
+
+microBearCol = input.color(#FF0000, "Micro Bear Bar Color", 
+     group = "Micro Settings", 
+     tooltip = "Color of the micro oscillator bars when micro RSI is below its lower threshold and the macro regime is bearish.")
+
+microBullOpa = input.int(100, "Micro Bull Opacity %", minval = 0, maxval = 100, 
+     group = "Micro Settings", 
+     tooltip = "Opacity of the micro bullish bars. 100 = fully visible, 0 = fully transparent.")
+
+microBearOpa = input.int(100, "Micro Bear Opacity %", minval = 0, maxval = 100, 
+     group = "Micro Settings", 
+     tooltip = "Opacity of the micro bearish bars. 100 = fully visible, 0 = fully transparent.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4. SIGNAL SETTINGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+showMacroBuySignal = input.bool(true, "Show Macro Buy Signal", 
+     group = "Signal Settings", 
+     tooltip = "Displays a diamond marker when the macro RSI first crosses above the upper threshold, marking the start of a new bullish regime. This is a state-transition event that fires once per regime change, not a repeated signal.")
+
+showMacroSellSignal = input.bool(true, "Show Macro Sell Signal", 
+     group = "Signal Settings", 
+     tooltip = "Displays a diamond marker when the macro RSI first crosses below the lower threshold, marking the start of a new bearish regime.")
+
+showMicroBuySignal = input.bool(true, "Show Micro Buy Signal", 
+     group = "Signal Settings", 
+     tooltip = "Displays a circle marker when the micro RSI first crosses above its upper threshold while the macro regime is bullish. Represents a momentum-aligned entry opportunity where both timeframes confirm directional agreement.")
+
+showMicroSellSignal = input.bool(true, "Show Micro Sell Signal", 
+     group = "Signal Settings", 
+     tooltip = "Displays a circle marker when the micro RSI first crosses below its lower threshold while the macro regime is bearish. Represents a momentum-aligned short opportunity within the dominant downtrend.")
+
+macroSigBullCol = input.color(#FFFFFF, "Macro Buy Signal Color", 
+     group = "Signal Settings", 
+     tooltip = "Color of the diamond marker that appears when a new macro bullish regime begins.")
+
+macroSigBearCol = input.color(#000000, "Macro Sell Signal Color", 
+     group = "Signal Settings", 
+     tooltip = "Color of the diamond marker that appears when a new macro bearish regime begins.")
+
+microSigBullCol = input.color(#00FF00, "Micro Buy Signal Color", 
+     group = "Signal Settings", 
+     tooltip = "Color of the circle marker that appears on micro bullish momentum-alignment events.")
+
+microSigBearCol = input.color(#FF0000, "Micro Sell Signal Color", 
+     group = "Signal Settings", 
+     tooltip = "Color of the circle marker that appears on micro bearish momentum-alignment events.")
+
+macroSigBullOpa = input.int(0, "Macro Buy Signal Transparency", minval = 0, maxval = 100, 
+     group = "Signal Settings", 
+     tooltip = "Transparency of the macro buy diamond marker. 0 = fully visible, 100 = fully transparent.")
+
+macroSigBearOpa = input.int(0, "Macro Sell Signal Transparency", minval = 0, maxval = 100, 
+     group = "Signal Settings", 
+     tooltip = "Transparency of the macro sell diamond marker. 0 = fully visible, 100 = fully transparent.")
+
+microSigBullOpa = input.int(0, "Micro Buy Signal Transparency", minval = 0, maxval = 100, 
+     group = "Signal Settings", 
+     tooltip = "Transparency of the micro buy circle marker. 0 = fully visible, 100 = fully transparent.")
+
+microSigBearOpa = input.int(0, "Micro Sell Signal Transparency", minval = 0, maxval = 100, 
+     group = "Signal Settings", 
+     tooltip = "Transparency of the micro sell circle marker. 0 = fully visible, 100 = fully transparent.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. VISUAL STYLE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+colorTurquoise = #40E0D0
+
+useGradients = input.bool(false, "Enable Gradient Fills", 
+     group = "Visual Style", 
+     tooltip = "When enabled, bar colors scale in intensity proportional to how far RSI has moved beyond its threshold. Bars near the threshold appear faded; bars deep into momentum territory appear fully saturated. Provides a visual gauge of momentum strength at a glance.")
+
+show50Line = input.bool(true, "Show Zero Reference Line", 
+     group = "Visual Style", 
+     tooltip = "Displays a horizontal reference line at zero during neutral macro periods. Provides baseline context when no regime is active. Has no effect when the macro thresholds eliminate the neutral zone (e.g., both set to 50).")
+
+showMatrix = input.bool(true, "Show Status Matrix", 
+     group = "Visual Style", 
+     tooltip = "Displays a compact table in the top-right corner showing the current macro and micro regime states (Bull, Bear, or Neutral). Provides an instant regime summary without needing to interpret the oscillator bars.")
+
+showMacroBG = input.bool(false, "Show Macro Background", 
+     group = "Visual Style", 
+     tooltip = "Fills the indicator background with the macro regime color for immediate visual identification of the dominant directional state across the entire visible chart area.")
+
+showMicroBG = input.bool(false, "Show Micro Background", 
+     group = "Visual Style", 
+     tooltip = "Fills the indicator background with the micro signal color when micro RSI exceeds its threshold and the macro regime is active. Layered over the macro background if both are enabled.")
+
+bgOpacity = input.int(50, "Background Opacity %", minval = 0, maxval = 100, 
+     group = "Visual Style", 
+     tooltip = "Controls the visibility of background fills. 100 = fully opaque, 0 = fully transparent. Lower values allow oscillator bars to remain clearly visible over the background coloring.")
+
+rsiSource = input.source(close, "RSI Source", 
+     tooltip = "Price source used for all RSI calculations across both timeframes. Default is close. Alternatives like hlc3 or ohlc4 smooth the input, producing less reactive regime transitions and fewer whipsaws in choppy conditions.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MULTI-TIMEFRAME RSI RETRIEVAL
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Computes RSI on the chart timeframe, then samples it at the target timeframe.
+// When confirmation is enabled, uses the previous completed bar [1] with 
+// lookahead_on to prevent repainting — a standard anti-repaint pattern.
+f_secureRSI(_tf, _len, _confirm) =>
+    _rsiVal = ta.rsi(rsiSource, _len)
+    request.security(syminfo.tickerid, _tf, _confirm ? _rsiVal[1] : _rsiVal, barmerge.gaps_off, barmerge.lookahead_on)
+
+macroRSI = f_secureRSI(macroTF, rsiLenMacro, confirmClose)
+microRSI = f_secureRSI(microTF, rsiLenMicro, confirmClose)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// REGIME GATE LOGIC
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The macro RSI determines the regime state via threshold comparison.
+// When RSI is between thresholds, the regime is "neutral" and the micro 
+// layer is completely suppressed — zero output, no bars, no signals.
+// Core principle: macro decides IF you trade, micro decides WHEN.
+macroIsBull = macroRSI >= upperMacro
+macroIsBear = macroRSI <= lowerMacro
+macroInNTZ  = not (macroIsBull or macroIsBear)
+
+// Oscillator values = delta (distance) from the threshold.
+// Bull regime: how far above upper threshold. Bear regime: how far below lower threshold.
+// Neutral regime: zero (flat line — the visual suppression state).
+macroOsc = macroIsBull ? (macroRSI - upperMacro) : macroIsBear ? (macroRSI - lowerMacro) : 0.0
+
+// Micro oscillator is gated — only computed when macro regime is resolved.
+float microOsc = 0.0
+if not macroInNTZ
+    microOsc := microRSI >= upperMicro ? (microRSI - upperMicro) : microRSI <= lowerMicro ? (microRSI - lowerMicro) : 0.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL DETECTION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Macro signals: fire on regime TRANSITIONS (first bar where macro RSI crosses its threshold).
+// Micro signals: fire on momentum ALIGNMENT (first bar where micro RSI crosses its threshold
+// in the same direction as the active macro regime). Cross-regime signals are impossible.
+macroBuy  = showMacroBuySignal  and macroIsBull and not macroIsBull[1]
+macroSell = showMacroSellSignal and macroIsBear and not macroIsBear[1]
+
+microBuy  = showMicroBuySignal  and macroIsBull and (microRSI >= upperMicro and not (microRSI[1] >= upperMicro))
+microSell = showMicroSellSignal and macroIsBear and (microRSI <= lowerMicro and not (microRSI[1] <= lowerMicro))
+
+plotshape(macroBuy, style = shape.diamond, location = location.bottom, 
+     color = color.new(macroSigBullCol, macroSigBullOpa), size = size.tiny, title = "Macro Buy Signal")
+plotshape(macroSell, style = shape.diamond, location = location.top, 
+     color = color.new(macroSigBearCol, macroSigBearOpa), size = size.tiny, title = "Macro Sell Signal")
+plotshape(microBuy, style = shape.circle, location = location.bottom, 
+     color = color.new(microSigBullCol, microSigBullOpa), size = size.tiny, title = "Micro Buy Signal")
+plotshape(microSell, style = shape.circle, location = location.top, 
+     color = color.new(microSigBearCol, microSigBearOpa), size = size.tiny, title = "Micro Sell Signal")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// OSCILLATOR RENDERING
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Color function: when gradients are enabled, maps oscillator magnitude to color intensity.
+// Higher delta = more saturated color. Near-threshold = faded color.
+f_gradCol(_osc, _bull, _bear, _grad, _opaBull, _opaBear) =>
+    if macroInNTZ
+        na
+    else if _osc >= 0
+        _grad ? color.from_gradient(math.abs(_osc), 0, 20, color.new(_bull, 100 - _opaBull / 2), color.new(_bull, 100 - _opaBull)) : color.new(_bull, 100 - _opaBull)
+    else
+        _grad ? color.from_gradient(math.abs(_osc), 0, 20, color.new(_bear, 100 - _opaBear / 2), color.new(_bear, 100 - _opaBear)) : color.new(_bear, 100 - _opaBear)
+
+plot(show50Line and macroInNTZ ? 0 : na, "Zero Reference", 
+     color = #000000, style = plot.style_linebr, linewidth = 1)
+
+plot(macroOsc, "Macro Oscillator", 
+     color = f_gradCol(macroOsc, macroBullCol, macroBearCol, useGradients, macroBullOpa, macroBearOpa), 
+     style = plot.style_histogram, linewidth = 3)
+plot(microOsc, "Micro Oscillator", 
+     color = f_gradCol(microOsc, microBullCol, microBearCol, useGradients, microBullOpa, microBearOpa), 
+     style = plot.style_histogram, linewidth = 3)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BACKGROUND FILLS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+transp = 100 - bgOpacity
+
+color macroBgColor = na
+if showMacroBG
+    if macroIsBull
+        macroBgColor := color.new(macroBullCol, transp)
+    else if macroIsBear
+        macroBgColor := color.new(macroBearCol, transp)
+
+color microBgColor = na
+if showMicroBG and not macroInNTZ
+    if microOsc > 0
+        microBgColor := color.new(microBullCol, transp)
+    else if microOsc < 0
+        microBgColor := color.new(microBearCol, transp)
+
+bgcolor(macroBgColor, title = "Macro Background")
+bgcolor(microBgColor, title = "Micro Background")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERT CONDITIONS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(macroBuy, 
+     title = "Macro Bullish Regime Start", 
+     message = "{{ticker}} — Macro RSI crossed above {{plot(\"upperMacro\")}} on {{interval}} chart. Bullish regime initiated on the {{input(\"Macro Timeframe\")}} timeframe.")
+
+alertcondition(macroSell, 
+     title = "Macro Bearish Regime Start", 
+     message = "{{ticker}} — Macro RSI crossed below threshold. Bearish regime initiated on the macro timeframe.")
+
+alertcondition(microBuy, 
+     title = "Micro Bullish Momentum Alignment", 
+     message = "{{ticker}} — Micro RSI crossed above threshold within active macro bull regime. Bullish momentum alignment detected on the micro timeframe.")
+
+alertcondition(microSell, 
+     title = "Micro Bearish Momentum Alignment", 
+     message = "{{ticker}} — Micro RSI crossed below threshold within active macro bear regime. Bearish momentum alignment detected on the micro timeframe.")
+
+alertcondition(macroBuy or macroSell, 
+     title = "Any Macro Regime Change", 
+     message = "{{ticker}} — Macro regime transition detected. Check chart for new directional state.")
+
+alertcondition(microBuy or microSell, 
+     title = "Any Micro Alignment Signal", 
+     message = "{{ticker}} — Micro momentum alignment detected within active macro regime. Check chart for direction.")
+
+alertcondition(macroBuy or macroSell or microBuy or microSell, 
+     title = "Any Signal (All Types)", 
+     message = "{{ticker}} — Signal detected on the Multi-Timeframe RSI Regime Oscillator. Check chart for signal type and direction.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STATUS MATRIX
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var table statusMatrix = table.new(position.top_right, 2, 3, border_width = 1)
+if barstate.islast and showMatrix
+    table.cell(statusMatrix, 0, 0, "TIMEFRAME", text_color = color.white, bgcolor = #322222)
+    table.cell(statusMatrix, 1, 0, "STATUS",    text_color = color.white, bgcolor = #322222)
+
+    m_color = macroInNTZ ? colorTurquoise : (macroIsBull ? #FFFFFF : #000000)
+    m_text  = macroInNTZ ? "NEUTRAL" : (macroIsBull ? "BULL" : "BEAR")
+    m_tCol  = (macroInNTZ or macroIsBull) ? color.black : color.white
+    table.cell(statusMatrix, 0, 1, "MACRO", text_color = color.rgb(254, 253, 253), bgcolor = #322222)
+    table.cell(statusMatrix, 1, 1, m_text,  bgcolor = m_color, text_color = m_tCol)
+
+    microIsNeutral = macroInNTZ or (microOsc == 0.0)
+    mi_color = microIsNeutral ? colorTurquoise : (microOsc > 0 ? microBullCol : microBearCol)
+    mi_text  = microIsNeutral ? "NEUTRAL" : (microOsc > 0 ? "BULL" : "BEAR")
+    mi_tCol  = microIsNeutral ? color.black : color.white
+    table.cell(statusMatrix, 0, 2, "MICRO", text_color = color.rgb(255, 254, 254), bgcolor = #322222)
+    table.cell(statusMatrix, 1, 2, mi_text, bgcolor = mi_color, text_color = mi_tCol)

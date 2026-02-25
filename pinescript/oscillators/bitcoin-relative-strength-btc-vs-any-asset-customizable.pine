@@ -1,0 +1,293 @@
+//@version=6
+indicator("Bitcoin Relative Strength: BTC vs Any Asset [Customizable]", shorttitle="BTC Ratio", overlay=false, precision=4, max_bars_back=5000)
+
+// =============================================================================
+// GROUP 1: DATA SOURCES
+// =============================================================================
+g_data = "📊  Data Sources"
+i_btc_sym   = input.symbol("INDEX:BTCUSD",      "Bitcoin Ticker",  group=g_data, tooltip="Ticker for Bitcoin price.\n\n📌 INDEX:BTCUSD = longest history (from ~2010)\n📌 BITSTAMP:BTCUSD = from ~2011\n📌 BINANCE:BTCUSD = from ~2017\n\n⚠️ The indicator start date depends on the selected ticker AND the chart you apply it to. For maximum history, use INDEX:BTCUSD and apply to a Daily chart.")
+i_comp_sym  = input.symbol("SP:SPX",            "Comparison Asset", group=g_data, tooltip="Any asset to compare BTC against.\n\nExamples: SP:SPX, NASDAQ:NDX, TVC:GOLD, FOREXCOM:DXY, BITSTAMP:ETHUSD\n\n⚠️ Apply this indicator to the comparison asset's chart (e.g. SPX) for maximum historical coverage.")
+i_src_type  = input.string("Close",             "Price Source",    options=["Close", "Open", "HL2", "HLC3", "OHLC4"], group=g_data)
+
+// =============================================================================
+// GROUP 2: MOVING AVERAGE 1
+// =============================================================================
+g_ma1 = "📈  Moving Average 1"
+i_ma1_show   = input.bool(false,  "Show MA 1",       group=g_ma1)
+i_ma1_type   = input.string("EMA", "MA 1 Type",      options=["SMA", "EMA", "WMA", "VWMA", "RMA"], group=g_ma1)
+i_ma1_len    = input.int(20,       "MA 1 Length",     minval=2, maxval=500, group=g_ma1)
+i_ma1_color  = input.color(color.new(#2196F3, 30), "MA 1 Color", group=g_ma1)
+
+// =============================================================================
+// GROUP 3: MOVING AVERAGE 2
+// =============================================================================
+g_ma2 = "📈  Moving Average 2"
+i_ma2_show   = input.bool(false,  "Show MA 2",       group=g_ma2)
+i_ma2_type   = input.string("SMA", "MA 2 Type",      options=["SMA", "EMA", "WMA", "VWMA", "RMA"], group=g_ma2)
+i_ma2_len    = input.int(50,       "MA 2 Length",     minval=2, maxval=500, group=g_ma2)
+i_ma2_color  = input.color(color.new(#FF9800, 30), "MA 2 Color", group=g_ma2)
+
+// =============================================================================
+// GROUP 4: BOLLINGER BANDS
+// =============================================================================
+g_bb = "🔔  Bollinger Bands"
+i_bb_show    = input.bool(false,   "Show Bollinger Bands", group=g_bb)
+i_bb_len     = input.int(20,       "BB Length",       minval=2, maxval=200, group=g_bb)
+i_bb_mult    = input.float(2.0,    "BB Multiplier",   minval=0.5, maxval=5.0, step=0.1, group=g_bb)
+i_bb_color   = input.color(color.new(#9C27B0, 60), "BB Zone Color",  group=g_bb)
+
+// =============================================================================
+// GROUP 5: RSI OF RATIO
+// =============================================================================
+g_rsi = "💡  RSI of Ratio"
+i_rsi_show   = input.bool(false,   "Show RSI",            group=g_rsi)
+i_rsi_len    = input.int(14,       "RSI Length",           minval=2, maxval=100, group=g_rsi)
+i_rsi_ob     = input.int(70,       "Overbought Level",    minval=50, maxval=95, group=g_rsi)
+i_rsi_os     = input.int(30,       "Oversold Level",      minval=5,  maxval=50, group=g_rsi)
+
+// =============================================================================
+// GROUP 6: PERCENT CHANGE
+// =============================================================================
+g_pct = "📉  Percent Change"
+i_pct_period = input.int(30,       "Period (days)",    minval=1, maxval=365, group=g_pct, tooltip="Lookback period for calculating ratio percent change")
+
+// =============================================================================
+// GROUP 7: VISUALIZATION
+// =============================================================================
+g_vis = "🎨  Visualization"
+i_line_width = input.int(2,        "Ratio Line Width",    minval=1, maxval=5, group=g_vis)
+i_col_bull   = input.color(#26A69A, "Bullish Color",      group=g_vis)
+i_col_bear   = input.color(#EF5350, "Bearish Color",      group=g_vis)
+i_col_neut   = input.color(#B0BEC5, "Neutral Color",      group=g_vis)
+i_fill_show  = input.bool(true,    "Fill Between Ratio & MA1", group=g_vis)
+i_fill_alpha = input.int(85,       "Fill Transparency",   minval=50, maxval=97, group=g_vis)
+
+// =============================================================================
+// GROUP 8: INFO TABLE
+// =============================================================================
+g_tbl = "📋  Info Table"
+i_tbl_show   = input.bool(false,   "Show Table",       group=g_tbl)
+i_tbl_pos    = input.string("Top-Right", "Table Position", options=["Top-Left", "Top-Right", "Top-Center", "Bottom-Left", "Bottom-Right", "Bottom-Center", "Middle-Left", "Middle-Right"], group=g_tbl)
+i_tbl_size   = input.string("Normal",    "Text Size",      options=["Small", "Normal", "Large"], group=g_tbl)
+
+// =============================================================================
+// GROUP 9: ALERTS
+// =============================================================================
+g_alert = "🔔  Alert Conditions"
+i_alert_ma_cross = input.bool(false, "Ratio × MA1 Cross",              group=g_alert)
+i_alert_ma_xo    = input.bool(false, "Golden / Death Cross (MA1 × MA2)", group=g_alert)
+i_alert_bb       = input.bool(false, "Bollinger Band Breakout",         group=g_alert)
+i_alert_rsi      = input.bool(false, "RSI Overbought / Oversold",      group=g_alert)
+
+// =============================================================================
+// DATA FETCHING
+// =============================================================================
+f_src(s) =>
+    switch s
+        "Open"  => open
+        "HL2"   => hl2
+        "HLC3"  => hlc3
+        "OHLC4" => ohlc4
+        => close
+
+btc_close  = request.security(i_btc_sym,  timeframe.period, f_src(i_src_type), ignore_invalid_symbol=true)
+comp_close = request.security(i_comp_sym, timeframe.period, f_src(i_src_type), ignore_invalid_symbol=true)
+
+// Extract comparison ticker name for dynamic labels
+comp_name = syminfo.ticker(i_comp_sym)
+
+// Detect first available BTC bar — indicator starts from here
+var bool btc_started = false
+if not na(btc_close) and not btc_started
+    btc_started := true
+
+// Safe ratio calculation
+ratio = (btc_started and not na(btc_close) and not na(comp_close) and comp_close != 0) ? btc_close / comp_close : na
+
+// =============================================================================
+// MOVING AVERAGES CALCULATION
+// =============================================================================
+f_ma(src, len, ma_type) =>
+    switch ma_type
+        "SMA"  => ta.sma(src, len)
+        "EMA"  => ta.ema(src, len)
+        "WMA"  => ta.wma(src, len)
+        "VWMA" => ta.vwma(src, len)
+        "RMA"  => ta.rma(src, len)
+        => ta.ema(src, len)
+
+ma1 = i_ma1_show ? f_ma(ratio, i_ma1_len, i_ma1_type) : na
+ma2 = i_ma2_show ? f_ma(ratio, i_ma2_len, i_ma2_type) : na
+
+// =============================================================================
+// BOLLINGER BANDS
+// =============================================================================
+bb_basis = i_bb_show ? ta.sma(ratio, i_bb_len) : na
+bb_dev   = i_bb_show ? ta.stdev(ratio, i_bb_len) * i_bb_mult : na
+bb_upper = i_bb_show ? bb_basis + bb_dev : na
+bb_lower = i_bb_show ? bb_basis - bb_dev : na
+
+// =============================================================================
+// RSI
+// =============================================================================
+rsi_val = i_rsi_show ? ta.rsi(ratio, i_rsi_len) : na
+
+// =============================================================================
+// PERCENT CHANGE
+// =============================================================================
+ratio_past = ratio[i_pct_period]
+pct_change = (not na(ratio) and not na(ratio_past) and ratio_past != 0) ? ((ratio - ratio_past) / ratio_past) * 100 : na
+
+// =============================================================================
+// TREND DETECTION
+// =============================================================================
+trend_bull = not na(ma1) ? ratio > ma1 : (not na(ratio[1]) ? ratio > ratio[1] : false)
+trend_bear = not na(ma1) ? ratio < ma1 : (not na(ratio[1]) ? ratio < ratio[1] : false)
+
+// Dynamic color
+c_trend = trend_bull ? i_col_bull : trend_bear ? i_col_bear : i_col_neut
+
+// =============================================================================
+// VISUALIZATION — MAIN LINE
+// =============================================================================
+p_ratio = plot(ratio,  "BTC / Comparison Ratio", color=c_trend, linewidth=i_line_width)
+
+// =============================================================================
+// VISUALIZATION — MOVING AVERAGES
+// =============================================================================
+p_ma1 = plot(ma1, "MA 1", color=i_ma1_show ? i_ma1_color : na, linewidth=1, display=display.none)
+p_ma2 = plot(ma2, "MA 2", color=i_ma2_show ? i_ma2_color : na, linewidth=1, display=display.none)
+
+// Fill between ratio and MA1
+fill_color_bull = color.new(i_col_bull, i_fill_alpha)
+fill_color_bear = color.new(i_col_bear, i_fill_alpha)
+fill(p_ratio, p_ma1, color=(i_fill_show and i_ma1_show) ? (ratio > ma1 ? fill_color_bull : fill_color_bear) : na, title="Trend Fill")
+
+// =============================================================================
+// VISUALIZATION — BOLLINGER BANDS
+// =============================================================================
+p_bb_up  = plot(bb_upper, "BB Upper", color=i_bb_show ? color.new(#9C27B0, 50) : na, linewidth=1, display=display.none)
+p_bb_lo  = plot(bb_lower, "BB Lower", color=i_bb_show ? color.new(#9C27B0, 50) : na, linewidth=1, display=display.none)
+fill(p_bb_up, p_bb_lo, color=i_bb_show ? i_bb_color : na, title="BB Zone")
+plot(bb_basis, "BB Middle", color=i_bb_show ? color.new(#9C27B0, 70) : na, linewidth=1, style=plot.style_circles, display=display.none)
+
+// =============================================================================
+// VISUALIZATION — RSI (secondary scale)
+// =============================================================================
+plot(rsi_val, "RSI Ratio", color=i_rsi_show ? color.new(#FF5722, 20) : na, linewidth=2, display=display.none)
+h_ob = hline(i_rsi_show ? i_rsi_ob : na, "RSI Overbought", color=color.new(#EF5350, 70), linestyle=hline.style_dotted, display=display.none)
+h_os = hline(i_rsi_show ? i_rsi_os : na, "RSI Oversold",   color=color.new(#26A69A, 70), linestyle=hline.style_dotted, display=display.none)
+h_50 = hline(i_rsi_show ? 50 : na,       "RSI 50",          color=color.new(#78909C, 80), linestyle=hline.style_dotted, display=display.none)
+
+// =============================================================================
+// LAST VALUE LABEL
+// =============================================================================
+var label lbl_last = na
+if barstate.islast and not na(ratio)
+    label.delete(lbl_last)
+    lbl_txt = str.tostring(ratio, "#.####") + "\n" + (not na(pct_change) ? (pct_change >= 0 ? "+" : "") + str.tostring(pct_change, "#.##") + "%" : "")
+    lbl_last := label.new(bar_index + 2, ratio, lbl_txt, color=c_trend, textcolor=color.white, style=label.style_label_left, size=size.normal)
+
+// =============================================================================
+// INFO TABLE
+// =============================================================================
+f_tbl_pos(pos_str) =>
+    switch pos_str
+        "Top-Left"       => position.top_left
+        "Top-Right"      => position.top_right
+        "Top-Center"     => position.top_center
+        "Bottom-Left"    => position.bottom_left
+        "Bottom-Right"   => position.bottom_right
+        "Bottom-Center"  => position.bottom_center
+        "Middle-Left"    => position.middle_left
+        "Middle-Right"   => position.middle_right
+        => position.top_right
+
+f_tbl_size(sz_str) =>
+    switch sz_str
+        "Small" => size.small
+        "Large" => size.large
+        => size.normal
+
+var table info_tbl = na
+
+if i_tbl_show and barstate.islast
+    info_tbl := table.new(f_tbl_pos(i_tbl_pos), 2, 8, bgcolor=color.new(#1E1E1E, 10), border_width=1, border_color=color.new(#424242, 30), frame_width=2, frame_color=color.new(#616161, 20))
+
+    txt_sz = f_tbl_size(i_tbl_size)
+    hdr_bg = color.new(#263238, 0)
+    row_bg = color.new(#37474F, 10)
+    txt_cl = color.new(#ECEFF1, 0)
+    lbl_cl = color.new(#90A4AE, 0)
+
+    // Header
+    table.cell(info_tbl, 0, 0, "BTC / " + comp_name, text_color=color.white, bgcolor=hdr_bg, text_size=txt_sz, text_halign=text.align_center)
+    table.merge_cells(info_tbl, 0, 0, 1, 0)
+
+    // Ratio
+    table.cell(info_tbl, 0, 1, "Ratio", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_tbl, 1, 1, not na(ratio) ? str.tostring(ratio, "#.####") : "N/A", text_color=c_trend, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // BTC
+    table.cell(info_tbl, 0, 2, "BTC", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_tbl, 1, 2, not na(btc_close) ? str.tostring(btc_close, "#.##") : "N/A", text_color=txt_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // Comparison asset
+    table.cell(info_tbl, 0, 3, comp_name, text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_tbl, 1, 3, not na(comp_close) ? str.tostring(comp_close, "#.##") : "N/A", text_color=txt_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // % Change
+    pct_col = not na(pct_change) ? (pct_change >= 0 ? i_col_bull : i_col_bear) : i_col_neut
+    pct_str = not na(pct_change) ? ((pct_change >= 0 ? "+" : "") + str.tostring(pct_change, "#.##") + "%") : "N/A"
+    table.cell(info_tbl, 0, 4, "Δ " + str.tostring(i_pct_period) + "D", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_tbl, 1, 4, pct_str, text_color=pct_col, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // Trend
+    trend_str = trend_bull ? "▲ Bullish" : trend_bear ? "▼ Bearish" : "● Neutral"
+    table.cell(info_tbl, 0, 5, "Trend", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+    table.cell(info_tbl, 1, 5, trend_str, text_color=c_trend, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // MA 1
+    if i_ma1_show
+        table.cell(info_tbl, 0, 6, i_ma1_type + "(" + str.tostring(i_ma1_len) + ")", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_tbl, 1, 6, not na(ma1) ? str.tostring(ma1, "#.####") : "N/A", text_color=i_ma1_color, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+    // MA 2
+    if i_ma2_show
+        table.cell(info_tbl, 0, 7, i_ma2_type + "(" + str.tostring(i_ma2_len) + ")", text_color=lbl_cl, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_left)
+        table.cell(info_tbl, 1, 7, not na(ma2) ? str.tostring(ma2, "#.####") : "N/A", text_color=i_ma2_color, bgcolor=row_bg, text_size=txt_sz, text_halign=text.align_right)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+// Ratio x MA1 cross
+cross_above_ma1 = i_ma1_show and ta.crossover(ratio, ma1)
+cross_below_ma1 = i_ma1_show and ta.crossunder(ratio, ma1)
+alertcondition(cross_above_ma1, title="Ratio Crossed MA1 Up",   message="BTC Ratio crossed above MA1 — bullish signal")
+alertcondition(cross_below_ma1, title="Ratio Crossed MA1 Down", message="BTC Ratio crossed below MA1 — bearish signal")
+
+// Golden / Death cross
+golden_cross = i_ma1_show and i_ma2_show and ta.crossover(ma1, ma2)
+death_cross  = i_ma1_show and i_ma2_show and ta.crossunder(ma1, ma2)
+alertcondition(golden_cross, title="Golden Cross (MA1 × MA2)", message="BTC Ratio: Golden Cross — MA1 crossed above MA2")
+alertcondition(death_cross,  title="Death Cross (MA1 × MA2)",  message="BTC Ratio: Death Cross — MA1 crossed below MA2")
+
+// Bollinger Band breakout
+bb_break_up  = i_bb_show and not na(bb_upper) and ratio > bb_upper
+bb_break_dn  = i_bb_show and not na(bb_lower) and ratio < bb_lower
+alertcondition(bb_break_up, title="Above BB Upper", message="BTC Ratio broke above upper Bollinger Band")
+alertcondition(bb_break_dn, title="Below BB Lower", message="BTC Ratio broke below lower Bollinger Band")
+
+// RSI
+rsi_overbought = i_rsi_show and not na(rsi_val) and rsi_val >= i_rsi_ob
+rsi_oversold   = i_rsi_show and not na(rsi_val) and rsi_val <= i_rsi_os
+alertcondition(rsi_overbought, title="RSI Overbought", message="BTC Ratio RSI reached overbought zone")
+alertcondition(rsi_oversold,   title="RSI Oversold",   message="BTC Ratio RSI reached oversold zone")
+
+// =============================================================================
+// SIGNAL SHAPES ON CHART
+// =============================================================================
+plotshape(cross_above_ma1, title="MA1 Cross Up",   style=shape.triangleup,   location=location.belowbar, color=i_col_bull, size=size.tiny, text="▲", display=display.none)
+plotshape(cross_below_ma1, title="MA1 Cross Down",  style=shape.triangledown, location=location.abovebar, color=i_col_bear, size=size.tiny, text="▼", display=display.none)
+plotshape(golden_cross,    title="Golden Cross",     style=shape.diamond,      location=location.belowbar, color=#FFD700,    size=size.small, text="GC", display=display.none)
+plotshape(death_cross,     title="Death Cross",      style=shape.diamond,      location=location.abovebar, color=#B71C1C,    size=size.small, text="DC", display=display.none)

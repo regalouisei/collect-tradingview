@@ -1,0 +1,201 @@
+//@version=6
+indicator("[blackcat] L1 Buy and Rise Indicator", shorttitle="L1 BAR", overlay=false, max_bars_back=5000, precision=2)
+
+// ===== INPUT PARAMETERS =====
+ma13Length = input.int(13, "13-Period MA Length", minval=1)
+range9Length = input.int(9, "9-Period Range Length", minval=1)
+rsv60Length = input.int(60, "60-Period RSV Length", minval=1)
+trend20Length = input.int(20, "20-Period Trend Length", minval=1)
+signal5Length = input.int(5, "5-Period Signal Length", minval=1)
+troughLeftBars = input.int(3, "Trough Detection Left Bars", minval=1)
+troughRightBars = input.int(15, "Trough Detection Right Bars", minval=1)
+troughIndex = input.int(1, "Trough Index", minval=1)
+showLabels = input.bool(true, "Show Buy/Sell Labels")
+showTable = input.bool(true, "Show Status Table")
+useColorfulTheme = input.bool(true, "Use Colorful Theme")
+
+// ===== COLOR THEME SETTINGS =====
+uptrendColor = useColorfulTheme ? color.new(color.fuchsia, 30) : color.new(color.red, 30)
+downtrendColor = useColorfulTheme ? color.new(color.aqua, 30) : color.new(color.green, 30)
+entrySignalColor = useColorfulTheme ? color.new(color.yellow, 20) : color.new(color.yellow, 20)
+mainTrendLineColor = useColorfulTheme ? color.fuchsia : color.red
+signalLineColor = useColorfulTheme ? color.aqua : color.green
+
+// ===== CUSTOM FUNCTIONS =====
+
+// Weighted Moving Average (TScript SMA equivalent)
+// Formula: Y = (X*M + Y'*(N-M))/N
+weightedMovingAverage(source, length, weight) =>
+    var float previousValue = na
+    float result = na
+    if length > 0
+        result := (source * weight + nz(previousValue) * (length - weight)) / length
+        previousValue := result
+    result
+
+// Bars From Trough Function
+// Returns the number of bars since the specified trough
+barsFromTroughFunction(source, leftBars, rightBars, targetIndex) =>
+    // Find pivot lows
+    pivotLow = ta.pivotlow(source, leftBars, rightBars)
+    
+    // Store pivot low positions and values
+    var int[] pivotPositions = array.new<int>()
+    var float[] pivotValues = array.new<float>()
+    
+    // Add new pivot low if found
+    if not na(pivotLow)
+        array.push(pivotPositions, bar_index[rightBars])
+        array.push(pivotValues, pivotLow)
+    
+    // Calculate bars from the specified trough
+    int barsFromTroughResult = na
+    if array.size(pivotPositions) >= targetIndex and targetIndex > 0
+        targetPosition = array.get(pivotPositions, array.size(pivotPositions) - targetIndex)
+        barsFromTroughResult := bar_index - targetPosition
+    
+    barsFromTroughResult
+
+// ===== CORE CALCULATIONS =====
+
+// Calculate 13-day simple moving average
+price13MovingAverage = ta.sma(close, ma13Length)
+
+// Calculate 9-day price range
+priceRange9Days = ta.highest(high, range9Length) - ta.lowest(low, range9Length)
+
+// Calculate high to close range (9-day high minus close)
+highToCloseRange9Days = ta.highest(high, range9Length) - close
+
+// Calculate close to low range (close minus 9-day low)
+closeToLowRange9Days = close - ta.lowest(low, range9Length)
+
+// Calculate price deviation measure
+priceDeviationMeasure = highToCloseRange9Days / priceRange9Days * 100 - 70
+
+// Calculate 60-day RSV value × 100
+rsv60Days = (close - ta.lowest(low, rsv60Length)) / (ta.highest(high, rsv60Length) - ta.lowest(low, rsv60Length)) * 100
+
+// Calculate main trend line (20-day weighted moving average of rsv60)
+mainTrendLine = weightedMovingAverage(rsv60Days, trend20Length, 1)
+
+// Calculate signal line (5-day weighted moving average of main trend line)
+signalLine = weightedMovingAverage(mainTrendLine, signal5Length, 1)
+
+// ===== SIGNAL CALCULATIONS =====
+
+// Calculate reversal: bars from trough < 4
+isReversalDetected = barsFromTroughFunction(close, troughLeftBars, troughRightBars, troughIndex) < 4
+
+// Golden Cross: Fast line (signalLine) crosses above Slow line (mainTrendLine)
+goldenCross = ta.crossover(signalLine, mainTrendLine)
+
+// Death Cross: Fast line (signalLine) crosses below Slow line (mainTrendLine)
+deathCross = ta.crossunder(signalLine, mainTrendLine)
+
+// Legacy entry signal (kept for reference but not used for labels)
+isEntrySignal = isReversalDetected and mainTrendLine < signalLine and mainTrendLine < 30 and close < price13MovingAverage and close > price13MovingAverage * 0.92
+
+// Legacy exit signal (kept for reference but not used for labels)
+isExitSignal = mainTrendLine[1] > signalLine[1] and mainTrendLine < signalLine
+
+// ===== VISUALIZATION =====
+
+// Plot main trend line
+plot(mainTrendLine, color=mainTrendLineColor, linewidth=2, title="Main Trend Line")
+
+// Plot signal line
+plot(signalLine, color=signalLineColor, linewidth=2, title="Signal Line")
+
+// Plot histogram based on trend direction
+trendHistogramColor = mainTrendLine > signalLine ? uptrendColor : downtrendColor
+plotcandle(mainTrendLine, mainTrendLine, signalLine, signalLine,
+           color=trendHistogramColor,
+           wickcolor=trendHistogramColor,
+           bordercolor=trendHistogramColor,
+           title="Trend Histogram")
+
+// Plot entry signal histogram
+plotcandle(isEntrySignal ? mainTrendLine : na,
+           isEntrySignal ? mainTrendLine : na,
+           isEntrySignal ? signalLine : na,
+           isEntrySignal ? signalLine : na,
+           color=entrySignalColor,
+           wickcolor=entrySignalColor,
+           bordercolor=entrySignalColor,
+           title="Entry Signal Histogram")
+
+// Plot entry level line
+plot(isEntrySignal ? 80 : na, 
+     color=color.white, 
+     linewidth=3, 
+     title="Entry Level")
+
+// ===== BUY/SELL LABELS =====
+
+if showLabels
+    // Buy label for death cross (fast line crossing below slow line)
+    if deathCross
+        label.new(bar_index, mainTrendLine, "B",
+                  color=color.new(color.green, 0),
+                  textcolor=color.white,
+                  style=label.style_label_up,
+                  size=size.large)
+    
+    // Sell label for golden cross (fast line crossing above slow line)
+    if goldenCross
+        label.new(bar_index, mainTrendLine, "S",
+                  color=color.new(color.red, 0),
+                  textcolor=color.white,
+                  style=label.style_label_down,
+                  size=size.large)
+
+// ===== STATUS TABLE =====
+
+if showTable and barstate.islast
+    // Create status table with colorful theme
+    var table statusTable = table.new(position.top_right, 2, 7, 
+                                      bgcolor=useColorfulTheme ? color.new(color.purple, 80) : color.new(color.black, 80),
+                                      border_width=1,
+                                      border_color=useColorfulTheme ? color.purple : color.gray)
+    
+    // Table headers
+    table.cell(statusTable, 0, 0, "Indicator", text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 70))
+    table.cell(statusTable, 1, 0, "Status", text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 70))
+    
+    // Trend status
+    trendStatus = mainTrendLine > signalLine ? "UPTREND" : "DOWNTREND"
+    trendStatusColor = mainTrendLine > signalLine ? color.green : color.red
+    table.cell(statusTable, 0, 1, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 1, trendStatus, text_color=trendStatusColor, text_size=size.small, bgcolor=color.new(trendStatusColor, 90))
+    
+    // Crossover signal status
+    crossoverStatus = deathCross ? "BUY SIGNAL" : goldenCross ? "SELL SIGNAL" : "NONE"
+    crossoverStatusColor = deathCross ? color.green : goldenCross ? color.red : color.gray
+    table.cell(statusTable, 0, 2, "BS Signal", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 2, crossoverStatus, text_color=crossoverStatusColor, text_size=size.small, bgcolor=color.new(crossoverStatusColor, 90))
+    
+    // Reversal status
+    reversalStatus = isReversalDetected ? "DETECTED" : "NONE"
+    reversalStatusColor = isReversalDetected ? color.orange : color.gray
+    table.cell(statusTable, 0, 3, "Reversal", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 3, reversalStatus, text_color=reversalStatusColor, text_size=size.small, bgcolor=color.new(reversalStatusColor, 90))
+    
+    // Price position relative to MA13
+    pricePosition = close > price13MovingAverage ? "ABOVE MA" : "BELOW MA"
+    pricePositionColor = close > price13MovingAverage ? color.lime : color.maroon
+    table.cell(statusTable, 0, 4, "Price vs MA13", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 4, pricePosition, text_color=pricePositionColor, text_size=size.small, bgcolor=color.new(pricePositionColor, 90))
+    
+    // Main trend line value
+    table.cell(statusTable, 0, 5, "Main Trend", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 5, str.tostring(math.round(mainTrendLine, 2)), text_color=mainTrendLineColor, text_size=size.small)
+    
+    // Signal line value
+    table.cell(statusTable, 0, 6, "Signal Line", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 6, str.tostring(math.round(signalLine, 2)), text_color=signalLineColor, text_size=size.small)
+
+// ===== ALERTS =====
+
+alertcondition(deathCross, title="Death Cross Buy Signal", message="Fast line crossed below slow line - Buy signal detected for BAR indicator")
+alertcondition(goldenCross, title="Golden Cross Sell Signal", message="Fast line crossed above slow line - Sell signal detected for BAR indicator")

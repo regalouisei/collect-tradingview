@@ -1,0 +1,318 @@
+//@version=6
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ludovic — modified source code from SeerQuant
+
+indicator(
+     title      = "ROC-WMA bull bear indicator",
+     shorttitle = "ROCWMA",
+     overlay    = false
+)
+
+// =======================
+// INPUTS
+// =======================
+
+// =======================
+// ROC SETTINGS
+// =======================
+_rocTitle = input.bool(false, "——— ROC PARAMETERS ———")
+
+rocLen = input.int(
+     55,
+     title = "ROC Length")
+
+// =======================
+// MA SETTINGS
+// =======================
+_maTitle = input.bool(false, "——— MOVING AVERAGE PARAMETERS ———")
+
+maLen = input.int(
+     7,
+     title = "MA Length")
+
+sigLen = input.int(
+     9,
+     title = "Signal Length")
+
+src = input.source(
+     hlcc4,
+     title = "Calculation Source")
+
+ma_type = input.string(
+     "TEMA",
+     title   = "MA Type",
+     options = ["SMA", "EMA", "SMMA", "WMA", "VWMA", "TEMA", "DEMA", "LSMA", "HMA", "ALMA"])
+
+// =======================
+// THRESHOLD SETTINGS
+// =======================
+_thrTitle = input.bool(false, "——— THRESHOLD PARAMETERS ———")
+
+neutralThr = input.float(
+     0.01,
+     title = "Neutral Threshold")
+
+sigPct = input.float(
+     50.0,
+     title  = "Signal threshold (% of max Oscillator bar)",
+     minval = 0.0,
+     maxval = 100.0,
+     step   = 0.5)
+
+// =======================
+// >>> CCI FILTER SETTINGS (ADDED)
+// =======================
+_cciTitle = input.bool(false, "——— CCI FILTER PARAMETERS ———")
+
+useCCIFilter = input.bool(true, "Enable CCI filter")
+cciMaLen      = input.int(14, "CCI SMA length", minval=1)
+cciLevel      = input.int(100, "CCI threshold (+)", minval=1)
+cciSlowBars   = input.int(2, "CCI slowdown bars", minval=1, maxval=10)
+
+// =======================
+// STYLE SETTINGS
+// =======================
+_styleTitle = input.bool(false, "——— STYLE PARAMETERS ———")
+
+paint = input.bool(
+     false,
+     title = "Colour Candles")
+
+colScheme = input.string(
+     "Default",
+     title   = "Color Scheme",
+     options = ["Default", "Modern", "Cool", "Alternate", "Bright"])
+
+// =======================
+// COLORS
+// =======================
+[bull, bear, neutral] = switch colScheme
+    "Default"   => [#00ff73, #ff0040, #606060]
+    "Modern"    => [#23d7e4, #e11179, #707070]
+    "Cool"      => [#00ffcc, #1600db, #505050]
+    "Alternate" => [#00ff80, #ff6600, #505050]
+    "Bright"    => [#e8ec00, #f200fa, #505050]
+
+// =======================
+// FUNCTIONS
+// =======================
+
+// Custom Moving Averages
+ma(source, length, type) =>
+    switch type
+        "SMA"  => ta.sma(source, length)
+        "EMA"  => ta.ema(source, length)
+        "SMMA" => ta.rma(source, length)
+        "WMA"  => ta.wma(source, length)
+        "VWMA" => ta.vwma(source, length)
+        "TEMA" =>
+            ema1 = ta.ema(source, length)
+            ema2 = ta.ema(ema1, length)
+            ema3 = ta.ema(ema2, length)
+            3 * (ema1 - ema2) + ema3
+        "DEMA" =>
+            ema1 = ta.ema(source, length)
+            ema2 = ta.ema(ema1, length)
+            2 * ema1 - ema2
+        "LSMA" => ta.linreg(source, length, 0)
+        "HMA"  => ta.wma(2 * ta.wma(source, length / 2) - ta.wma(source, length), math.floor(math.sqrt(length)))
+        "ALMA" => ta.alma(source, length, 0.85, 6)
+
+// Z-Score (safe: no division by zero)
+zscore(source, length) =>
+    mean  = ta.sma(source, length)
+    stdev = ta.stdev(source, length)
+    stdev != 0 ? (source - mean) / stdev : 0.0
+
+// =======================
+// INDICATOR CALCULATION
+// =======================
+roc = ta.roc(src, rocLen)
+
+// Normalized ROC (SAFE: no division by zero)
+rocLo = ta.lowest(roc, rocLen)
+rocHi = ta.highest(roc, rocLen)
+den   = rocHi - rocLo
+normalized_roc = den != 0 ? (roc - rocLo) / den : 0.0
+
+base_ma       = ma(src, maLen, ma_type)
+weighted_diff = normalized_roc * (src - base_ma)
+rwma          = base_ma + weighted_diff
+
+oscillator = zscore(rwma, rocLen)
+signal     = ta.ema(oscillator, sigLen)
+
+// =======================
+// >>> CCI CALC (ADDED) — NO PLOT
+// =======================
+cci_raw = ta.cci(hlc3, 20)
+cci_ma  = ta.sma(cci_raw, cciMaLen)
+
+// pente CCI sur N bougies
+cciSellSlope = true
+for i = 0 to cciSlowBars - 1
+    cciSellSlope := cciSellSlope and (cci_ma[i] < cci_ma[i + 1])
+
+cciBuySlope = true
+for i = 0 to cciSlowBars - 1
+    cciBuySlope := cciBuySlope and (cci_ma[i] > cci_ma[i + 1])
+
+// états CCI (pas de cross) => "dès que sous/au-dessus"
+cciSellState = (cci_ma <  cciLevel) and cciSellSlope
+cciBuyState  = (cci_ma > -cciLevel) and cciBuySlope
+
+// =======================
+// PLOTTING
+// =======================
+
+var color currentCol = na
+var color prevColor  = na
+
+inNeutralZone = oscillator > -neutralThr and oscillator < neutralThr
+
+if inNeutralZone
+    currentCol := prevColor
+else
+    currentCol := oscillator > neutralThr ? bull : oscillator < -neutralThr ? bear : neutral
+
+prevColor := currentCol
+
+plot(oscillator * 8, color=currentCol, style=plot.style_histogram, linewidth=2)
+plot(signal * 8, color=color.white, linewidth=1)
+
+barcolor(paint ? currentCol : na)
+
+// =======================
+// MARKERS (Signal reaches X% of max Oscillator bar per period)
+// =======================
+
+// New period = entering neutral zone
+enterNeutral = inNeutralZone and not inNeutralZone[1]
+
+// Max histogram bar per period
+var float maxBull    = na
+var float maxBearAbs = na
+
+if enterNeutral
+    maxBull    := na
+    maxBearAbs := na
+
+// Measure maxima only outside neutral
+if not inNeutralZone
+    if oscillator > 0
+        maxBull := na(maxBull) ? oscillator : math.max(maxBull, oscillator)
+    if oscillator < 0
+        bearAbs    = math.abs(oscillator)
+        maxBearAbs := na(maxBearAbs) ? bearAbs : math.max(maxBearAbs, bearAbs)
+
+// Thresholds = X% of the largest bar in the current period
+bullThr = na(maxBull)    ? na : maxBull     * (sigPct / 100.0)
+bearThr = na(maxBearAbs) ? na : -maxBearAbs * (sigPct / 100.0)
+
+// Signal slope
+sigDown = signal < signal[1]
+sigUp   = signal > signal[1]
+
+// Exact conditions (UNCHANGED)
+bullCond = not inNeutralZone and oscillator > 0 and not na(bullThr) and (signal <= bullThr) and sigDown
+bearCond = not inNeutralZone and oscillator < 0 and not na(bearThr) and (signal >= bearThr) and sigUp
+
+// Front trigger (UNCHANGED base)
+bullBaseTrig = bullCond and not bullCond[1]
+bearBaseTrig = bearCond and not bearCond[1]
+
+// =======================
+// >>> APPLY CCI FILTER (ADDED) WITHOUT CHANGING BASE BEHAVIOR WHEN OFF
+// =======================
+bullTrig = useCCIFilter ? (bullBaseTrig and cciSellState) : bullBaseTrig
+bearTrig = useCCIFilter ? (bearBaseTrig and cciBuyState)  : bearBaseTrig
+
+plotshape(
+     bullTrig,
+     title="Bull: signal <= X% max osc + falling",
+     style=shape.triangledown,
+     color=bear,
+     text="SIG↓",
+     textcolor=bear,
+     size=size.small,
+     location=location.belowbar,
+     force_overlay=true
+)
+
+plotshape(
+     bearTrig,
+     title="Bear: signal >= -X% max osc + rising",
+     style=shape.triangleup,
+     color=bull,
+     text="SIG↑",
+     textcolor=bull,
+     size=size.small,
+     location=location.abovebar,
+     force_overlay=true
+)
+
+// =======================
+// RSI (simple)
+// =======================
+_rsiTitle = input.bool(false, "——— RSI PARAMETERS ———")
+lenRSI = input.int(title="RSI Period", minval=1, defval=14)
+srcRSI = input.source(defval=close, title="RSI Source")
+
+rsiVal = ta.rsi(srcRSI, lenRSI)
+
+plot(rsiVal, title="RSI", linewidth=2, color=#2962FF)
+hline(50, title="Middle Line", color=#787B86, linestyle=hline.style_dotted)
+obLevel = hline(70, title="Overbought", color=#787B86, linestyle=hline.style_dotted)
+osLevel = hline(30, title="Oversold",  color=#787B86, linestyle=hline.style_dotted)
+fill(obLevel, osLevel, title="Background", color=color.rgb(33, 150, 243, 90))
+
+
+
+
+// =======================
+// CCI SMA — VISUAL OVERLAY ON RSI (PATCH)
+// =======================
+
+// ON/OFF affichage
+showCCI = input.bool(true, "Show CCI SMA on RSI panel")
+
+// Échelle VISUELLE FIXE (ne dépend PAS du seuil CCI)
+cciVisScale = input.float(
+     200.0,
+     "CCI visual scale (±CCI -> 0..100)",
+     minval = 50.0,
+     maxval = 1000.0,
+     step   = 10.0
+)
+
+// Mapping CCI SMA -> échelle RSI (0..100)
+// ⚠️ Stable : changer cciLevel NE change PAS l’amplitude
+cciMapped = 50.0 + 50.0 * (cci_ma / cciVisScale)
+cciMapped := math.max(0.0, math.min(100.0, cciMapped))
+
+// Mapping du seuil CCI (+/-)
+cciPosLevel = 50.0 + 50.0 * (cciLevel / cciVisScale)
+cciNegLevel = 50.0 - 50.0 * (cciLevel / cciVisScale)
+
+// Courbe CCI SMA
+plot(
+     showCCI ? cciMapped : na,
+     title="CCI SMA (mapped)",
+     linewidth=2,
+     color=color.orange
+)
+
+// Lignes de seuil CCI (dynamiques)
+plot(
+     showCCI ? cciPosLevel : na,
+     title="CCI +Level",
+     color=color.new(color.orange, 40),
+     linewidth=1
+)
+
+plot(
+     showCCI ? cciNegLevel : na,
+     title="CCI -Level",
+     color=color.new(color.orange, 40),
+     linewidth=1
+)

@@ -1,0 +1,280 @@
+// This script is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © QuantAlgo
+
+//@version=6
+indicator('Adaptive Z-Score Oscillator [QuantAlgo]', overlay=false, max_lines_count=100, max_labels_count=100)
+
+//              ╔════════════════════════════════╗              //
+//              ║      USER-DEFINED SETTINGS     ║              //
+//              ╚════════════════════════════════╝              //
+
+var string calc_settings = '════════ Calculation Settings ════════'
+var string threshold_settings = '════════ Threshold Settings ════════'
+var string divergence_settings = '════════ Divergence Settings ════════'
+var string visual_settings = '════════ Visualization Settings ════════'
+
+tooltip_length = 'Number of bars used for Z-Score calculation. Lower values (10-15) create a more responsive indicator that reacts quickly to price changes but generates more noise. Higher values (25-50) produce smoother readings with better trend identification but increased lag.'
+tooltip_ma_type = 'Moving average type used for basis and smoothing calculations. EMA: Exponentially weighted, more responsive to recent data. SMA: Simple average with equal weight to all periods. WMA: Linearly weighted toward recent prices. HMA: Hull MA provides smooth output with minimal lag. VWMA: Volume-weighted for incorporating market participation.'
+tooltip_smoothing = 'Additional smoothing applied to the raw Z-Score output. Higher values reduce noise and false signals but increase lag. Values of 1-3 work well for most timeframes. Use 1 for maximum responsiveness or 5+ for very smooth readings.'
+tooltip_threshold_mode = 'Select threshold calculation method. Adaptive: Thresholds automatically adjust based on historical Z-Score distribution using percentile calculations, adapting to changing market volatility and regime shifts. Fixed: Uses static threshold levels based on traditional Z-Score interpretation.'
+tooltip_lookback = 'Period for calculating adaptive percentile thresholds. 252 bars ≈ 1 year of daily data. Longer periods provide more stable, historically-grounded thresholds. Shorter periods adapt faster to recent market conditions.'
+tooltip_upper_pct = 'Percentile level for the upper threshold. A value of 85 means the threshold is positioned where 85% of historical Z-Score readings fall below. Higher values create more selective overbought signals.'
+tooltip_lower_pct = 'Percentile level for the lower threshold. A value of 15 means the threshold is positioned where only 15% of historical readings fall below. Lower values create more selective oversold signals.'
+tooltip_show_fixed = 'Display fixed reference threshold lines on the chart. Useful for comparing adaptive thresholds against traditional static levels and understanding how market conditions have shifted.'
+tooltip_fixed_upper = 'Fixed upper threshold level. Traditional Z-Score interpretation: 2.0 represents 2 standard deviations above the mean, statistically significant in normal distributions.'
+tooltip_fixed_lower = 'Fixed lower threshold level. Traditional Z-Score interpretation: -2.0 represents 2 standard deviations below the mean, indicating statistically significant downside deviation.'
+tooltip_enable_div = 'Enable divergence detection. Identifies when price makes new extremes but Z-Score shows decreasing statistical deviation - a key signal of trend exhaustion and potential mean reversion. Only detects divergences in extreme zones where they are statistically meaningful.'
+tooltip_pivot_length = 'Bars on each side required to confirm a price pivot. Higher values (5-10) produce more reliable pivots with fewer false signals but more lag. Lower values (2-4) detect pivots faster but may include noise. Recommended: 5 for swing trading, 3 for day trading.'
+tooltip_max_pivot_lookback = 'Maximum bars between compared pivots. Too short misses valid divergences; too long compares unrelated market conditions. 40-80 bars works for most timeframes - allows 2-4 major swings to develop while maintaining relevance.'
+tooltip_min_pivot_lookback = 'Minimum bars between compared pivots. Prevents comparing pivots that are too close together (noise). Should be at least 2x pivot length. Recommended: 10-20 bars to ensure distinct price swings.'
+tooltip_div_strength = 'Minimum Z-Score difference required between pivots to confirm divergence. Filters weak/marginal divergences. 0.2-0.5 = sensitive (more signals, some weak), 0.5-1.0 = moderate (balanced), 1.0+ = strong (fewer but high quality signals). Set based on your threshold levels.'
+tooltip_show_labels = 'Display text labels on divergences. "Bull" for bullish (price exhaustion, potential bounce), "Bear" for bearish (rally exhaustion, potential reversal). Helps quick visual identification but can clutter chart with many signals.'
+tooltip_color_preset = 'Pre-configured color schemes optimized for different chart backgrounds and visual preferences. Each preset maintains strong contrast between bullish and bearish states for instant recognition.'
+tooltip_bullish = 'Color for bullish/overbought readings when Z-Score exceeds upper threshold zones. Used for extreme and moderate bullish histogram bars and upper threshold lines.'
+tooltip_bearish = 'Color for bearish/oversold readings when Z-Score falls below lower threshold zones. Used for extreme and moderate bearish histogram bars and lower threshold lines.'
+tooltip_neutral = 'Color for neutral readings when Z-Score is between threshold zones. Used for histogram bars when the indicator is in the neutral zone.'
+tooltip_bar_transparency = 'Transparency level for the Z-Score histogram bars. Lower values (0-20) create bold, prominent bars. Higher values (50-80) create subtle bars that blend with background elements.'
+tooltip_candle_coloring = 'Enable coloring of price candles on the main chart based on Z-Score readings.'
+
+length = input.int(20, 'Length', minval=2, group=calc_settings, tooltip=tooltip_length)
+maType = input.string('EMA', 'MA Type', options=['SMA', 'EMA', 'WMA', 'HMA', 'VWMA'], group=calc_settings, tooltip=tooltip_ma_type)
+smooth = input.int(3, 'Smoothing', minval=1, group=calc_settings, tooltip=tooltip_smoothing)
+
+thresholdMode = input.string('Adaptive', 'Threshold Mode', options=['Adaptive', 'Fixed'], group=threshold_settings, tooltip=tooltip_threshold_mode)
+percentilePeriod = input.int(252, 'Lookback Period', minval=50, group=threshold_settings, tooltip=tooltip_lookback)
+upperPercentile = input.float(85, 'Adaptive Upper %', minval=50, maxval=99, step=1, group=threshold_settings, tooltip=tooltip_upper_pct)
+lowerPercentile = input.float(15, 'Adaptive Lower %', minval=1, maxval=50, step=1, group=threshold_settings, tooltip=tooltip_lower_pct)
+showFixed = input.bool(false, 'Show Fixed Levels', group=threshold_settings, tooltip=tooltip_show_fixed)
+fixedUpper = input.float(2.0, 'Fixed Upper Level', minval=0.5, step=0.5, group=threshold_settings, tooltip=tooltip_fixed_upper)
+fixedLower = input.float(-2.0, 'Fixed Lower Level', maxval=-0.5, step=0.5, group=threshold_settings, tooltip=tooltip_fixed_lower)
+
+enableDiv = input.bool(true, 'Enable Divergences', group=divergence_settings, tooltip=tooltip_enable_div)
+pivotLength = input.int(5, 'Pivot Length', minval=2, maxval=20, group=divergence_settings, tooltip=tooltip_pivot_length)
+maxPivotLookback = input.int(60, 'Max Pivot Lookback', minval=20, maxval=200, group=divergence_settings, tooltip=tooltip_max_pivot_lookback)
+minPivotLookback = input.int(10, 'Min Pivot Lookback', minval=5, maxval=100, group=divergence_settings, tooltip=tooltip_min_pivot_lookback)
+divStrength = input.float(0.3, 'Divergence Strength Filter', minval=0.1, maxval=2.0, step=0.1, group=divergence_settings, tooltip=tooltip_div_strength)
+showDivLabels = input.bool(true, 'Show Divergence Labels', group=divergence_settings, tooltip=tooltip_show_labels)
+
+colorPreset = input.string('Custom', 'Color Preset', options=['Classic', 'Aqua', 'Cosmic', 'Ember', 'Neon', 'Custom'], group=visual_settings, tooltip=tooltip_color_preset)
+bullishColorInput = input.color(#00ffaa, 'Bullish Color', group=visual_settings, tooltip=tooltip_bullish)
+bearishColorInput = input.color(#ff0000, 'Bearish Color', group=visual_settings, tooltip=tooltip_bearish)
+neutralColorInput = input.color(#808080, 'Neutral Color', group=visual_settings, tooltip=tooltip_neutral)
+barTransparency = input.int(0, 'Bar Transparency', minval=0, maxval=90, step=10, group=visual_settings, tooltip=tooltip_bar_transparency)
+enableCandleColoring = input.bool(true, 'Enable Candle Coloring', group=visual_settings, tooltip=tooltip_candle_coloring)
+
+[bullishColor, bearishColor, neutralColor] = switch colorPreset
+    'Classic' => [#00ff00, #ff0000, #808080]
+    'Aqua' => [#00bfff, #ff8c00, #7f7f7f]
+    'Cosmic' => [#49ffce, #9932cc, #6a5acd]
+    'Ember' => [#ff6600, #00cccc, #999999]
+    'Neon' => [#ffff00, #ff00ff, #00ff00]
+    'Custom' => [bullishColorInput, bearishColorInput, neutralColorInput]
+
+//              ╔════════════════════════════════╗              //
+//              ║        CORE CALCULATION        ║              //
+//              ╚════════════════════════════════╝              //
+
+adaptive = thresholdMode == 'Adaptive'
+
+ma(source, len, type) =>
+    switch type
+        'SMA' => ta.sma(source, len)
+        'EMA' => ta.ema(source, len)
+        'WMA' => ta.wma(source, len)
+        'HMA' => ta.hma(source, len)
+        'VWMA' => ta.vwma(source, len)
+
+basis = ma(close, length, maType)
+stdev = ta.stdev(close, length)
+zScore = stdev != 0 ? (close - basis) / stdev : 0
+smoothedZ = ma(zScore, smooth, maType)
+
+upperThreshold = adaptive and not na(smoothedZ) ? ta.percentile_linear_interpolation(smoothedZ, percentilePeriod, upperPercentile) : fixedUpper
+lowerThreshold = adaptive and not na(smoothedZ) ? ta.percentile_linear_interpolation(smoothedZ, percentilePeriod, lowerPercentile) : fixedLower
+
+midUpper = upperThreshold / 2
+midLower = lowerThreshold / 2
+
+extremeBullish = smoothedZ >= upperThreshold
+moderateBullish = smoothedZ >= midUpper and smoothedZ < upperThreshold
+extremeBearish = smoothedZ <= lowerThreshold
+moderateBearish = smoothedZ <= midLower and smoothedZ > lowerThreshold
+
+isBullish = extremeBullish or moderateBullish
+isBearish = extremeBearish or moderateBearish
+isNeutral = not isBullish and not isBearish
+
+wasBullish = extremeBullish[1] or moderateBullish[1]
+wasBearish = extremeBearish[1] or moderateBearish[1]
+wasNeutral = not wasBullish and not wasBearish
+
+bullishToBearish = wasBullish and isBearish
+bearishToBullish = wasBearish and isBullish
+bullishToNeutral = wasBullish and isNeutral
+bearishToNeutral = wasBearish and isNeutral
+neutralToBullish = wasNeutral and isBullish
+neutralToBearish = wasNeutral and isBearish
+
+enterOverbought = ta.crossover(smoothedZ, upperThreshold)
+enterOversold = ta.crossunder(smoothedZ, lowerThreshold)
+exitOverbought = ta.crossunder(smoothedZ, upperThreshold)
+exitOversold = ta.crossover(smoothedZ, lowerThreshold)
+zeroCrossUp = ta.crossover(smoothedZ, 0)
+zeroCrossDown = ta.crossunder(smoothedZ, 0)
+
+//              ╔════════════════════════════════╗              //
+//              ║      DIVERGENCE DETECTION      ║              //
+//              ╚════════════════════════════════╝              //
+
+var bool bullishDivergence = false
+var bool bearishDivergence = false
+
+if enableDiv
+    pricePivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+    pricePivotLow = ta.pivotlow(low, pivotLength, pivotLength)
+    
+    var array<float> priceHighs = array.new<float>()
+    var array<int> priceHighBars = array.new<int>()
+    var array<float> zScoreAtHighs = array.new<float>()
+    
+    var array<float> priceLows = array.new<float>()
+    var array<int> priceLowBars = array.new<int>()
+    var array<float> zScoreAtLows = array.new<float>()
+    
+    if not na(pricePivotHigh)
+        currentBar = bar_index - pivotLength
+        currentPriceHigh = high[pivotLength]
+        currentZScore = smoothedZ[pivotLength]
+        currentThreshold = upperThreshold[pivotLength]
+        
+        array.push(priceHighs, currentPriceHigh)
+        array.push(priceHighBars, currentBar)
+        array.push(zScoreAtHighs, currentZScore)
+        
+        if array.size(priceHighs) > 10
+            array.shift(priceHighs)
+            array.shift(priceHighBars)
+            array.shift(zScoreAtHighs)
+        
+        if currentZScore >= currentThreshold and array.size(priceHighs) > 1
+            for i = array.size(priceHighs) - 2 to 0
+                prevBar = array.get(priceHighBars, i)
+                barsAgo = currentBar - prevBar
+                
+                if barsAgo >= minPivotLookback and barsAgo <= maxPivotLookback
+                    prevPriceHigh = array.get(priceHighs, i)
+                    prevZScore = array.get(zScoreAtHighs, i)
+                    
+                    isPriceHigherHigh = currentPriceHigh > prevPriceHigh
+                    isZScoreLowerHigh = currentZScore < prevZScore
+                    isStrongEnough = math.abs(prevZScore - currentZScore) >= divStrength
+                    
+                    if isPriceHigherHigh and isZScoreLowerHigh and isStrongEnough
+                        line.new(prevBar, prevZScore, currentBar, currentZScore, 
+                                 color=bearishColor, width=2, style=line.style_solid)
+                        
+                        if showDivLabels
+                            label.new(currentBar, currentZScore, ' Bear ', 
+                                     style=label.style_label_down, color=bearishColor, 
+                                     textcolor=color.black, size=size.small,
+                                     tooltip='Price: Higher High\nZ-Score: Lower High\nTrend exhaustion signal')
+                        
+                        bearishDivergence := true
+                        break
+    
+    if not na(pricePivotLow)
+        currentBar = bar_index - pivotLength
+        currentPriceLow = low[pivotLength]
+        currentZScore = smoothedZ[pivotLength]
+        currentThreshold = lowerThreshold[pivotLength]
+        
+        array.push(priceLows, currentPriceLow)
+        array.push(priceLowBars, currentBar)
+        array.push(zScoreAtLows, currentZScore)
+        
+        if array.size(priceLows) > 10
+            array.shift(priceLows)
+            array.shift(priceLowBars)
+            array.shift(zScoreAtLows)
+        
+        if currentZScore <= currentThreshold and array.size(priceLows) > 1
+            for i = array.size(priceLows) - 2 to 0
+                prevBar = array.get(priceLowBars, i)
+                barsAgo = currentBar - prevBar
+                
+                if barsAgo >= minPivotLookback and barsAgo <= maxPivotLookback
+                    prevPriceLow = array.get(priceLows, i)
+                    prevZScore = array.get(zScoreAtLows, i)
+                    
+                    isPriceLowerLow = currentPriceLow < prevPriceLow
+                    isZScoreHigherLow = currentZScore > prevZScore
+                    isStrongEnough = math.abs(prevZScore - currentZScore) >= divStrength
+                    
+                    if isPriceLowerLow and isZScoreHigherLow and isStrongEnough
+                        line.new(prevBar, prevZScore, currentBar, currentZScore, 
+                                 color=bullishColor, width=2, style=line.style_solid)
+                        
+                        if showDivLabels
+                            label.new(currentBar, currentZScore, ' Bull ', 
+                                     style=label.style_label_up, color=bullishColor, 
+                                     textcolor=color.black, size=size.small,
+                                     tooltip='Price: Lower Low\nZ-Score: Higher Low\nTrend exhaustion signal')
+                        
+                        bullishDivergence := true
+                        break
+
+//              ╔════════════════════════════════╗              //
+//              ║         VISUALIZATION          ║              //
+//              ╚════════════════════════════════╝              //
+
+color barColor = switch
+    extremeBullish => color.new(bullishColor, barTransparency)
+    moderateBullish => color.new(bullishColor, barTransparency + 40)
+    extremeBearish => color.new(bearishColor, barTransparency)
+    moderateBearish => color.new(bearishColor, barTransparency + 40)
+    => color.new(neutralColor, 40)
+
+barcolor(enableCandleColoring ? barColor : na, title='Z-Score Candle Coloring')
+
+plot(smoothedZ, 'Z-Score', color=barColor, style=plot.style_columns, linewidth=2)
+hline(0, 'Zero', color=color.white, linestyle=hline.style_dashed, linewidth=1)
+
+plot(upperThreshold, 'Upper Threshold', color=bearishColor, linewidth=2, style=plot.style_line)
+plot(lowerThreshold, 'Lower Threshold', color=bullishColor, linewidth=2, style=plot.style_line)
+
+plot(showFixed ? fixedUpper : na, 'Fixed Upper', color=color.new(bearishColor, 50), linewidth=1, style=plot.style_line)
+plot(showFixed ? fixedLower : na, 'Fixed Lower', color=color.new(bullishColor, 50), linewidth=1, style=plot.style_line)
+
+//              ╔════════════════════════════════╗              //
+//              ║             ALERTS             ║              //
+//              ╚════════════════════════════════╝              //
+
+alertcondition(bullishToBearish, title='Bullish to Bearish', message='Z-Score: Color changed GREEN to RED - Bearish signal {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bearishToBullish, title='Bearish to Bullish', message='Z-Score: Color changed RED to GREEN - Bullish signal {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bullishToNeutral, title='Bullish to Neutral', message='Z-Score: Color changed GREEN to GREY - Momentum fading {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bearishToNeutral, title='Bearish to Neutral', message='Z-Score: Color changed RED to GREY - Momentum fading {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(neutralToBullish, title='Neutral to Bullish', message='Z-Score: Color changed GREY to GREEN - Bullish momentum building {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(neutralToBearish, title='Neutral to Bearish', message='Z-Score: Color changed GREY to RED - Bearish momentum building {{exchange}}:{{ticker}} - {{interval}}')
+
+alertcondition(enterOverbought, title='Enter Overbought', message='Z-Score Oscillator: Entered OVERBOUGHT zone {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(enterOversold, title='Enter Oversold', message='Z-Score Oscillator: Entered OVERSOLD zone {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(exitOverbought, title='Exit Overbought', message='Z-Score Oscillator: Exited OVERBOUGHT zone {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(exitOversold, title='Exit Oversold', message='Z-Score Oscillator: Exited OVERSOLD zone {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(zeroCrossUp, title='Zero Cross Up', message='Z-Score Oscillator: Crossed ABOVE zero line {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(zeroCrossDown, title='Zero Cross Down', message='Z-Score Oscillator: Crossed BELOW zero line {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(enterOverbought or enterOversold, title='Extreme Zone Entry', message='Z-Score Oscillator: Entered EXTREME zone - Check chart {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bullishDivergence, title='Bullish Divergence', message='Z-Score: BULLISH Divergence - Price lower low but less oversold, potential reversal {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bearishDivergence, title='Bearish Divergence', message='Z-Score: BEARISH Divergence - Price higher high but less overbought, potential reversal {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(bullishDivergence or bearishDivergence, title='Any Divergence', message='Z-Score: Divergence detected - Trend exhaustion signal {{exchange}}:{{ticker}} - {{interval}}')
+
+//              ╔════════════════════════════════╗              //
+//              ║           CREATED BY           ║              //
+//              ╚════════════════════════════════╝              //
+
+// ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗     █████╗ ██╗      ██████╗  ██████╗ 
+//██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝    ██╔══██╗██║     ██╔════╝ ██╔═══██╗
+//██║   ██║██║   ██║███████║██╔██╗ ██║   ██║       ███████║██║     ██║  ███╗██║   ██║
+//██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║       ██╔══██║██║     ██║   ██║██║   ██║
+//╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║       ██║  ██║███████╗╚██████╔╝╚██████╔╝
+// ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝       ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝

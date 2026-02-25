@@ -1,0 +1,274 @@
+//@version=6
+indicator("CPR Supertrend SMA - Credit Spread Engine (Options Sellers) [KedArc Quant]",
+     overlay=true, max_bars_back=2000, max_labels_count=500)
+
+//====================================================
+// 1H timeframe logic
+//
+// Bull Put CREDIT Spread (PUT CS):
+//  1) Close > CPR Top
+//  2) Supertrend < CPR Top
+//  3) Close > SMA21
+//
+// Bear Call CREDIT Spread (CALL CS):
+//  1) Close < CPR Bottom
+//  2) Supertrend > Weekly Pivot (P)
+//  3) Close < SMA21
+//
+// Auto EXIT arrows (added WITHOUT changing entry logic):
+//  - Exit PUT CS when: Close < Weekly Pivot (P) OR opposite CALL CS signal triggers
+//  - Exit CALL CS when: Close > Weekly Pivot (P) OR opposite PUT CS signal triggers
+//====================================================
+
+//====================
+// Inputs
+//====================
+groupTF = "Timeframe"
+enforce1H = input.bool(true, "Enforce 1H timeframe", group=groupTF)
+
+groupVis = "Visuals (KGS style)"
+showCPR     = input.bool(true, "Show Weekly CPR (dotted)", group=groupVis)
+showR1S1     = input.bool(true, "Show Weekly R1/S1 (dotted)", group=groupVis)
+showPrevHL   = input.bool(false, "Show Prev Week High/Low (dotted)", group=groupVis)
+shadeCPR     = input.bool(true, "Shade CPR Pivot Range", group=groupVis)
+
+showST       = input.bool(true, "Show Supertrend (with shading)", group=groupVis)
+showSMA      = input.bool(true, "Show SMA21", group=groupVis)
+
+showSignals  = input.bool(true, "Show Entry Signals", group=groupVis)
+showStrikeTxt= input.bool(true, "Show strike text (small)", group=groupVis)
+
+groupExit = "Auto EXIT (Arrows)"
+showExitArrows = input.bool(true, "Show EXIT arrows", group=groupExit)
+showExitText   = input.bool(false, "Show EXIT text labels", group=groupExit)
+
+groupST = "Supertrend"
+stAtrLen = input.int(10, "ATR Length", minval=1, group=groupST)
+stFactor = input.float(3.0, "Factor", minval=0.1, step=0.1, group=groupST)
+
+groupSMA = "SMA"
+smaLen = input.int(21, "SMA Length", minval=1, group=groupSMA)
+
+groupOpt = "Strike Suggestion"
+instType = input.string("NIFTY", "Instrument", options=["NIFTY", "BANKNIFTY", "STOCK"], group=groupOpt)
+useAutoStep  = input.bool(true, "Auto Strike Step", group=groupOpt)
+manualStep   = input.int(50, "Manual Strike Step", minval=1, group=groupOpt)
+useAutoWidth = input.bool(true, "Auto Hedge Width", group=groupOpt)
+manualWidth  = input.int(200, "Manual Hedge Width (pts)", minval=1, group=groupOpt)
+
+groupSpam = "Signal Throttle (optional)"
+cooldownBars = input.int(0, "Cooldown bars between ENTRY signals (0 = off)", minval=0, group=groupSpam)
+
+groupAlert = "Alerts"
+enableDynamicAlerts = input.bool(true, "Enable alert() (dynamic)", group=groupAlert)
+
+//====================
+// Strike step & width presets
+//====================
+autoStep  = instType == "BANKNIFTY" ? 100 : instType == "NIFTY" ? 50 : 1
+autoWidth = instType == "BANKNIFTY" ? 400 : instType == "NIFTY" ? 200 : 10
+
+step  = useAutoStep  ? autoStep  : manualStep
+width = useAutoWidth ? autoWidth : manualWidth
+
+floorToStep(x, step_) =>
+    step_ <= 0 ? x : math.floor(x / step_) * step_
+
+ceilToStep(x, step_) =>
+    step_ <= 0 ? x : math.ceil(x / step_) * step_
+
+//====================
+// Weekly CPR / Pivot / R1/S1 (previous week only -> non-repainting)
+//====================
+wH = request.security(syminfo.tickerid, "W", high,  barmerge.gaps_off, barmerge.lookahead_off)[1]
+wL = request.security(syminfo.tickerid, "W", low,   barmerge.gaps_off, barmerge.lookahead_off)[1]
+wC = request.security(syminfo.tickerid, "W", close, barmerge.gaps_off, barmerge.lookahead_off)[1]
+
+wP  = (wH + wL + wC) / 3.0
+wBC = (wH + wL) / 2.0
+wTC = 2.0 * wP - wBC
+
+cprTop = math.max(wTC, wBC)
+cprBot = math.min(wTC, wBC)
+
+wR1 = 2.0 * wP - wL
+wS1 = 2.0 * wP - wH
+
+pWH = wH
+pWL = wL
+
+//====================
+// Supertrend + SMA
+//====================
+[stLine, stDir] = ta.supertrend(stFactor, stAtrLen) // stDir: 1 bull, -1 bear
+sma21 = ta.sma(close, smaLen)
+
+//====================
+// Timeframe gate (1H)
+//====================
+is1H = timeframe.isintraday and timeframe.multiplier == 60
+tfOk = enforce1H ? is1H : true
+
+//====================
+//  Conditions (A) — ENTRY (UNCHANGED)
+//====================
+bullPutCS_raw =     tfOk and     (close > cprTop) and     (stLine < cprTop) and     (close > sma21)
+
+bearCallCS_raw =     tfOk and     (close < cprBot) and     (stLine > wP) and     (close < sma21)
+
+//====================
+// Optional cooldown (prevents ENTRY spam)
+//====================
+var int lastEntryBar = na
+coolOk = cooldownBars <= 0 or na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+
+bullPutCS = bullPutCS_raw and coolOk
+bearCallCS = bearCallCS_raw and coolOk
+
+if bullPutCS or bearCallCS
+    lastEntryBar := bar_index
+
+//====================
+// Strike Suggestions (UNCHANGED)
+//====================
+bpsShortPutAnchor = math.min(stLine, cprBot)
+bpsSellPE = floorToStep(bpsShortPutAnchor, step)
+bpsBuyPE  = bpsSellPE - width
+
+bcsShortCallAnchor = math.max(stLine, cprTop)
+bcsSellCE = ceilToStep(bcsShortCallAnchor, step)
+bcsBuyCE  = bcsSellCE + width
+
+//====================================================
+// Plots (KGS-like dotted levels + pivot shading)
+//====================================================
+plotTC = plot(showCPR ? cprTop : na, "Weekly CPR Top (TC)", style=plot.style_circles, linewidth=2)
+plotPP = plot(showCPR ? wP     : na, "Weekly Pivot (P)",    style=plot.style_circles, linewidth=2)
+plotBC = plot(showCPR ? cprBot : na, "Weekly CPR Bottom (BC)", style=plot.style_circles, linewidth=2)
+
+fill(plotTC, plotBC, color = (shadeCPR and showCPR) ? color.new(color.blue, 88) : na, title="CPR Pivot Range Shade")
+
+plot(showR1S1 ? wR1 : na, "Weekly R1", style=plot.style_circles, linewidth=2)
+plot(showR1S1 ? wS1 : na, "Weekly S1", style=plot.style_circles, linewidth=2)
+
+plot(showPrevHL ? pWH : na, "Prev Week High", style=plot.style_circles, linewidth=2)
+plot(showPrevHL ? pWL : na, "Prev Week Low",  style=plot.style_circles, linewidth=2)
+
+stPlot = plot(showST ? stLine : na, "Supertrend (10,3)", style=plot.style_linebr, linewidth=2)
+mid    = plot(showST ? hl2 : na, "HL2 (for ST shade)", display=display.none)
+fill(stPlot, mid, color = showST ? (stDir == 1 ? color.new(color.green, 88) : color.new(color.red, 88)) : na, title="Supertrend Shade")
+
+plot(showSMA ? sma21 : na, "SMA 21", linewidth=2)
+
+//====================================================
+// ENTRY Signals (UNCHANGED)
+//====================================================
+plotshape(showSignals and bullPutCS, title="Entry: Bull Put Credit Spread", style=shape.triangleup, location=location.belowbar, size=size.tiny, text="PUT CS")
+plotshape(showSignals and bearCallCS, title="Entry: Bear Call Credit Spread", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="CALL CS")
+
+//====================================================
+// Strike labels (your “clean above bar” version)
+//====================================================
+atr = ta.atr(14)
+offset = atr * 2.5
+
+if showStrikeTxt and bullPutCS
+    label.new(bar_index, high + offset,
+         "PUT CREDIT SPREAD\nSELL PE " + str.tostring(bpsSellPE) + "\nBUY  PE " + str.tostring(bpsBuyPE),
+         style=label.style_label_down,
+         color=color.new(color.green, 85),
+         textcolor=color.white,
+         size=size.small)
+
+if showStrikeTxt and bearCallCS
+    label.new(bar_index, high + offset,
+         "CALL CREDIT SPREAD\nSELL CE " + str.tostring(bcsSellCE) + "\nBUY  CE " + str.tostring(bcsBuyCE),
+         style=label.style_label_down,
+         color=color.new(color.red, 85),
+         textcolor=color.white,
+         size=size.small)
+
+//====================================================
+// AUTO EXIT ARROWS (ADDED, NO ENTRY LOGIC CHANGES)
+// State machine: track whether we are "in" a PUT CS or CALL CS regime.
+// Exits are structure-based:
+//  - Exit PUT CS when close < Weekly Pivot (P) OR a CALL CS entry triggers.
+//  - Exit CALL CS when close > Weekly Pivot (P) OR a PUT CS entry triggers.
+//====================================================
+var bool inPutCS  = false
+var bool inCallCS = false
+
+// Set state on entries (note: if both somehow true, we prioritize the latest bar's signals deterministically)
+if bullPutCS
+    inPutCS  := true
+    inCallCS := false
+
+if bearCallCS
+    inCallCS := true
+    inPutCS  := false
+
+// Exit conditions
+exitPutCS  = inPutCS  and (close < wP or bearCallCS_raw)
+exitCallCS = inCallCS and (close > wP or bullPutCS_raw)
+
+// Fire exits (one-shot) and clear state
+if exitPutCS
+    inPutCS := false
+
+if exitCallCS
+    inCallCS := false
+
+// Plot EXIT arrows
+plotshape(showExitArrows and exitPutCS,  title="EXIT: PUT CS",  style=shape.xcross, location=location.abovebar, size=size.small, text="EXIT")
+plotshape(showExitArrows and exitCallCS, title="EXIT: CALL CS", style=shape.xcross, location=location.belowbar, size=size.small, text="EXIT")
+
+// Optional EXIT text labels (clean, above)
+if showExitText and exitPutCS
+    label.new(bar_index, high + offset,
+        "EXIT PUT CS\n(Structure broke)\nClose < Pivot OR CALL CS",
+        style=label.style_label_down,
+        color=color.new(color.gray, 80),
+        textcolor=color.white,
+        size=size.small)
+
+if showExitText and exitCallCS
+    label.new(bar_index, high + offset,
+        "EXIT CALL CS\n(Structure broke)\nClose > Pivot OR PUT CS",
+        style=label.style_label_down,
+        color=color.new(color.gray, 80),
+        textcolor=color.white,
+        size=size.small)
+
+//====================================================
+// Alerts
+//====================================================
+alertcondition(bullPutCS,  title="Entry PUT CS",  message="Entry PUT Credit Spread")
+alertcondition(bearCallCS, title="Entry CALL CS", message="Entry CALL Credit Spread")
+alertcondition(exitPutCS,  title="EXIT PUT CS",   message="EXIT PUT Credit Spread")
+alertcondition(exitCallCS, title="EXIT CALL CS",  message="EXIT CALL Credit Spread")
+
+if enableDynamicAlerts and bullPutCS
+    alert("ENTRY PUT CS | " + syminfo.ticker +
+          " | SELL PE " + str.tostring(bpsSellPE) +
+          " | BUY PE " + str.tostring(bpsBuyPE),
+          alert.freq_once_per_bar_close)
+
+if enableDynamicAlerts and bearCallCS
+    alert("ENTRY CALL CS | " + syminfo.ticker +
+          " | SELL CE " + str.tostring(bcsSellCE) +
+          " | BUY CE " + str.tostring(bcsBuyCE),
+          alert.freq_once_per_bar_close)
+
+if enableDynamicAlerts and exitPutCS
+    alert("EXIT PUT CS | " + syminfo.ticker + " | Reason: Close<Pivot or CALL CS",
+          alert.freq_once_per_bar_close)
+
+if enableDynamicAlerts and exitCallCS
+    alert("EXIT CALL CS | " + syminfo.ticker + " | Reason: Close>Pivot or PUT CS",
+          alert.freq_once_per_bar_close)
+
+//====================================================
+// Reminder
+//====================================================
+if barstate.islast and enforce1H and not is1H
+    label.new(bar_index, close, "Switch to 1H timeframe", style=label.style_none, size=size.small)

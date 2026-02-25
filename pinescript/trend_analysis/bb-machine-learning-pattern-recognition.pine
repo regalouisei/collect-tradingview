@@ -1,0 +1,774 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+indicator("BB Machine Learning - Pattern Recognition", overlay=true, max_labels_count=500, max_bars_back=5000)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Bollinger Bands Settings
+grpBB = "═══ Bollinger Bands ═══"
+bbLength = input.int(20, "BB Length", minval=5, maxval=100, group=grpBB)
+bbMult = input.float(2.0, "BB Multiplier", minval=0.5, maxval=4.0, step=0.1, group=grpBB)
+bbSource = input.source(close, "Source", group=grpBB)
+
+// Machine Learning Settings
+grpML = "═══ Machine Learning ═══"
+mlLookback = input.int(300, "ML Lookback Bars", minval=100, maxval=1000, group=grpML)
+patternLookback = input.int(5, "Pattern Lookback Candles", minval=3, maxval=10, group=grpML)
+minConfidence = input.float(60.0, "Min Confidence %", minval=30, maxval=90, step=5, group=grpML)
+minSamples = input.int(5, "Min Historical Samples", minval=3, maxval=20, group=grpML)
+futureCandles = input.int(10, "Future Outcome Bars", minval=3, maxval=30, group=grpML)
+successThreshold = input.float(1.5, "Success % Threshold", minval=0.5, maxval=5.0, step=0.25, group=grpML)
+
+// BB State Detection
+grpState = "═══ BB State Detection ═══"
+squeezeThreshold = input.float(2.0, "Squeeze Threshold %", minval=0.5, maxval=5.0, step=0.25, group=grpState)
+expansionRate = input.float(1.5, "Expansion Rate", minval=1.1, maxval=3.0, step=0.1, group=grpState)
+bandWalkBars = input.int(3, "Band Walk Min Bars", minval=2, maxval=10, group=grpState)
+
+// Visual Settings
+grpVisual = "═══ Visual Settings ═══"
+showBB = input.bool(true, "Show Bollinger Bands", group=grpVisual)
+showSignals = input.bool(true, "Show Trading Signals", group=grpVisual)
+showBBState = input.bool(true, "Show BB State", group=grpVisual)
+showDashboard = input.bool(true, "Show ML Dashboard", group=grpVisual)
+showPatternLabels = input.bool(false, "Show Pattern Labels", group=grpVisual)
+showZones = input.bool(true, "Show Entry Zones", group=grpVisual)
+
+// Risk Management
+grpRisk = "═══ Risk Management ═══"
+stopLossPct = input.float(2.0, "Stop Loss %", minval=0.5, maxval=10.0, step=0.25, group=grpRisk)
+takeProfitPct = input.float(4.0, "Take Profit %", minval=1.0, maxval=20.0, step=0.5, group=grpRisk)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Custom sum function for boolean conditions over N bars
+sumOfCondition(condition, length) =>
+    result = 0
+    for i = 0 to length - 1
+        result := result + (condition[i] ? 1 : 0)
+    result
+
+// Custom sum function for float values over N bars
+sumOfValues(src, length) =>
+    result = 0.0
+    for i = 0 to length - 1
+        result := result + nz(src[i])
+    result
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOLLINGER BANDS CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+basis = ta.sma(bbSource, bbLength)
+dev = bbMult * ta.stdev(bbSource, bbLength)
+upperBand = basis + dev
+lowerBand = basis - dev
+
+// BB Metrics
+bbWidth = (upperBand - lowerBand) / basis * 100
+bbWidthSMA = ta.sma(bbWidth, 20)
+bbWidthChange = bbWidth - bbWidth[1]
+bbPercentB = (close - lowerBand) / (upperBand - lowerBand)
+
+// Plot Bollinger Bands
+p_basis = plot(showBB ? basis : na, "Middle Band", color=color.new(color.blue, 20), linewidth=2)
+p_upper = plot(showBB ? upperBand : na, "Upper Band", color=color.new(color.red, 30), linewidth=1)
+p_lower = plot(showBB ? lowerBand : na, "Lower Band", color=color.new(color.green, 30), linewidth=1)
+fill(p_upper, p_lower, color=color.new(color.blue, 92), title="BB Fill")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BB STATE DETECTION (Squeeze, Expansion, Contraction)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Squeeze Detection
+bbWidthLowest = ta.lowest(bbWidth, 50)
+bbWidthHighest = ta.highest(bbWidth, 50)
+bbWidthPercentile = (bbWidth - bbWidthLowest) / (bbWidthHighest - bbWidthLowest) * 100
+
+isSqueeze = bbWidth < squeezeThreshold or bbWidthPercentile < 20
+isExpanding = bbWidthChange > 0 and bbWidth > bbWidth[1] * expansionRate / 100 + bbWidth[1]
+isContracting = bbWidthChange < 0 and ta.falling(bbWidth, 3)
+
+// Squeeze Strength (0-100)
+squeezeStrength = isSqueeze ? 100 - bbWidthPercentile : 0.0
+
+// Expansion Momentum
+expansionMomentum = ta.sma(bbWidthChange, 5)
+
+// BB State Enum
+var int STATE_SQUEEZE = 1
+var int STATE_EXPANDING = 2
+var int STATE_CONTRACTING = 3
+var int STATE_NORMAL = 0
+
+bbState = isSqueeze ? STATE_SQUEEZE : isExpanding ? STATE_EXPANDING : isContracting ? STATE_CONTRACTING : STATE_NORMAL
+
+// Squeeze Duration
+var int squeezeDuration = 0
+if isSqueeze
+    squeezeDuration := squeezeDuration + 1
+else
+    squeezeDuration := 0
+
+// Post-Squeeze Breakout Detection
+wasSqueezing = isSqueeze[1] and not isSqueeze
+breakoutUp = wasSqueezing and close > basis
+breakoutDown = wasSqueezing and close < basis
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CANDLE PATTERN DETECTION AT BB
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Candle Metrics
+candleBody = math.abs(close - open)
+candleRange = high - low
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+bodyPct = candleRange != 0 ? candleBody / candleRange * 100 : 0
+isBullish = close > open
+isBearish = close < open
+
+// Price Position Relative to Bands
+touchedUpperBand = high >= upperBand
+touchedLowerBand = low <= lowerBand
+closedAboveUpper = close > upperBand
+closedBelowLower = close < lowerBand
+closedAboveBasis = close > basis
+closedBelowBasis = close < basis
+
+// ═══ Pattern 1: Pin Bar at Bands ═══
+pinBarThreshold = 60.0
+isPinBarAtLower = touchedLowerBand and lowerWick > candleBody * 2 and candleRange != 0 and lowerWick / candleRange * 100 > pinBarThreshold
+isPinBarAtUpper = touchedUpperBand and upperWick > candleBody * 2 and candleRange != 0 and upperWick / candleRange * 100 > pinBarThreshold
+
+// ═══ Pattern 2: Engulfing at Bands ═══
+isBullishEngulfing = isBearish[1] and isBullish and close > open[1] and open < close[1]
+isBearishEngulfing = isBullish[1] and isBearish and close < open[1] and open > close[1]
+bullishEngulfingAtLower = isBullishEngulfing and touchedLowerBand[1]
+bearishEngulfingAtUpper = isBearishEngulfing and touchedUpperBand[1]
+
+// ═══ Pattern 3: Doji at Bands ═══
+isDoji = bodyPct < 10
+dojiAtLower = isDoji and touchedLowerBand
+dojiAtUpper = isDoji and touchedUpperBand
+
+// ═══ Pattern 4: Band Walk Detection ═══
+var int upperBandWalkCount = 0
+var int lowerBandWalkCount = 0
+
+if close > upperBand or (close > basis and high >= upperBand)
+    upperBandWalkCount := upperBandWalkCount + 1
+    lowerBandWalkCount := 0
+else if close < lowerBand or (close < basis and low <= lowerBand)
+    lowerBandWalkCount := lowerBandWalkCount + 1
+    upperBandWalkCount := 0
+else
+    upperBandWalkCount := 0
+    lowerBandWalkCount := 0
+
+isUpperBandWalk = upperBandWalkCount >= bandWalkBars
+isLowerBandWalk = lowerBandWalkCount >= bandWalkBars
+
+// ═══ Pattern 5: Rejection Candle ═══
+rejectionFromUpper = touchedUpperBand and close < open and close < basis + (upperBand - basis) * 0.5
+rejectionFromLower = touchedLowerBand and close > open and close > basis - (basis - lowerBand) * 0.5
+
+// ═══ Pattern 6: Strong Close at Bands ═══
+avgBody = ta.sma(candleBody, 20)
+strongCloseAtUpper = closedAboveUpper and candleBody > avgBody * 1.5
+strongCloseAtLower = closedBelowLower and candleBody > avgBody * 1.5
+
+// ═══ Pattern 7: Multiple Touch Pattern (FIXED - using custom function) ═══
+recentUpperTouches = sumOfCondition(touchedUpperBand, 10)
+recentLowerTouches = sumOfCondition(touchedLowerBand, 10)
+multiTouchUpper = recentUpperTouches >= 3
+multiTouchLower = recentLowerTouches >= 3
+
+// ═══ Pattern 8: Breakout Candle ═══
+isBreakoutCandleUp = closedAboveUpper and isBullish and candleBody > avgBody * 2
+isBreakoutCandleDown = closedBelowLower and isBearish and candleBody > avgBody * 2
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PATTERN ENCODING SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Create pattern signature (encoded as single value for comparison)
+getPatternSignature() =>
+    sig = 0.0
+    
+    // BB State Component (0-30)
+    sig += bbState * 10
+    
+    // BB Width Percentile Component (0-100 scaled to 0-10)
+    sig += bbWidthPercentile / 10
+    
+    // %B Component (scaled to 0-20)
+    sig += math.max(0.0, math.min(1.0, bbPercentB)) * 20 + 30
+    
+    // Candle Pattern Component (50-80)
+    if isPinBarAtLower
+        sig += 50
+    else if isPinBarAtUpper
+        sig += 51
+    else if bullishEngulfingAtLower
+        sig += 52
+    else if bearishEngulfingAtUpper
+        sig += 53
+    else if dojiAtLower
+        sig += 54
+    else if dojiAtUpper
+        sig += 55
+    else if rejectionFromLower
+        sig += 56
+    else if rejectionFromUpper
+        sig += 57
+    else if isBreakoutCandleUp
+        sig += 58
+    else if isBreakoutCandleDown
+        sig += 59
+    
+    // Trend Component (80-100)
+    sig += (close > ta.ema(close, 50) ? 10.0 : 0.0) + 80
+    
+    sig
+
+currentSignature = getPatternSignature()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ML FEATURE VECTOR
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Normalized Features (0-1 scale)
+f_bbWidth = math.min(1.0, bbWidth / 10)
+f_bbPercentB = math.max(0.0, math.min(1.0, (bbPercentB + 0.5) / 2))
+f_squeeze = isSqueeze ? 1.0 : 0.0
+f_squeezeStrength = squeezeStrength / 100
+f_expansionRate = math.min(1.0, math.max(0.0, expansionMomentum / 0.5 + 0.5))
+f_rsi = ta.rsi(close, 14) / 100
+f_bodyRatio = candleRange != 0 ? math.min(1.0, candleBody / candleRange) : 0.0
+f_trend = close > ta.ema(close, 50) ? 1.0 : 0.0
+volumeSMA = ta.sma(volume, 20)
+f_volume = volumeSMA != 0 ? math.min(1.0, volume / volumeSMA / 2) : 0.0
+f_momentum = math.min(1.0, math.max(0.0, (ta.mom(close, 10) / close * 100 + 5) / 10))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HISTORICAL PATTERN LEARNING & KNN
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate Euclidean distance between current and historical patterns
+patternDistance(idx) =>
+    hist_bbWidth = math.min(1.0, nz(bbWidth[idx]) / 10)
+    hist_bbPercentB = math.max(0.0, math.min(1.0, (nz(bbPercentB[idx]) + 0.5) / 2))
+    hist_squeeze = nz(isSqueeze[idx]) ? 1.0 : 0.0
+    hist_rsi = nz(ta.rsi(close, 14)[idx]) / 100
+    hist_candleRange = nz(candleRange[idx])
+    hist_bodyRatio = hist_candleRange != 0 ? math.min(1.0, nz(candleBody[idx]) / hist_candleRange) : 0.0
+    hist_volumeSMA = nz(ta.sma(volume, 20)[idx])
+    hist_volume = hist_volumeSMA != 0 ? math.min(1.0, nz(volume[idx]) / hist_volumeSMA / 2) : 0.0
+    
+    // Weighted Euclidean distance
+    w1 = 0.25  // BB Width
+    w2 = 0.30  // %B Position
+    w3 = 0.15  // Squeeze
+    w4 = 0.15  // RSI
+    w5 = 0.10  // Body Ratio
+    w6 = 0.05  // Volume
+    
+    dist = math.sqrt(
+         w1 * math.pow(f_bbWidth - hist_bbWidth, 2) +
+         w2 * math.pow(f_bbPercentB - hist_bbPercentB, 2) +
+         w3 * math.pow(f_squeeze - hist_squeeze, 2) +
+         w4 * math.pow(f_rsi - hist_rsi, 2) +
+         w5 * math.pow(f_bodyRatio - hist_bodyRatio, 2) +
+         w6 * math.pow(f_volume - hist_volume, 2))
+    
+    dist
+
+// Calculate future return for historical bar
+futureReturn(idx) =>
+    entryPrice = close[idx]
+    maxHigh = ta.highest(high, futureCandles)[idx - futureCandles]
+    maxLow = ta.lowest(low, futureCandles)[idx - futureCandles]
+    exitPrice = close[idx - futureCandles]
+    
+    upReturn = entryPrice != 0 ? (maxHigh - entryPrice) / entryPrice * 100 : 0.0
+    downReturn = entryPrice != 0 ? (entryPrice - maxLow) / entryPrice * 100 : 0.0
+    netReturn = entryPrice != 0 ? (exitPrice - entryPrice) / entryPrice * 100 : 0.0
+    
+    [upReturn, downReturn, netReturn]
+
+// KNN Analysis for Long Signals
+knnAnalyzeLong() =>
+    var float[] distances = array.new_float(0)
+    var float[] returns = array.new_float(0)
+    var int[] indices = array.new_int(0)
+    
+    array.clear(distances)
+    array.clear(returns)
+    array.clear(indices)
+    
+    // Only analyze when near lower band
+    if bbPercentB < 0.2
+        for i = futureCandles + 5 to mlLookback
+            // Check if historical bar was also near lower band
+            if nz(bbPercentB[i]) < 0.2
+                dist = patternDistance(i)
+                [upRet, downRet, netRet] = futureReturn(i)
+                
+                if not na(dist) and dist < 0.5  // Only similar patterns
+                    array.push(distances, dist)
+                    array.push(returns, upRet)
+                    array.push(indices, i)
+    
+    // Calculate weighted success rate
+    totalWeight = 0.0
+    successWeight = 0.0
+    avgReturn = 0.0
+    sampleCount = array.size(distances)
+    
+    if sampleCount >= minSamples
+        // Sort by distance and take k nearest
+        k = math.min(20, sampleCount)
+        for i = 0 to k - 1
+            if i < array.size(distances)
+                dist = array.get(distances, i)
+                ret = array.get(returns, i)
+                weight = 1 / (dist + 0.01)
+                totalWeight += weight
+                avgReturn += ret * weight
+                if ret >= successThreshold
+                    successWeight += weight
+        
+        avgReturn := totalWeight > 0 ? avgReturn / totalWeight : 0.0
+    
+    confidence = totalWeight > 0 ? successWeight / totalWeight * 100 : 0.0
+    [confidence, avgReturn, sampleCount]
+
+// KNN Analysis for Short Signals
+knnAnalyzeShort() =>
+    var float[] distances = array.new_float(0)
+    var float[] returns = array.new_float(0)
+    
+    array.clear(distances)
+    array.clear(returns)
+    
+    // Only analyze when near upper band
+    if bbPercentB > 0.8
+        for i = futureCandles + 5 to mlLookback
+            // Check if historical bar was also near upper band
+            if nz(bbPercentB[i]) > 0.8
+                dist = patternDistance(i)
+                [upRet, downRet, netRet] = futureReturn(i)
+                
+                if not na(dist) and dist < 0.5
+                    array.push(distances, dist)
+                    array.push(returns, downRet)
+    
+    totalWeight = 0.0
+    successWeight = 0.0
+    avgReturn = 0.0
+    sampleCount = array.size(distances)
+    
+    if sampleCount >= minSamples
+        k = math.min(20, sampleCount)
+        for i = 0 to k - 1
+            if i < array.size(distances)
+                dist = array.get(distances, i)
+                ret = array.get(returns, i)
+                weight = 1 / (dist + 0.01)
+                totalWeight += weight
+                avgReturn += ret * weight
+                if ret >= successThreshold
+                    successWeight += weight
+        
+        avgReturn := totalWeight > 0 ? avgReturn / totalWeight : 0.0
+    
+    confidence = totalWeight > 0 ? successWeight / totalWeight * 100 : 0.0
+    [confidence, avgReturn, sampleCount]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PATTERN-SPECIFIC ML ANALYSIS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Analyze specific pattern success rates
+analyzePatternSuccess(bool patternCondition, bool isLong) =>
+    successCount = 0
+    totalCount = 0
+    totalReturn = 0.0
+    
+    for i = futureCandles + 5 to mlLookback
+        wasPattern = patternCondition[i]
+        if wasPattern
+            totalCount += 1
+            [upRet, downRet, netRet] = futureReturn(i)
+            targetReturn = isLong ? upRet : downRet
+            if targetReturn >= successThreshold
+                successCount += 1
+            totalReturn += targetReturn
+    
+    winRate = totalCount > 0 ? float(successCount) / float(totalCount) * 100 : 0.0
+    avgRet = totalCount > 0 ? totalReturn / totalCount : 0.0
+    [winRate, avgRet, totalCount]
+
+// Calculate pattern-specific metrics
+[pinBarLowerWR, pinBarLowerRet, pinBarLowerN] = analyzePatternSuccess(isPinBarAtLower, true)
+[pinBarUpperWR, pinBarUpperRet, pinBarUpperN] = analyzePatternSuccess(isPinBarAtUpper, false)
+[engulfLowerWR, engulfLowerRet, engulfLowerN] = analyzePatternSuccess(bullishEngulfingAtLower, true)
+[engulfUpperWR, engulfUpperRet, engulfUpperN] = analyzePatternSuccess(bearishEngulfingAtUpper, false)
+[rejLowerWR, rejLowerRet, rejLowerN] = analyzePatternSuccess(rejectionFromLower, true)
+[rejUpperWR, rejUpperRet, rejUpperN] = analyzePatternSuccess(rejectionFromUpper, false)
+[squeezeBullWR, squeezeBullRet, squeezeBullN] = analyzePatternSuccess(breakoutUp, true)
+[squeezeBearWR, squeezeBearRet, squeezeBearN] = analyzePatternSuccess(breakoutDown, false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BB STATE LEARNING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Analyze BB state transitions
+analyzeSqueezeOutcome() =>
+    bullishBreakouts = 0
+    bearishBreakouts = 0
+    totalSqueezes = 0
+    
+    for i = futureCandles + 10 to mlLookback
+        wasSqueeze = nz(isSqueeze[i]) == false
+        wasSqueezing = nz(isSqueeze[i+1])
+        
+        // Squeeze ended
+        if wasSqueeze and wasSqueezing
+            totalSqueezes += 1
+            // Check direction of breakout
+            if nz(close[i]) > nz(basis[i])
+                bullishBreakouts += 1
+            else
+                bearishBreakouts += 1
+    
+    bullishPct = totalSqueezes > 0 ? float(bullishBreakouts) / float(totalSqueezes) * 100 : 50.0
+    [bullishPct, totalSqueezes]
+
+[squeezeBullishPct, totalSqueezeCount] = analyzeSqueezeOutcome()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMBINED ML SIGNAL GENERATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+[longConfidence, longAvgReturn, longSamples] = knnAnalyzeLong()
+[shortConfidence, shortAvgReturn, shortSamples] = knnAnalyzeShort()
+
+// Pattern Bonus Scoring
+patternBonusLong() =>
+    bonus = 0.0
+    if isPinBarAtLower and pinBarLowerWR > 50
+        bonus += 15
+    if bullishEngulfingAtLower and engulfLowerWR > 50
+        bonus += 20
+    if rejectionFromLower and rejLowerWR > 50
+        bonus += 15
+    if dojiAtLower
+        bonus += 5
+    if isSqueeze and squeezeBullishPct > 55
+        bonus += 10
+    if multiTouchLower
+        bonus += 5
+    bonus
+
+patternBonusShort() =>
+    bonus = 0.0
+    if isPinBarAtUpper and pinBarUpperWR > 50
+        bonus += 15
+    if bearishEngulfingAtUpper and engulfUpperWR > 50
+        bonus += 20
+    if rejectionFromUpper and rejUpperWR > 50
+        bonus += 15
+    if dojiAtUpper
+        bonus += 5
+    if isSqueeze and squeezeBullishPct < 45
+        bonus += 10
+    if multiTouchUpper
+        bonus += 5
+    bonus
+
+// Final Confidence Calculation
+finalLongConfidence = longConfidence + patternBonusLong()
+finalShortConfidence = shortConfidence + patternBonusShort()
+
+// Signal Conditions
+longSignalCondition = bbPercentB < 0.1 or touchedLowerBand or isPinBarAtLower or bullishEngulfingAtLower or rejectionFromLower
+shortSignalCondition = bbPercentB > 0.9 or touchedUpperBand or isPinBarAtUpper or bearishEngulfingAtUpper or rejectionFromUpper
+
+// ML-Filtered Signals
+mlLongSignal = longSignalCondition and finalLongConfidence >= minConfidence and longSamples >= minSamples
+mlShortSignal = shortSignalCondition and finalShortConfidence >= minConfidence and shortSamples >= minSamples
+
+// Prevent consecutive signals
+var int lastLongBar = 0
+var int lastShortBar = 0
+minBarsBetweenSignals = 5
+
+validLongSignal = mlLongSignal and (bar_index - lastLongBar) > minBarsBetweenSignals
+validShortSignal = mlShortSignal and (bar_index - lastShortBar) > minBarsBetweenSignals
+
+if validLongSignal
+    lastLongBar := bar_index
+if validShortSignal
+    lastShortBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════════
+// POSITION MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool inLong = false
+var bool inShort = false
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit = na
+var float unrealizedPnL = 0.0
+
+// Long Entry
+if validLongSignal and not inLong and not inShort
+    inLong := true
+    entryPrice := close
+    stopLoss := close * (1 - stopLossPct / 100)
+    takeProfit := close * (1 + takeProfitPct / 100)
+
+// Short Entry
+if validShortSignal and not inShort and not inLong
+    inShort := true
+    entryPrice := close
+    stopLoss := close * (1 + stopLossPct / 100)
+    takeProfit := close * (1 - takeProfitPct / 100)
+
+// Exit Conditions
+longExitMR = inLong and ta.crossover(close, basis)
+longExitSL = inLong and low <= stopLoss
+longExitTP = inLong and high >= takeProfit
+longExit = longExitMR or longExitSL or longExitTP
+
+shortExitMR = inShort and ta.crossunder(close, basis)
+shortExitSL = inShort and high >= stopLoss
+shortExitTP = inShort and low <= takeProfit
+shortExit = shortExitMR or shortExitSL or shortExitTP
+
+if longExit
+    inLong := false
+    entryPrice := na
+    stopLoss := na
+    takeProfit := na
+
+if shortExit
+    inShort := false
+    entryPrice := na
+    stopLoss := na
+    takeProfit := na
+
+// Calculate unrealized P&L
+if inLong and not na(entryPrice)
+    unrealizedPnL := (close - entryPrice) / entryPrice * 100
+else if inShort and not na(entryPrice)
+    unrealizedPnL := (entryPrice - close) / entryPrice * 100
+else
+    unrealizedPnL := 0.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL PLOTTING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Signal Plots with Confidence
+plotshape(showSignals and validLongSignal, "Long Signal", shape.triangleup, location.belowbar, 
+          color.new(color.lime, 0), size=size.normal)
+plotshape(showSignals and validShortSignal, "Short Signal", shape.triangledown, location.abovebar, 
+          color.new(color.red, 0), size=size.normal)
+
+// Confidence Labels
+if showSignals and validLongSignal
+    label.new(bar_index, low, "LONG\n" + str.tostring(finalLongConfidence, "#.#") + "%", 
+              color=color.new(color.green, 20), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if showSignals and validShortSignal
+    label.new(bar_index, high, "SHORT\n" + str.tostring(finalShortConfidence, "#.#") + "%", 
+              color=color.new(color.red, 20), textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Exit Labels
+plotshape(showSignals and longExitMR and inLong[1], "Long Exit MR", shape.xcross, location.abovebar, 
+          color.new(color.orange, 0), size=size.small)
+plotshape(showSignals and shortExitMR and inShort[1], "Short Exit MR", shape.xcross, location.belowbar, 
+          color.new(color.orange, 0), size=size.small)
+plotshape(showSignals and longExitSL and inLong[1], "Long SL Hit", shape.xcross, location.belowbar, 
+          color.new(color.red, 0), size=size.small)
+plotshape(showSignals and shortExitSL and inShort[1], "Short SL Hit", shape.xcross, location.abovebar, 
+          color.new(color.red, 0), size=size.small)
+plotshape(showSignals and longExitTP and inLong[1], "Long TP Hit", shape.xcross, location.abovebar, 
+          color.new(color.lime, 0), size=size.small)
+plotshape(showSignals and shortExitTP and inShort[1], "Short TP Hit", shape.xcross, location.belowbar, 
+          color.new(color.lime, 0), size=size.small)
+
+// SL/TP Lines
+plot(inLong ? stopLoss : na, "Long SL", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(inLong ? takeProfit : na, "Long TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(inShort ? stopLoss : na, "Short SL", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(inShort ? takeProfit : na, "Short TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(inLong or inShort ? entryPrice : na, "Entry", color=color.new(color.blue, 0), style=plot.style_linebr, linewidth=1)
+
+// Position Background
+bgcolor(inLong ? color.new(color.green, 92) : inShort ? color.new(color.red, 92) : na)
+
+// BB State Indicator
+stateColor = isSqueeze ? color.yellow : isExpanding ? color.lime : isContracting ? color.orange : color.gray
+plotshape(showBBState and isSqueeze, "Squeeze", shape.diamond, location.bottom, color.new(color.yellow, 30), size=size.tiny)
+plotshape(showBBState and breakoutUp, "Breakout Up", shape.triangleup, location.bottom, color.new(color.lime, 0), size=size.tiny)
+plotshape(showBBState and breakoutDown, "Breakout Down", shape.triangledown, location.bottom, color.new(color.red, 0), size=size.tiny)
+
+// Entry Zones
+upperZone = showZones ? upperBand - (upperBand - basis) * 0.1 : na
+lowerZone = showZones ? lowerBand + (basis - lowerBand) * 0.1 : na
+p_upperZone = plot(upperZone, display=display.none)
+p_lowerZone = plot(lowerZone, display=display.none)
+fill(p_upperZone, p_upper, color=color.new(color.red, 85), title="Short Zone")
+fill(p_lower, p_lowerZone, color=color.new(color.green, 85), title="Long Zone")
+
+// Pattern Labels
+if showPatternLabels
+    if isPinBarAtLower
+        label.new(bar_index, low, "PIN", color=color.new(color.green, 50), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    if isPinBarAtUpper
+        label.new(bar_index, high, "PIN", color=color.new(color.red, 50), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    if bullishEngulfingAtLower
+        label.new(bar_index, low, "ENG", color=color.new(color.green, 50), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+    if bearishEngulfingAtUpper
+        label.new(bar_index, high, "ENG", color=color.new(color.red, 50), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ML DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table dashboard = table.new(position.top_right, 5, 18, 
+     bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=color.new(color.gray, 50))
+
+if showDashboard and barstate.islast
+    // Header
+    table.cell(dashboard, 0, 0, "🤖 ML PATTERN RECOGNITION", text_color=color.white, text_size=size.normal, bgcolor=color.new(#16213e, 0))
+    table.merge_cells(dashboard, 0, 0, 4, 0)
+    
+    // BB State Section
+    table.cell(dashboard, 0, 1, "═══ BB STATE ═══", text_color=color.new(color.blue, 0), text_size=size.small)
+    table.merge_cells(dashboard, 0, 1, 4, 1)
+    
+    table.cell(dashboard, 0, 2, "State:", text_color=color.gray, text_size=size.small)
+    stateText = isSqueeze ? "🔴 SQUEEZE" : isExpanding ? "🟢 EXPANDING" : isContracting ? "🟡 CONTRACTING" : "⚪ NORMAL"
+    table.cell(dashboard, 1, 2, stateText, text_color=stateColor, text_size=size.small)
+    table.merge_cells(dashboard, 1, 2, 4, 2)
+    
+    table.cell(dashboard, 0, 3, "BB Width:", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 1, 3, str.tostring(bbWidth, "#.##") + "%", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 2, 3, "%B:", text_color=color.gray, text_size=size.small)
+    percentBColor = bbPercentB < 0 ? color.lime : bbPercentB > 1 ? color.red : color.white
+    table.cell(dashboard, 3, 3, str.tostring(bbPercentB, "#.###"), text_color=percentBColor, text_size=size.small)
+    
+    if isSqueeze
+        table.cell(dashboard, 0, 4, "Squeeze Duration:", text_color=color.gray, text_size=size.small)
+        table.cell(dashboard, 1, 4, str.tostring(squeezeDuration) + " bars", text_color=color.yellow, text_size=size.small)
+        table.merge_cells(dashboard, 1, 4, 4, 4)
+    else
+        table.cell(dashboard, 0, 4, "Squeeze Outlook:", text_color=color.gray, text_size=size.small)
+        table.cell(dashboard, 1, 4, str.tostring(squeezeBullishPct, "#.#") + "% Bullish", text_color=squeezeBullishPct > 50 ? color.lime : color.red, text_size=size.small)
+        table.merge_cells(dashboard, 1, 4, 4, 4)
+    
+    // ML Confidence Section
+    table.cell(dashboard, 0, 5, "═══ ML CONFIDENCE ═══", text_color=color.new(color.green, 0), text_size=size.small)
+    table.merge_cells(dashboard, 0, 5, 4, 5)
+    
+    table.cell(dashboard, 0, 6, "", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 1, 6, "LONG", text_color=color.lime, text_size=size.small)
+    table.cell(dashboard, 2, 6, "SHORT", text_color=color.red, text_size=size.small)
+    table.cell(dashboard, 3, 6, "THRESH", text_color=color.gray, text_size=size.small)
+    
+    table.cell(dashboard, 0, 7, "KNN Score:", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 1, 7, str.tostring(longConfidence, "#.#") + "%", text_color=longConfidence >= minConfidence ? color.lime : color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 7, str.tostring(shortConfidence, "#.#") + "%", text_color=shortConfidence >= minConfidence ? color.red : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 7, str.tostring(minConfidence, "#") + "%", text_color=color.gray, text_size=size.small)
+    
+    table.cell(dashboard, 0, 8, "Pattern Bonus:", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 1, 8, "+" + str.tostring(patternBonusLong(), "#") + "%", text_color=color.lime, text_size=size.small)
+    table.cell(dashboard, 2, 8, "+" + str.tostring(patternBonusShort(), "#") + "%", text_color=color.red, text_size=size.small)
+    table.cell(dashboard, 3, 8, "", text_size=size.small)
+    
+    table.cell(dashboard, 0, 9, "FINAL:", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(dashboard, 1, 9, str.tostring(finalLongConfidence, "#.#") + "%", text_color=finalLongConfidence >= minConfidence ? color.lime : color.orange, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(dashboard, 2, 9, str.tostring(finalShortConfidence, "#.#") + "%", text_color=finalShortConfidence >= minConfidence ? color.red : color.orange, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    table.cell(dashboard, 3, 9, "Samples: " + str.tostring(longSamples) + "/" + str.tostring(shortSamples), text_color=color.gray, text_size=size.small, bgcolor=color.new(color.blue, 70))
+    
+    // Pattern Analysis Section
+    table.cell(dashboard, 0, 10, "═══ PATTERN WIN RATES ═══", text_color=color.new(color.purple, 0), text_size=size.small)
+    table.merge_cells(dashboard, 0, 10, 4, 10)
+    
+    table.cell(dashboard, 0, 11, "Pattern", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 1, 11, "Long WR", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 11, "Short WR", text_color=color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 11, "N", text_color=color.gray, text_size=size.small)
+    
+    // Pin Bar
+    table.cell(dashboard, 0, 12, "Pin Bar", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 12, str.tostring(pinBarLowerWR, "#.#") + "%", text_color=pinBarLowerWR > 50 ? color.lime : color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 12, str.tostring(pinBarUpperWR, "#.#") + "%", text_color=pinBarUpperWR > 50 ? color.red : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 12, str.tostring(pinBarLowerN) + "/" + str.tostring(pinBarUpperN), text_color=color.gray, text_size=size.small)
+    
+    // Engulfing
+    table.cell(dashboard, 0, 13, "Engulfing", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 13, str.tostring(engulfLowerWR, "#.#") + "%", text_color=engulfLowerWR > 50 ? color.lime : color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 13, str.tostring(engulfUpperWR, "#.#") + "%", text_color=engulfUpperWR > 50 ? color.red : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 13, str.tostring(engulfLowerN) + "/" + str.tostring(engulfUpperN), text_color=color.gray, text_size=size.small)
+    
+    // Rejection
+    table.cell(dashboard, 0, 14, "Rejection", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 14, str.tostring(rejLowerWR, "#.#") + "%", text_color=rejLowerWR > 50 ? color.lime : color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 14, str.tostring(rejUpperWR, "#.#") + "%", text_color=rejUpperWR > 50 ? color.red : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 14, str.tostring(rejLowerN) + "/" + str.tostring(rejUpperN), text_color=color.gray, text_size=size.small)
+    
+    // Squeeze Breakout
+    table.cell(dashboard, 0, 15, "Squeeze BO", text_color=color.white, text_size=size.small)
+    table.cell(dashboard, 1, 15, str.tostring(squeezeBullWR, "#.#") + "%", text_color=squeezeBullWR > 50 ? color.lime : color.gray, text_size=size.small)
+    table.cell(dashboard, 2, 15, str.tostring(squeezeBearWR, "#.#") + "%", text_color=squeezeBearWR > 50 ? color.red : color.gray, text_size=size.small)
+    table.cell(dashboard, 3, 15, str.tostring(squeezeBullN) + "/" + str.tostring(squeezeBearN), text_color=color.gray, text_size=size.small)
+    
+    // Position Status
+    table.cell(dashboard, 0, 16, "═══ POSITION ═══", text_color=color.new(color.orange, 0), text_size=size.small)
+    table.merge_cells(dashboard, 0, 16, 4, 16)
+    
+    posText = inLong ? "🟢 LONG" : inShort ? "🔴 SHORT" : "⚪ FLAT"
+    posColor = inLong ? color.lime : inShort ? color.red : color.gray
+    table.cell(dashboard, 0, 17, posText, text_color=posColor, text_size=size.small)
+    
+    if inLong or inShort
+        pnlColor = unrealizedPnL >= 0 ? color.lime : color.red
+        table.cell(dashboard, 1, 17, "P&L: " + str.tostring(unrealizedPnL, "#.##") + "%", text_color=pnlColor, text_size=size.small)
+        table.cell(dashboard, 2, 17, "SL: " + str.tostring(stopLossPct) + "%", text_color=color.red, text_size=size.small)
+        table.cell(dashboard, 3, 17, "TP: " + str.tostring(takeProfitPct) + "%", text_color=color.green, text_size=size.small)
+    else
+        table.cell(dashboard, 1, 17, "Ready to trade", text_color=color.gray, text_size=size.small)
+        table.merge_cells(dashboard, 1, 17, 3, 17)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+//alertcondition(validLongSignal, "ML Long Signal", "BB ML: LONG Signal - Confidence: " + str.tostring(finalLongConfidence) + "%")
+//alertcondition(validShortSignal, "ML Short Signal", "BB ML: SHORT Signal - Confidence: " + str.tostring(finalShortConfidence) + "%")
+//alertcondition(isSqueeze and not isSqueeze[1], "Squeeze Started", "BB ML: Squeeze Detected - Prepare for Breakout")
+//alertcondition(breakoutUp, "Bullish Breakout", "BB ML: Bullish Breakout from Squeeze")
+//alertcondition(breakoutDown, "Bearish Breakout", "BB ML: Bearish Breakout from Squeeze")
+//alertcondition(longExit, "Long Exit", "BB ML: Exit LONG Position")
+//alertcondition(shortExit, "Short Exit", "BB ML: Exit SHORT Position")
+
+// Debug Plots (Data Window only)
+plot(finalLongConfidence, "Long Confidence", display=display.data_window)
+plot(finalShortConfidence, "Short Confidence", display=display.data_window)
+plot(bbPercentB * 100, "BB %B", display=display.data_window)
+plot(bbWidth, "BB Width", display=display.data_window)
+plot(longSamples, "Long Samples", display=display.data_window)
+plot(shortSamples, "Short Samples", display=display.data_window)

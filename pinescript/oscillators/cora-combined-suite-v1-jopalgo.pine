@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: MPL-2.0
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// File: Cora Combined Suite v1 [JopAlgo]  (short title: CCSV1)
+// Description: Two-in-one CoRa suite: an OVERLAY for trend/structure and a compact OSCILLATOR for momentum/pressure.
+//              Overlay = CoRa-inspired trend wave with an asymmetric ATR cloud whose width adapts to volume pressure.
+//              Oscillator = Stretch-Z (price–CoRa residual), Slope-Z (CoRa momentum), and a Volume-Pressure line (VPO).
+//              Optional HTF Gate can require higher-timeframe agreement for oscillator alerts.
+//              Retail-first automation (Profiles + Auto toggles) chooses sensible parameters per timeframe.
+//
+// Key Concepts:
+//   - CoRa Wave (overlay): Compound-Ratio WMA (CRWMA) smoothed trend line, ribbon-colored by slope.
+//   - Pressure-Biased Cloud (overlay): Upper/Lower = CoRa ± ATR · k; k scales asymmetrically with smoothed pressure.
+//       • “Pressure” from positive/negative volume-weighted move sums (posPress/negPress); dynamic but stable baseline.
+//       • Range-Lock Gate mutes pullback alerts when the cloud bandwidth stays too tight relative to ATR (chop guard).
+//   - Oscillator Trio (subpane or inline preview):
+//       • Stretch-Z = robust z-score of residual (close – CoRa), clipped to ±clipAbs.
+//       • Slope-Z   = robust z-score of CoRa slope (momentum), MAD or STDEV selectable (auto-picks MAD on spiky LTFs).
+//       • VPO       = (posPress – negPress) / (posPress + negPress), rendered as a clean step-line.
+//       • Event bands at ±2 (subpane) aid quick “extended vs mean” read; optional floor/ceiling markers.
+//   - HTF Gate (optional): Only gates oscillator alerts by requiring HTF Slope-Z agreement; overlay visuals unchanged.
+//   - Inline Osc Preview: When running oscillator in the price pane, values are auto-anchored and scaled under price,
+//                         so the preview never crushes the price scale. Move to a subpane for raw ±clipAbs view.
+//
+// Clean Defaults (publisher-friendly):
+//   - Profile Presets: Scalp (1–5m), Intraday (15–60m), Swing (4H–1D) → length, z-window, clip, VPO window.
+//   - Auto Core/Normalize/VPO/Overlay/Oscillator: ON (users can ignore advanced settings).
+//   - Z-Method: Auto prefers MAD on spiky lower TFs; otherwise STDEV is fine.
+//   - Visuals: Light cloud fill to keep candles readable; thin ±2 bands in subpane; turquoise VPO; purple Slope-Z.
+//   - Alerts (constant text):
+//       • Overlay:  “CCSV1 • Overlay: Pullback Long OK / Pullback Short OK”
+//       • Oscillator: “CCSV1 • Osc: Funded Flip Up / Funded Flip Down / Pullback Long Ready / Pullback Short Ready
+//                      / Exhaustion Risk (Long) / Exhaustion Risk (Short)”
+//
+// Originality & Third-Party Notices:
+//   - Portions based on conceptual ideas of “CoRa” by RedKTrader — © RedKTrader.
+//   - All integration, pressure model, automation, visuals, and oscillator design © 2025 JopAlgo.
+//   - No third-party source code reused; only Pine built-ins (ATR, SMA/EMA, STDEV, MAD proxy, security, etc.).
+//
+// Distribution & Modifications (MPL-2.0):
+//   - If you distribute a modified version of this file, it must remain under MPL-2.0 and include the source of this file.
+//   - MPL copyleft is file-level; you may combine this with other files under different terms.
+//
+// Non-Repainting & Performance Notes:
+//   - request.security uses barmerge.lookahead_off; signals finalize on bar close.
+//   - Inline oscillator preview auto-scales each bar; subpane shows raw ±clipAbs scale.
+//   - Lightweight-safe: we precompute both MAD/STDEV and Median/EMA baselines and then select per bar.
+//
+// TradingView Publishing Notes:
+//   - Keep this header intact when publishing/open-sourcing.
+//   - Public description: explain Overlay vs Oscillator, the Auto profile, HTF Gate scope (alerts only), and best practices.
+//   - Screenshots: one of Overlay (cloud + CoRa) and one of Oscillator (subpane with Stretch-Z/Slope-Z/VPO and ±2 bands).
+//
+// Quick Start (for users):
+//   1) Choose “Run As”: Overlay (price pane) or Oscillator (then move to a new subpane for raw view).
+//   2) Leave Auto toggles ON; pick your Profile (Scalp/Intraday/Swing).
+//   3) Overlay: trade with trend (CoRa color) and respect the cloud; pullback alerts mute during tight chop.
+//   4) Oscillator: prefer Funded Flips (Slope-Z cross 0 with VPO agreement). Use ±2 bands for extension/exhaustion.
+//   5) Optionally enable HTF Gate to require higher-timeframe Slope-Z agreement for oscillator alerts.
+//
+// Disclaimer:
+//   - Educational purposes only. Not financial advice. Use at your own risk.
+// © 2025 JopAlgo
+
+
+//@version=6
+indicator(title="Cora Combined Suite v1 [JopAlgo]", shorttitle="CCSV1", overlay=true, max_lines_count=500, max_labels_count=500)
+
+//=========================
+// Mode & Profile (retail-facing)
+//=========================
+grpMode   = "Mode"
+mode      = input.string("Overlay (CSV1.1)", "Run As", options=["Overlay (CSV1.1)","Oscillator (CSV2.1)"], group=grpMode)
+showOverlay = mode == "Overlay (CSV1.1)"
+showOsc     = mode == "Oscillator (CSV2.1)"
+
+grpProfile = "Trading Profile"
+profile = input.string("Intraday 15–60m", "Profile", options=["Scalp 1–5m","Intraday 15–60m","Swing 4H–1D"], group=grpProfile)
+
+// Profile-based defaults
+prof_len   = profile == "Scalp 1–5m"       ? 21 : profile == "Intraday 15–60m" ? 34 : 55
+prof_zlen  = prof_len
+prof_clip  = profile == "Scalp 1–5m"       ? 2.2 : profile == "Intraday 15–60m" ? 2.5 : 3.0
+prof_vpo   = profile == "Scalp 1–5m"       ? 30  : profile == "Intraday 15–60m" ? 40  : 60
+
+//=========================
+// Group-level AUTO toggles (ON = use smart defaults; inputs become passive)
+//=========================
+grpAuto = "Automation"
+autoCore   = input.bool(true,  "Auto Core (lengths, smoothing)", group=grpAuto)
+autoNorm   = input.bool(true,  "Auto Normalize (Z-method & Clip)", group=grpAuto)
+autoVPO    = input.bool(true,  "Auto Volume/Pressure (window & baseline)", group=grpAuto)
+autoOv     = input.bool(true,  "Auto Overlay (asym cloud & range-gate)", group=grpAuto)
+autoOsc    = input.bool(true,  "Auto Oscillator (inline preview, bands/floor logic)", group=grpAuto)
+useHTF     = input.bool(false, "HTF Gate (osc alerts require HTF SlopeZ agreement)", group=grpAuto)
+htfTf      = input.timeframe("240", "HTF (suggested ≈ 4× chart TF)", group=grpAuto)
+
+//=========================
+// Core Inputs (Advanced — ignored when Auto Core = ON)
+//=========================
+grpCore   = "ADV — Core"
+src       = input.source(hlc3, "Source", group=grpCore)
+len_i     = input.int(34, "CoRa Length", minval=2, group=grpCore)
+rMulti    = input.float(1.8, "Comp Ratio Multiplier", minval=0, step=0.1, group=grpCore)
+autoSm_i  = input.bool(true, "Auto Smoothing (√Length)", group=grpCore)
+manSm     = input.int(1, "Manual Smoothing", minval=1, group=grpCore)
+
+//=========================
+// Normalization (Advanced — ignored when Auto Normalize = ON)
+//=========================
+grpNorm   = "ADV — Normalize"
+atrLen_i  = input.int(34, "ATR Length", minval=1, group=grpNorm)
+zLen_i    = input.int(34, "Z-Window (Slope & Stretch-Z)", minval=5, group=grpNorm)
+zMethod_i = input.string("MAD", "Z-Score Method", options=["MAD","STDEV"], group=grpNorm)
+clipAbs_i = input.float(2.5, "Oscillator Clip ±", minval=1.5, maxval=4.0, step=0.1, group=grpNorm)
+
+//=========================
+// Volume / Pressure (Advanced — ignored when Auto VPO = ON)
+//=========================
+grpVPO    = "ADV — Volume & Pressure"
+vpoLen_i  = input.int(30, "VPO Window (bars)", minval=2, group=grpVPO)
+vpoWidth  = input.int(2, "VPO Width (stepline)", minval=1, maxval=7, group=grpVPO)
+ov_prMethod_i = input.string("Median", "PR Baseline", options=["Median","EMA"], group=grpVPO, tooltip="Median resists spikes; EMA is classic.")
+ov_prSmooth_i = input.int(3, "PR tiny smoothing (EMA)", minval=1, maxval=10, group=grpVPO)
+
+//=========================
+// Overlay-only options (Advanced — look kept identical to CCSV1)
+//=========================
+grpOv = "ADV — Overlay (CSV1.1 design)"
+ov_asymCloud_i = input.bool(true, "Asymmetric Cloud Width (pressure-biased)", group=grpOv)
+ov_kBase_i     = input.float(1.00, "Base ATR width (kBase)", minval=0.1, step=0.05, group=grpOv)
+ov_kScale_i    = input.float(1.00, "Pressure scaling (kScale)", minval=0.0, step=0.1, group=grpOv)
+ov_rangeGate_i = input.float(0.60, "Range-Lock Gate (bandwidth/ATR)", minval=0.0, step=0.05, group=grpOv, tooltip="If (Upper-Lower)/ATR < threshold for a while, mute PB alerts.")
+ov_showFill    = input.bool(true, "Cloud Fill On", group=grpOv)
+ov_fillBase    = input.int(88, "Cloud Base Opacity %", minval=50, maxval=100, group=grpOv, tooltip="Higher = lighter. 88 is very light.")
+ov_fillGain    = input.int(20, "Cloud Dynamic Gain %", minval=0, maxval=40, group=grpOv, tooltip="Extra opacity under strong pressure.")
+ov_borderW     = input.int(1, "Cloud Border Width", minval=1, maxval=4, group=grpOv)
+
+//=========================
+// Oscillator-only options
+//=========================
+grpOsc = "ADV — Oscillator (CSV2.1)"
+osc_render   = input.string("Inline (overlay)", "Oscillator Render", options=["Inline (overlay)","Subpane (raw)"], group=grpOsc, tooltip="Move to new pane when using Subpane (raw).")
+osc_divSep   = input.int(5, "Divergence min separation (bars)", minval=2, group=grpOsc)
+osc_showBands= input.bool(true, "Show ±2 Event Bands (Subpane only)", group=grpOsc)
+osc_maxSeg   = input.int(200, "Max VPO step segments", minval=50, maxval=2000, group=grpOsc)
+osc_inline_lookback = input.int(60, "Inline anchor lookback (bars)", minval=20, maxval=300, group=grpOsc)
+osc_inline_scaleATR = input.float(0.35, "Inline scale (×ATR)", minval=0.05, maxval=1.00, step=0.05, group=grpOsc)
+osc_showFloor = input.bool(true,  "Show Oscillator Floor", group=grpOsc)
+osc_showCeil  = input.bool(false, "Show Oscillator Ceiling", group=grpOsc)
+osc_pad       = input.float(0.30, "Floor/Ceiling Padding", minval=0.0, maxval=1.0, step=0.05, group=grpOsc)
+osc_floorW    = input.int(3,  "Osc Floor Width",   minval=1, maxval=8, group=grpOsc)
+osc_ceilW     = input.int(2,  "Osc Ceiling Width", minval=1, maxval=8, group=grpOsc)
+
+//=========================
+// Style 
+//=========================
+grpStyle  = "Style"
+bullCol   = input.color(color.new(color.teal, 0), "Bull Color", group=grpStyle)
+bearCol   = input.color(color.new(color.red, 0),  "Bear Color", group=grpStyle)
+vpoCol    = input.color(color.rgb(64,224,208), "VPO Color (turquoise)", group=grpStyle) // near #40E0D0
+slopeCol  = input.color(color.new(color.purple, 0), "SlopeZ Color", group=grpStyle)
+
+//=========================
+// Helpers
+//=========================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+f_clamp_int(x, lo, hi) =>
+    int(math.max(lo, math.min(hi, x)))
+f_rollsum(x, n) =>
+    c = ta.cum(x)
+    c - nz(c[n])
+f_median(x, n) =>
+    ta.percentile_nearest_rank(x, n, 50)
+f_z_mad(x, n) =>
+    med  = f_median(x, n)
+    mad  = f_median(math.abs(x - med), n)
+    mad > 0 ? 0.6745 * (x - med) / mad : 0.0
+f_z_stdev(x, n) =>
+    m  = ta.sma(x, n)
+    sd = ta.stdev(x, n)
+    sd > 0 ? (x - m) / sd : 0.0
+f_crwma(_src, _L, _startWt, _rMult) =>
+    L2    = math.max(_L, 2)
+    endWt = L2 * 1.0
+    r     = math.pow(endWt / _startWt, 1.0 / (L2 - 1.0)) - 1.0
+    base  = 1.0 + r * _rMult
+    numer = 0.0
+    denom = 0.0
+    for i = 0 to L2 - 1
+        w = _startWt * math.pow(base, (L2 - i))
+        numer += nz(_src[i]) * w
+        denom += w
+    denom != 0 ? numer / denom : nz(_src)
+f_cora_line(_src, _len, _rMult, _smLen) =>
+    coraRaw = f_crwma(_src, _len, 0.01, _rMult)
+    ta.wma(coraRaw, _smLen)
+// Refactored: compute both z-scores, then select
+f_slope_z_current(_src, _len, _rMult, _smLen, _zLen, _useMad) =>
+    _cora  = f_cora_line(_src, _len, _rMult, _smLen)
+    _slope = _cora - _cora[1]
+    _zMad  = f_z_mad(_slope, _zLen)
+    _zStd  = f_z_stdev(_slope, _zLen)
+    _useMad ? _zMad : _zStd
+
+//=========================
+// Effective parameters from Autos
+//=========================
+// Core
+len     = autoCore ? prof_len  : len_i
+zLen    = autoCore ? prof_zlen : zLen_i
+atrLen  = autoCore ? len       : atrLen_i
+autoSm  = autoCore ? true      : autoSm_i
+smLen   = autoSm ? int(math.round(math.sqrt(len))) : manSm
+
+// Normalize
+retAbs  = math.abs(math.log(close / nz(close[1], close)))
+spkStd  = ta.stdev(retAbs, zLen)
+spkEma  = ta.ema(retAbs, zLen)
+spikeR  = spkEma > 0 ? spkStd / spkEma : 0.0
+lowerTF = timeframe.in_seconds(timeframe.period) <= 3600
+useMad  = autoNorm ? (lowerTF or spikeR > 1.5) : (zMethod_i == "MAD")
+
+atrNorm = ta.atr(atrLen) / math.max(ta.ema(close, atrLen), 1e-6)
+volMA   = ta.sma(atrNorm, 200)
+volSD   = ta.stdev(atrNorm, 200)
+volZ    = volSD > 0 ? (atrNorm - volMA) / volSD : 0.0
+adj     = autoNorm ? (volZ > 0.8 ? 0.2 : volZ < -0.8 ? -0.2 : 0.0) : 0.0
+clipAbs = autoNorm ? f_clamp(prof_clip + adj, 2.0, 3.2) : clipAbs_i
+
+// VPO / PR baseline
+vpoLen    = autoVPO ? prof_vpo : vpoLen_i
+volSpikeR = ta.highest(volume, vpoLen) / math.max(ta.sma(volume, vpoLen), 1.0)
+useMedian = autoVPO ? (volSpikeR > 5.0) : (ov_prMethod_i == "Median")
+prSmooth  = autoVPO ? 3 : ov_prSmooth_i
+
+// Overlay behavior
+ov_asymCloud = autoOv ? true  : ov_asymCloud_i
+ov_kBase     = autoOv ? 1.00  : ov_kBase_i
+ov_kScale    = autoOv ? 0.80  : ov_kScale_i
+ov_rangeGate = autoOv ? 0.60  : ov_rangeGate_i
+
+//=========================
+// Core series
+//=========================
+cora     = f_cora_line(src, len, rMulti, smLen)
+slope    = cora - cora[1]
+atr      = ta.atr(atrLen)
+residual = close - cora
+
+// Compute both z-variants every bar
+zSlope_mad     = f_z_mad(slope, zLen)
+zSlope_std     = f_z_stdev(slope, zLen)
+zStretch_mad   = f_z_mad(residual, zLen)
+zStretch_std   = f_z_stdev(residual, zLen)
+zSlope         = useMad ? zSlope_mad   : zSlope_std
+zStretchRaw    = useMad ? zStretch_mad : zStretch_std
+zStretch       = f_clamp(zStretchRaw, -clipAbs, clipAbs)
+
+// Pressure model
+upMove   = math.max(close - open, 0.0)
+dnMove   = math.max(open - close, 0.0)
+posPress = f_rollsum(volume * upMove, vpoLen)
+negPress = f_rollsum(volume * dnMove, vpoLen)
+pressDen = posPress + negPress
+vpo      = pressDen > 0 ? (posPress - negPress) / pressDen : 0.0
+
+//=========================
+// OVERLAY (CSV1.1 visuals intact)
+//=========================
+// Compute both baselines every bar, then select (fixes lightweight warnings)
+volMed  = f_median(volume, vpoLen)
+volEma  = ta.ema(volume, vpoLen)
+volBase = useMedian ? volMed : volEma
+
+normDen = math.max(volBase * vpoLen, 1e-10)
+pratio  = f_clamp((posPress - negPress) / normDen, -1.0, 1.0)
+prSm    = ta.ema(pratio, prSmooth)
+
+kUp = ov_asymCloud ? ov_kBase * (1.0 + math.max(prSm, 0) * ov_kScale) : ov_kBase
+kDn = ov_asymCloud ? ov_kBase * (1.0 + math.max(-prSm,0) * ov_kScale) : ov_kBase
+
+upper = cora + atr * kUp
+lower = cora - atr * kDn
+
+bandwidthATR = (upper - lower) / math.max(atr, 1e-9)
+gateSeries   = ta.sma(bandwidthATR < ov_rangeGate ? 1.0 : 0.0, int(math.max(2, len/2)))
+rangeLocked  = gateSeries > 0.8  // need sustained narrow band to mute PB alerts
+
+coraUp = cora > cora[1]
+pU = plot(showOverlay ? upper : na, color=color.new(bullCol, 0), linewidth=ov_borderW, title="Cloud Upper (Overlay)")
+pL = plot(showOverlay ? lower : na, color=color.new(bearCol, 0),  linewidth=ov_borderW, title="Cloud Lower (Overlay)")
+pC = plot(showOverlay ? cora  : na, color=coraUp ? bullCol : bearCol, linewidth=2, title="CoRa Line (Overlay)")
+
+dyn    = f_clamp_int(int(math.abs(prSm) * ov_fillGain), 0, ov_fillGain)
+tFill  = f_clamp_int(ov_fillBase - dyn, 0, 100)
+fillCol = showOverlay and ov_showFill
+  ? (prSm >= 0 ? color.new(bullCol, tFill) : color.new(bearCol, tFill))
+  : na
+fill(pU, pL, color=fillCol, title="Cloud Fill (Overlay)")
+
+//=========================
+// OSCILLATOR (CSV2.1 visuals intact)
+//=========================
+renderInline = showOsc and (osc_render == "Inline (overlay)")
+renderSub    = showOsc and (osc_render == "Subpane (raw)")
+
+inlineAnchor = ta.lowest(low, autoOsc ? 60 : osc_inline_lookback) - atr * 0.5
+inlineScale  = atr * (autoOsc ? 0.35 : osc_inline_scaleATR)
+zStretch_i   = inlineAnchor + zStretch * inlineScale
+zSlope_i     = inlineAnchor + zSlope   * inlineScale
+vpo_i        = inlineAnchor + vpo      * inlineScale
+
+zStretch_series = showOsc ? (renderSub ? zStretch : zStretch_i) : na
+zSlope_series   = showOsc ? (renderSub ? zSlope   : zSlope_i  ) : na
+vpo_series      = showOsc ? (renderSub ? vpo      : vpo_i     ) : na
+
+histCol = zStretch >= 0 ? color.new(bullCol, 0) : color.new(bearCol, 0)
+plot(zStretch_series, title="Stretch-Z", style=plot.style_columns, color=histCol)
+plot(zSlope_series,   title="SlopeZ",    color=slopeCol, linewidth=2)
+plot(vpo_series,      title="VPO (base)", color=color.new(vpoCol, 60), linewidth=1)
+
+// Floor / Ceiling
+floorRaw   = -(clipAbs + osc_pad)
+ceilRaw    =  (clipAbs + osc_pad)
+lbI        = int(math.max(20, autoOsc ? 60 : osc_inline_lookback))
+minI       = math.min(ta.lowest(zStretch_i, lbI), math.min(ta.lowest(zSlope_i, lbI), ta.lowest(vpo_i, lbI)))
+maxI       = math.max(ta.highest(zStretch_i, lbI), math.max(ta.highest(zSlope_i, lbI), ta.highest(vpo_i, lbI)))
+inlinePad  = atr * 0.10
+floorInline= minI - inlinePad
+ceilInline = maxI + inlinePad
+
+floorSeries = showOsc ? (renderSub ? floorRaw : (renderInline and autoOsc ? floorInline : na)) : na
+ceilSeries  = showOsc ? (renderSub ? ceilRaw  : (renderInline and autoOsc ? ceilInline  : na)) : na
+
+plot(osc_showFloor ? floorSeries : na, title="Osc Floor",   color=color.rgb(35,35,35), linewidth=osc_floorW)
+plot(osc_showCeil  ? ceilSeries  : na, title="Osc Ceiling", color=color.rgb(70,70,70), linewidth=osc_ceilW)
+
+// Event bands (Subpane only; Auto Osc hides inline)
+bandPlus  = (renderSub and (autoOsc or osc_showBands)) ?  2.0 : na
+bandMinus = (renderSub and (autoOsc or osc_showBands)) ? -2.0 : na
+plot(bandPlus,  title="Band +2", color=color.new(color.silver, 80), linewidth=1)
+plot(bandMinus, title="Band -2", color=color.new(color.silver, 80), linewidth=1)
+
+// VPO stepline (both renders)
+var line[] vpoH = array.new_line()
+var line[] vpoV = array.new_line()
+float prevVal = nz(vpo[1], vpo)
+float prevY   = renderSub ? prevVal : (renderInline ? (inlineAnchor + prevVal * inlineScale) : na)
+float currY   = renderSub ? vpo     : (renderInline ? vpo_i : na)
+maxSegEff     = autoOsc ? 250 : osc_maxSeg
+if showOsc and bar_index > 0 and not na(prevY) and not na(currY)
+    line lH = line.new(bar_index - 1, prevY, bar_index, prevY, xloc=xloc.bar_index, extend=extend.none, color=vpoCol, width=vpoWidth)
+    array.push(vpoH, lH)
+    if currY != prevY
+        line lV = line.new(bar_index, prevY, bar_index, currY, xloc=xloc.bar_index, extend=extend.none, color=vpoCol, width=vpoWidth)
+        array.push(vpoV, lV)
+    while array.size(vpoH) > maxSegEff
+        line dl = array.shift(vpoH)
+        line.delete(dl)
+    while array.size(vpoV) > maxSegEff
+        line dl2 = array.shift(vpoV)
+        line.delete(dl2)
+
+// Divergence (Subpane only)
+pH_osc   = ta.pivothigh(zStretch, osc_divSep, osc_divSep)
+pL_osc   = ta.pivotlow(zStretch,  osc_divSep, osc_divSep)
+pH_price = ta.pivothigh(cora,     osc_divSep, osc_divSep)
+pL_price = ta.pivotlow(cora,      osc_divSep, osc_divSep)
+
+var int   h1_bar = na
+var int   h2_bar = na
+var float h1_val = na
+var float h2_val = na
+var int   l1_bar = na
+var int   l2_bar = na
+var float l1_val = na
+var float l2_val = na
+
+if renderSub and not na(pH_osc)
+    h2_bar := h1_bar
+    h2_val := h1_val
+    h1_bar := bar_index - osc_divSep
+    h1_val := pH_osc
+if renderSub and not na(pL_osc)
+    l2_bar := l1_bar
+    l2_val := l1_val
+    l1_bar := bar_index - osc_divSep
+    l1_val := pL_osc
+
+lastPH  = ta.valuewhen(not na(pH_price), pH_price, 0)
+prevPH  = ta.valuewhen(not na(pH_price), pH_price, 1)
+lastPL  = ta.valuewhen(not na(pL_price), pL_price, 0)
+prevPL  = ta.valuewhen(not na(pL_price), pL_price, 1)
+
+bearDiv = renderSub and (not na(lastPH) and not na(prevPH) and not na(h1_val) and not na(h2_val)) and (lastPH > prevPH) and (h1_val < h2_val)
+bullDiv = renderSub and (not na(lastPL) and not na(prevPL) and not na(l1_val) and not na(l2_val)) and (lastPL < prevPL) and (l1_val > l2_val)
+
+var line bearLine = na
+var line bullLine = na
+if bearDiv and not na(h1_bar) and not na(h2_bar)
+    if not na(bearLine)
+        line.delete(bearLine)
+    bearLine := line.new(h2_bar, h2_val, h1_bar, h1_val, xloc=xloc.bar_index, extend=extend.none, color=color.new(bearCol, 0), width=2)
+if bullDiv and not na(l1_bar) and not na(l2_bar)
+    if not na(bullLine)
+        line.delete(bullLine)
+    bullLine := line.new(l2_bar, l2_val, l1_bar, l1_val, xloc=xloc.bar_index, extend=extend.none, color=color.new(bullCol, 0), width=2)
+
+//=========================
+// HTF gate (alerts only)
+//=========================
+htfSlopeZ = request.security(syminfo.tickerid, htfTf,
+     f_slope_z_current(src, len, rMulti, smLen, zLen, useMad),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+agreeLong  = (not useHTF) or (htfSlopeZ >= 0)
+agreeShort = (not useHTF) or (htfSlopeZ <= 0)
+
+//=========================
+// Alerts (same behavior, CCSV1 naming)
+//=========================
+crUp = ta.crossover(zSlope, 0)
+crDn = ta.crossunder(zSlope, 0)
+
+ov_pbLong  = showOverlay and not rangeLocked and coraUp and (close >= cora) and (prSm >= 0)
+ov_pbShort = showOverlay and not rangeLocked and (not coraUp) and (close <= cora) and (prSm <= 0)
+alertcondition(ov_pbLong,  title="CCSV1 • Overlay: Pullback Long OK",  message="CCSV1 Overlay: Pullback long context OK (trend & pressure).")
+alertcondition(ov_pbShort, title="CCSV1 • Overlay: Pullback Short OK", message="CCSV1 Overlay: Pullback short context OK (trend & pressure).")
+
+osc_flipUp   = showOsc and crUp and vpo > 0 and agreeLong
+osc_flipDown = showOsc and crDn and vpo < 0 and agreeShort
+alertcondition(osc_flipUp,   title="CCSV1 • Osc: Funded Flip Up",   message="CCSV1 Osc: SlopeZ UP with positive VPO (HTF ok if enabled).")
+alertcondition(osc_flipDown, title="CCSV1 • Osc: Funded Flip Down", message="CCSV1 Osc: SlopeZ DOWN with negative VPO (HTF ok if enabled).")
+
+osc_pbLong  = showOsc and (zSlope >= 0) and (zStretch >= 0 and zStretch <= 0.7)  and (vpo >= 0) and agreeLong
+osc_pbShort = showOsc and (zSlope <= 0) and (zStretch <= 0 and zStretch >= -0.7) and (vpo <= 0) and agreeShort
+alertcondition(osc_pbLong,  title="CCSV1 • Osc: Pullback Long Ready",  message="CCSV1 Osc: Pullback (Long) — Stretch near 0, SlopeZ≥0, VPO≥0.")
+alertcondition(osc_pbShort, title="CCSV1 • Osc: Pullback Short Ready", message="CCSV1 Osc: Pullback (Short) — Stretch near 0, SlopeZ≤0, VPO≤0.")
+
+osc_exhLong = showOsc and (zStretch >  2.0) and ((zSlope < 0) or (vpo < 0)) and agreeLong
+osc_exhShort= showOsc and (zStretch < -2.0) and ((zSlope > 0) or (vpo > 0)) and agreeShort
+alertcondition(osc_exhLong,  title="CCSV1 • Osc: Exhaustion Risk (Long)",  message="CCSV1 Osc: Stretch > +2 with weakening momentum/pressure.")
+alertcondition(osc_exhShort, title="CCSV1 • Osc: Exhaustion Risk (Short)", message="CCSV1 Osc: Stretch < -2 with weakening momentum/pressure.")

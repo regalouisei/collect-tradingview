@@ -1,0 +1,375 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TradingView
+
+//@version=6
+indicator("CVD - Cumulative Volume Delta Candles", "CVD Candle", format = format.volume)
+
+// CVD - Cumulative Volume Delta Candles
+// v8, 2026.01.09
+
+// This code's style is based on the recommendations from the Pine Script User Manual's Style guide:
+//    https://www.tradingview.com/pine-script-docs/writing/style-guide/
+
+
+
+import PineCoders/Time/5 as PCtime
+import PineCoders/lower_tf/5 as PCltf
+import TradingView/ta/12 as TVta
+
+
+
+//#region ———————————————————— Constants and inputs
+
+
+// ————— Constants
+
+int     MS_IN_MIN   = 60 * 1000
+int     MS_IN_HOUR  = MS_IN_MIN  * 60
+int     MS_IN_DAY   = MS_IN_HOUR * 24
+
+// Default colors
+color   GRAY        = #808080ff
+color   LIME        = #00FF00ff
+color   MAROON      = #800000ff
+color   ORANGE      = #FF8000ff
+color   PINK        = #FF0080ff
+color   TEAL        = #008080ff
+color   BG_DIV      = color.new(ORANGE, 90)
+color   BG_RESETS   = color.new(GRAY, 90)
+
+// Reset conditions
+string  RST1 = "None"
+string  RST2 = "On a stepped higher timeframe"
+string  RST3 = "On a fixed higher timeframe..."
+string  RST4 = "At a fixed time..."
+string  RST5 = "At the beginning of the regular session"
+string  RST6 = "At the first visible chart bar"
+string  RST7 = "On trend changes..."
+
+// Trend types
+string  TR01 = "Supertrend"
+string  TR02 = "Aroon"
+string  TR03 = "Parabolic SAR"
+
+// Volume delta calculation modes
+string  VD01 = "Volume delta"
+string  VD02 = "Volume delta percent"
+
+// LTF precision options
+string LTF1  = "Covering most chart bars (least precise)"
+string LTF2  = "Covering some chart bars (less precise)"
+string LTF3  = "Covering less chart bars (more precise)"
+string LTF4  = "Covering few chart bars (very precise)"
+string LTF5  = "Covering the least chart bars (most precise)"
+string LTF6  = "~12 intrabars per chart bar"
+string LTF7  = "~24 intrabars per chart bar"
+string LTF8  = "~50 intrabars per chart bar"
+string LTF9  = "~100 intrabars per chart bar"
+string LTF10 = "~250 intrabars per chart bar"
+
+// Tooltips
+string TT_RST = (
+    "Specifies the reset behavior of the CVD calculation. When selecting one of the last three options, use the "
+    + "inputs below to specify additional settings for the reset conditions."
+)
+string TT_RST_HTF = (
+    "Specifies the higher timeframe to use for the 'On a fixed higher timeframe' CVD reset option. "
+    + "The CVD calculation resets at the open of a bar on the specified timeframe."
+)
+string TT_RST_TIME = (
+    "Hour: 0-23\nMinute: 0-59\nThese values specify the fixed time of day to use for the 'At a fixed time' CVD reset "
+    + "option. The CVD calculation resets when the time of day is after or equal to the bar's opening time and "
+    + "before the bar's closing time."
+)
+string TT_RST_TREND = (
+    "These values control the settings of the trend indicator to use for the 'On trend changes' CVD reset option. "
+    + "The CVD calculation resets when the indicator signals a change in trend direction.\n\n"
+    + "The first field specifies the length for the Aroon indicator or the ATR length for the Supertrend indicator.\n\n"
+    + "The second field specifies the ATR multiplier for the Supertrend indicator.\n\n"
+    + "The Parabolic SAR uses predefined settings. Neither field affects it."
+)
+string TT_TOTVOL = (
+    "If enabled and the calculation mode is 'Volume delta', the indicator projects each bar's total volume from the "
+    + "open of each CVD candle for visual comparison.\n\nThe 'Bodies' field specifies the transparency of the total "
+    + "volume candle bodies. A value of 0 means fully opaque, and 100 means completely transparent."
+)
+string TT_LINE = "Select to view a line plot displaying the close values of the CVD candles."
+string TT_LTF  = (
+    "Controls the number of intrabars that the indicator analyzes per chart bar. "
+    + "Increasing the intrabars per chart bar enables more precise calculations. However, it also reduces the number "
+    + "of chart bars that the indicator can analyze. "
+    + "The first five options determine the requested lower timeframe based on a desired relative amount of chart bar "
+    + "coverage. The last five determine the timeframe based on an approximate number of intrabars per chart bar."
+)
+string TT_MA = (
+    "Select to plot an average of the CVD. If the 'CVD resets' input is 'None', the indicator calculates a moving "
+    + "average with the length specified by the 'Length' field. Otherwise, it calculates the cumulative average of the "
+    + "CVD since the last reset."
+)
+
+
+// ————— Inputs
+
+string  resetInput              = input.string(RST2,         "CVD resets",                       inline = "00", options = [RST1, RST2, RST5, RST6, RST3, RST4, RST7], tooltip = TT_RST)
+string  fixedTfInput            = input.timeframe("D",       "  Fixed higher timeframe:",        tooltip = TT_RST_HTF)
+int     hourInput               = input.int(9,               "  Fixed time: Hour",               inline = "01", minval  = 0, maxval = 23)
+int     minuteInput             = input.int(30,              "Minute",                           inline = "01", minval  = 0, maxval = 59, tooltip = TT_RST_TIME)
+string  trendInput              = input.string(TR01,         "  Trend: ",                        inline = "02", options = [TR02, TR03, TR01])
+int     trendPeriodInput        = input.int(14,              " Length",                          inline = "02", minval = 2)
+float   trendValue2Input        = input.float(3.0,           "",                                 inline = "02", minval = 0.25, step = 0.25, tooltip = TT_RST_TREND)
+string  ltfModeInput            = input.string(LTF3,         "Intrabar precision",               inline = "03", options = [LTF1, LTF2, LTF3, LTF4, LTF5, LTF6, LTF7, LTF8, LTF9, LTF10], tooltip = TT_LTF)
+string  vdCalcModeInput         = input.string(VD01,         "Volume delta calculation",         inline = "04", options = [VD01, VD02])
+
+string  GRP1 = "Visuals"
+bool    showCandlesInput        = input.bool(true,           "CVD candles",                      inline = "11", group = GRP1)
+color   upColorInput            = input.color(LIME,          " 🡑",                               inline = "11", group = GRP1)
+color   dnColorInput            = input.color(PINK,          "🡓",                                inline = "11", group = GRP1)
+bool    colorDivBodiesInput     = input.bool(true,           "Color CVD bodies on divergences ", inline = "12", group = GRP1)
+color   upDivColorInput         = input.color(TEAL,          "🡑",                                inline = "12", group = GRP1)
+color   dnDivColorInput         = input.color(MAROON,        "🡓",                                inline = "12", group = GRP1)
+bool    showTotVolInput         = input.bool(false,          "Total volume candle borders",      inline = "13", group = GRP1)
+color   upTotVolColorInput      = input.color(TEAL,          "🡑",                                inline = "13", group = GRP1)
+color   dnTotVolColorInput      = input.color(MAROON,        "🡓",                                inline = "13", group = GRP1)
+int     totVolBodyTranspInput   = input.int(80,              "bodies",                           inline = "13", group = GRP1, minval = 0, maxval = 100, tooltip = TT_TOTVOL)
+bool    showLineInput           = input.bool(false,          "CVD line",                         inline = "14", group = GRP1)
+color   lineUpColorInput        = input.color(LIME,          " 🡑",                               inline = "14", group = GRP1)
+color   lineDnColorInput        = input.color(PINK,          "🡓",                                inline = "14", group = GRP1, tooltip = TT_LINE)
+bool    showMaInput             = input.bool(false,          "CVD MA",                           inline = "15", group = GRP1)
+color   maUpColorInput          = input.color(TEAL,          "  🡑",                              inline = "15", group = GRP1)
+color   maDnColorInput          = input.color(MAROON,        "🡓",                                inline = "15", group = GRP1)
+int     maPeriodInput           = input.int(20,              " Length",                          inline = "15", group = GRP1, minval = 2, tooltip = TT_MA)
+bool    bgDivInput              = input.bool(false,          "Color background on divergences ", inline = "16", group = GRP1)
+color   bgDivColorInput         = input.color(BG_DIV,        "",                                 inline = "16", group = GRP1)
+bool    bgResetInput            = input.bool(true,           "Color background on resets ",      inline = "17", group = GRP1)
+color   bgResetColorInput       = input.color(BG_RESETS,     "",                                 inline = "17", group = GRP1)
+bool    showZeroLineInput       = input.bool(true,           "Zero line",                        inline = "18", group = GRP1)
+bool    showInfoBoxInput        = input.bool(true,           "Show information box ",                           group = GRP1)
+string  infoBoxSizeInput        = input.string("small",      "Size ",                            inline = "19", group = GRP1, options = ["tiny", "small", "normal", "large", "huge", "auto"])
+string  infoBoxYPosInput        = input.string("bottom",     "↕",                                inline = "19", group = GRP1, options = ["top", "middle", "bottom"])
+string  infoBoxXPosInput        = input.string("right",      "↔",                                inline = "19", group = GRP1, options = ["left", "center", "right"])
+color   infoBoxColorInput       = input.color(color.gray,  "",                                 inline = "19", group = GRP1)
+color   infoBoxTxtColorInput    = input.color(color.white, "T",                                inline = "19", group = GRP1)
+//#endregion
+
+
+
+//#region ———————————————————— Functions
+
+
+// @function            Categorizes volume as upward or downward based on price action.
+// @returns             ([float, float]) A tuple containing the upward and downward volume values. The first value
+//                      is the bar's volume if the volume is upward. Otherwise, the second value is the bar's volume.
+//                      If a call to `request.security_lower_tf()` uses a call to this function as its `expression`
+//                      argument, it returns a tuple of "float" arrays containing the upward and downward volume for
+//                      each available intrabar in the chart bar.
+upDnIntrabarVolumes() =>
+    float upVol = 0.0
+    float dnVol = 0.0
+    switch
+        close > open     => upVol += volume
+        close < open     => dnVol -= volume
+        close > close[1] => upVol += volume
+        close < close[1] => dnVol -= volume
+        upVol[1] > 0     => upVol += volume
+        dnVol[1] < 0     => dnVol -= volume
+        close == open    => upVol += volume
+    [upVol, dnVol]
+
+
+// @function            Selects a string representing a higher timeframe based on the chart's timeframe.
+// @returns             (simple string) A timeframe string.
+htfStep() =>
+    int tfInMs = timeframe.in_seconds() * 1000
+    string result = switch
+        tfInMs <= MS_IN_MIN       => "60"
+        tfInMs <  MS_IN_HOUR * 3  => "1D"
+        tfInMs <= MS_IN_HOUR * 12 => "1W"
+        tfInMs <  MS_IN_DAY  * 7  => "1M"
+        =>                           "12M"
+
+
+// @function            Determines whether an intraday bar opens before or at a specified time of day and closes after
+//                      that time.
+// @param hours         (series int) The hour of the day.
+// @param minutes       (series int) The minute within the hour.
+// @returns             (bool) `true` if the bar's span includes the specified time of day, and `false` otherwise.
+timeReset(int hours, int minutes) =>
+    int openTime = timestamp(year, month, dayofmonth, hours, minutes, 0)
+    bool timeInBar = time <= openTime and time_close > openTime
+    bool result = timeframe.isintraday and not timeInBar[1] and timeInBar
+//#endregion
+
+
+
+//#region ———————————————————— Calculations
+
+
+// @variable A string representing the lower timeframe for which to retrieve intrabar data.
+var string ltfString = PCltf.ltf(ltfModeInput, LTF1, LTF2, LTF3, LTF4, LTF5, LTF6, LTF7, LTF8, LTF9, LTF10)
+
+// Retrieve the IDs of arrays containing upward and downward volume for each available intrabar in the current bar.
+[upVolumes, dnVolumes] = request.security_lower_tf(
+    syminfo.tickerid, ltfString, upDnIntrabarVolumes(), calc_bars_count = 200000
+)
+
+// Calculate the maximum volumes, total volume, and volume delta values.
+float totalUpVolume = nz(upVolumes.sum())
+float totalDnVolume = nz(dnVolumes.sum())
+float maxUpVolume   = nz(upVolumes.max())
+float maxDnVolume   = nz(dnVolumes.min())
+float totalVolume   = totalUpVolume - totalDnVolume
+float delta         = totalUpVolume + totalDnVolume
+float deltaPct      = delta / totalVolume
+bool  isDelta       = vdCalcModeInput == VD01
+float barDelta      = isDelta ? delta : deltaPct
+
+// Declare variables to track CVD and reset information.
+var float cvd = 0.0
+[reset, hasTrendDirection, trendIsUp, resetDescription] = switch resetInput
+    RST1 => [false, false, false, "No resets"]
+    RST2 => [timeframe.change(htfStep()), false, false, "Resets every " + htfStep()]
+    RST3 => [timeframe.change(fixedTfInput), false, false, "Resets every " + fixedTfInput]
+    RST4 => [
+         timeReset(hourInput, minuteInput), false, false,
+         str.format("Resets at {0,number,00}:{1,number,00}", hourInput, minuteInput)
+     ]
+    RST5 => [session.isfirstbar_regular, false, false, "Resets at the beginning of the session"]
+    RST6 => [time == chart.left_visible_bar_time, false, false, "Resets at the beginning of visible bars"]
+    RST7 =>
+        switch trendInput
+            TR01 =>
+                [_, direction] = ta.supertrend(trendValue2Input, trendPeriodInput)
+                [ta.change(direction, 1) != 0, true, direction == -1, "Resets on Supertrend changes"]
+            TR02 =>
+                [up, dn] = TVta.aroon(trendPeriodInput)
+                [ta.cross(up, dn), true, ta.crossover(up, dn), "Resets on Aroon changes"]
+            TR03 =>
+                float psar = ta.sar(0.02, 0.02, 0.2)
+                [ta.cross(psar, close), true, ta.crossunder(psar, close), "Resets on PSAR changes"]
+    => [false, false, false, na]
+
+// Rest the CVD to 0 when the `reset` value is `true`.
+if reset
+    cvd := 0
+
+// Calculate OHLC values for the CVD candles.
+float cvdO = cvd
+float cvdC = cvdO + barDelta
+float cvdH = not isDelta ? math.max(cvdO, cvdC) : cvdO + maxUpVolume
+float cvdL = not isDelta ? math.min(cvdO, cvdC) : cvdO + maxDnVolume
+cvd += barDelta
+
+// Calculate the average CVD.
+var float ma = cvd
+var cvdValues = array.new<float>()
+if resetInput == RST1
+    ma := ta.sma(cvdC, maPeriodInput)
+else
+    if reset
+        cvdValues.clear()
+        cvdValues.push(cvd)
+    else
+        cvdValues.push(cvd)
+    ma := cvdValues.avg()
+
+// Calculate OHLC values for the total volume candles.
+float totalVolumeLevel = cvdO + (totalVolume * math.sign(barDelta))
+[totalVolO, totalVolH, totalVolL, totalVolC] = if showTotVolInput and isDelta
+    [cvdO, math.max(cvdO, totalVolumeLevel), math.min(cvdO, totalVolumeLevel), totalVolumeLevel]
+else
+    [na, na, na, na]
+
+// Retrieve intrabar and chart bar information for the table display.
+[intrabars, chartBarsCovered, avgIntrabars] = PCltf.ltfStats(upVolumes)
+int chartBars = bar_index + 1
+
+// Detect divergences between volume delta and the bar's polarity.
+bool divergence = delta != 0 and math.sign(delta) != math.sign(close - open)
+//#endregion
+
+
+
+//#region ———————————————————— Visuals
+
+
+// Calculate candle colors.
+color candleColor = (
+    delta > 0 ?
+    colorDivBodiesInput and divergence ?
+    upDivColorInput : upColorInput : colorDivBodiesInput and divergence ?
+    dnDivColorInput : dnColorInput
+)
+color totVolCandleColor = delta > 0 ? upTotVolColorInput : dnTotVolColorInput
+
+// Display key values in the Data Window.
+displayLocation = display.data_window
+plot(delta,             "Volume delta for the bar",     candleColor,  display = displayLocation)
+plot(totalUpVolume,     "Up volume for the bar",        upColorInput, display = displayLocation)
+plot(totalDnVolume,     "Dn volume for the bar",        dnColorInput, display = displayLocation)
+plot(totalVolume,       "Total volume",                 display = displayLocation)
+plot(na,                "═════════════════",            display = displayLocation)
+plot(cvdO,              "CVD before this bar",          display = displayLocation)
+plot(cvdC,              "CVD after this bar",           display = displayLocation)
+plot(maxUpVolume,       "Max intrabar up volume",       upColorInput, display = displayLocation)
+plot(maxDnVolume,       "Max intrabar dn volume",       dnColorInput, display = displayLocation)
+plot(intrabars,         "Intrabars in this bar",        display = displayLocation)
+plot(avgIntrabars,      "Average intrabars",            display = displayLocation)
+plot(chartBarsCovered,  "Chart bars covered",           display = displayLocation)
+plot(bar_index + 1,     "Chart bars",                   display = displayLocation)
+plot(na,                "═════════════════",            display = displayLocation)
+
+// Plot the total volume candles.
+plotcandle(
+    totalVolO, totalVolH, totalVolL, totalVolC, "CVD", color = color.new(totVolCandleColor, totVolBodyTranspInput),
+    wickcolor = totVolCandleColor, bordercolor = totVolCandleColor
+)
+// Plot the CVD candles.
+plotcandle(
+    showCandlesInput ? cvdO : na, cvdH, cvdL, cvdC, "CVD", color = candleColor,
+    wickcolor = candleColor, bordercolor = candleColor
+)
+// Plot the CVD line and average.
+plot(showLineInput ? cvdC : na, "CVD line", cvdC > 0 ? lineUpColorInput : lineDnColorInput)
+plot(showMaInput ? ma : na, "CVD MA", reset ? na : ma > 0 ? maUpColorInput : maDnColorInput)
+// Display a horizontal line at 0.
+hline(showZeroLineInput ? 0 : na, "Zero", GRAY, hline.style_dotted)
+
+// Plot an up or down arrow when a reset occurs based on trend changes.
+plotchar(hasTrendDirection and reset and trendIsUp,     "Up trend", "▲", location.top, upColorInput)
+plotchar(hasTrendDirection and reset and not trendIsUp, "Dn trend", "▼", location.top, dnColorInput)
+
+// Color the background on bars where resets or divergences occur.
+bgcolor(bgResetInput and reset ? bgResetColorInput : bgDivInput and divergence ? bgDivColorInput : na)
+
+// Create a table to display intrabar information on the last historical bar.
+if showInfoBoxInput and barstate.islastconfirmedhistory
+    var table infoBox = table.new(infoBoxYPosInput + "_" + infoBoxXPosInput, 1, 1)
+    color infoBoxBgColor = infoBoxColorInput
+    string txt = str.format(
+        "{0}\nUses intrabars at {1}\nAvg intrabars per chart bar: {2,number,#.##}\n"
+        + "Chart bars covered: {3} / {4} ({5,number,percent})",
+        resetDescription, PCtime.formattedNoOfPeriods(timeframe.in_seconds(ltfString) * 1000),
+        avgIntrabars, chartBarsCovered, bar_index + 1, chartBarsCovered / (bar_index + 1)
+    )
+    if avgIntrabars < 5
+        txt += "\nThis quantity of intrabars is dangerously small.\nResults will not be as reliable with so few."
+        infoBoxBgColor := color.red
+    table.cell(
+        infoBox, 0, 0, txt, text_color = infoBoxTxtColorInput, text_size = infoBoxSizeInput, bgcolor = infoBoxBgColor
+    )
+//#endregion
+
+
+
+//#region ———————————————————— Errors
+
+
+if resetInput == RST3 and timeframe.in_seconds(fixedTfInput) <= timeframe.in_seconds()
+    runtime.error("The higher timeframe for resets must be greater than the chart's timeframe.")
+else if resetInput == RST4 and not timeframe.isintraday
+    runtime.error("Resets at a fixed time of day work on intraday charts only.")
+else if ta.cum(totalVolume) == 0 and barstate.islast
+    runtime.error("No volume is provided by the data vendor.")
+else if ta.cum(intrabars) == 0 and barstate.islast
+    runtime.error("No intrabar information is available for the '" + ltfString + "' timeframe.")
+//#endregion

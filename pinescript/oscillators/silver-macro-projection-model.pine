@@ -1,0 +1,321 @@
+// This Pine Script™ code is subject to the terms of the Mozilla// https://x.com/bigcitytom  Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Silver Macro Projection Model - [BCT]
+// © bigcitytom
+
+// Main Indicator (Silver Projection Model - [BCT])
+// Complimentary Indicator (Silver Projection Divergence - [BCT])
+// This overlay indicator projects where silver should be trading based on the macro relationships:
+
+// Correlation-Weighted Composite: Calculates rolling correlations between silver and each factor, then weights their influence dynamically based on correlation strength
+// Gold/Silver Ratio: Uses the historical gold/silver ratio mean-reversion tendency
+// M2 Money Supply Anchor: Long-term relationship between silver and monetary expansion
+// Combined Projection: Blends all three methods (50% composite, 35% gold ratio, 15% M2)
+
+// The green/red fill shows when silver is trading below/above its projected value.
+
+
+//@version=6
+indicator("Silver Macro Projection Model", shorttitle="Silver Proj", overlay=false, precision=4)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Lookback Periods
+i_corrPeriod    = input.int(60, "Correlation Period", minval=20, maxval=252, group="Lookback Settings")
+i_regPeriod     = input.int(120, "Regression Period", minval=30, maxval=504, group="Lookback Settings")
+i_smoothPeriod  = input.int(10, "Smoothing Period", minval=1, maxval=50, group="Lookback Settings")
+
+// Symbol Inputs
+i_silverSym     = input.symbol("COMEX:SI1!", "Silver Symbol", group="Symbols")
+i_goldSym       = input.symbol("COMEX:GC1!", "Gold Symbol", group="Symbols")
+i_m2Sym         = input.symbol("ECONOMICS:USM2", "M2 Money Supply", group="Symbols")
+i_dxySym        = input.symbol("TVC:DXY", "US Dollar Index", group="Symbols")
+i_spxSym        = input.symbol("SP:SPX", "S&P 500", group="Symbols")
+i_djiSym        = input.symbol("DJ:DJI", "Dow Jones", group="Symbols")
+i_ndxSym        = input.symbol("NASDAQ:NDX", "Nasdaq 100", group="Symbols")
+i_rutSym        = input.symbol("TVC:RUT", "Russell 2000", group="Symbols")
+
+// Weight Adjustments (optional manual override)
+i_useAutoWeights = input.bool(true, "Use Auto Correlation Weights", group="Weight Settings")
+i_goldWeight    = input.float(1.0, "Gold Weight", minval=0, maxval=3, step=0.1, group="Weight Settings")
+i_m2Weight      = input.float(1.0, "M2 Weight", minval=0, maxval=3, step=0.1, group="Weight Settings")
+i_dxyWeight     = input.float(1.0, "DXY Weight", minval=0, maxval=3, step=0.1, group="Weight Settings")
+i_equityWeight  = input.float(0.5, "Equity Index Weight", minval=0, maxval=3, step=0.1, group="Weight Settings")
+
+// Display Settings
+i_showActual    = input.bool(true, "Show Actual Silver", group="Display")
+i_showProjected = input.bool(true, "Show Projected Silver", group="Display")
+i_showDivergence = input.bool(true, "Show Divergence Panel", group="Display")
+i_showCorrelations = input.bool(false, "Show Correlation Table", group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DATA FETCHING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Fetch all securities - using daily timeframe for consistency
+silver  = request.security(i_silverSym, "D", close, lookahead=barmerge.lookahead_off)
+gold    = request.security(i_goldSym, "D", close, lookahead=barmerge.lookahead_off)
+m2      = request.security(i_m2Sym, "D", close, lookahead=barmerge.lookahead_off)
+dxy     = request.security(i_dxySym, "D", close, lookahead=barmerge.lookahead_off)
+spx     = request.security(i_spxSym, "D", close, lookahead=barmerge.lookahead_off)
+dji     = request.security(i_djiSym, "D", close, lookahead=barmerge.lookahead_off)
+ndx     = request.security(i_ndxSym, "D", close, lookahead=barmerge.lookahead_off)
+rut     = request.security(i_rutSym, "D", close, lookahead=barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate percentage returns
+pctReturn(src, len) =>
+    (src - src[len]) / src[len] * 100
+
+// Normalize a series to z-score
+zScore(src, len) =>
+    mean = ta.sma(src, len)
+    std = ta.stdev(src, len)
+    std != 0 ? (src - mean) / std : 0
+
+// Simple linear regression slope
+regSlope(y, x, len) =>
+    sumX = 0.0
+    sumY = 0.0
+    sumXY = 0.0
+    sumX2 = 0.0
+    for i = 0 to len - 1
+        xi = x[i]
+        yi = y[i]
+        sumX := sumX + xi
+        sumY := sumY + yi
+        sumXY := sumXY + xi * yi
+        sumX2 := sumX2 + xi * xi
+    n = float(len)
+    denom = n * sumX2 - sumX * sumX
+    denom != 0 ? (n * sumXY - sumX * sumY) / denom : 0
+
+// Simple linear regression intercept
+regIntercept(y, x, len, slope) =>
+    ta.sma(y, len) - slope * ta.sma(x, len)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CORRELATION CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate rolling correlations between silver and each factor
+corrGold    = ta.correlation(silver, gold, i_corrPeriod)
+corrM2      = ta.correlation(silver, m2, i_corrPeriod)
+corrDXY     = ta.correlation(silver, dxy, i_corrPeriod)
+corrSPX     = ta.correlation(silver, spx, i_corrPeriod)
+corrDJI     = ta.correlation(silver, dji, i_corrPeriod)
+corrNDX     = ta.correlation(silver, ndx, i_corrPeriod)
+corrRUT     = ta.correlation(silver, rut, i_corrPeriod)
+
+// Create equity composite correlation (average of equity indices)
+corrEquity  = (corrSPX + corrDJI + corrNDX + corrRUT) / 4
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Z-SCORE NORMALIZATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Normalize all inputs to z-scores for comparable scaling
+zSilver     = zScore(silver, i_regPeriod)
+zGold       = zScore(gold, i_regPeriod)
+zM2         = zScore(m2, i_regPeriod)
+zDXY        = zScore(dxy, i_regPeriod)
+zSPX        = zScore(spx, i_regPeriod)
+zDJI        = zScore(dji, i_regPeriod)
+zNDX        = zScore(ndx, i_regPeriod)
+zRUT        = zScore(rut, i_regPeriod)
+
+// Equity composite z-score
+zEquity     = (zSPX + zDJI + zNDX + zRUT) / 4
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEIGHT CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate absolute correlation weights (higher correlation = more weight)
+absGoldCorr     = math.abs(corrGold)
+absM2Corr       = math.abs(corrM2)
+absDXYCorr      = math.abs(corrDXY)
+absEquityCorr   = math.abs(corrEquity)
+
+// Sum of absolute correlations for normalization
+totalAbsCorr    = absGoldCorr + absM2Corr + absDXYCorr + absEquityCorr
+
+// Normalized weights based on correlation strength
+autoGoldW       = totalAbsCorr != 0 ? absGoldCorr / totalAbsCorr : 0.25
+autoM2W         = totalAbsCorr != 0 ? absM2Corr / totalAbsCorr : 0.25
+autoDXYW        = totalAbsCorr != 0 ? absDXYCorr / totalAbsCorr : 0.25
+autoEquityW     = totalAbsCorr != 0 ? absEquityCorr / totalAbsCorr : 0.25
+
+// Final weights (auto or manual)
+finalGoldW      = i_useAutoWeights ? autoGoldW : i_goldWeight / (i_goldWeight + i_m2Weight + i_dxyWeight + i_equityWeight)
+finalM2W        = i_useAutoWeights ? autoM2W : i_m2Weight / (i_goldWeight + i_m2Weight + i_dxyWeight + i_equityWeight)
+finalDXYW       = i_useAutoWeights ? autoDXYW : i_dxyWeight / (i_goldWeight + i_m2Weight + i_dxyWeight + i_equityWeight)
+finalEquityW    = i_useAutoWeights ? autoEquityW : i_equityWeight / (i_goldWeight + i_m2Weight + i_dxyWeight + i_equityWeight)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROJECTION MODEL
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Method 1: Correlation-Weighted Z-Score Composite
+// Adjust sign based on expected relationship (DXY typically inverse to silver)
+dxySign = corrDXY < 0 ? -1 : 1
+
+compositZ = (zGold * finalGoldW * math.sign(corrGold)) + (zM2 * finalM2W * math.sign(corrM2)) + (zDXY * finalDXYW * dxySign) + (zEquity * finalEquityW * math.sign(corrEquity))
+
+// Convert composite z-score back to silver price scale
+silverMean  = ta.sma(silver, i_regPeriod)
+silverStd   = ta.stdev(silver, i_regPeriod)
+projectedZ  = silverMean + compositZ * silverStd
+
+// Method 2: Gold-to-Silver Ratio Based Projection
+goldSilverRatio = gold / silver
+avgGSRatio      = ta.sma(goldSilverRatio, i_regPeriod)
+projectedGSR    = gold / avgGSRatio
+
+// Method 3: M2-Adjusted Projection (Silver tends to track money supply over time)
+silverM2Ratio   = silver / (m2 / 1000)  // Scale M2 for readability
+avgSM2Ratio     = ta.sma(silverM2Ratio, i_regPeriod)
+projectedM2     = (m2 / 1000) * avgSM2Ratio
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMBINED PROJECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Weighted combination of all projection methods
+// Higher weight to more reliable methods
+w1 = 0.50  // Z-score composite (most comprehensive)
+w2 = 0.35  // Gold/Silver ratio (historically reliable)
+w3 = 0.15  // M2 adjusted (long-term anchor)
+
+combinedProjection = (projectedZ * w1) + (projectedGSR * w2) + (projectedM2 * w3)
+
+// Smooth the projection to reduce noise
+smoothedProjection = ta.ema(combinedProjection, i_smoothPeriod)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DIVERGENCE CALCULATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate divergence (actual - projected)
+divergence      = silver - smoothedProjection
+divergencePct   = smoothedProjection != 0 ? (divergence / smoothedProjection) * 100 : 0
+
+// Divergence z-score for extreme detection
+divergenceZ     = zScore(divergence, i_regPeriod)
+
+// Signal levels
+extremeOver     = divergenceZ > 2      // Silver extremely overvalued
+moderateOver    = divergenceZ > 1      // Silver moderately overvalued
+extremeUnder    = divergenceZ < -2     // Silver extremely undervalued
+moderateUnder   = divergenceZ < -1     // Silver moderately undervalued
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Main price plots
+actualColor     = color.new(color.silver, 0)
+projectedColor  = color.new(color.yellow, 0)
+fillColorOver   = color.new(color.red, 85)
+fillColorUnder  = color.new(color.green, 85)
+
+p1 = plot(i_showActual ? silver : na, "Actual Silver", actualColor, 2)
+p2 = plot(i_showProjected ? smoothedProjection : na, "Projected Silver", projectedColor, 2, plot.style_line)
+
+// Fill between actual and projected
+fillColor = divergence > 0 ? fillColorOver : fillColorUnder
+fill(p1, p2, fillColor)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DIVERGENCE PANEL (Bottom)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Horizontal lines for reference
+hline(0, "Zero Line", color.gray, hline.style_dashed)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFORMATION TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 4, 10, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(infoTable, 0, 0, "Factor", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Correlation", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 2, 0, "Weight", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 0, "Z-Score", text_color=color.white, text_size=size.small)
+    
+    // Gold row
+    goldCorrColor = corrGold > 0 ? color.green : color.red
+    table.cell(infoTable, 0, 1, "Gold", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(corrGold, "#.##"), text_color=goldCorrColor, text_size=size.small)
+    table.cell(infoTable, 2, 1, str.tostring(finalGoldW * 100, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 1, str.tostring(zGold, "#.##"), text_color=color.white, text_size=size.small)
+    
+    // M2 row
+    m2CorrColor = corrM2 > 0 ? color.green : color.red
+    table.cell(infoTable, 0, 2, "M2 Supply", text_color=color.aqua, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(corrM2, "#.##"), text_color=m2CorrColor, text_size=size.small)
+    table.cell(infoTable, 2, 2, str.tostring(finalM2W * 100, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 2, str.tostring(zM2, "#.##"), text_color=color.white, text_size=size.small)
+    
+    // DXY row
+    dxyCorrColor = corrDXY > 0 ? color.green : color.red
+    table.cell(infoTable, 0, 3, "DXY", text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(corrDXY, "#.##"), text_color=dxyCorrColor, text_size=size.small)
+    table.cell(infoTable, 2, 3, str.tostring(finalDXYW * 100, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 3, str.tostring(zDXY, "#.##"), text_color=color.white, text_size=size.small)
+    
+    // Equity Composite row
+    eqCorrColor = corrEquity > 0 ? color.green : color.red
+    table.cell(infoTable, 0, 4, "Equities", text_color=color.purple, text_size=size.small)
+    table.cell(infoTable, 1, 4, str.tostring(corrEquity, "#.##"), text_color=eqCorrColor, text_size=size.small)
+    table.cell(infoTable, 2, 4, str.tostring(finalEquityW * 100, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 4, str.tostring(zEquity, "#.##"), text_color=color.white, text_size=size.small)
+    
+    // Separator
+    table.cell(infoTable, 0, 5, "─────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 5, "─────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 2, 5, "─────", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 3, 5, "─────", text_color=color.gray, text_size=size.small)
+    
+    // Results section
+    table.cell(infoTable, 0, 6, "Actual:", text_color=color.silver, text_size=size.small)
+    table.cell(infoTable, 1, 6, "$" + str.tostring(silver, "#.##"), text_color=color.silver, text_size=size.small)
+    table.cell(infoTable, 2, 6, "", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 6, "", text_color=color.white, text_size=size.small)
+    
+    table.cell(infoTable, 0, 7, "Projected:", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 7, "$" + str.tostring(smoothedProjection, "#.##"), text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 2, 7, "", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 3, 7, "", text_color=color.white, text_size=size.small)
+    
+    // Divergence with color coding
+    divColor = divergencePct > 5 ? color.red : divergencePct < -5 ? color.green : color.gray
+    divText = divergence > 0 ? "Overvalued" : "Undervalued"
+    table.cell(infoTable, 0, 8, "Divergence:", text_color=divColor, text_size=size.small)
+    table.cell(infoTable, 1, 8, str.tostring(divergencePct, "#.#") + "%", text_color=divColor, text_size=size.small)
+    table.cell(infoTable, 2, 8, divText, text_color=divColor, text_size=size.small)
+    table.cell(infoTable, 3, 8, "", text_color=color.white, text_size=size.small)
+    
+    // Signal
+    signalText = extremeUnder ? "STRONG BUY" : moderateUnder ? "BUY" : extremeOver ? "STRONG SELL" : moderateOver ? "SELL" : "NEUTRAL"
+    signalColor = extremeUnder ? color.lime : moderateUnder ? color.green : extremeOver ? color.red : moderateOver ? color.orange : color.gray
+    table.cell(infoTable, 0, 9, "Signal:", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 9, signalText, text_color=signalColor, text_size=size.small)
+    table.cell(infoTable, 2, 9, "Z: " + str.tostring(divergenceZ, "#.##"), text_color=signalColor, text_size=size.small)
+    table.cell(infoTable, 3, 9, "", text_color=color.white, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(extremeUnder, "Silver Extremely Undervalued", "Silver is trading significantly below projected value - potential buy signal")
+alertcondition(extremeOver, "Silver Extremely Overvalued", "Silver is trading significantly above projected value - potential sell signal")
+alertcondition(ta.crossover(silver, smoothedProjection), "Silver Crossed Above Projection", "Actual silver price crossed above projected price")
+alertcondition(ta.crossunder(silver, smoothedProjection), "Silver Crossed Below Projection", "Actual silver price crossed below projected price")

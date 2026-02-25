@@ -1,0 +1,488 @@
+//@version=6
+indicator("Rachev Regime Analyzer", overlay=false, max_bars_back=500)
+ 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📊 RACHEV RATIO & MARKET REGIME INDICATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+// Author: GForge
+// 
+// The Rachev Ratio measures the ratio of expected tail gains to expected tail 
+// losses, providing insight into asymmetric risk-reward characteristics. This 
+// enhanced version includes regime filtering across multiple assets to identify
+// broad market conditions.
+// Key Features:
+// • Advanced Ratio calculation with log/simple return options
+// • Multi-asset regime aggregation across crypto/stocks
+// • Expanded dynamic color schemes and visual signals
+// • Improved statistical confidence with tail sampling
+// • Customizable thresholds, alerts, and UI elements
+// • Optional histogram for ratio distribution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                            USER INPUTS                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// === MAIN SETTINGS ===
+g_main = "┃ Main Settings"
+mode = input.string("Single Asset", "Operating Mode", 
+     options=["Single Asset", "Multi-Asset Regime"], 
+     group=g_main,
+     tooltip="Single Asset: Analyze current chart\nMulti-Asset: Aggregate regime across watchlist")
+
+lookback = input.int(40, "Lookback Period", 
+     minval=20, maxval=200, step=5, 
+     group=g_main,
+     tooltip="Number of bars for Rachev calculation (20-200)")
+
+alpha = input.float(0.10, "Tail Percentile (α)", 
+     minval=0.05, maxval=0.30, step=0.01, 
+     group=g_main,
+     tooltip="Defines tail events (0.10 = 10% tails). Lower = more extreme events")
+
+return_type = input.string("Log", "Return Type", 
+     options=["Log", "Simple"], 
+     group=g_main,
+     tooltip="Log: Better for normalization\nSimple: Standard percentage")
+
+// === THRESHOLDS ===
+g_thresh = "┃ Signal Thresholds"
+bull_threshold = input.float(1.2, "Bullish Threshold", 
+     minval=0.8, maxval=3.0, step=0.1, 
+     group=g_thresh,
+     tooltip="Rachev > this value signals bullish regime")
+
+bear_threshold = input.float(0.8, "Bearish Threshold", 
+     minval=0.3, maxval=1.2, step=0.1, 
+     group=g_thresh,
+     tooltip="Rachev < this value signals bearish regime")
+
+// === MULTI-ASSET WATCHLIST ===
+g_assets = "┃ Multi-Asset Watchlist"
+use_multi = mode == "Multi-Asset Regime"
+
+asset1 = input.symbol("BINANCE:BTCUSDT", "Asset 1", group=g_assets, inline="a1")
+w1 = input.float(1.0, "", minval=0.1, maxval=2.0, step=0.1, group=g_assets, inline="a1", tooltip="Weight")
+
+asset2 = input.symbol("BINANCE:ETHUSDT", "Asset 2", group=g_assets, inline="a2")
+w2 = input.float(1.0, "", minval=0.1, maxval=2.0, step=0.1, group=g_assets, inline="a2", tooltip="Weight")
+
+asset3 = input.symbol("BINANCE:SOLUSDT", "Asset 3", group=g_assets, inline="a3")
+w3 = input.float(0.8, "", minval=0.1, maxval=2.0, step=0.1, group=g_assets, inline="a3", tooltip="Weight")
+
+asset4 = input.symbol("BINANCE:XRPUSDT", "Asset 4", group=g_assets, inline="a4")
+w4 = input.float(0.7, "", minval=0.1, maxval=2.0, step=0.1, group=g_assets, inline="a4", tooltip="Weight")
+
+asset5 = input.symbol("BINANCE:DOGEUSDT", "Asset 5", group=g_assets, inline="a5")
+w5 = input.float(0.6, "", minval=0.1, maxval=2.0, step=0.1, group=g_assets, inline="a5", tooltip="Weight")
+
+// === DISPLAY OPTIONS ===
+g_display = "┃ Display & Styling"
+show_signals = input.bool(true, "Show Buy/Sell Signals", group=g_display)
+show_table = input.bool(true, "Show Info Table", group=g_display)
+show_bg = input.bool(true, "Background Color Regime", group=g_display)
+show_ma = input.bool(true, "Show Moving Average", group=g_display)
+ma_length = input.int(10, "MA Length", minval=3, maxval=50, group=g_display)
+show_hist = input.bool(false, "Show Ratio Histogram", group=g_display)
+
+color_scheme = input.string("Gradient", "Color Scheme", 
+     options=["Gradient", "Classic", "Neon", "Monochrome", "Dark Mode", "Pastel"],
+     group=g_display)
+
+// === ALERTS ===
+g_alerts = "┃ Alert Settings"
+alert_bullish = input.bool(true, "Alert: Bullish Cross", group=g_alerts)
+alert_bearish = input.bool(true, "Alert: Bearish Cross", group=g_alerts)
+alert_regime = input.bool(false, "Alert: Regime Change", group=g_alerts)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                        COLOR SCHEME DEFINITIONS                              ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// Color scheme function (expanded options)
+f_get_colors(scheme, ratio) =>
+    color col_bull = na
+    color col_bear = na
+    color col_neutral = na
+    color col_bg_bull = na
+    color col_bg_bear = na
+    
+    if scheme == "Gradient"
+        intensity = math.abs(ratio - 1.0) * 100
+        col_bull := ratio > 1.0 ? color.from_gradient(ratio, 1.0, 2.0, color.new(#26A69A, 70), color.new(#00E676, 0)) : color.new(#546E7A, 80)
+        col_bear := ratio < 1.0 ? color.from_gradient(ratio, 0.3, 1.0, color.new(#EF5350, 0), color.new(#FF6B6B, 70)) : color.new(#546E7A, 80)
+        col_neutral := color.new(#685e50, 50)
+        col_bg_bull := color.new(#26A69A, 95)
+        col_bg_bear := color.new(#EF5350, 95)
+    else if scheme == "Classic"
+        col_bull := color.new(#089981, 0)
+        col_bear := color.new(#F23645, 0)
+        col_neutral := color.new(#787B86, 50)
+        col_bg_bull := color.new(#089981, 97)
+        col_bg_bear := color.new(#F23645, 97)
+    else if scheme == "Neon"
+        col_bull := color.new(#00FF41, 0)
+        col_bear := color.new(#FF006E, 0)
+        col_neutral := color.new(#8B00FF, 50)
+        col_bg_bull := color.new(#00FF41, 96)
+        col_bg_bear := color.new(#FF006E, 96)
+    else if scheme == "Monochrome"
+        col_bull := color.new(#FFFFFF, 0)
+        col_bear := color.new(#404040, 0)
+        col_neutral := color.new(#A0A0A0, 50)
+        col_bg_bull := color.new(#FFFFFF, 97)
+        col_bg_bear := color.new(#404040, 97)
+    else if scheme == "Dark Mode"
+        col_bull := color.new(#4CAF50, 0)
+        col_bear := color.new(#F44336, 0)
+        col_neutral := color.new(#9E9E9E, 50)
+        col_bg_bull := color.new(#4CAF50, 98)
+        col_bg_bear := color.new(#F44336, 98)
+    else // Pastel
+        col_bull := color.new(#A5D6A7, 0)
+        col_bear := color.new(#EF9A9A, 0)
+        col_neutral := color.new(#FFF59D, 50)
+        col_bg_bull := color.new(#A5D6A7, 95)
+        col_bg_bear := color.new(#EF9A9A, 95)
+    
+    [col_bull, col_bear, col_neutral, col_bg_bull, col_bg_bear]
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                      ENHANCED RACHEV RATIO FUNCTION                          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+f_rachev_ratio(src, lb, alp, ret_type) =>
+    // Validate inputs
+    if na(src) or lb < 20
+        [na, na, na]
+    else
+        float[] returns = array.new_float(lb)
+        int valid_count = 0
+        
+        for i = 1 to lb
+            if not na(src[i]) and not na(src[i-1]) and src[i] > 0 and src[i-1] > 0
+                float ret = ret_type == "Log" ? math.log(src[i-1] / src[i]) : (src[i-1] - src[i]) / src[i]
+                array.set(returns, valid_count, ret)
+                valid_count += 1
+        
+        if valid_count < 20
+            [na, na, na]
+        else
+            // Trim array to valid size
+            array.slice(returns, 0, valid_count)
+            
+            // Sort returns for tail analysis
+            float[] sorted_rets = array.copy(returns)
+            array.sort(sorted_rets)
+            
+            // Calculate tail count (minimum 2 observations)
+            int tail_cnt = math.max(2, math.round(valid_count * alp))
+            
+            // Expected Tail Loss (ETL) - Average magnitude of worst returns (losses)
+            float etl_sum = 0.0
+            for j = 0 to tail_cnt - 1
+                float tail_val = array.get(sorted_rets, j)
+                etl_sum += tail_val < 0 ? -tail_val : 0.0  // Only count losses, magnitude
+            float etl = tail_cnt > 0 ? etl_sum / tail_cnt : 0.0001  // Avoid zero
+            
+            // Expected Tail Gain (ETG) - Average of best returns (gains)
+            float etg_sum = 0.0
+            for j = 0 to tail_cnt - 1
+                float tail_val = array.get(sorted_rets, valid_count - 1 - j)
+                etg_sum += tail_val > 0 ? tail_val : 0.0  // Only count gains
+            float etg = tail_cnt > 0 ? etg_sum / tail_cnt : 0.0
+            
+            // Rachev Ratio calculation with safety checks
+            float rachev = etl > 0.0001 ? etg / etl : (etg > 0 ? 10.0 : 1.0)
+            
+            // Cap extreme values for visualization
+            float rachev_capped = math.max(0.1, math.min(rachev, 5.0))
+            
+            // Calculate confidence (factoring sample size and tail count)
+            float confidence = math.min(100, (valid_count / lb) * 100 * (tail_cnt / 4.0))  // Slight boost for tails
+            
+            [rachev_capped, confidence, valid_count]
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                   ENHANCED MULTI-ASSET REGIME FUNCTION                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+f_aggregate_regime(r1, r2, r3, r4, r5, c1, c2, c3, c4, c5, w1, w2, w3, w4, w5) =>
+    float rachev_sum = 0.0
+    float weight_sum = 0.0
+    int count = 0
+    int bullish_cnt = 0
+    int bearish_cnt = 0
+    float avg_confidence = 0.0
+    
+    // Process asset 1
+    if not na(r1) and r1 > 0.1 and r1 < 5.0
+        rachev_sum += r1 * w1
+        weight_sum += w1
+        avg_confidence += c1
+        count += 1
+        if r1 > 1.3
+            bullish_cnt += 1
+        else if r1 < 0.7
+            bearish_cnt += 1
+    
+    // Process asset 2
+    if not na(r2) and r2 > 0.1 and r2 < 5.0
+        rachev_sum += r2 * w2
+        weight_sum += w2
+        avg_confidence += c2
+        count += 1
+        if r2 > 1.3
+            bullish_cnt += 1
+        else if r2 < 0.7
+            bearish_cnt += 1
+    
+    // Process asset 3
+    if not na(r3) and r3 > 0.1 and r3 < 5.0
+        rachev_sum += r3 * w3
+        weight_sum += w3
+        avg_confidence += c3
+        count += 1
+        if r3 > 1.3
+            bullish_cnt += 1
+        else if r3 < 0.7
+            bearish_cnt += 1
+    
+    // Process asset 4
+    if not na(r4) and r4 > 0.1 and r4 < 5.0
+        rachev_sum += r4 * w4
+        weight_sum += w4
+        avg_confidence += c4
+        count += 1
+        if r4 > 1.3
+            bullish_cnt += 1
+        else if r4 < 0.7
+            bearish_cnt += 1
+    
+    // Process asset 5
+    if not na(r5) and r5 > 0.1 and r5 < 5.0
+        rachev_sum += r5 * w5
+        weight_sum += w5
+        avg_confidence += c5
+        count += 1
+        if r5 > 1.3
+            bullish_cnt += 1
+        else if r5 < 0.7
+            bearish_cnt += 1
+    
+    if count == 0
+        [na, na, na, na, na]
+    else
+        // Weighted average Rachev
+        float avg_rachev = rachev_sum / weight_sum
+        
+        // Calculate percentages
+        float bull_pct = (bullish_cnt / count) * 100
+        float bear_pct = (bearish_cnt / count) * 100
+        float conf_pct = avg_confidence / count
+        
+        // Regime score: -1 (bearish) to +1 (bullish)
+        float regime = 0.0
+        if avg_rachev > 1.4 and bull_pct > 60
+            regime := 1.0
+        else if avg_rachev > 1.2 and bull_pct > 40
+            regime := 0.7
+        else if avg_rachev > 1.0 and bull_pct > 25
+            regime := 0.4
+        else if avg_rachev > 0.9
+            regime := 0.0
+        else if avg_rachev > 0.7 or bear_pct > 40
+            regime := -0.4
+        else if avg_rachev > 0.5 or bear_pct > 60
+            regime := -0.7
+        else
+            regime := -1.0
+        
+        [avg_rachev, regime, bull_pct, bear_pct, conf_pct]
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                              MAIN CALCULATION                                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// Fetch multi-asset data if needed
+src1 = use_multi ? request.security(asset1, timeframe.period, close, gaps=barmerge.gaps_off) : na
+src2 = use_multi ? request.security(asset2, timeframe.period, close, gaps=barmerge.gaps_off) : na
+src3 = use_multi ? request.security(asset3, timeframe.period, close, gaps=barmerge.gaps_off) : na
+src4 = use_multi ? request.security(asset4, timeframe.period, close, gaps=barmerge.gaps_off) : na
+src5 = use_multi ? request.security(asset5, timeframe.period, close, gaps=barmerge.gaps_off) : na
+
+// Calculate Rachev Ratio for each asset
+[r1, c1, n1] = f_rachev_ratio(src1, lookback, alpha, return_type)
+[r2, c2, n2] = f_rachev_ratio(src2, lookback, alpha, return_type)
+[r3, c3, n3] = f_rachev_ratio(src3, lookback, alpha, return_type)
+[r4, c4, n4] = f_rachev_ratio(src4, lookback, alpha, return_type)
+[r5, c5, n5] = f_rachev_ratio(src5, lookback, alpha, return_type)
+
+float rachev = na
+float confidence = na
+float regime_score = na
+float bull_pct = na
+float bear_pct = na
+
+if not use_multi
+    // Single asset mode
+    [r, conf, n] = f_rachev_ratio(close, lookback, alpha, return_type)
+    rachev := r
+    confidence := conf
+    regime_score := not na(r) ? (r > bull_threshold ? 1.0 : r < bear_threshold ? -1.0 : 0.0) : 0.0
+else
+    // Multi-asset mode
+    [avg_r, reg, b_pct, be_pct, conf] = f_aggregate_regime(r1, r2, r3, r4, r5, c1, c2, c3, c4, c5, w1, w2, w3, w4, w5)
+    rachev := avg_r
+    regime_score := reg
+    bull_pct := b_pct
+    bear_pct := be_pct
+    confidence := conf
+
+// Moving average for smoothing
+rachev_ma = show_ma ? ta.sma(rachev, ma_length) : na
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                            SIGNAL GENERATION                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// Generate signals with hysteresis
+var int signal = 0  // -1 = bearish, 0 = neutral, 1 = bullish
+
+if not na(rachev)
+    if rachev > bull_threshold and signal != 1
+        signal := 1
+    else if rachev < bear_threshold and signal != -1
+        signal := -1
+    else if rachev >= bear_threshold and rachev <= bull_threshold
+        signal := 0
+
+// Detect signal changes
+bool bullish_cross = signal == 1 and signal[1] != 1
+bool bearish_cross = signal == -1 and signal[1] != -1
+bool regime_change = signal != signal[1]
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                           VISUALIZATION                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// Get colors
+[col_bull, col_bear, col_neutral, col_bg_bull, col_bg_bear] = f_get_colors(color_scheme, rachev)
+
+// Dynamic line color
+color line_color = rachev > bull_threshold ? col_bull : 
+                   rachev < bear_threshold ? col_bear : 
+                   col_neutral
+
+// Plot Rachev Ratio
+plot(rachev, "Rachev Ratio", color=line_color, linewidth=3, style=plot.style_line)
+plot(rachev_ma, "Rachev MA", color=color.new(#FFFFFF, 60), linewidth=1, style=plot.style_line)
+
+// Optional histogram (for distribution viz, conditional plotting)
+plot(show_hist ? rachev : na, "Rachev Hist", color=show_hist ? line_color : na, style=plot.style_histogram, linewidth=2)
+
+// Reference lines
+hline(1.0, "Neutral (1.0)", color=color.new(#808080, 70), linestyle=hline.style_solid, linewidth=1)
+hline(bull_threshold, "Bullish", color=color.new(#26A69A, 60), linestyle=hline.style_dashed, linewidth=1)
+hline(bear_threshold, "Bearish", color=color.new(#EF5350, 60), linestyle=hline.style_dashed, linewidth=1)
+
+// Background coloring (more translucent)
+color bg_color = show_bg and not na(rachev) ? (signal == 1 ? color.new(col_bg_bull, 90) : signal == -1 ? color.new(col_bg_bear, 90) : na) : na
+bgcolor(bg_color, title="Regime Background")
+
+// Visual signals
+plotshape(show_signals and bullish_cross, "Buy Signal", 
+     shape.labelup, location.bottom, col_bull, 
+     text="BUY", textcolor=#FFFFFF, size=size.small)
+
+plotshape(show_signals and bearish_cross, "Sell Signal", 
+     shape.labeldown, location.top, col_bear, 
+     text="SELL", textcolor=#FFFFFF, size=size.small)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                           INFORMATION TABLE                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+if show_table and barstate.islast
+    int rows = use_multi ? 8 : 6  // Dynamic rows
+    var table info_table = table.new(position.top_right, 2, rows, 
+         border_width=1, 
+         border_color=color.new(#808080, 50),
+         frame_width=1,
+         frame_color=color.new(#808080, 50))
+    
+    // Header
+    table.cell(info_table, 0, 0, "Rachev Regime", 
+         bgcolor=color.new(#808080, 80), 
+         text_color=#FFFFFF, 
+         text_size=size.normal)
+    table.cell(info_table, 1, 0, mode, 
+         bgcolor=color.new(#808080, 80), 
+         text_color=#FFFFFF, 
+         text_size=size.small)
+    
+    // Current Rachev
+    table.cell(info_table, 0, 1, "Rachev Ratio", 
+         text_color=#808080, text_size=size.small)
+    table.cell(info_table, 1, 1, str.tostring(rachev, "#.###"), 
+         bgcolor=line_color, 
+         text_color=#FFFFFF, 
+         text_size=size.normal)
+    
+    // Regime
+    string regime_text = signal == 1 ? "BULLISH ▲" : signal == -1 ? "BEARISH ▼" : "NEUTRAL ●"
+    color regime_color = signal == 1 ? col_bull : signal == -1 ? col_bear : col_neutral
+    table.cell(info_table, 0, 2, "Regime", 
+         text_color=#808080, text_size=size.small)
+    table.cell(info_table, 1, 2, regime_text, 
+         bgcolor=regime_color, 
+         text_color=#FFFFFF, 
+         text_size=size.normal)
+    
+    // Confidence
+    if not na(confidence)
+        table.cell(info_table, 0, 3, "Confidence", 
+             text_color=#808080, text_size=size.small)
+        table.cell(info_table, 1, 3, str.tostring(confidence, "#") + "%", 
+             text_color=#FFFFFF, text_size=size.small)
+    
+    // Multi-asset stats (conditional)
+    if use_multi and not na(bull_pct)
+        table.cell(info_table, 0, 4, "Bullish Assets", 
+             text_color=#808080, text_size=size.small)
+        table.cell(info_table, 1, 4, str.tostring(bull_pct, "#") + "%", 
+             text_color=col_bull, text_size=size.small)
+        
+        table.cell(info_table, 0, 5, "Bearish Assets", 
+             text_color=#808080, text_size=size.small)
+        table.cell(info_table, 1, 5, str.tostring(bear_pct, "#") + "%", 
+             text_color=col_bear, text_size=size.small)
+    
+    // Parameters (always at bottom)
+    int param_row = use_multi ? 6 : 4
+    table.cell(info_table, 0, param_row, "Lookback", 
+         text_color=#808080, text_size=size.tiny)
+    table.cell(info_table, 1, param_row, str.tostring(lookback), 
+         text_color=#FFFFFF, text_size=size.tiny)
+    
+    table.cell(info_table, 0, param_row + 1, "Alpha", 
+         text_color=#808080, text_size=size.tiny)
+    table.cell(info_table, 1, param_row + 1, str.tostring(alpha, "#.##"), 
+         text_color=#FFFFFF, text_size=size.tiny)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                              ALERT CONDITIONS                                ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+if alert_bullish and bullish_cross
+    alert("🚀 Rachev BULLISH Signal | Ratio: " + str.tostring(rachev, "#.##") + 
+          " | Symbol: " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if alert_bearish and bearish_cross
+    alert("🔻 Rachev BEARISH Signal | Ratio: " + str.tostring(rachev, "#.##") + 
+          " | Symbol: " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if alert_regime and regime_change
+    string regime_text = signal == 1 ? "BULLISH" : signal == -1 ? "BEARISH" : "NEUTRAL"
+    alert("📊 Rachev Regime Change: " + regime_text + 
+          " | Ratio: " + str.tostring(rachev, "#.##"), alert.freq_once_per_bar_close)

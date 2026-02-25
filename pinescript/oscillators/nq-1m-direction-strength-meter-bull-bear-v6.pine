@@ -1,0 +1,168 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © StanTheTradingMan
+
+//@version=6
+indicator("NQ 1M Direction Strength Meter (Bull + Bear) [v6]", overlay=false, max_labels_count=50, max_lines_count=50)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs
+//──────────────────────────────────────────────────────────────────────────────
+grpSess = "Session Filter (optional)"
+useRTH  = input.bool(true, "Score only during RTH (0930–1600)", group=grpSess)
+sessRTH = input.session("0930-1600", "RTH Session", group=grpSess)
+
+grpCore = "Core"
+src        = input.source(close, "Source", group=grpCore)
+emaFastLen = input.int(8,  "EMA Fast", group=grpCore, minval=1)
+emaMidLen  = input.int(21, "EMA Mid",  group=grpCore, minval=1)
+emaSlowLen = input.int(50, "EMA Slow", group=grpCore, minval=1)
+atrLen     = input.int(14, "ATR Length", group=grpCore, minval=1)
+rsiLen     = input.int(7,  "RSI Length (fast)", group=grpCore, minval=1)
+volLen     = input.int(20, "Volume MA Length", group=grpCore, minval=1)
+lookback   = input.int(60, "Lookback (pullback quality)", group=grpCore, minval=10)
+
+grpTuning = "Tuning"
+maxMoveATR = input.float(2.0, "Max counter-move in ATRs (worse=0 score)", group=grpTuning, minval=0.5, step=0.1)
+smoothLen  = input.int(5, "Smoothing", group=grpTuning, minval=1)
+useVWAP    = input.bool(true, "Include VWAP in level score", group=grpTuning)
+strongThr  = input.float(70, "Strong threshold", group=grpTuning, minval=1, maxval=99)
+weakThr    = input.float(50, "Weak threshold", group=grpTuning, minval=1, maxval=99)
+
+grpUI = "UI"
+showBull    = input.bool(true, "Show Bull Strength line", group=grpUI)
+showBear    = input.bool(true, "Show Bear Strength line", group=grpUI)
+showNet     = input.bool(true, "Show Net (Bull-Bear) histogram", group=grpUI)
+tintBG      = input.bool(true, "Tint background when strong bull/bear", group=grpUI)
+showSignals = input.bool(true, "Show flip triangles", group=grpUI)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Session gate
+//──────────────────────────────────────────────────────────────────────────────
+inRTH  = not na(time(timeframe.period, sessRTH))
+useBar = useRTH ? inRTH : true
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+//──────────────────────────────────────────────────────────────────────────────
+clamp01(x) =>
+    math.max(0.0, math.min(1.0, x))
+
+// atan-based mapping to -1..+1 (no tanh needed)
+atanSigned(x, k) =>
+    // atan outputs ~(-pi/2..+pi/2), normalize to -1..+1
+    (math.atan(x * k) / (math.pi / 2))
+
+//──────────────────────────────────────────────────────────────────────────────
+// Core series
+//──────────────────────────────────────────────────────────────────────────────
+emaFast = ta.ema(src, emaFastLen)
+emaMid  = ta.ema(src, emaMidLen)
+emaSlow = ta.ema(src, emaSlowLen)
+atrv    = ta.atr(atrLen)
+
+vwapVal = (useVWAP and timeframe.isintraday) ? ta.vwap(hlc3) : na
+
+aboveVW = useVWAP ? (timeframe.isintraday ? close >= vwapVal : true) : true
+belowVW = useVWAP ? (timeframe.isintraday ? close <= vwapVal : true) : true
+
+//──────────────────────────────────────────────────────────────────────────────
+// 1) Directional slope scores
+//──────────────────────────────────────────────────────────────────────────────
+slopeNorm   = atrv > 0 ? (emaFast - emaFast[1]) / atrv : 0.0
+dirSigned   = atanSigned(slopeNorm, 3.0) // -1..+1
+bullSlope   = clamp01(dirSigned)         // only positive part
+bearSlope   = clamp01(-dirSigned)        // only negative part
+
+//──────────────────────────────────────────────────────────────────────────────
+// 2) Directional level/trend alignment
+//──────────────────────────────────────────────────────────────────────────────
+bullStack = emaFast >= emaMid and emaMid >= emaSlow
+bearStack = emaFast <= emaMid and emaMid <= emaSlow
+
+bullLevel = (aboveVW ? 0.45 : 0.0) + (close >= emaMid ? 0.35 : 0.0) + (bullStack ? 0.20 : 0.0)
+bearLevel = (belowVW ? 0.45 : 0.0) + (close <= emaMid ? 0.35 : 0.0) + (bearStack ? 0.20 : 0.0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 3) Volume participation (shared)
+/// (0 at 0.8x, 1 at 1.7x+)
+ //──────────────────────────────────────────────────────────────────────────────
+volMA    = ta.sma(volume, volLen)
+volRatio = volMA > 0 ? (volume / volMA) : 1.0
+volScore = clamp01((volRatio - 0.8) / (1.7 - 0.8))
+
+//──────────────────────────────────────────────────────────────────────────────
+// 4) Pullback quality (directional)
+// Bull: shallow pullbacks from recent high
+// Bear: shallow bounces from recent low
+//──────────────────────────────────────────────────────────────────────────────
+hh    = ta.highest(high, lookback)
+ll    = ta.lowest(low,  lookback)
+
+ddATR = atrv > 0 ? (hh - close) / atrv : 0.0   // bull counter-move
+duATR = atrv > 0 ? (close - ll) / atrv : 0.0   // bear counter-move
+
+bullPB = 1.0 - clamp01(ddATR / maxMoveATR)
+bearPB = 1.0 - clamp01(duATR / maxMoveATR)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 5) Momentum (directional)
+// Bull likes higher RSI; Bear likes lower RSI
+//──────────────────────────────────────────────────────────────────────────────
+rsiVal    = ta.rsi(src, rsiLen)
+bullRSI   = clamp01((rsiVal - 30.0) / 40.0)     // 30->0, 70->1
+bearRSI   = clamp01((70.0 - rsiVal) / 40.0)     // 70->0, 30->1
+
+//──────────────────────────────────────────────────────────────────────────────
+// Weighted scores (0..100)
+//──────────────────────────────────────────────────────────────────────────────
+wSlope = 0.32
+wVol   = 0.26
+wPB    = 0.18
+wLevel = 0.16
+wRSI   = 0.08
+
+bullRaw = 100.0 * (bullSlope*wSlope + volScore*wVol + bullPB*wPB + bullLevel*wLevel + bullRSI*wRSI)
+bearRaw = 100.0 * (bearSlope*wSlope + volScore*wVol + bearPB*wPB + bearLevel*wLevel + bearRSI*wRSI)
+
+bull0 = ta.ema(bullRaw, smoothLen)
+bear0 = ta.ema(bearRaw, smoothLen)
+
+bull = useBar ? bull0 : na
+bear = useBar ? bear0 : na
+
+net0 = bull0 - bear0
+net  = useBar ? net0 : na
+
+strongBull = bull >= strongThr
+strongBear = bear >= strongThr
+
+//──────────────────────────────────────────────────────────────────────────────
+// Plots
+//──────────────────────────────────────────────────────────────────────────────
+hline(strongThr, "Strong (70)", color=color.new(color.gray, 70))
+hline(weakThr,   "Weak (50)",   color=color.new(color.gray, 80))
+hline(0,         "Zero (net)",  color=color.new(color.gray, 85))
+
+plot(showBull ? bull : na, "Bull Strength (0–100)", linewidth=2, color=color.new(color.green, 0))
+plot(showBear ? bear : na, "Bear Strength (0–100)", linewidth=2, color=color.new(color.red, 0))
+
+plot(showNet ? net : na, "Net (Bull - Bear)", style=plot.style_columns, color=color.new(color.gray, 85))
+
+// bg tint (global scope)
+bg = tintBG ? (strongBull ? color.new(color.green, 90) : strongBear ? color.new(color.red, 90) : na) : na
+bgcolor(bg)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Signals + Alerts (compute every bar, then gate)
+//──────────────────────────────────────────────────────────────────────────────
+bullFlipRaw = ta.crossover(bull0, strongThr)
+bearFlipRaw = ta.crossover(bear0, strongThr)
+
+bullFlip = useBar and bullFlipRaw
+bearFlip = useBar and bearFlipRaw
+
+plotshape(showSignals and bullFlip, title="Bull turns STRONG", style=shape.triangleup, location=location.bottom, size=size.tiny, color=color.new(color.green, 0))
+plotshape(showSignals and bearFlip, title="Bear turns STRONG", style=shape.triangledown, location=location.top, size=size.tiny, color=color.new(color.red, 0))
+
+alertcondition(bullFlip, title="BULL STRONG", message="BULL STRONG ({{ticker}}) | Bull Strength crossed above threshold.")
+alertcondition(bearFlip, title="BEAR STRONG", message="BEAR STRONG ({{ticker}}) | Bear Strength crossed above threshold.")

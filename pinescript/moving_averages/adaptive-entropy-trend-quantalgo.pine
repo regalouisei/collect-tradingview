@@ -1,0 +1,133 @@
+// This script is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+//@version=6
+indicator('Adaptive Entropy Trend [QuantAlgo]', overlay = true, max_lines_count = 500)
+
+//              ╔════════════════════════════════╗              //
+//              ║      USER-DEFINED SETTINGS     ║              //
+//              ╚════════════════════════════════╝              //
+
+var string calculation_settings = '════════ Calculation Parameters ════════'
+var string visual_settings      = '════════ Visualization Settings ════════'
+
+tooltip_lookback = 'Lookback period used to sample log returns for Shannon entropy calculation and ATR measurement. Shorter periods (10-15) make the indicator highly reactive — entropy updates quickly, causing the adaptive EMA to accelerate and decelerate rapidly and bands to respond to short-term volatility shifts. Ideal for intraday and scalping setups where fast adaptation to momentum changes is critical. Medium periods (20-30) offer balanced entropy sampling that smooths out noise while still adapting meaningfully to changing market conditions — suitable for swing trading on 4H and daily charts. Longer periods (35-50) produce stable entropy readings, resulting in a slower-adapting EMA and wider band reactions only on sustained volatility expansions — best for position trading and identifying primary trend regimes. Standard value is 25.'
+tooltip_fast_mult = 'Multiplier applied to the ATR-based fast (inner) band, scaled by trend strength derived from entropy. The inner band acts as the primary trend trigger — when close breaks above it, a bullish trend is confirmed; below it, bearish. Lower values (1.0-1.3) place the inner band closer to the adaptive EMA, triggering trend changes more frequently but with higher false signal risk in choppy markets. Higher values (1.8-2.5) require a stronger breakout to confirm a trend change, reducing false signals but delaying entry. In low-entropy (trending) markets, band width automatically expands via trend strength scaling, so the effective threshold self-adjusts. Standard value is 1.8.'
+tooltip_slow_mult = 'Multiplier applied to the ATR-based slow (outer) band, scaled by trend strength. The outer band defines the broader volatility envelope and is used purely for visual context — it shows the extreme range price would need to breach for a high-conviction move. Lower values (2.0-2.5) create tighter outer bands, making the envelope feel compressed and more sensitive to breakouts. Higher values (3.5-5.0) create wide outer bands that only price during strong trending phases will consistently approach. The fill between inner and outer bands provides a visual gradient of trend intensity. Standard value is 3.5.'
+tooltip_preset = 'Select a predefined configuration optimized for different trading styles and timeframes.'
+tooltip_preset_details = 'Default (25, 1.8, 3.5): Balanced configuration suitable for swing trading on 4H and daily charts. Entropy sampled over 25 bars for stable normalization, fast band at 1.8x ATR ensures the effective trigger threshold stays meaningful even in low-trend conditions, outer band at 3.5x gives clear visual context. Best starting point for most traders and market conditions with reduced false signals versus tighter settings.\n\nFast Response (12, 1.4, 2.8): Aggressive configuration for intraday and scalping on 1min-1H charts. Shorter entropy window reacts quickly to regime shifts, bands trigger earlier on breakouts, adaptive EMA accelerates faster. Fast multiplier raised to 1.4x to maintain a workable effective band floor and reduce whipsaws versus more aggressive settings. Best for active traders monitoring positions closely.\n\nSmooth Trend (40, 2.2, 4.5): Conservative configuration for position trading on daily and weekly charts. Extended lookback stabilizes entropy readings, wider bands only signal on major breakouts, adaptive EMA responds slowly to noise. Outer band at 4.5x better suits the larger ATR scale of higher timeframes. Best for patient traders seeking high-conviction primary trend direction with minimal false signals.'
+tooltip_color_preset = 'Pre-configured color schemes optimized for different chart themes and visual preferences. Classic uses traditional green/red. Aqua provides ocean-inspired teal and orange. Cosmic offers futuristic cyan and purple. Cyber features warm orange and cool teal contrast. Neon delivers high-contrast yellow and magenta for maximum visibility. Custom allows full color customization via the color pickers below.'
+tooltip_bull_color = 'Color applied to the adaptive EMA, bands, fills, and bar coloring during bullish trend conditions — when close breaks above the inner upper band. Represents statistically low-entropy, directional upward momentum confirmed by the entropy-adaptive EMA exceeding its volatility threshold. Use vibrant, distinct colors to clearly highlight uptrend zones and potential long opportunities.'
+tooltip_bear_color = 'Color applied to the adaptive EMA, bands, fills, and bar coloring during bearish trend conditions — when close breaks below the inner lower band. Represents sustained downward momentum with the entropy-weighted baseline falling below its volatility floor. Use warning colors that clearly contrast with bullish coloring to signal downtrend zones and potential short opportunities or exit signals.'
+tooltip_fill_transparency = 'Transparency of the filled areas between the outer bands and inner bands (outer fill), and between the inner bands and the adaptive EMA (inner fill). Lower values (60-75) produce more opaque fills with stronger color presence — useful for emphasizing trend zones or on charts with many other elements. Higher values (88-97) create subtle, lightweight fills that stay visible without dominating the chart. The inner fill zone (between inner bands and EMA) is always rendered slightly more transparent than the outer fill to preserve the natural gradient depth. Standard value is 88.'
+tooltip_barcolor = 'Enable/disable bar coloring based on current trend direction. When enabled, price bars are tinted with the bullish or bearish color to provide instant visual confirmation of trend state across the chart. Useful for quickly identifying trend alignment across timeframes at a glance. Disable if you prefer default bar colors or are running other bar coloring indicators simultaneously.'
+
+lookbackLen      = input.int(25,    'Entropy Lookback',       minval = 5,          group = calculation_settings, tooltip = tooltip_lookback)
+fastMultiplier   = input.float(1.8, 'Fast Band Multiplier',   step = 0.1,          group = calculation_settings, tooltip = tooltip_fast_mult)
+slowMultiplier   = input.float(3.5, 'Slow Band Multiplier',   step = 0.1,          group = calculation_settings, tooltip = tooltip_slow_mult)
+presetConfig     = input.string('Default', 'Preset Configuration', options = ['Default', 'Fast Response', 'Smooth Trend'], group = calculation_settings, tooltip = tooltip_preset + '\n\n' + tooltip_preset_details)
+colorPreset      = input.string('Custom', 'Color Preset', options = ['Classic', 'Aqua', 'Cosmic', 'Cyber', 'Neon', 'Custom'], group = visual_settings, tooltip = tooltip_color_preset)
+bullColorInput   = input.color(#00ffaa, 'Bull Color',          group = visual_settings, tooltip = tooltip_bull_color)
+bearColorInput   = input.color(#ff0000, 'Bear Color',          group = visual_settings, tooltip = tooltip_bear_color)
+fillTransparency = input.int(88,    'Fill Transparency',       minval = 0, maxval = 100, group = visual_settings, tooltip = tooltip_fill_transparency)
+enableBarcolor   = input.bool(true, 'Enable Bar Coloring',     group = visual_settings, tooltip = tooltip_barcolor)
+
+if presetConfig == 'Fast Response'
+    lookbackLen    := 12
+    fastMultiplier := 1.4
+    slowMultiplier := 2.8
+else if presetConfig == 'Smooth Trend'
+    lookbackLen    := 40
+    fastMultiplier := 2.2
+    slowMultiplier := 4.5
+
+[bullColor, bearColor] = switch colorPreset
+    'Classic' => [#00ff00,  #ff0000]
+    'Aqua'    => [#00d4ff,  #ff8c00]
+    'Cosmic'  => [#49ffce,  #9932cc]
+    'Cyber'   => [#00cccc,  #ff6600]
+    'Neon'    => [#ffff00,  #ff00ff]
+    'Custom'  => [bullColorInput, bearColorInput]
+
+//              ╔════════════════════════════════╗              //
+//              ║        CORE CALCULATION        ║              //
+//              ╚════════════════════════════════╝              //
+
+logReturn   = math.log(close / close[1])
+histBins    = 10
+minReturn   = ta.lowest(logReturn, lookbackLen)
+maxReturn   = ta.highest(logReturn, lookbackLen)
+returnRange = maxReturn - minReturn
+entropy     = 0.0
+
+if returnRange > 0
+    array<float> binCounts = array.new_float(histBins, 0.0)
+    for i = 0 to lookbackLen - 1
+        binIndex = math.floor((logReturn[i] - minReturn) / returnRange * (histBins - 1))
+        binIndex := math.min(math.max(binIndex, 0), histBins - 1)
+        array.set(binCounts, binIndex, array.get(binCounts, binIndex) + 1.0)
+    for i = 0 to histBins - 1
+        probability = array.get(binCounts, i) / lookbackLen
+        if probability > 0
+            entropy := entropy - probability * math.log(probability) / math.log(2)
+
+maxEntropy        = math.log(histBins) / math.log(2)
+normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : 0.5
+adaptiveAlpha     = 2.0 / (lookbackLen * (0.3 + normalizedEntropy * 1.4) + 1.0)
+var float adaptiveEma = na
+adaptiveEma   := na(adaptiveEma) ? close : adaptiveEma + adaptiveAlpha * (close - adaptiveEma)
+atr            = ta.atr(lookbackLen)
+trendStrength  = 1.0 - normalizedEntropy
+fastBandWidth  = atr * fastMultiplier * (0.5 + trendStrength)
+slowBandWidth  = atr * slowMultiplier * (0.5 + trendStrength)
+innerUpper     = adaptiveEma + fastBandWidth
+innerLower     = adaptiveEma - fastBandWidth
+outerUpper     = adaptiveEma + slowBandWidth
+outerLower     = adaptiveEma - slowBandWidth
+
+var int trendDirection = 0
+if close > innerUpper
+    trendDirection := 1
+else if close < innerLower
+    trendDirection := -1
+
+trendTurnedBullish = trendDirection == 1  and trendDirection[1] != 1
+trendTurnedBearish = trendDirection == -1 and trendDirection[1] != -1
+trendChanged       = trendTurnedBullish or trendTurnedBearish
+trendColor         = trendDirection == 1 ? bullColor : trendDirection == -1 ? bearColor : color(#787b86)
+
+outerFillTransparency = fillTransparency
+innerFillTransparency = math.min(fillTransparency + 6, 100)
+
+//              ╔════════════════════════════════╗              //
+//              ║          VISUALIZATION         ║              //
+//              ╚════════════════════════════════╝              //
+
+plotOuterUpper = plot(outerUpper,  'Outer Upper', color = color.new(trendColor, 90))
+plotInnerUpper = plot(innerUpper,  'Inner Upper', color = color.new(trendColor, 70))
+plotEma        = plot(adaptiveEma, 'Adaptive EMA', color = trendColor, linewidth = 3)
+plotInnerLower = plot(innerLower,  'Inner Lower', color = color.new(trendColor, 70))
+plotOuterLower = plot(outerLower,  'Outer Lower', color = color.new(trendColor, 90))
+fill(plotOuterUpper, plotInnerUpper, color = color.new(trendColor, outerFillTransparency))
+fill(plotInnerUpper, plotInnerLower, color = color.new(trendColor, innerFillTransparency))
+fill(plotInnerLower, plotOuterLower, color = color.new(trendColor, outerFillTransparency))
+barcolor(enableBarcolor ? color.new(trendColor, 20) : na, title = 'Trend Bar Color')
+
+//              ╔════════════════════════════════╗              //
+//              ║             ALERTS             ║              //
+//              ╚════════════════════════════════╝              //
+
+alertcondition(trendTurnedBullish, title = 'Bullish Trend Signal',   message = 'Adaptive Entropy Trend: BULLISH trend confirmed on {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(trendTurnedBearish, title = 'Bearish Trend Signal',   message = 'Adaptive Entropy Trend: BEARISH trend confirmed on {{exchange}}:{{ticker}} - {{interval}}')
+alertcondition(trendChanged,       title = 'Trend Direction Changed', message = 'Adaptive Entropy Trend: Trend direction changed on {{exchange}}:{{ticker}} - {{interval}}')
+
+//              ╔════════════════════════════════╗              //
+//              ║           CREATED BY           ║              //
+//              ╚════════════════════════════════╝              //
+
+// ██████╗ ██╗   ██╗ █████╗ ███╗   ██╗████████╗     █████╗ ██╗      ██████╗  ██████╗ 
+//██╔═══██╗██║   ██║██╔══██╗████╗  ██║╚══██╔══╝    ██╔══██╗██║     ██╔════╝ ██╔═══██╗
+//██║   ██║██║   ██║███████║██╔██╗ ██║   ██║       ███████║██║     ██║  ███╗██║   ██║
+//██║▄▄ ██║██║   ██║██╔══██║██║╚██╗██║   ██║       ██╔══██║██║     ██║   ██║██║   ██║
+//╚██████╔╝╚██████╔╝██║  ██║██║ ╚████║   ██║       ██║  ██║███████╗╚██████╔╝╚██████╔╝
+// ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝       ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝

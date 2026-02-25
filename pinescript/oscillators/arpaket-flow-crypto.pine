@@ -1,0 +1,438 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Smart Money Flow Indicator v1.0
+// ===================================================================================
+// ARPAKET_FLOW - Multi-Asset Edition
+// ===================================================================================
+// 
+// DESCRIPTION:
+// A comprehensive money flow indicator that visualizes whether smart money is 
+// flowing INTO or OUT of the market, with intensity measurement for buy/sell decisions.
+//
+// FEATURES:
+// - Multi-asset support (Crypto, Low Liquidity Stocks, High Liquidity Markets)
+// - Multiple trading styles (Scalping, Day Trading, Swing, Position Trading)
+// - Whale activity detection for crypto
+// - Multi-timeframe analysis
+// - Composite Flow Score (0-100)
+// - Visual dashboard with actionable signals
+//
+// HOW TO USE:
+// 1. Select your Market Type (Crypto/Low Liquidity/High Liquidity)
+// 2. Select your Trading Style (Scalping/Day Trading/Swing/Position)
+// 3. Adjust sensitivity based on your risk preference
+// 4. Watch for BUY/SELL signals and Flow Score
+//
+// INTERPRETATION:
+// - Green histogram = Money flowing IN (bullish)
+// - Red histogram = Money flowing OUT (bearish)
+// - Score > 70 = Strong buy zone
+// - Score < 30 = Strong sell zone
+// - Whale icons = Large player activity detected
+// ===================================================================================
+
+//@version=5
+indicator("Arpaket_FLOW", shorttitle="ARPAKET", overlay=false, precision=2)
+
+// ===================================================================================
+// INPUT SETTINGS
+// ===================================================================================
+
+// ─── General Settings ───
+grp_general = "═══ General Settings ═══"
+i_marketType = input.string("Crypto", "Market Type", options=["Crypto", "Low Liquidity Stock", "High Liquidity"], group=grp_general, tooltip="Select your market type for optimized signals")
+i_tradingStyle = input.string("Day Trading", "Trading Style", options=["Scalping", "Day Trading", "Swing", "Position"], group=grp_general, tooltip="Select your trading timeframe style")
+i_sensitivity = input.string("Normal", "Sensitivity", options=["Conservative", "Normal", "Aggressive"], group=grp_general, tooltip="Signal sensitivity level")
+
+// ─── Period Settings ───
+grp_periods = "═══ Period Settings ═══"
+i_fastPeriod = input.int(7, "Fast Period", minval=3, maxval=20, group=grp_periods)
+i_slowPeriod = input.int(21, "Slow Period", minval=10, maxval=50, group=grp_periods)
+i_signalSmooth = input.int(5, "Signal Smoothing", minval=2, maxval=15, group=grp_periods)
+i_mfiPeriod = input.int(14, "MFI Period", minval=5, maxval=30, group=grp_periods)
+i_cmfPeriod = input.int(20, "CMF Period", minval=10, maxval=40, group=grp_periods)
+
+// ─── Visual Settings ───
+grp_visual = "═══ Visual Settings ═══"
+i_showSignals = input.bool(true, "Show Signal Markers", group=grp_visual)
+i_showDashboard = input.bool(true, "Show Dashboard Table", group=grp_visual)
+i_showMTF = input.bool(true, "Show MTF Panel", group=grp_visual)
+i_showWhale = input.bool(true, "Show Whale Markers", group=grp_visual)
+i_showBackground = input.bool(true, "Show Background Zones", group=grp_visual)
+
+// ─── Alert Settings ───
+grp_alerts = "═══ Alert Settings ═══"
+i_buyThreshold = input.int(70, "Buy Signal Threshold", minval=60, maxval=90, group=grp_alerts)
+i_sellThreshold = input.int(30, "Sell Signal Threshold", minval=10, maxval=40, group=grp_alerts)
+i_volumeSurge = input.float(2.0, "Volume Surge Multiplier", minval=1.5, maxval=5.0, step=0.1, group=grp_alerts)
+i_whaleMultiplier = input.float(3.0, "Whale Detection Multiplier", minval=2.0, maxval=10.0, step=0.5, group=grp_alerts)
+
+// ─── Colors ───
+grp_colors = "═══ Color Settings ═══"
+c_strongBull = input.color(color.new(#00E676, 0), "Strong Inflow", group=grp_colors)
+c_weakBull = input.color(color.new(#81C784, 0), "Moderate Inflow", group=grp_colors)
+c_neutral = input.color(color.new(#9E9E9E, 0), "Neutral", group=grp_colors)
+c_weakBear = input.color(color.new(#E57373, 0), "Moderate Outflow", group=grp_colors)
+c_strongBear = input.color(color.new(#FF1744, 0), "Strong Outflow", group=grp_colors)
+
+// ===================================================================================
+// HELPER FUNCTIONS
+// ===================================================================================
+
+// ─── Sensitivity Multiplier ───
+getSensitivityMult() =>
+    i_sensitivity == "Conservative" ? 1.2 : i_sensitivity == "Aggressive" ? 0.8 : 1.0
+
+// ─── Period Adjustment based on Trading Style ───
+getAdjustedPeriod(basePeriod) =>
+    switch i_tradingStyle
+        "Scalping" => math.max(3, math.round(basePeriod * 0.5))
+        "Day Trading" => basePeriod
+        "Swing" => math.round(basePeriod * 1.5)
+        "Position" => math.round(basePeriod * 2)
+        => basePeriod
+
+// ─── Market Type Adjustment ───
+getMarketAdjustment() =>
+    switch i_marketType
+        "Crypto" => 1.2           // Higher volatility threshold
+        "Low Liquidity Stock" => 0.8  // More sensitive to smaller moves
+        "High Liquidity" => 1.0
+        => 1.0
+
+// ─── Normalize Value to 0-100 ───
+normalize(value, minVal, maxVal) =>
+    math.max(0, math.min(100, (value - minVal) / (maxVal - minVal) * 100))
+
+// ─── Safe Division ───
+safeDivide(numerator, denominator) =>
+    denominator == 0 ? 0 : numerator / denominator
+
+// ===================================================================================
+// CORE CALCULATIONS
+// ===================================================================================
+
+// ─── Adjusted Periods ───
+fastPeriod = getAdjustedPeriod(i_fastPeriod)
+slowPeriod = getAdjustedPeriod(i_slowPeriod)
+mfiPeriod = getAdjustedPeriod(i_mfiPeriod)
+cmfPeriod = getAdjustedPeriod(i_cmfPeriod)
+sensitivityMult = getSensitivityMult()
+marketAdj = getMarketAdjustment()
+
+// ─── Volume Analysis ───
+vol = volume
+volSMA = ta.sma(vol, slowPeriod)
+volRatio = safeDivide(vol, volSMA)
+isVolumeSurge = volRatio >= i_volumeSurge
+isWhaleActivity = volRatio >= i_whaleMultiplier and i_marketType == "Crypto"
+
+// ─── Money Flow Index (MFI) ───
+typicalPrice = hlc3
+rawMoneyFlow = typicalPrice * vol
+positiveFlow = rawMoneyFlow * (typicalPrice > typicalPrice[1] ? 1 : 0)
+negativeFlow = rawMoneyFlow * (typicalPrice < typicalPrice[1] ? 1 : 0)
+positiveFlowSum = math.sum(positiveFlow, mfiPeriod)
+negativeFlowSum = math.sum(negativeFlow, mfiPeriod)
+moneyFlowRatio = safeDivide(positiveFlowSum, negativeFlowSum)
+mfi = 100 - (100 / (1 + moneyFlowRatio))
+
+// ─── Chaikin Money Flow (CMF) ───
+mfMultiplier = safeDivide((close - low) - (high - close), high - low)
+mfVolume = mfMultiplier * vol
+cmf = safeDivide(math.sum(mfVolume, cmfPeriod), math.sum(vol, cmfPeriod))
+cmfNormalized = normalize(cmf, -1, 1)
+
+// ─── On-Balance Volume (OBV) ───
+obv = ta.cum(math.sign(ta.change(close)) * vol)
+obvEmaFast = ta.ema(obv, fastPeriod)
+obvEmaSlow = ta.ema(obv, slowPeriod)
+obvSignal = obvEmaFast > obvEmaSlow ? 1 : obvEmaFast < obvEmaSlow ? -1 : 0
+obvTrend = normalize(ta.ema(obvSignal, fastPeriod), -1, 1)
+
+// ─── VWAP Deviation ───
+vwapValue = ta.vwap(close)
+vwapDeviation = safeDivide(close - vwapValue, vwapValue) * 100
+vwapScore = normalize(vwapDeviation, -5, 5)
+
+// ─── RSI Momentum ───
+rsi = ta.rsi(close, mfiPeriod)
+rsiScore = rsi
+
+// ─── Price Rate of Change ───
+roc = ta.roc(close, fastPeriod)
+rocNormalized = normalize(roc, -10 * marketAdj, 10 * marketAdj)
+
+// ===================================================================================
+// COMPOSITE FLOW SCORE CALCULATION
+// ===================================================================================
+
+// Weight distribution
+w_volume = 0.25
+w_mfi = 0.20
+w_cmf = 0.20
+w_obv = 0.15
+w_momentum = 0.10
+w_vwap = 0.10
+
+// Volume Score (0-100)
+volumeScore = normalize(volRatio, 0.5, 3)
+
+// Calculate composite score
+rawFlowScore = (volumeScore * w_volume) + 
+               (mfi * w_mfi) + 
+               (cmfNormalized * w_cmf) + 
+               (obvTrend * w_obv) + 
+               (rsiScore * w_momentum) + 
+               (vwapScore * w_vwap)
+
+// Apply sensitivity adjustment
+flowScore = math.max(0, math.min(100, rawFlowScore * (2 - sensitivityMult)))
+
+// Smooth the score
+smoothedScore = ta.ema(flowScore, i_signalSmooth)
+
+// ===================================================================================
+// SIGNAL LOGIC
+// ===================================================================================
+
+// ─── Flow Direction ───
+flowDirection = smoothedScore > 55 ? 1 : smoothedScore < 45 ? -1 : 0
+flowStrength = smoothedScore > 80 ? "Extreme" : smoothedScore > 65 ? "Strong" : smoothedScore > 55 ? "Moderate" : smoothedScore > 45 ? "Weak" : smoothedScore > 35 ? "Moderate" : smoothedScore > 20 ? "Strong" : "Extreme"
+
+// ─── Buy/Sell Signals ───
+buyCondition = (smoothedScore > i_buyThreshold) and (smoothedScore > smoothedScore[1]) and (close > vwapValue) and (cmf > 0)
+
+sellCondition = (smoothedScore < i_sellThreshold) and (smoothedScore < smoothedScore[1]) and (close < vwapValue) and (cmf < 0)
+
+// Confirmation for cleaner signals (avoid consecutive signals)
+confirmedBuy = buyCondition and not buyCondition[1] and not buyCondition[2]
+confirmedSell = sellCondition and not sellCondition[1] and not sellCondition[2]
+
+// ─── Divergence Detection ───
+priceLL = low < ta.lowest(low, slowPeriod)[1]
+priceLH = low > ta.lowest(low, slowPeriod)[1]
+priceHH = high > ta.highest(high, slowPeriod)[1]
+priceHL = high < ta.highest(high, slowPeriod)[1]
+
+flowLL = smoothedScore < ta.lowest(smoothedScore, slowPeriod)[1]
+flowLH = smoothedScore > ta.lowest(smoothedScore, slowPeriod)[1]
+flowHH = smoothedScore > ta.highest(smoothedScore, slowPeriod)[1]
+flowHL = smoothedScore < ta.highest(smoothedScore, slowPeriod)[1]
+
+bullishDivergence = priceLL and flowLH
+bearishDivergence = priceHH and flowHL
+
+// ─── Whale Detection (Crypto) ───
+whaleAccumulation = isWhaleActivity and close >= open
+whaleDistribution = isWhaleActivity and close < open
+
+// ===================================================================================
+// MULTI-TIMEFRAME ANALYSIS
+// ===================================================================================
+
+// Request MTF data (only for Swing and Position trading)
+[mtf1hScore, mtf4hScore, mtfDailyScore, mtfWeeklyScore] = request.security(syminfo.tickerid, "", [smoothedScore, smoothedScore, smoothedScore, smoothedScore])
+
+// For actual MTF, we use different timeframes
+mtf_1h = request.security(syminfo.tickerid, "60", smoothedScore)
+mtf_4h = request.security(syminfo.tickerid, "240", smoothedScore)
+mtf_daily = request.security(syminfo.tickerid, "D", smoothedScore)
+mtf_weekly = request.security(syminfo.tickerid, "W", smoothedScore)
+
+// MTF Alignment Count
+mtfBullish = (mtf_1h > 50 ? 1 : 0) + (mtf_4h > 50 ? 1 : 0) + (mtf_daily > 50 ? 1 : 0) + (mtf_weekly > 50 ? 1 : 0)
+mtfBearish = (mtf_1h < 50 ? 1 : 0) + (mtf_4h < 50 ? 1 : 0) + (mtf_daily < 50 ? 1 : 0) + (mtf_weekly < 50 ? 1 : 0)
+
+// ===================================================================================
+// VISUAL RENDERING
+// ===================================================================================
+
+// ─── Histogram Color Logic ───
+histogramColor = smoothedScore >= 80 ? c_strongBull :
+                 smoothedScore >= 60 ? c_weakBull :
+                 smoothedScore >= 40 ? c_neutral :
+                 smoothedScore >= 20 ? c_weakBear :
+                 c_strongBear
+
+// ─── Plot Histogram ───
+// Convert score to centered histogram (-50 to +50)
+histogramValue = smoothedScore - 50
+plot(histogramValue, "Money Flow", color=histogramColor, style=plot.style_columns, linewidth=3)
+
+// ─── Signal Line ───
+signalLine = ta.ema(histogramValue, i_signalSmooth * 2)
+plot(signalLine, "Signal Line", color=color.new(color.yellow, 20), linewidth=2)
+
+// ─── Zero Line ───
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dashed)
+
+// ─── Threshold Lines ───
+hline(i_buyThreshold - 50, "Buy Zone", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+hline(i_sellThreshold - 50, "Sell Zone", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+
+// ─── Background Zones ───
+bgColor = i_showBackground ? 
+          (smoothedScore > i_buyThreshold ? color.new(color.green, 90) :
+           smoothedScore < i_sellThreshold ? color.new(color.red, 90) :
+           na) : na
+bgcolor(bgColor, title="Zone Background")
+
+// ─── Signal Markers ───
+plotshape(i_showSignals and confirmedBuy, "Buy Signal", shape.triangleup, location.bottom, c_strongBull, size=size.small)
+plotshape(i_showSignals and confirmedSell, "Sell Signal", shape.triangledown, location.top, c_strongBear, size=size.small)
+
+// ─── Whale Markers ───
+plotshape(i_showWhale and whaleAccumulation, "Whale Buy", shape.diamond, location.top, color.new(color.blue, 0), size=size.tiny, text="🐋")
+plotshape(i_showWhale and whaleDistribution, "Whale Sell", shape.diamond, location.bottom, color.new(color.purple, 0), size=size.tiny, text="🐋")
+
+// ─── Divergence Markers ───
+plotshape(bullishDivergence, "Bullish Divergence", shape.labelup, location.bottom, color.new(color.teal, 0), size=size.tiny, text="DIV")
+plotshape(bearishDivergence, "Bearish Divergence", shape.labeldown, location.top, color.new(color.orange, 0), size=size.tiny, text="DIV")
+
+// ─── Volume Surge Marker ───
+plotshape(isVolumeSurge and not isWhaleActivity, "Volume Surge", shape.circle, location.top, color.new(color.yellow, 50), size=size.tiny)
+
+// ===================================================================================
+// DASHBOARD TABLE
+// ===================================================================================
+
+if i_showDashboard and barstate.islast
+    // Create dashboard table
+    var table dashboard = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+    
+    // Title
+    table.cell(dashboard, 0, 0, "ARPAKET_FLOW", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 50), text_halign=text.align_center)
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+    
+    // Flow Direction
+    flowDirText = smoothedScore > 55 ? "▲ INFLOW" : smoothedScore < 45 ? "▼ OUTFLOW" : "● NEUTRAL"
+    flowDirColor = smoothedScore > 55 ? color.green : smoothedScore < 45 ? color.red : color.gray
+    table.cell(dashboard, 0, 1, "Direction:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 1, flowDirText, text_color=flowDirColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Flow Score
+    scoreColor = smoothedScore > 70 ? color.green : smoothedScore > 50 ? color.lime : smoothedScore > 30 ? color.orange : color.red
+    table.cell(dashboard, 0, 2, "Score:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 2, str.tostring(math.round(smoothedScore)) + "/100", text_color=scoreColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Flow Strength
+    strengthColor = flowStrength == "Extreme" or flowStrength == "Strong" ? (smoothedScore > 50 ? color.green : color.red) : color.yellow
+    table.cell(dashboard, 0, 3, "Strength:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 3, flowStrength, text_color=strengthColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Volume Status
+    volStatus = isWhaleActivity ? "🐋 WHALE" : isVolumeSurge ? "⚡ SURGE" : volRatio > 1.2 ? "↑ Above Avg" : "○ Normal"
+    volColor = isWhaleActivity ? color.blue : isVolumeSurge ? color.yellow : volRatio > 1.2 ? color.lime : color.gray
+    table.cell(dashboard, 0, 4, "Volume:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 4, volStatus + " (" + str.tostring(math.round(volRatio, 1)) + "x)", text_color=volColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // MFI
+    mfiColor = mfi > 80 ? color.red : mfi > 70 ? color.orange : mfi > 30 ? color.white : mfi > 20 ? color.lime : color.green
+    mfiStatus = mfi > 80 ? "Overbought" : mfi > 70 ? "High" : mfi > 30 ? "Normal" : mfi > 20 ? "Low" : "Oversold"
+    table.cell(dashboard, 0, 5, "MFI:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 5, str.tostring(math.round(mfi)) + " (" + mfiStatus + ")", text_color=mfiColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // CMF
+    cmfColor = cmf > 0.1 ? color.green : cmf > 0 ? color.lime : cmf > -0.1 ? color.orange : color.red
+    cmfText = cmf > 0.1 ? "Strong Acc" : cmf > 0 ? "Accumulation" : cmf > -0.1 ? "Distribution" : "Strong Dist"
+    table.cell(dashboard, 0, 6, "CMF:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 6, str.tostring(math.round(cmf, 2)) + " (" + cmfText + ")", text_color=cmfColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // MTF Alignment (for Swing/Position)
+    if i_showMTF and (i_tradingStyle == "Swing" or i_tradingStyle == "Position")
+        mtfText = str.tostring(mtfBullish) + "/4 Bullish"
+        mtfColor = mtfBullish >= 3 ? color.green : mtfBullish >= 2 ? color.yellow : color.red
+        table.cell(dashboard, 0, 7, "MTF Align:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dashboard, 1, 7, mtfText, text_color=mtfColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Divergence
+    divText = bullishDivergence ? "⚠ Bullish" : bearishDivergence ? "⚠ Bearish" : "None"
+    divColor = bullishDivergence ? color.teal : bearishDivergence ? color.orange : color.gray
+    table.cell(dashboard, 0, 8, "Divergence:", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dashboard, 1, 8, divText, text_color=divColor, text_size=size.tiny, text_halign=text.align_right)
+    
+    // Overall Signal
+    signalText = confirmedBuy ? "🟢 BUY" : confirmedSell ? "🔴 SELL" : smoothedScore > i_buyThreshold ? "● BULLISH" : smoothedScore < i_sellThreshold ? "● BEARISH" : "● NEUTRAL"
+    signalColor = confirmedBuy or smoothedScore > i_buyThreshold ? color.green : confirmedSell or smoothedScore < i_sellThreshold ? color.red : color.gray
+    signalBg = confirmedBuy ? color.new(color.green, 70) : confirmedSell ? color.new(color.red, 70) : color.new(color.gray, 80)
+    table.cell(dashboard, 0, 9, "SIGNAL:", text_color=color.white, text_size=size.tiny, bgcolor=signalBg, text_halign=text.align_left)
+    table.cell(dashboard, 1, 9, signalText, text_color=signalColor, text_size=size.tiny, bgcolor=signalBg, text_halign=text.align_right)
+
+// ===================================================================================
+// MTF PANEL (for Swing/Position Trading)
+// ===================================================================================
+
+if i_showMTF and (i_tradingStyle == "Swing" or i_tradingStyle == "Position") and barstate.islast
+    var table mtfPanel = table.new(position.bottom_right, 3, 5, bgcolor=color.new(color.black, 30), border_width=1, border_color=color.gray)
+    
+    // Header
+    table.cell(mtfPanel, 0, 0, "TIMEFRAME", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.purple, 50))
+    table.cell(mtfPanel, 1, 0, "FLOW", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.purple, 50))
+    table.cell(mtfPanel, 2, 0, "SCORE", text_color=color.white, text_size=size.tiny, bgcolor=color.new(color.purple, 50))
+    
+    // 1H
+    flow1h = mtf_1h > 55 ? "▲ IN" : mtf_1h < 45 ? "▼ OUT" : "● NEU"
+    color1h = mtf_1h > 55 ? color.green : mtf_1h < 45 ? color.red : color.gray
+    table.cell(mtfPanel, 0, 1, "1H", text_color=color.white, text_size=size.tiny)
+    table.cell(mtfPanel, 1, 1, flow1h, text_color=color1h, text_size=size.tiny)
+    table.cell(mtfPanel, 2, 1, str.tostring(math.round(mtf_1h)), text_color=color1h, text_size=size.tiny)
+    
+    // 4H
+    flow4h = mtf_4h > 55 ? "▲ IN" : mtf_4h < 45 ? "▼ OUT" : "● NEU"
+    color4h = mtf_4h > 55 ? color.green : mtf_4h < 45 ? color.red : color.gray
+    table.cell(mtfPanel, 0, 2, "4H", text_color=color.white, text_size=size.tiny)
+    table.cell(mtfPanel, 1, 2, flow4h, text_color=color4h, text_size=size.tiny)
+    table.cell(mtfPanel, 2, 2, str.tostring(math.round(mtf_4h)), text_color=color4h, text_size=size.tiny)
+    
+    // Daily
+    flowD = mtf_daily > 55 ? "▲ IN" : mtf_daily < 45 ? "▼ OUT" : "● NEU"
+    colorD = mtf_daily > 55 ? color.green : mtf_daily < 45 ? color.red : color.gray
+    table.cell(mtfPanel, 0, 3, "Daily", text_color=color.white, text_size=size.tiny)
+    table.cell(mtfPanel, 1, 3, flowD, text_color=colorD, text_size=size.tiny)
+    table.cell(mtfPanel, 2, 3, str.tostring(math.round(mtf_daily)), text_color=colorD, text_size=size.tiny)
+    
+    // Weekly
+    flowW = mtf_weekly > 55 ? "▲ IN" : mtf_weekly < 45 ? "▼ OUT" : "● NEU"
+    colorW = mtf_weekly > 55 ? color.green : mtf_weekly < 45 ? color.red : color.gray
+    table.cell(mtfPanel, 0, 4, "Weekly", text_color=color.white, text_size=size.tiny)
+    table.cell(mtfPanel, 1, 4, flowW, text_color=colorW, text_size=size.tiny)
+    table.cell(mtfPanel, 2, 4, str.tostring(math.round(mtf_weekly)), text_color=colorW, text_size=size.tiny)
+
+// ===================================================================================
+// ALERTS
+// ===================================================================================
+
+// Buy/Sell Alerts
+alertcondition(confirmedBuy, "Strong Buy Signal", "🟢 STRONG BUY: Money Flow Score above threshold with confirmation")
+alertcondition(confirmedSell, "Strong Sell Signal", "🔴 STRONG SELL: Money Flow Score below threshold with confirmation")
+
+// Zone Alerts
+alertcondition(ta.crossover(smoothedScore, i_buyThreshold), "Enter Buy Zone", "📈 Price entering BUY ZONE - Flow Score crossed above threshold")
+alertcondition(ta.crossunder(smoothedScore, i_sellThreshold), "Enter Sell Zone", "📉 Price entering SELL ZONE - Flow Score crossed below threshold")
+
+// Whale Alerts
+alertcondition(whaleAccumulation, "Whale Accumulation", "🐋 WHALE ACCUMULATION DETECTED - Large volume with price increase")
+alertcondition(whaleDistribution, "Whale Distribution", "🐋 WHALE DISTRIBUTION DETECTED - Large volume with price decrease")
+
+// Divergence Alerts
+alertcondition(bullishDivergence, "Bullish Divergence", "⚠️ BULLISH DIVERGENCE - Price making lower lows but flow making higher lows")
+alertcondition(bearishDivergence, "Bearish Divergence", "⚠️ BEARISH DIVERGENCE - Price making higher highs but flow making lower highs")
+
+// Volume Surge Alert
+alertcondition(isVolumeSurge, "Volume Surge", "⚡ VOLUME SURGE DETECTED - Volume is above average threshold")
+
+// MTF Alignment Alerts
+alertcondition(mtfBullish >= 3 and mtfBullish[1] < 3, "MTF Bullish Alignment", "📊 MTF BULLISH ALIGNMENT - 3+ timeframes showing inflow")
+alertcondition(mtfBearish >= 3 and mtfBearish[1] < 3, "MTF Bearish Alignment", "📊 MTF BEARISH ALIGNMENT - 3+ timeframes showing outflow")
+
+// Extreme Conditions
+alertcondition(smoothedScore > 90, "Extreme Inflow", "🔥 EXTREME INFLOW - Flow Score above 90")
+alertcondition(smoothedScore < 10, "Extreme Outflow", "❄️ EXTREME OUTFLOW - Flow Score below 10")
+
+// Flow Reversal
+alertcondition(ta.crossover(smoothedScore, 50) and smoothedScore[1] < 40, "Flow Reversal to Bullish", "🔄 FLOW REVERSAL - Turning BULLISH from bearish territory")
+alertcondition(ta.crossunder(smoothedScore, 50) and smoothedScore[1] > 60, "Flow Reversal to Bearish", "🔄 FLOW REVERSAL - Turning BEARISH from bullish territory")
+
+// ===================================================================================
+// END OF SCRIPT
+// ===================================================================================

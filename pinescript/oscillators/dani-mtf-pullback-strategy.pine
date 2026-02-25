@@ -1,0 +1,146 @@
+//@version=5
+strategy("MTF Pullback Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=10000)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+htf = input.timeframe("240", "Higher Timeframe (4H)", group="Timeframes")
+emaLength = input.int(50, "EMA Length", group="Trend Filter")
+rsiLength = input.int(14, "RSI Length", group="RSI")
+rsiOversold = input.int(30, "RSI Oversold Level", group="RSI")
+rsiOverbought = input.int(70, "RSI Overbought Level", group="RSI")
+divergenceLookback = input.int(10, "Divergence Lookback Bars", group="RSI")
+swingLookback = input.int(5, "Swing Detection Lookback", group="Swing Detection")
+atrLength = input.int(14, "ATR Length", group="Risk Management")
+atrMultiplier = input.float(2.0, "Stop Loss ATR Multiplier", group="Risk Management")
+tpPercent = input.float(2.0, "Take Profit %", group="Risk Management")
+tradeLongs = input.bool(true, "Trade Longs", group="Trade Direction")
+tradeShorts = input.bool(true, "Trade Shorts", group="Trade Direction")
+
+// ============================================================================
+// HIGHER TIMEFRAME DATA (4H)
+// ============================================================================
+ema50_htf = request.security(syminfo.tickerid, htf, ta.ema(close, emaLength), lookahead=barmerge.lookahead_off)
+ema50_htf_prev = request.security(syminfo.tickerid, htf, ta.ema(close[1], emaLength), lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+
+htfUptrend = htfClose > ema50_htf and ema50_htf > ema50_htf_prev
+htfDowntrend = htfClose < ema50_htf and ema50_htf < ema50_htf_prev
+
+htfSwingHigh = request.security(syminfo.tickerid, htf, ta.pivothigh(high, swingLookback, swingLookback), lookahead=barmerge.lookahead_off)
+htfSwingLow = request.security(syminfo.tickerid, htf, ta.pivotlow(low, swingLookback, swingLookback), lookahead=barmerge.lookahead_off)
+
+var float lastHtfSwingHigh = na
+var float lastHtfSwingLow = na
+if not na(htfSwingHigh)
+    lastHtfSwingHigh := htfSwingHigh
+if not na(htfSwingLow)
+    lastHtfSwingLow := htfSwingLow
+
+pullbackFromHigh = htfUptrend and not na(lastHtfSwingHigh) and htfClose < lastHtfSwingHigh
+pullbackFromLow = htfDowntrend and not na(lastHtfSwingLow) and htfClose > lastHtfSwingLow
+
+// ============================================================================
+// ENTRY TIMEFRAME DATA
+// ============================================================================
+rsi = ta.rsi(close, rsiLength)
+rsiOversoldCondition = rsi < rsiOversold
+rsiOverboughtCondition = rsi > rsiOverbought
+
+priceLow = ta.lowest(low, divergenceLookback)
+rsiLow = ta.lowest(rsi, divergenceLookback)
+priceLL = low <= priceLow[1] and low < low[1]
+rsiHL = rsi > rsiLow[1]
+bullishDivergence = priceLL and rsiHL and rsiOversoldCondition
+
+priceHigh = ta.highest(high, divergenceLookback)
+rsiHigh = ta.highest(rsi, divergenceLookback)
+priceHH = high >= priceHigh[1] and high > high[1]
+rsiLH = rsi < rsiHigh[1]
+bearishDivergence = priceHH and rsiLH and rsiOverboughtCondition
+
+// Candlestick Patterns
+bullishEngulfing = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+bearishEngulfing = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+
+// Swing Detection
+swingLowEntry = ta.pivotlow(low, swingLookback, swingLookback)
+swingHighEntry = ta.pivothigh(high, swingLookback, swingLookback)
+
+var bool recentSwingLow = false
+var bool recentSwingHigh = false
+var int barsSinceSwingLow = 0
+var int barsSinceSwingHigh = 0
+
+if not na(swingLowEntry)
+    recentSwingLow := true
+    barsSinceSwingLow := 0
+else
+    barsSinceSwingLow += 1
+    if barsSinceSwingLow > swingLookback + 2
+        recentSwingLow := false
+
+if not na(swingHighEntry)
+    recentSwingHigh := true
+    barsSinceSwingHigh := 0
+else
+    barsSinceSwingHigh += 1
+    if barsSinceSwingHigh > swingLookback + 2
+        recentSwingHigh := false
+
+swingLowBullishEngulfing = (not na(swingLowEntry) and bullishEngulfing) or (recentSwingLow and barsSinceSwingLow <= 2 and bullishEngulfing)
+swingHighBearishEngulfing = (not na(swingHighEntry) and bearishEngulfing) or (recentSwingHigh and barsSinceSwingHigh <= 2 and bearishEngulfing)
+
+// ATR
+atr = ta.atr(atrLength)
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+longCondition = tradeLongs and htfUptrend and close > ema50_htf and pullbackFromHigh and
+     (rsiOversoldCondition or rsi < 40) and (bullishDivergence or (rsi > rsi[1] and rsi[1] < rsiOversold)) and swingLowBullishEngulfing
+
+shortCondition = tradeShorts and htfDowntrend and close < ema50_htf and pullbackFromLow and
+     (rsiOverboughtCondition or rsi > 60) and (bearishDivergence or (rsi < rsi[1] and rsi[1] > rsiOverbought)) and swingHighBearishEngulfing
+
+// ============================================================================
+// TRADE EXECUTION
+// ============================================================================
+if longCondition and strategy.position_size == 0
+    stopLoss = close - (atr * atrMultiplier)
+    takeProfit = close * (1 + tpPercent / 100)
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=stopLoss, limit=takeProfit)
+
+if shortCondition and strategy.position_size == 0
+    stopLoss = close + (atr * atrMultiplier)
+    takeProfit = close * (1 - tpPercent / 100)
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=stopLoss, limit=takeProfit)
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+plot(ema50_htf, "50 EMA 4H", color=color.blue, linewidth=2)
+plotshape(longCondition and strategy.position_size == 0, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.normal)
+plotshape(shortCondition and strategy.position_size == 0, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.normal)
+bgcolor(htfUptrend ? color.new(color.green, 95) : htfDowntrend ? color.new(color.red, 95) : na)
+
+// Info Table
+var table infoTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80))
+if barstate.islast
+    table.cell(infoTable, 0, 0, "4H Trend", text_color=color.white)
+    table.cell(infoTable, 1, 0, htfUptrend ? "UP ↑" : htfDowntrend ? "DOWN ↓" : "NEUTRAL", text_color=htfUptrend ? color.green : htfDowntrend ? color.red : color.gray)
+    table.cell(infoTable, 0, 1, "Price vs EMA", text_color=color.white)
+    table.cell(infoTable, 1, 1, close > ema50_htf ? "ABOVE" : "BELOW", text_color=close > ema50_htf ? color.green : color.red)
+    table.cell(infoTable, 0, 2, "Pullback L", text_color=color.white)
+    table.cell(infoTable, 1, 2, pullbackFromHigh ? "YES" : "NO", text_color=pullbackFromHigh ? color.green : color.gray)
+    table.cell(infoTable, 0, 3, "Pullback S", text_color=color.white)
+    table.cell(infoTable, 1, 3, pullbackFromLow ? "YES" : "NO", text_color=pullbackFromLow ? color.green : color.gray)
+    table.cell(infoTable, 0, 4, "Bull Div", text_color=color.white)
+    table.cell(infoTable, 1, 4, bullishDivergence ? "YES" : "NO", text_color=bullishDivergence ? color.green : color.gray)
+    table.cell(infoTable, 0, 5, "Bear Div", text_color=color.white)
+    table.cell(infoTable, 1, 5, bearishDivergence ? "YES" : "NO", text_color=bearishDivergence ? color.green : color.gray)
+
+alertcondition(longCondition, "Long Entry Signal", "Long entry conditions met")
+alertcondition(shortCondition, "Short Entry Signal", "Short entry conditions met")

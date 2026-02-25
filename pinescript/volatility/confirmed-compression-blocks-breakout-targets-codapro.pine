@@ -1,0 +1,461 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CodaPro.ai LLC / ArisCodes
+//@version=6
+indicator("Compression Blocks + Breakout Targets [Confirmed]", overlay=true,
+     max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SQUEEZE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+grpSqueeze = "Squeeze Detection"
+bbLen      = input.int(20, "BB Length", minval=5, maxval=50, group=grpSqueeze)
+kcLen      = input.int(20, "KC Length", minval=5, maxval=50, group=grpSqueeze)
+kcMult     = input.float(1.5, "KC Multiplier", minval=0.5, maxval=3.0, step=0.1, group=grpSqueeze)
+minSqzBars = input.int(4, "Min Squeeze Bars", minval=2, maxval=20, group=grpSqueeze, tooltip="Minimum bars in squeeze to form a valid compression block.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BREAKOUT SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+grpBreak = "Breakout Settings"
+projMult     = input.float(1.0, "Projection Multiplier", minval=0.5, maxval=3.0, step=0.1, group=grpBreak, tooltip="1.0 = measured move. 1.5 = 150% extension.")
+maxWatchBars = input.int(20, "Max Watch Bars", minval=5, maxval=100, group=grpBreak, tooltip="Bars to watch for breakout after squeeze ends. If no breakout, block goes stale.")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+grpTM = "Trade Management"
+enableTM       = input.bool(true, "Enable Trade Management", group=grpTM)
+cooldownLen    = input.int(5, "Cooldown Bars", minval=1, maxval=20, group=grpTM)
+maxBarsInTrade = input.int(50, "Max Bars in Trade", minval=10, maxval=200, group=grpTM)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════════════════
+grpVis = "Visuals"
+show3D         = input.bool(true, "3D Depth Effect", group=grpVis)
+showProjection = input.bool(true, "Show Projection Boxes", group=grpVis)
+showLabels     = input.bool(true, "Show Labels", group=grpVis)
+showDash       = input.bool(true, "Show Dashboard", group=grpVis)
+showSqzDots    = input.bool(true, "Show Squeeze Dots", group=grpVis)
+sqzColor       = input.color(#00F5D4, "Compression Block", group=grpVis)
+bullColor      = input.color(#00FF88, "Bull", group=grpVis)
+bearColor      = input.color(#FF4466, "Bear", group=grpVis)
+tpColor        = input.color(#00BCD4, "TP Color", group=grpVis)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SQUEEZE MATH
+// ═══════════════════════════════════════════════════════════════════════════════
+float bbBasis = ta.sma(close, bbLen)
+float bbDev   = 2.0 * ta.stdev(close, bbLen)
+float bbUp    = bbBasis + bbDev
+float bbDn    = bbBasis - bbDev
+float kcRange = kcMult * ta.atr(kcLen)
+float kcUp    = bbBasis + kcRange
+float kcDn    = bbBasis - kcRange
+
+bool squeezeOn = bbDn > kcDn and bbUp < kcUp
+
+// Compression score: how tight (BB width vs KC width)
+float bbW = bbUp - bbDn
+float kcW = kcUp - kcDn
+float compScore = kcW > 0 ? math.max(0, (1 - bbW / kcW) * 100) : 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MACHINE
+// States: 0=SCANNING  1=BUILDING  2=WATCHING  3=TRADING
+// ═══════════════════════════════════════════════════════════════════════════════
+var int state = 0
+var int prevState = 0
+
+// Compression zone tracking
+var int sqzStart = na
+var float sqzHi = na
+var float sqzLo = na
+var int sqzLen = 0
+var int sqzEndBar = na
+
+// Active drawing objects (redrawn during BUILDING)
+var box actMain = na
+var box actD1 = na
+var box actD2 = na
+
+// Trade tracking
+var int tradeDir = 0
+var float entryPrice = na
+var float tpLevel = na
+var float slLevel = na
+var int entryBar = 0
+var int exitBar = -999
+var box projBox = na
+var int lastTradeDir = 0
+
+// Breakout signals for plotshape
+bool breakoutLong = false
+bool breakoutShort = false
+string exitReason = ""
+
+if barstate.isconfirmed
+    // ──── SCANNING: look for squeeze ────
+    if state == 0
+        if squeezeOn
+            state := 1
+            sqzStart := bar_index
+            sqzHi := high
+            sqzLo := low
+            sqzLen := 1
+
+    // ──── BUILDING: squeeze active, grow block ────
+    else if state == 1
+        if squeezeOn
+            sqzHi := math.max(sqzHi, high)
+            sqzLo := math.min(sqzLo, low)
+            sqzLen += 1
+        else
+            // Squeeze ended
+            if sqzLen >= minSqzBars
+                sqzEndBar := bar_index
+                bool coolOK = (bar_index - exitBar) >= cooldownLen
+                // Check immediate breakout
+                if close > sqzHi and enableTM and coolOK and tradeDir == 0
+                    state := 3
+                    tradeDir := 1
+                    entryPrice := close
+                    tpLevel := sqzHi + (sqzHi - sqzLo) * projMult
+                    slLevel := sqzLo
+                    entryBar := bar_index
+                    breakoutLong := true
+                else if close < sqzLo and enableTM and coolOK and tradeDir == 0
+                    state := 3
+                    tradeDir := -1
+                    entryPrice := close
+                    tpLevel := sqzLo - (sqzHi - sqzLo) * projMult
+                    slLevel := sqzHi
+                    entryBar := bar_index
+                    breakoutShort := true
+                else if close > sqzHi and not enableTM
+                    breakoutLong := true
+                    state := 0
+                else if close < sqzLo and not enableTM
+                    breakoutShort := true
+                    state := 0
+                else
+                    state := 2
+            else
+                state := 0
+            sqzLen := 0
+
+    // ──── WATCHING: squeeze ended, waiting for breakout ────
+    else if state == 2
+        if squeezeOn
+            // New squeeze, start fresh
+            state := 1
+            sqzStart := bar_index
+            sqzHi := high
+            sqzLo := low
+            sqzLen := 1
+        else if (bar_index - sqzEndBar) > maxWatchBars
+            state := 0
+        else
+            bool coolOK = (bar_index - exitBar) >= cooldownLen
+            if close > sqzHi
+                if enableTM and coolOK and tradeDir == 0
+                    state := 3
+                    tradeDir := 1
+                    entryPrice := close
+                    tpLevel := sqzHi + (sqzHi - sqzLo) * projMult
+                    slLevel := sqzLo
+                    entryBar := bar_index
+                    breakoutLong := true
+                else if not enableTM
+                    breakoutLong := true
+                    state := 0
+            else if close < sqzLo
+                if enableTM and coolOK and tradeDir == 0
+                    state := 3
+                    tradeDir := -1
+                    entryPrice := close
+                    tpLevel := sqzLo - (sqzHi - sqzLo) * projMult
+                    slLevel := sqzHi
+                    entryBar := bar_index
+                    breakoutShort := true
+                else if not enableTM
+                    breakoutShort := true
+                    state := 0
+
+    // ──── TRADING: breakout active, track TP/SL ────
+    else if state == 3
+        int barsIn = bar_index - entryBar
+        if tradeDir == 1
+            if high >= tpLevel
+                exitReason := "TP HIT"
+            else if low <= slLevel
+                exitReason := "SL HIT"
+            else if barsIn >= maxBarsInTrade
+                exitReason := "MAX BARS"
+            else if squeezeOn and barsIn >= 3
+                exitReason := "BLOCKED"
+        else if tradeDir == -1
+            if low <= tpLevel
+                exitReason := "TP HIT"
+            else if high >= slLevel
+                exitReason := "SL HIT"
+            else if barsIn >= maxBarsInTrade
+                exitReason := "MAX BARS"
+            else if squeezeOn and barsIn >= 3
+                exitReason := "BLOCKED"
+
+        if exitReason != ""
+            lastTradeDir := tradeDir
+            exitBar := bar_index
+            tradeDir := 0
+            entryPrice := na
+            tpLevel := na
+            slLevel := na
+            state := 0
+
+    // ──── FREEZE / CLEANUP on state transitions ────
+    if prevState == 1 and state != 1
+        if state == 0 and sqzLen == 0 and prevState == 1
+            // Invalid squeeze (too short) — delete boxes
+            if not na(actMain)
+                box.delete(actMain)
+            if not na(actD1)
+                box.delete(actD1)
+            if not na(actD2)
+                box.delete(actD2)
+        // Null refs so next squeeze creates fresh boxes
+        actMain := na
+        actD1 := na
+        actD2 := na
+
+    prevState := state
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPRESSION BLOCK DRAWING (during BUILDING)
+// ═══════════════════════════════════════════════════════════════════════════════
+if state == 1 and sqzLen >= minSqzBars and barstate.isconfirmed
+    float blockH = sqzHi - sqzLo
+    float d1 = blockH * 0.10
+    float d2 = blockH * 0.20
+    // Transparency brightens as squeeze builds (more bars = tighter = brighter)
+    int baseA = math.max(50, 85 - sqzLen * 2)
+
+    // Delete old active boxes
+    if not na(actMain)
+        box.delete(actMain)
+    if not na(actD1)
+        box.delete(actD1)
+    if not na(actD2)
+        box.delete(actD2)
+
+    // 3D depth layers (draw outer first so inner renders on top)
+    if show3D
+        actD2 := box.new(sqzStart - 2, sqzHi + d2, bar_index + 2, sqzLo - d2,
+             border_color=color.new(sqzColor, math.min(baseA + 25, 95)),
+             bgcolor=color.new(sqzColor, math.min(baseA + 25, 95)),
+             border_width=0)
+        actD1 := box.new(sqzStart - 1, sqzHi + d1, bar_index + 1, sqzLo - d1,
+             border_color=color.new(sqzColor, math.min(baseA + 15, 92)),
+             bgcolor=color.new(sqzColor, math.min(baseA + 15, 92)),
+             border_width=0)
+
+    // Main compression block (front layer)
+    actMain := box.new(sqzStart, sqzHi, bar_index, sqzLo,
+         border_color=color.new(sqzColor, math.max(baseA - 20, 10)),
+         bgcolor=color.new(sqzColor, baseA),
+         border_width=2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROJECTION BOX + BREAKOUT LABELS
+// ═══════════════════════════════════════════════════════════════════════════════
+if (breakoutLong or breakoutShort) and barstate.isconfirmed
+    // Projection box
+    if showProjection and enableTM and not na(tpLevel)
+        if not na(projBox)
+            box.delete(projBox)
+        if breakoutLong
+            projBox := box.new(bar_index, tpLevel, bar_index + maxBarsInTrade, sqzHi,
+                 border_color=color.new(bullColor, 30),
+                 bgcolor=color.new(bullColor, 85),
+                 border_width=1,
+                 border_style=line.style_dashed)
+        else
+            projBox := box.new(bar_index, sqzLo, bar_index + maxBarsInTrade, tpLevel,
+                 border_color=color.new(bearColor, 30),
+                 bgcolor=color.new(bearColor, 85),
+                 border_width=1,
+                 border_style=line.style_dashed)
+
+    // Breakout labels
+    if showLabels
+        if breakoutLong
+            label.new(bar_index, low, "BREAKOUT",
+                 style=label.style_label_up, color=color.new(bullColor, 10),
+                 textcolor=color.white, size=size.normal)
+        if breakoutShort
+            label.new(bar_index, high, "BREAKOUT",
+                 style=label.style_label_down, color=color.new(bearColor, 10),
+                 textcolor=color.white, size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT LABELS + PROJECTION CLEANUP
+// ═══════════════════════════════════════════════════════════════════════════════
+if exitReason != "" and barstate.isconfirmed
+    if not na(projBox)
+        box.delete(projBox)
+        projBox := na
+    if showLabels and not str.contains(exitReason, "SL")
+        bool isTP = str.contains(exitReason, "TP")
+        bool isBlocked = str.contains(exitReason, "BLOCKED")
+        color eLblClr = isTP ? tpColor : isBlocked ? color.new(#FFD700, 0) : color.new(#555555, 40)
+        color eTxtClr = isTP or isBlocked ? color.white : color.new(#ffffff, 30)
+        string eLblSz = isTP or isBlocked ? size.normal : size.tiny
+        label.new(bar_index, lastTradeDir == 1 ? low : high,
+             exitReason,
+             style=lastTradeDir == 1 ? label.style_label_up : label.style_label_down,
+             color=eLblClr, textcolor=eTxtClr, size=eLblSz)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL SHAPES + SQUEEZE DOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+plotshape(breakoutLong, "Long Breakout", shape.triangleup, location.belowbar, bullColor, size=size.normal)
+plotshape(breakoutShort, "Short Breakout", shape.triangledown, location.abovebar, bearColor, size=size.normal)
+plotshape(showSqzDots and squeezeOn, "Squeeze Active", shape.diamond, location.belowbar,
+     color.new(sqzColor, 30), size=size.tiny)
+
+// Ghost candles
+barcolor(color.new(color.gray, 80))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CODAPRO GAUGE-BAR DASHBOARD (Signature Style)
+// ═══════════════════════════════════════════════════════════════════════════════
+f_gauge(float pct, int barLen) =>
+    int filled = math.round(pct / 100 * barLen)
+    int empty = barLen - filled
+    string bar = ""
+    for i = 0 to filled - 1
+        bar += "█"
+    for i = 0 to empty - 1
+        bar += "░"
+    bar
+
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 3, 8,
+         bgcolor=color.new(#0a0a14, 15), border_width=1,
+         border_color=color.new(#1a1a2e, 0))
+
+    // ── Header ──
+    table.cell(dash, 0, 0, "C O M P R E S S I O N", text_color=color.new(#00F5D4, 0),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 0, "", bgcolor=color.new(#0a0a14, 0))
+    table.cell(dash, 2, 0, "BLOCKS", text_color=color.new(#00F5D4, 0),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── State with colored dot ──
+    string dotChar = "●"
+    string stateText = state == 0 ? "SCANNING" : state == 1 ? "BUILDING" : state == 2 ? "WATCHING" : "ARMED"
+    color dotClr = state == 0 ? color.gray : state == 1 ? #00F5D4 : state == 2 ? #FFD700 : bullColor
+    table.cell(dash, 0, 1, dotChar + " " + stateText, text_color=dotClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 1, "", bgcolor=color.new(#0a0a14, 0))
+    string trdDot = tradeDir == 1 ? "● LONG" : tradeDir == -1 ? "● SHORT" : "○ FLAT"
+    color trdDotClr = tradeDir == 1 ? bullColor : tradeDir == -1 ? bearColor : color.gray
+    table.cell(dash, 2, 1, trdDot, text_color=trdDotClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── Separator ──
+    table.cell(dash, 0, 2, "─────────", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 2, "───", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 2, 2, "─────────", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── Compression Pressure Gauge ──
+    float displayComp = math.min(compScore, 100)
+    color compGaugeClr = displayComp > 60 ? #00F5D4 : displayComp > 30 ? #FFD700 : color.gray
+    table.cell(dash, 0, 3, "Pressure", text_color=color.new(color.white, 30),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 3, f_gauge(displayComp, 10), text_color=compGaugeClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 2, 3, str.tostring(displayComp, "#.#") + "%", text_color=compGaugeClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── BB Width Gauge (how tight bands are vs KC) ──
+    float bbWidthPct = kcW > 0 ? math.min(bbW / kcW * 100, 100) : 100
+    float tightness = 100 - bbWidthPct
+    color tightClr = tightness > 60 ? #00F5D4 : tightness > 30 ? #FFD700 : color.gray
+    table.cell(dash, 0, 4, "Tightness", text_color=color.new(color.white, 30),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 4, f_gauge(tightness, 10), text_color=tightClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 2, 4, str.tostring(tightness, "#.#") + "%", text_color=tightClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── Volatility Gauge (ATR relative) ──
+    float atrNow = ta.atr(14)
+    float atrHi = ta.highest(ta.atr(14), 100)
+    float volPct = atrHi > 0 ? math.min(atrNow / atrHi * 100, 100) : 0
+    color volClr = volPct > 60 ? bearColor : volPct > 30 ? #FFD700 : bullColor
+    table.cell(dash, 0, 5, "Volatility", text_color=color.new(color.white, 30),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 5, f_gauge(volPct, 10), text_color=volClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 2, 5, str.tostring(volPct, "#.#") + "%", text_color=volClr,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── Separator ──
+    table.cell(dash, 0, 6, "─────────", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 6, "───", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 2, 6, "─────────", text_color=color.new(#00F5D4, 70),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+    // ── Block Info + Target ──
+    string blockText = not na(sqzHi) and not na(sqzLo) and (state == 1 or state == 2 or state == 3) ? str.tostring(sqzHi - sqzLo, "#.##") : "---"
+    table.cell(dash, 0, 7, "Block", text_color=color.new(color.white, 30),
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    table.cell(dash, 1, 7, blockText, text_color=color.white,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+    string tpText = not na(tpLevel) ? "$" + str.tostring(tpLevel, "#.##") : "---"
+    table.cell(dash, 2, 7, "TP " + tpText, text_color=tpColor,
+         text_size=size.small, bgcolor=color.new(#0a0a14, 0), text_font_family=font.family_monospace)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATUS LINE
+// ═══════════════════════════════════════════════════════════════════════════════
+plot(compScore, "Compression %", display=display.status_line, color=sqzColor, editable=false)
+plot(squeezeOn ? 1.0 : 0.0, "Squeeze", display=display.status_line, color=sqzColor, editable=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(breakoutLong, "Bullish Breakout", "Compression Block breakout to the upside")
+alertcondition(breakoutShort, "Bearish Breakout", "Compression Block breakout to the downside")
+alertcondition(squeezeOn and not squeezeOn[1], "Squeeze Started", "New compression squeeze detected")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISCLAIMER
+// ═══════════════════════════════════════════════════════════════════════════════
+// This tool was created using the CodaPro.ai Pine Script AI engine — designed to
+// produce robust trading overlays, educational visuals, and automation-ready
+// alerts. It is provided strictly for educational and informational purposes
+// and does not constitute financial advice. Past performance does not guarantee
+// future results. Always backtest and demo before applying to real capital.
+// Use at your own risk. Created by ArisCodes | CodaPro Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+//─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+//─██████████████───██████████████───██████████████───██████████████───██████████████───██████████████───██████████████─
+//─██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██─
+//─██░░██████████───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██───██░░██████░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░████████░░██─██░░██████░░██───██░░████████░░██─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░░░░░░░░░░░██─██░░░░░░░░░░██───██░░░░░░░░░░░░██─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██████░░████─██░░██████████───██░░██████░░████─██░░██──██░░██─
+//─██░░██───────────██░░██──██░░██───██░░██──██░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░██──██░░██─
+//─██░░██████████───██░░██████░░██───██░░██████░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░██████░░██─
+//─██░░░░░░░░░░██───██░░░░░░░░░░██───██░░░░░░░░░░██───██░░██──██░░██───██░░██───────────██░░██──██░░██───██░░░░░░░░░░██─
+//─██████████████───██████████████───██████████████───██████──██████───██████───────────██████──██████───██████████████─
+//─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+//                                              CodaPro Trading Systems

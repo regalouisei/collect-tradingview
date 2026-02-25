@@ -1,0 +1,105 @@
+//@version=5
+indicator("Predictive Analysis Engine", shorttitle="PAE", overlay=false, max_lines_count=200, max_labels_count=200)
+
+// ---------------------- User Inputs ----------------------
+r2_len        = input.int(20, "R² Period (stability)", minval=5)
+fast_len      = input.int(10, "Fast EMA Length", minval=2)
+slow_len      = input.int(20, "Slow EMA Length", minval=2)
+sig_len       = input.int(9,  "Signal Length", minval=2)
+
+proj_len      = input.int(14, "Projection LR Length", minval=4, tooltip="Length used when forecasting MACD with linear regression")
+proj_weight   = input.float(0.6, "Forecast Blend Weight", step=0.05, tooltip="0 = no forecast, 1 = only forecasted price")
+atr_len       = input.int(14, "ATR Length (vol filter)", minval=2)
+conf_min      = input.float(0.55, "Min Confidence (0-1) to allow signals", step=0.01)
+smooth_signal = input.bool(true, "Use TEMA for signal smoothing")
+hist_smooth   = input.int(3, "Histogram Smoothing (0 = none)", minval=0)
+
+// ---------------------- Helper: safe NA -> 0 ----------------------
+f_na(x) => na(x) ? 0.0 : x
+
+// ---------------------- Helper: TEMA implementation ----------------------
+tema(src, length) =>
+    e1 = ta.ema(src, length)
+    e2 = ta.ema(e1, length)
+    e3 = ta.ema(e2, length)
+    3 * e1 - 3 * e2 + e3
+
+// ---------------------- 1) Stability (R²) ----------------------
+r2_raw = math.pow(ta.correlation(close, bar_index, r2_len), 2)
+R2 = 0.5 * r2_raw + 0.5   // bias similar to LuxAlgo style
+
+// ---------------------- 2) Forecasted price (leading) ----------------------
+forecast_close = ta.linreg(close, proj_len, -1)
+blended_price = close * (1 - proj_weight) + forecast_close * proj_weight
+
+// ---------------------- 3) MACD base on blended (leading) ----------------------
+ema_fast = ta.ema(blended_price, fast_len)
+ema_slow = ta.ema(blended_price, slow_len)
+macd_base = ema_fast - ema_slow
+macd_base_sm = ta.ema(macd_base, 2)
+
+// ---------------------- 4) Signal line (optionally TEMA smoothed) ----------------------
+signal_raw = smooth_signal ? tema(macd_base_sm, sig_len) : ta.ema(macd_base_sm, sig_len)
+signal = signal_raw
+
+// ---------------------- 5) Histogram (and optional smoothing) ----------------------
+hist = macd_base_sm - signal
+hist_s = hist_smooth > 0 ? ta.ema(hist, hist_smooth) : hist
+
+// ---------------------- 6) Projected MACD (direct forecast on MACD) ----------------------
+proj_macd = ta.linreg(macd_base_sm, proj_len, -1)
+proj_signal = ta.linreg(signal, proj_len, -1)
+proj_hist = proj_macd - proj_signal
+
+// ---------------------- 7) Volatility & Confidence ----------------------
+atr = ta.atr(atr_len)
+atr_sma = ta.sma(atr, 40)
+vol_ratio = atr_sma == 0 ? 1.0 : atr / atr_sma
+confidence = R2 * math.min(1.0, vol_ratio)
+
+// ---------------------- 8) Signal Rules (predictive + safe) ----------------------
+lead_cross_up   = ta.crossover(proj_hist, 0)
+lead_cross_down = ta.crossunder(proj_hist, 0)
+
+guard_ok_up = hist > - (atr * 0.25)
+guard_ok_dn = hist <   (atr * 0.25)
+
+buy  = lead_cross_up and (confidence >= conf_min) and guard_ok_up
+sell = lead_cross_down and (confidence >= conf_min) and guard_ok_dn
+
+buy_strong  = buy and hist_s > hist_s[1]
+sell_strong = sell and hist_s < hist_s[1]
+
+// ---------------------- 9) Plotting ----------------------
+hcol = hist_s > 0 ? (hist_s > hist_s[1] ? color.new(color.teal, 0) : color.new(color.teal, 60))
+     : (hist_s < hist_s[1] ? color.new(color.red, 0) : color.new(color.red, 60))
+
+plot(hist_s, title="Histogram (smoothed)", style=plot.style_columns, linewidth=1, color=hcol)
+plot(macd_base_sm, title="MACD (base)", color=color.white)
+plot(signal, title="Signal", color=color.orange)
+plot(proj_hist, title="Projected Histogram (lead)", color=color.new(color.blue, 40), style=plot.style_line, linewidth=2)
+
+plot(confidence, title="Confidence", color=color.new(color.green, 60), linewidth=1)
+hline(conf_min, title="Min Confidence", color=color.new(color.yellow, 60), linestyle=hline.style_dotted)
+
+// ---------------------- 10) Signals on chart ----------------------
+plotshape(buy,  title="BUY",  style=shape.labelup,    location=location.bottom, color=color.new(color.green,0),  text="BUY",   textcolor=color.black, size=size.small)
+plotshape(sell, title="SELL", style=shape.labeldown,  location=location.top,    color=color.new(color.red,0),    text="SELL",  textcolor=color.white, size=size.small)
+
+plotshape(buy_strong,  title="BUY_STRONG",  style=shape.triangleup,   location=location.bottom, color=color.green,  size=size.tiny)
+plotshape(sell_strong, title="SELL_STRONG", style=shape.triangledown, location=location.top,    color=color.red,    size=size.tiny)
+
+bgcolor(hist_s > 0 and confidence >= conf_min ? color.new(color.green, 90) : na)
+bgcolor(hist_s < 0 and confidence >= conf_min ? color.new(color.red, 90) : na)
+
+// ---------------------- 11) Alerts ----------------------
+alertcondition(buy,  title="AMO BUY (Predictive)",  message="AMO Pro: Predictive BUY signal")
+alertcondition(sell, title="AMO SELL (Predictive)", message="AMO Pro: Predictive SELL signal")
+
+// ---------------------- 12) Info Table ----------------------
+var table info = table.new(position.top_right, 1, 4, border_width=1)
+if barstate.islast
+    table.cell(info, 0, 0, "R²: " + str.tostring(R2, "#.##") + "  |  Conf: " + str.tostring(confidence, "#.##"))
+    table.cell(info, 0, 1, "ATR: " + str.tostring(atr, "#.5") + "  |  VolRatio: " + str.tostring(vol_ratio, "#.##"))
+    table.cell(info, 0, 2, "Hist: " + str.tostring(hist_s, "#.5") + "  |  ProjHist: " + str.tostring(proj_hist, "#.5"))
+    table.cell(info, 0, 3, buy ? "Signal: BUY" : sell ? "Signal: SELL" : "Signal: None")

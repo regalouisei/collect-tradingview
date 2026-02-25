@@ -1,0 +1,220 @@
+//@version=6
+strategy("Tetrad RSI→RSI Cross→MACD (Sequenced) — Counter-Trend (SL-Only Visuals)",
+     shorttitle="Tetrad RSIxMACD Seq CT (SL-Only)",
+     overlay=true, initial_capital=100000,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     pyramiding=0, calc_on_every_tick=true, calc_on_order_fills=true, process_orders_on_close=true)
+
+//──────── Colors
+tPurple = color.rgb(126, 87, 194)
+tTeal   = color.rgb(0, 229, 255)
+tBlue   = color.rgb(30,144,255)
+tGlowUpLight   = color.new(color.rgb( 30,150,255), 80)
+tGlowUpDeep    = color.new(color.rgb(  0, 50,255), 70)
+tGlowDownLight = color.new(color.rgb(200,140,255), 80)
+tGlowDownDeep  = color.new(color.rgb(120,  0,200), 70)
+tGlowFlat      = color.new(color.white, 100)
+
+//──────── Mode
+grpMode = "Mode"
+strategyMode  = input.string("Market Neutral", "Strategy Mode", options=["Long Only","Short Only","Market Neutral"], group=grpMode)
+userAllowLong  = strategyMode == "Long Only"  or strategyMode == "Market Neutral"
+userAllowShort = strategyMode == "Short Only" or strategyMode == "Market Neutral"
+
+//──────── Core Signals
+grpCore = "Core Signals"
+rsiLen  = input.int(14, minval=1, title="RSI Length", group=grpCore)
+rsiLow  = input.float(27.5, "RSI Oversold",  minval=1,  maxval=60, step=0.5, group=grpCore)
+rsiHigh = input.float(74.0, "RSI Overbought", minval=40, maxval=99, step=0.5, group=grpCore)
+fastLen = input.int(12, "MACD Fast", minval=1, group=grpCore)
+slowLen = input.int(26, "MACD Slow", minval=1, group=grpCore)
+sigLen  = input.int(9,  "MACD Signal", minval=1, group=grpCore)
+
+//──────── Sequence Controls
+grpSeq = "Sequence Controls"
+maxBars_RSI_from_Extreme = input.int(36, "Max bars: Extreme → RSI Cross", minval=1, maxval=200, group=grpSeq)
+maxBars_MACD_from_RSI    = input.int(36, "Max bars: RSI Cross → MACD Cross", minval=1, maxval=200, group=grpSeq)
+
+//──────── Risk / Exits
+grpRisk = "Stops / Targets"
+useSL       = input.bool(true,  "Enable Stop-Loss (default ON)", group=grpRisk)
+slPct       = input.float(14.0, "Stop-Loss %", step=0.1, group=grpRisk)
+
+//──────── Regime Engine (counter-trend)
+grpReg = "Regime Engine"
+useRegime   = input.bool(true,  "Use Market Regime Filter (Counter-Trend)", group=grpReg)
+adxLen      = input.int(12,     "ADX Length", minval=3, group=grpReg)
+adxTrendMin = input.float(18.0, "Trend ADX >=", step=0.5, group=grpReg)
+adxParaMin  = input.float(28.0, "Parabolic ADX >=", step=0.5, group=grpReg)
+atrLen      = input.int(14,     "ATR Length (for ATR%)", minval=2, group=grpReg)
+atrParaPct  = input.float(1.20, "Parabolic Vol floor (ATR% of price)", step=0.05, group=grpReg)
+
+atr    = ta.atr(atrLen)
+atrPct = atr / close * 100.0
+upMove   = ta.change(high)
+downMove = -ta.change(low)
+plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+atrADX   = ta.atr(adxLen)
+plusDI   = 100.0 * ta.rma(plusDM,  adxLen) / atrADX
+minusDI  = 100.0 * ta.rma(minusDM, adxLen) / atrADX
+dxRaw    = 100.0 * math.abs(plusDI - minusDI) / math.max(plusDI + minusDI, 1e-10)
+adxVal   = ta.rma(dxRaw, adxLen)
+dirUp    = plusDI >= minusDI
+
+Regime_Range     = 0
+Regime_TrendUp   = 1
+Regime_TrendDown = 2
+Regime_ParabUp   = 3
+Regime_ParabDown = 4
+
+resolveRegime() =>
+    isPara  = (adxVal >= adxParaMin) and (atrPct >= atrParaPct)
+    isTrend = (adxVal >= adxTrendMin)
+    ret = Regime_Range
+    if isPara
+        ret := dirUp ? Regime_ParabUp : Regime_ParabDown
+    else if isTrend
+        ret := dirUp ? Regime_TrendUp : Regime_TrendDown
+    ret
+
+regNow = resolveRegime()
+
+// Counter-trend gate
+regAllowLongCT  = not useRegime or regNow == Regime_Range or regNow == Regime_TrendDown or regNow == Regime_ParabDown
+regAllowShortCT = not useRegime or regNow == Regime_Range or regNow == Regime_TrendUp   or regNow == Regime_ParabUp
+allowLong  = userAllowLong  and regAllowLongCT
+allowShort = userAllowShort and regAllowShortCT
+
+//──────── Donchian Glow only (50 by default)
+lengthDC = input.int(50, "Donchian Length (Glow Only)", minval=2)
+upper = ta.highest(high, lengthDC)
+lower = ta.lowest (low,  lengthDC)
+pU = plot(upper, "Donchian Upper (hidden)", color=color.new(tPurple, 100), linewidth=1, style=plot.style_line, display=display.none)
+pL = plot(lower, "Donchian Lower (hidden)", color=color.new(tBlue,   100), linewidth=1, style=plot.style_line, display=display.none)
+fillCol = regNow == Regime_TrendUp ? tGlowUpLight : regNow == Regime_ParabUp ? tGlowUpDeep : regNow == Regime_TrendDown ? tGlowDownLight : regNow == Regime_ParabDown ? tGlowDownDeep : tGlowFlat
+fill(pU, pL, color=fillCol, title="Regime Glow (Band)")
+
+//──────── RSI / MACD
+chg  = ta.change(close)
+up   = ta.rma(math.max(chg, 0), rsiLen)
+down = ta.rma(-math.min(chg, 0), rsiLen)
+rsi  = down == 0 ? 100.0 : up == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + up / down))
+macd_fast  = ta.ema(close, fastLen)
+macd_slow  = ta.ema(close, slowLen)
+macdLine   = macd_fast - macd_slow
+macdSignal = ta.ema(macdLine, sigLen)
+
+rsiCrossUpLow     = ta.crossover(rsi, rsiLow)
+rsiCrossDownHigh  = ta.crossunder(rsi, rsiHigh)
+macdBullCross     = ta.crossover(macdLine, macdSignal)
+macdBearCross     = ta.crossunder(macdLine, macdSignal)
+rsiExtremeLong  = rsi < rsiLow
+rsiExtremeShort = rsi > rsiHigh
+
+//──────── Sequence Engine
+var int longStage = 0
+var int shortStage = 0
+var int longStageBar = na
+var int shortStageBar = na
+
+if rsiExtremeLong
+    longStage := 1
+    longStageBar := bar_index
+    shortStage := 0
+    shortStageBar := na
+if longStage == 1 and rsiCrossUpLow and (bar_index - longStageBar) <= maxBars_RSI_from_Extreme
+    longStage := 2
+    longStageBar := bar_index
+if longStage == 1 and (bar_index - longStageBar) > maxBars_RSI_from_Extreme
+    longStage := 0
+    longStageBar := na
+if longStage == 2 and (bar_index - longStageBar) > maxBars_MACD_from_RSI
+    longStage := 0
+    longStageBar := na
+
+if rsiExtremeShort
+    shortStage := 1
+    shortStageBar := bar_index
+    longStage := 0
+    longStageBar := na
+if shortStage == 1 and rsiCrossDownHigh and (bar_index - shortStageBar) <= maxBars_RSI_from_Extreme
+    shortStage := 2
+    shortStageBar := bar_index
+if shortStage == 1 and (bar_index - shortStageBar) > maxBars_RSI_from_Extreme
+    shortStage := 0
+    shortStageBar := na
+if shortStage == 2 and (bar_index - shortStageBar) > maxBars_MACD_from_RSI
+    shortStage := 0
+    shortStageBar := na
+
+rawEnterLong  = longStage  == 2 and macdBullCross
+rawEnterShort = shortStage == 2 and macdBearCross
+
+//──────── Price Gate for Longs (disable longs above ceiling)
+grpPG = "Price Gate"
+useLongCeiling = input.bool(true,  "Disable new LONGs above a price?", group=grpPG)
+longCeiling    = input.float(209.0, "LONGs allowed only if price ≤", step=0.1, group=grpPG)
+longPriceOK    = (not useLongCeiling) or (close <= longCeiling)
+
+//──────── Final entries
+enterLong  = rawEnterLong  and allowLong  and longPriceOK
+enterShort = rawEnterShort and allowShort
+
+if enterLong
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Flip Long")
+    strategy.entry("Long", strategy.long)
+    longStage := 0
+    longStageBar := na
+    shortStage := 0
+    shortStageBar := na
+
+if enterShort
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Flip Short")
+    strategy.entry("Short", strategy.short)
+    shortStage := 0
+    shortStageBar := na
+    longStage := 0
+    longStageBar := na
+
+//──────── Exits / Stop-Loss logic
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avg     = strategy.position_avg_price
+longSL  = useSL and inLong  ? avg * (1 - slPct/100.0) : na
+shortSL = useSL and inShort ? avg * (1 + slPct/100.0) : na
+
+if inLong and useSL
+    strategy.exit("SL_Long", from_entry="Long", stop=longSL)
+if inShort and useSL
+    strategy.exit("SL_Short", from_entry="Short", stop=shortSL)
+
+//──────── Draw SL ONLY when hit — thin dashed red on that bar
+slHitLong  = inLong[1]  and useSL and not na(longSL[1])  and low  <= longSL[1]
+slHitShort = inShort[1] and useSL and not na(shortSL[1]) and high >= shortSL[1]
+if slHitLong
+    line.new(bar_index - 1, longSL[1], bar_index, longSL[1], xloc=xloc.bar_index, extend=extend.none, color=color.new(color.red, 0), width=1, style=line.style_dashed)
+if slHitShort
+    line.new(bar_index - 1, shortSL[1], bar_index, shortSL[1], xloc=xloc.bar_index, extend=extend.none, color=color.new(color.red, 0), width=1, style=line.style_dashed)
+
+//──────── Regime HUD (top-right)
+var table rb = na
+showRegimeBox = input.bool(true, "Show Regime Box (top-right)", group="HUD")
+if showRegimeBox
+    if na(rb)
+        rb := table.new(position.top_right, 1, 6, border_width=2, border_color=color.new(color.black, 0), frame_color=color.new(color.black, 0))
+    curIdx = regNow == Regime_TrendUp ? 1 : regNow == Regime_ParabUp ? 2 : regNow == Regime_TrendDown ? 3 : regNow == Regime_ParabDown ? 4 : 5
+    for i = 0 to 5
+        txt = i==0 ? "Regime" : i==1 ? "Long Trend" : i==2 ? "Long Parabolic" : i==3 ? "Short Trend" : i==4 ? "Short Parabolic" : "Ranging"
+        isHdr = i == 0
+        isCur = i == curIdx
+        base = i==1 ? color.new(color.rgb( 90,180,255), 80) : i==2 ? color.new(color.rgb(  0, 90,255), 70) : i==3 ? color.new(color.rgb(200,140,255), 80) : i==4 ? color.new(color.rgb(120,  0,200), 70) : color.new(color.black, 100)
+        bg   = isHdr ? color.new(color.black, 0) : (isCur ? color.new(base, 35) : color.new(base, 0))
+        disp = (isCur and not isHdr) ? ("> " + txt) : txt
+        table.cell(rb, 0, i, disp, text_color=color.white, bgcolor=bg, text_size=size.tiny)
+
+// Alerts (optional)
+alertcondition(enterLong,  "Sequenced Long (CT)",  "RSI<low→RSI cross↑→MACD bull cross (CT ok) + long price gate")
+alertcondition(enterShort, "Sequenced Short (CT)", "RSI>high→RSI cross↓→MACD bear cross (CT ok)")

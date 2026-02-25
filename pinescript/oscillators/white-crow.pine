@@ -1,0 +1,209 @@
+//@version=6
+indicator("White Crow", overlay=true, format=format.price, precision=8)
+
+// === Indicator Settings ===
+// Pivot Settings
+showPivots = input.bool(true, "Show Pivots", group="Pivot Settings")
+pivotSigma = input.float(0.036, "Sigma (% retracement)", minval=0.001, step=0.001, group="Pivot Settings")
+pivotColorTop = input.color(color.rgb(255, 82, 82, 80), "Top Color", group="Pivot Settings")
+pivotColorBottom = input.color(color.rgb(76, 175, 79, 80), "Bottom Color", group="Pivot Settings")
+
+// CCI Settings
+cci_length = input.int(5, "Period", minval=3, group="CCI Settings")
+
+// RSI Filter
+show_rsi = input.bool(true, "Enable RSI Filter", group="RSI Settings")
+rsi_length = input.int(14, "RSI Period", minval=5, group="RSI Settings")
+// Hidden RSI levels (fixed values)
+rsi_oversold = 20
+rsi_overbought = 80
+
+// Order Block Settings
+show_order_block = input.bool(true, "Show Order Blocks", group="Order Blocks")
+order_block_threshold = input.float(1.5, "Block Threshold (ATR multiplier)", minval=0.1, group="Order Blocks")
+
+// Signal Toggles
+show_buy = input.bool(true, "Show Buy Signals", group="Signals")
+show_buy_x = input.bool(true, "Show Buy X Signals", group="Signals")
+show_close = input.bool(true, "Show Close Signals", group="Signals")
+show_closev = input.bool(true, "Show CloseV Signals", group="Signals")
+
+// Time Filter
+enable_time_filter = input.bool(true, "Enable Time Filter", group="Signal Filters")
+bar_filter = input.int(10, "Min Bars Between Signals", minval=1, group="Signal Filters")
+
+// Alert Settings
+alert_buy = input.bool(true, "Buy Alerts", group="Alert Settings")
+alert_buy_x = input.bool(true, "Buy X Alerts", group="Alert Settings")
+alert_close = input.bool(true, "Close Alerts", group="Alert Settings")
+alert_closev = input.bool(true, "CloseV Alerts", group="Alert Settings")
+alert_once_per_bar = input.bool(true, "One Alert Per Bar", group="Alert Settings")
+
+// ========================
+// Trend Detection Variables
+// ========================
+var float last_bottom = na
+var float last_top = na
+var float prev_bottom = na
+var float prev_top = na
+var string trend = "Undefined"
+
+// ========================
+// Pivot Detection Logic
+// ========================
+var bool up_zig = true
+var float tmp_max = high
+var float tmp_min = low
+var int tmp_max_i = 0
+var int tmp_min_i = 0
+
+if showPivots
+    if up_zig
+        if high > tmp_max
+            tmp_max := high
+            tmp_max_i := bar_index
+        else if close < tmp_max * (1 - pivotSigma)
+            label.new(tmp_max_i, tmp_max, "Top", 
+                 color=pivotColorTop, 
+                 style=label.style_label_down, 
+                 textcolor=color.white,
+                 size=size.small)
+            // Update top levels
+            prev_top := last_top
+            last_top := tmp_max
+            up_zig := false
+            tmp_min := low
+            tmp_min_i := bar_index
+    else
+        if low < tmp_min
+            tmp_min := low
+            tmp_min_i := bar_index
+        else if close > tmp_min * (1 + pivotSigma)
+            label.new(tmp_min_i, tmp_min, "Bottom", 
+                 color=pivotColorBottom, 
+                 style=label.style_label_up, 
+                 textcolor=color.white,
+                 size=size.small)
+            // Update bottom levels
+            prev_bottom := last_bottom
+            last_bottom := tmp_min
+            up_zig := true
+            tmp_max := high
+            tmp_max_i := bar_index
+
+// Determine trend based on pivots
+trend := "Sideways"
+if not na(last_bottom) and not na(prev_bottom) and last_bottom > prev_bottom
+    trend := "Bullish"
+else if not na(last_top) and not na(prev_top) and last_top < prev_top
+    trend := "Bearish"
+
+// ========================
+// Core Indicator Logic
+// ========================
+// Fixed CCI levels
+cci_upper = 100
+cci_lower = -100
+
+// Indicator calculations
+cci = ta.cci(close, cci_length)
+rsi = ta.rsi(close, rsi_length)
+atr = ta.atr(14)
+
+// Base signal conditions
+long_signal = 
+  cci < cci_lower and
+  (show_rsi ? rsi < rsi_oversold : true)
+
+short_signal = 
+  cci > cci_upper and
+  (show_rsi ? rsi > rsi_overbought : true)
+
+// Time filter variables
+var int last_buy_x_bar = 0
+var int last_closev_bar = 0
+
+// Signal clusters
+buy_count = (long_signal ? 1 : 0) + (long_signal[1] ? 1 : 0) + (long_signal[2] ? 1 : 0) + (long_signal[3] ? 1 : 0)
+sell_count = (short_signal ? 1 : 0) + (short_signal[1] ? 1 : 0) + (short_signal[2] ? 1 : 0) + (short_signal[3] ? 1 : 0)
+
+// Buy X signal
+buy_x_base_cond = buy_count >= 2
+buy_x_time_ok = not enable_time_filter or (bar_index - last_buy_x_bar) >= bar_filter
+buy_x_signal = buy_x_base_cond and buy_x_time_ok
+
+if buy_x_signal
+    last_buy_x_bar := bar_index
+
+// CloseV signal
+closev_base_cond = sell_count >= 2
+closev_time_ok = not enable_time_filter or (bar_index - last_closev_bar) >= bar_filter
+closev_signal = closev_base_cond and closev_time_ok
+
+if closev_signal
+    last_closev_bar := bar_index
+
+// Order Block Detection
+if show_order_block and math.abs(close - open) > order_block_threshold * atr
+    box.new(bar_index-1, math.min(open, close), bar_index, math.max(open, close), bgcolor=color.new(close>open ? color.green:color.red, 80))
+
+// Signal conditions
+buy_alert_condition = show_buy and long_signal and not buy_x_signal
+buy_x_alert_condition = show_buy_x and buy_x_signal
+close_alert_condition = show_close and short_signal and not closev_signal
+closev_alert_condition = show_closev and closev_signal
+
+// Plot signals
+plotshape(buy_alert_condition, style=shape.labelup, location=location.belowbar, color=color.rgb(179, 247, 21, 24), text="Buy", textcolor=color.white)
+plotshape(close_alert_condition, style=shape.labeldown, location=location.abovebar, color=color.rgb(241, 229, 55), text="Close", textcolor=color.white)
+plotshape(buy_x_alert_condition, style=shape.labelup, location=location.belowbar, color=color.blue, text="Buy X", textcolor=color.white)
+plotshape(closev_alert_condition, style=shape.labeldown, location=location.abovebar, color=color.rgb(255, 0, 0), text="CloseV", textcolor=color.white)
+
+// ========================
+// Alert System
+// ========================
+alert_message(message) => 
+    message + " | " + syminfo.ticker + " (" + timeframe.period + ") | Price: " + str.tostring(close)
+
+// Alert triggers
+if alert_buy and buy_alert_condition
+    alert(alert_message("Buy Signal"), alert_once_per_bar ? alert.freq_once_per_bar_close : alert.freq_all)
+
+if alert_buy_x and buy_x_alert_condition
+    alert(alert_message("Buy X Signal"), alert_once_per_bar ? alert.freq_once_per_bar_close : alert.freq_all)
+
+if alert_close and close_alert_condition
+    alert(alert_message("Close Signal"), alert_once_per_bar ? alert.freq_once_per_bar_close : alert.freq_all)
+
+if alert_closev and closev_alert_condition
+    alert(alert_message("CloseV Signal"), alert_once_per_bar ? alert.freq_once_per_bar_close : alert.freq_all)
+
+// ======================
+// Simplified Trend Table
+// ========================
+var table trendTable = table.new(position.top_right, 2, 3, bgcolor=color.rgb(33, 40, 51, 85), border_width=2)
+
+if barstate.islast
+    // Market Trend
+    table.cell(trendTable, 0, 0, "Market Trend", bgcolor=color.gray)
+    table.cell(trendTable, 1, 0, trend, 
+         bgcolor=trend == "Bullish" ? color.green : trend == "Bearish" ? color.red : color.orange,
+         text_color=color.white)
+    
+    // Last Bottom - adaptive precision
+    table.cell(trendTable, 0, 1, "Last Bottom", bgcolor=color.gray)
+    table.cell(trendTable, 1, 1, 
+         na(last_bottom) ? "N/A" : 
+         last_bottom < 0.1 ? str.tostring(last_bottom, "0.000000") : 
+         last_bottom < 1 ? str.tostring(last_bottom, "0.0000") : 
+         str.tostring(last_bottom, "0.00"), 
+         text_color=color.white)
+    
+    // Last Top - adaptive precision
+    table.cell(trendTable, 0, 2, "Last Top", bgcolor=color.gray)
+    table.cell(trendTable, 1, 2, 
+         na(last_top) ? "N/A" : 
+         last_top < 0.1 ? str.tostring(last_top, "0.000000") : 
+         last_top < 1 ? str.tostring(last_top, "0.0000") : 
+         str.tostring(last_top, "0.00"), 
+         text_color=color.white)

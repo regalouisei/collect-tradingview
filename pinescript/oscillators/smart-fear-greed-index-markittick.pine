@@ -1,0 +1,193 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © MarkitTick
+
+//@version=6
+indicator("Smart Fear & Greed Index", overlay = false)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. CONFIGURATION & CONSTANTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+group_sets = 'Calculation Settings'
+group_vis  = 'Visualization Settings'
+group_div  = 'Divergence Settings'
+
+i_lookback     = input.int(21, 'Global Lookback Period', minval=5, tooltip='Sensitivity of metrics.', group=group_sets)
+i_smooth       = input.int(5, 'Smoothing Length', minval=1, group=group_sets)
+i_show_candles = input.bool(true, 'Color Main Chart Candles', tooltip='Colors the chart bars based on Fear/Greed sentiment.', group=group_vis)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. QUANT ENGINE ARCHITECTURE
+// ═════════════════════════════════════════════════════════════════════════════
+
+type QuantEngine
+    float m_momentum
+    float m_volatility
+    float m_volume
+    float m_position
+    float m_composite
+    float m_final
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. METHOD DEFINITIONS 
+// ═════════════════════════════════════════════════════════════════════════════
+
+normalize_helper(float src, int len) =>
+    float h = ta.highest(src, len)
+    float l = ta.lowest(src, len)
+    float div = math.max(h - l, 1e-9)
+    math.min(100, math.max(0, (src - l) / div * 100))
+
+method update_metrics(QuantEngine eng, int lookback_len) =>
+    eng.m_momentum := ta.rsi(close, lookback_len)
+
+    float raw_atr = ta.atr(lookback_len)
+    float norm_atr = normalize_helper(raw_atr, lookback_len * 2)
+    eng.m_volatility := 100.0 - norm_atr
+
+    float vol_sma = ta.sma(volume, lookback_len)
+    float vol_rel = volume / math.max(vol_sma, 1.0)
+    
+    float vol_metric = math.min(vol_rel, 2.0) / 2.0 * 100.0
+    eng.m_volume := close > open ? vol_metric : (100.0 - vol_metric)
+
+    eng.m_position := ta.stoch(close, high, low, lookback_len)
+
+method aggregate(QuantEngine eng, int smooth_len) =>
+    eng.m_composite := (eng.m_momentum + eng.m_volatility + eng.m_volume + eng.m_position) / 4.0
+    eng.m_final := ta.ema(eng.m_composite, smooth_len)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. EXECUTION LOGIC
+// ═════════════════════════════════════════════════════════════════════════════
+
+var QuantEngine engine = QuantEngine.new()
+
+engine.update_metrics(i_lookback)
+engine.aggregate(i_smooth)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. VISUALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+float fgi = engine.m_final
+
+plot(fgi, "Index Baseline", color=color.new(color.blue, 0), linewidth=1)
+
+bool s_ext_greed = fgi >= 70
+bool s_greed     = fgi >= 60 and fgi < 70
+bool s_neutral   = fgi >= 40 and fgi < 60
+bool s_fear      = fgi >= 30 and fgi < 40
+bool s_ext_fear  = fgi < 30
+
+plot(s_ext_greed ? fgi : na, "Zone: Extreme Greed", color=#ff0000, linewidth=2, style=plot.style_linebr, display = display.pane)
+plot(s_greed     ? fgi : na, "Zone: Greed",         color=#ff6b35, linewidth=2, style=plot.style_linebr, display = display.pane)
+plot(s_neutral   ? fgi : na, "Zone: Neutral",       color=#ffd700, linewidth=2, style=plot.style_linebr, display = display.pane)
+plot(s_fear      ? fgi : na, "Zone: Fear",          color=#7cb342, linewidth=2, style=plot.style_linebr, display = display.pane)
+plot(s_ext_fear  ? fgi : na, "Zone: Extreme Fear",  color=#00ff00, linewidth=2, style=plot.style_linebr, display = display.pane)
+
+barcolor(i_show_candles and s_ext_greed ? #ff0000 : na, title="Candles: Extreme Greed")
+barcolor(i_show_candles and s_greed     ? #ff6b35 : na, title="Candles: Greed")
+barcolor(i_show_candles and s_neutral   ? #ffd700 : na, title="Candles: Neutral")
+barcolor(i_show_candles and s_fear      ? #7cb342 : na, title="Candles: Fear")
+barcolor(i_show_candles and s_ext_fear  ? #00ff00 : na, title="Candles: Extreme Fear")
+
+h_80 = hline(80, "Ref: Extreme Greed", color=color.red,   linestyle=hline.style_dotted)
+h_70 = hline(70, "Ref: Extreme Greed", color=color.red,   linestyle=hline.style_dotted)
+fill(h_80, h_70, color = color.new(color.red, 90), title = "Extreme Greed Zone Fill")
+
+hline(50, "Ref: Neutral",       color=color.gray,  linestyle=hline.style_dashed)
+
+h_30 = hline(30, "Ref: Extreme Fear",  color=color.green, linestyle=hline.style_dotted)
+h_20 = hline(20, "Ref: Extreme Fear",  color=color.green, linestyle=hline.style_dotted)
+fill(h_30, h_20, color = color.new(color.green, 90), title = "Extreme Fear Zone Fill")
+
+bgcolor(fgi >= 75 ? color.new(color.red, 90) : na, title="Background: Top Extreme")
+bgcolor(fgi <= 25 ? color.new(color.green, 90) : na, title="Background: Bottom Extreme")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. DIVERGENCE DETECTION
+// ═════════════════════════════════════════════════════════════════════════════
+
+i_div_left  = input.int(5, "Pivot Lookback (Left)", minval=1, group=group_div, tooltip="Bars to the left to define a peak.")
+i_div_right = input.int(5, "Confirmation (Right)",  minval=1, group=group_div, tooltip="Bars to wait for confirmation.")
+
+i_show_ln   = input.bool(true, "Show Divergence Lines", group=group_div)
+i_show_lb   = input.bool(true, "Show Divergence Labels", group=group_div)
+i_show_hid  = input.bool(true, "Show Hidden Divergence", group=group_div)
+
+float div_ph = ta.pivothigh(fgi, i_div_left, i_div_right)
+float div_pl = ta.pivotlow(fgi, i_div_left, i_div_right)
+
+var float last_ph_val = na
+var int   last_ph_idx = na
+var float last_price_ph = na
+
+if not na(div_ph)
+    float price_at_pivot = high[i_div_right]
+    
+    if not na(last_ph_val)
+        if price_at_pivot > last_price_ph and div_ph < last_ph_val
+            if i_show_ln
+                line.new(last_ph_idx, last_ph_val, bar_index - i_div_right, div_ph, 
+                         color=color.red, width=1, style=line.style_solid)
+                line.new(last_ph_idx, last_price_ph, bar_index - i_div_right, price_at_pivot, 
+                         color=color.red, width=1, style=line.style_solid, force_overlay = true)
+            if i_show_lb
+                label.new(bar_index - i_div_right, div_ph, "Bear", 
+                          color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+                label.new(bar_index - i_div_right, price_at_pivot, "Bear", 
+                          color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay = true)
+
+        else if i_show_hid and price_at_pivot < last_price_ph and div_ph > last_ph_val
+            if i_show_ln
+                line.new(last_ph_idx, last_ph_val, bar_index - i_div_right, div_ph, 
+                         color=color.new(color.red, 30), width=1, style=line.style_dashed)
+                line.new(last_ph_idx, last_price_ph, bar_index - i_div_right, price_at_pivot, 
+                         color=color.new(color.red, 30), width=1, style=line.style_dashed, force_overlay = true)
+            if i_show_lb
+                label.new(bar_index - i_div_right, div_ph, "H Bear", 
+                          color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+                label.new(bar_index - i_div_right, price_at_pivot, "H Bear", 
+                          color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small, force_overlay = true)
+    
+    last_ph_val   := div_ph
+    last_ph_idx   := bar_index - i_div_right
+    last_price_ph := price_at_pivot
+
+var float last_pl_val = na
+var int   last_pl_idx = na
+var float last_price_pl = na
+
+if not na(div_pl)
+    float price_at_pivot = low[i_div_right]
+    
+    if not na(last_pl_val)
+        if price_at_pivot < last_price_pl and div_pl > last_pl_val
+            if i_show_ln
+                line.new(last_pl_idx, last_pl_val, bar_index - i_div_right, div_pl, 
+                         color=color.green, width=1, style=line.style_solid)
+                line.new(last_pl_idx, last_price_pl, bar_index - i_div_right, price_at_pivot, 
+                         color=color.green, width=1, style=line.style_solid, force_overlay = true)
+            if i_show_lb
+                label.new(bar_index - i_div_right, div_pl, "Bull", 
+                          color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+                label.new(bar_index - i_div_right, price_at_pivot, "Bull", 
+                          color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small, force_overlay = true)
+
+        else if i_show_hid and price_at_pivot > last_price_pl and div_pl < last_pl_val
+            if i_show_ln
+                line.new(last_pl_idx, last_pl_val, bar_index - i_div_right, div_pl, 
+                         color=color.new(color.green, 30), width=1, style=line.style_dashed)
+                line.new(last_pl_idx, last_price_pl, bar_index - i_div_right, price_at_pivot, 
+                         color=color.new(color.green, 30), width=1, style=line.style_dashed, force_overlay = true)
+            if i_show_lb
+                label.new(bar_index - i_div_right, div_pl, "H Bull", 
+                          color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+                label.new(bar_index - i_div_right, price_at_pivot, "H Bull", 
+                          color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small, force_overlay = true)
+
+    last_pl_val   := div_pl
+    last_pl_idx   := bar_index - i_div_right
+    last_price_pl := price_at_pivot

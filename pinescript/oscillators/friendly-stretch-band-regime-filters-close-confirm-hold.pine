@@ -1,0 +1,170 @@
+//@version=5
+// SPDX-License-Identifier: MPL-2.0
+indicator("ADHD-Friendly Stretch Band Regime + Filters (Close Confirm + Hold)", shorttitle="Stretch Band Regime", overlay=true)
+
+//──────────────────────────────────────────────────────────────────────────────
+// OVERVIEW
+// A calm, regime-based stretch band designed to reduce noise:
+//
+// Regime logic (core):
+//   - BUY ZONE   = price below lower band  -> lower band turns GREEN
+//   - SELL ZONE  = price above upper band  -> upper band turns RED
+//   - NEUTRAL    = inside bands            -> bands are GREY
+//
+// Anti-noise options:
+//   1) Close-confirm: require CLOSE beyond band (reduces wick spikes).
+//   2) Hold/debounce: hold zone state N bars after trigger ends (reduces flicker).
+//
+// Optional qualification filters (only applied if enabled):
+//   - Trend filter (basis slope or slow EMA)
+//   - ATR expansion gate
+//   - Minimum exceed beyond band (ATR units)
+//
+// Visuals:
+//   - No background tint
+//   - No markers/labels/shapes
+//   - Calm neutral fill between bands
+//
+// NOTE: Educational tool only. Not financial advice.
+//──────────────────────────────────────────────────────────────────────────────
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+groupCore = "1) Core Bands"
+src      = input.source(close, "Source", group=groupCore)
+emaLen   = input.int(100, "EMA Length", minval=1, group=groupCore)
+atrLen   = input.int(14, "ATR Length", minval=1, group=groupCore)
+atrMult  = input.float(2.8, "ATR Multiplier (Wide)", minval=0.1, step=0.1, group=groupCore)
+
+groupDetect = "2) Detection + Stability"
+useWicks       = input.bool(true, "Use Wicks (when Close Confirm is OFF)", group=groupDetect)
+confirmOnClose = input.bool(false, "Confirm Zones on CLOSE", group=groupDetect)
+holdBars       = input.int(1, "Hold Zone (bars) after trigger ends", minval=0, maxval=50, group=groupDetect)
+
+groupVisual = "3) Visuals"
+colorBands = input.bool(true, "Color Bands by Zone", group=groupVisual)
+colorBars  = input.bool(false, "Color Bars by Zone (optional)", group=groupVisual)
+
+groupFilters = "4) Optional Filters"
+useFiltersForZones = input.bool(false, "Use Filters to Qualify Zone Colors", group=groupFilters)
+
+// Trend filter
+useTrendFilter = input.bool(true, "Trend Filter", group=groupFilters)
+trendMode      = input.string("Basis Slope", "Trend Mode", options=["Basis Slope", "Slow EMA"], group=groupFilters)
+slowEmaLen     = input.int(200, "Slow EMA Length (if Trend Mode = Slow EMA)", minval=1, group=groupFilters)
+
+// ATR expansion gate
+useAtrGate   = input.bool(true, "ATR Expansion Gate", group=groupFilters)
+atrAvgLen    = input.int(50, "ATR Average Length", minval=1, group=groupFilters)
+atrExpandMin = input.float(1.05, "ATR Expansion Min (ATR / ATRavg)", minval=0.5, step=0.01, group=groupFilters)
+
+// Min exceed beyond band
+useMinExceed = input.bool(true, "Min Exceed Beyond Band", group=groupFilters)
+minExceedAtr = input.float(0.25, "Min Exceed (ATR units)", minval=0.0, step=0.05, group=groupFilters)
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE CALCS
+//──────────────────────────────────────────────────────────────────────────────
+basis = ta.ema(src, emaLen)
+atrv  = ta.atr(atrLen)
+
+upper = basis + atrMult * atrv
+lower = basis - atrMult * atrv
+
+hiRef = useWicks ? high : close
+loRef = useWicks ? low  : close
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTER 1: TREND
+//──────────────────────────────────────────────────────────────────────────────
+slowEma = ta.ema(src, slowEmaLen)
+
+trendOkLong_slope  = basis > basis[1]
+trendOkShort_slope = basis < basis[1]
+
+trendOkLong_slow   = close > slowEma
+trendOkShort_slow  = close < slowEma
+
+trendOkLong  = trendMode == "Basis Slope" ? trendOkLong_slope  : trendOkLong_slow
+trendOkShort = trendMode == "Basis Slope" ? trendOkShort_slope : trendOkShort_slow
+
+trendPassLong  = (not useTrendFilter) or trendOkLong
+trendPassShort = (not useTrendFilter) or trendOkShort
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTER 2: ATR EXPANSION GATE
+//──────────────────────────────────────────────────────────────────────────────
+atrAvg   = ta.sma(atrv, atrAvgLen)
+atrRatio = atrAvg > 0 ? (atrv / atrAvg) : 0.0
+atrPass  = (not useAtrGate) or (atrRatio >= atrExpandMin)
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTER 3: MIN EXCEED BEYOND BAND
+//──────────────────────────────────────────────────────────────────────────────
+exceedNowAbove = (hiRef - upper) >= (minExceedAtr * atrv)
+exceedNowBelow = (lower - loRef) >= (minExceedAtr * atrv)
+
+minPassNowAbove = (not useMinExceed) or exceedNowAbove
+minPassNowBelow = (not useMinExceed) or exceedNowBelow
+
+//──────────────────────────────────────────────────────────────────────────────
+// RAW ZONE LOGIC (with Close Confirm option)
+//──────────────────────────────────────────────────────────────────────────────
+rawBuyZone_base  = confirmOnClose ? (close < lower) : (loRef < lower)
+rawSellZone_base = confirmOnClose ? (close > upper) : (hiRef > upper)
+
+// Apply filters optionally
+rawBuyZone  = useFiltersForZones ? (rawBuyZone_base  and trendPassLong  and atrPass and minPassNowBelow) : rawBuyZone_base
+rawSellZone = useFiltersForZones ? (rawSellZone_base and trendPassShort and atrPass and minPassNowAbove) : rawSellZone_base
+
+//──────────────────────────────────────────────────────────────────────────────
+// HOLD / DEBOUNCE (reduces flicker)
+//──────────────────────────────────────────────────────────────────────────────
+var int holdBuy  = 0
+var int holdSell = 0
+
+holdBuy  := rawBuyZone  ? holdBars : math.max(holdBuy  - 1, 0)
+holdSell := rawSellZone ? holdBars : math.max(holdSell - 1, 0)
+
+heldBuy  = holdBuy  > 0
+heldSell = holdSell > 0
+
+// Conflict resolution: if both true, choose side with larger distance
+distAbove = close - upper
+distBelow = lower - close
+conflict  = heldBuy and heldSell
+
+buyZone  = conflict ? (distBelow > distAbove) : (heldBuy and not heldSell)
+sellZone = conflict ? (distAbove > distBelow) : (heldSell and not heldBuy)
+neutralZone = not buyZone and not sellZone
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUALS (NO BACKGROUND)
+//──────────────────────────────────────────────────────────────────────────────
+bandColUpper = sellZone ? color.new(color.red, 0)  : color.new(color.gray, 0)
+bandColLower = buyZone  ? color.new(color.lime, 0) : color.new(color.gray, 0)
+
+plot(basis, title="EMA Basis", linewidth=2, color=color.new(color.white, 0))
+
+pU = plot(upper, title="Upper Stretch", linewidth=2, color=colorBands ? bandColUpper : color.new(color.gray, 0))
+pL = plot(lower, title="Lower Stretch", linewidth=2, color=colorBands ? bandColLower : color.new(color.gray, 0))
+
+fill(pU, pL, color=color.new(color.gray, 90))
+
+// Optional bar colouring (only in zones)
+color barCol = na
+if colorBars
+    if buyZone
+        barCol := color.new(color.lime, 0)
+    else if sellZone
+        barCol := color.new(color.red, 0)
+    else
+        barCol := na
+barcolor(barCol)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERTS
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(buyZone,  title="BUY ZONE (Below Lower Band)",  message="Stretch Band: BUY zone (price below lower band).")
+alertcondition(sellZone, title="SELL ZONE (Above Upper Band)", message="Stretch Band: SELL zone (price above upper band).")

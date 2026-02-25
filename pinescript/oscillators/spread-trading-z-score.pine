@@ -1,0 +1,470 @@
+//@version=6
+indicator("Z-Score Pairs Trading - Complete", shorttitle="PairsZ", overlay=false)
+
+// ============================================================================
+// INPUTS - SYMBOLES
+// ============================================================================
+sym1 = input.symbol("BINANCE:BTCUSDT", title="Asset A", group="📊 Symboles")
+sym2 = input.symbol("BINANCE:ETHUSDT", title="Asset B", group="📊 Symboles")
+useLog = input.bool(false, title="Use Log", group="📊 Symboles")
+
+// ============================================================================
+// INPUTS - STATS
+// ============================================================================
+lookbackStats = input.int(20, title="Lookback Z", minval=5, group="📈 Stats")
+lookbackADF = input.int(100, title="Lookback ADF", minval=50, group="📈 Stats")
+adfCritical = input.float(-2.9, title="ADF Critical", group="📈 Stats")
+lookbackHurst = input.int(100, title="Lookback Hurst", minval=50, group="📈 Stats")
+corrThreshold = input.float(0.6, title="Corr Min", minval=0, maxval=1, step=0.05, group="📈 Stats")
+
+// ============================================================================
+// INPUTS - TRADING
+// ============================================================================
+entryThreshold = input.float(2.0, title="Entry (σ)", step=0.1, group="🎯 Trading")
+exitThreshold = input.float(0.5, title="Exit (σ)", step=0.1, group="🎯 Trading")
+slThreshold = input.float(3.0, title="Stop (σ)", step=0.1, group="🎯 Trading")
+
+// ============================================================================
+// INPUTS - POSITION
+// ============================================================================
+baseLotsA = input.int(1, title="Lots A", minval=1, group="💼 Position")
+pointValueA = input.float(1.0, title="Point Val A", minval=0.01, group="💼 Position")
+pointValueB = input.float(1.0, title="Point Val B", minval=0.01, group="💼 Position")
+useDollarNeutral = input.bool(true, title="Dollar-Neutral", group="💼 Position")
+
+// ============================================================================
+// INPUTS - DISPLAY
+// ============================================================================
+showValidation = input.bool(true, title="Show Validation", group="🎨 Display")
+showADF = input.bool(true, title="Show ADF", group="🎨 Display")
+showPosition = input.bool(true, title="Show Position", group="🎨 Display")
+
+tablePos = input.string("Top", title="Position", options=["Top", "Middle", "Bottom"], group="🎨 Display")
+                        
+tableAlign = input.string("Left", title="Align", options=["Left", "Center", "Right"], group="🎨 Display")
+                          
+
+// ============================================================================
+// DATA
+// ============================================================================
+price1 = request.security(sym1, timeframe.period, close)
+price2 = request.security(sym2, timeframe.period, close)
+
+p1 = useLog ? math.log(price1) : price1
+p2 = useLog ? math.log(price2) : price2
+
+// ============================================================================
+// HEDGE RATIO
+// ============================================================================
+hedgeRatio = p2 > 0 ? p1 / p2 : 0
+
+// ============================================================================
+// LOTS
+// ============================================================================
+lotsB_ShareNeutral = hedgeRatio > 0 ? math.round(baseLotsA * hedgeRatio) : 0
+
+dollarValueA = baseLotsA * price1 * pointValueA
+lotsB_DollarNeutral = (price2 > 0 and hedgeRatio > 0 and pointValueB > 0) ? 
+                       math.round(dollarValueA / (price2 * pointValueB)) : 0
+
+lotsB = useDollarNeutral ? lotsB_DollarNeutral : lotsB_ShareNeutral
+
+// ============================================================================
+// SPREAD
+// ============================================================================
+spreadDollars = (baseLotsA * p1 * pointValueA) - (lotsB * p2 * pointValueB)
+
+// ============================================================================
+// Z-SCORE
+// ============================================================================
+spreadMean = ta.sma(spreadDollars, lookbackStats)
+spreadStd = ta.stdev(spreadDollars, lookbackStats)
+zScore = spreadStd > 0 ? (spreadDollars - spreadMean) / spreadStd : 0
+
+// ============================================================================
+// ADF TEST
+// ============================================================================
+adfTest(series float ser, int lookback) =>
+    float sumX = 0.0
+    float sumY = 0.0
+    float sumXY = 0.0
+    float sumX2 = 0.0
+    int count = 0
+    
+    for i = 1 to lookback
+        if not na(ser[i]) and not na(ser[i-1])
+            delta = ser[i-1] - ser[i]
+            lag = ser[i]
+            sumX += lag
+            sumY += delta
+            sumXY += lag * delta
+            sumX2 += lag * lag
+            count += 1
+    
+    if count > 2
+        denom = count * sumX2 - sumX * sumX
+        if math.abs(denom) > 1e-10
+            beta_adf = (count * sumXY - sumX * sumY) / denom
+            alpha_adf = (sumY - beta_adf * sumX) / count
+            
+            float sumErr2 = 0.0
+            for i = 1 to lookback
+                if not na(ser[i]) and not na(ser[i-1])
+                    pred = alpha_adf + beta_adf * ser[i]
+                    err = (ser[i-1] - ser[i]) - pred
+                    sumErr2 += err * err
+            
+            variance = sumX2 - sumX * sumX / count
+            if variance > 1e-10 and sumErr2 > 0
+                seBeta = math.sqrt(sumErr2 / (count - 2)) / math.sqrt(variance)
+                tStat = seBeta > 1e-10 ? beta_adf / seBeta : na
+                tStat
+            else
+                na
+        else
+            na
+    else
+        na
+
+adfSpread = adfTest(spreadDollars, lookbackADF)
+adfP1 = adfTest(p1, lookbackADF)
+adfP2 = adfTest(p2, lookbackADF)
+
+// ============================================================================
+// P-VALUE
+// ============================================================================
+pValueApprox(float tStat) =>
+    if na(tStat)
+        na
+    else
+        absTstat = math.abs(tStat)
+        if absTstat < 1.28
+            0.20
+        else if absTstat < 1.64
+            0.10
+        else if absTstat < 1.96
+            0.05
+        else if absTstat < 2.57
+            0.01
+        else
+            0.001
+
+pValue = pValueApprox(adfSpread)
+
+// ============================================================================
+// HURST
+// ============================================================================
+hurstExponent(series float ser, int lookback) =>
+    if bar_index < lookback
+        na
+    else
+        float sumReturns = 0.0
+        int validCount = 0
+        
+        for i = 0 to lookback - 2
+            if not na(ser[i]) and not na(ser[i+1])
+                sumReturns += ser[i] - ser[i+1]
+                validCount += 1
+        
+        if validCount > 0
+            meanReturn = sumReturns / validCount
+            
+            float cumDev = 0.0
+            float maxCumDev = 0.0
+            float minCumDev = 0.0
+            
+            for i = 0 to lookback - 2
+                if not na(ser[i]) and not na(ser[i+1])
+                    cumDev += (ser[i] - ser[i+1]) - meanReturn
+                    maxCumDev := math.max(maxCumDev, cumDev)
+                    minCumDev := math.min(minCumDev, cumDev)
+            
+            rangeVal = maxCumDev - minCumDev
+            
+            float sumSqDev = 0.0
+            for i = 0 to lookback - 2
+                if not na(ser[i]) and not na(ser[i+1])
+                    dev = (ser[i] - ser[i+1]) - meanReturn
+                    sumSqDev += dev * dev
+            
+            stdDev = math.sqrt(sumSqDev / validCount)
+            
+            if stdDev > 1e-10 and rangeVal > 0
+                rs = rangeVal / stdDev
+                hurst = math.log(rs) / math.log(lookback)
+                hurst
+            else
+                na
+        else
+            na
+
+hurstValue = hurstExponent(spreadDollars, lookbackHurst)
+
+// ============================================================================
+// VALIDATION
+// ============================================================================
+stationaryP1 = not na(adfP1) and adfP1 < adfCritical
+stationaryP2 = not na(adfP2) and adfP2 < adfCritical
+stationarySpread = not na(adfSpread) and adfSpread < adfCritical
+
+nonStatAlert = stationaryP1 or stationaryP2
+cointegrated = stationarySpread
+
+correlation = ta.correlation(p1, p2, lookbackStats)
+corrOK = not na(correlation) and correlation >= corrThreshold
+
+canTrade = cointegrated and corrOK and not nonStatAlert
+
+// ============================================================================
+// EXPOSURE
+// ============================================================================
+exposureA = baseLotsA * price1 * pointValueA
+exposureB = lotsB * price2 * pointValueB
+totalExposure = exposureA + exposureB
+netExposure = exposureA - exposureB
+neutralityPct = totalExposure > 0 ? (math.abs(netExposure) / totalExposure) * 100 : 0
+
+// ============================================================================
+// SIGNALS
+// ============================================================================
+longEntry = ta.crossunder(zScore, -entryThreshold) and canTrade
+shortEntry = ta.crossover(zScore, entryThreshold) and canTrade
+exitLong = ta.crossover(zScore, -exitThreshold)
+exitShort = ta.crossunder(zScore, exitThreshold)
+slLong = ta.crossunder(zScore, -slThreshold)
+slShort = ta.crossover(zScore, slThreshold)
+
+// ============================================================================
+// TABLE POSITION
+// ============================================================================
+getTablePosition() =>
+    posStr = tablePos + tableAlign
+    switch posStr
+        "TopLeft" => position.top_left
+        "TopCenter" => position.top_center
+        "TopRight" => position.top_right
+        "MiddleLeft" => position.middle_left
+        "MiddleCenter" => position.middle_center
+        "MiddleRight" => position.middle_right
+        "BottomLeft" => position.bottom_left
+        "BottomCenter" => position.bottom_center
+        "BottomRight" => position.bottom_right
+        => position.top_left
+
+getOppositePosition() =>
+    oppAlign = tableAlign == "Left" ? "Right" : tableAlign == "Right" ? "Left" : tableAlign
+    posStr = tablePos + oppAlign
+    switch posStr
+        "TopLeft" => position.top_left
+        "TopCenter" => position.top_center
+        "TopRight" => position.top_right
+        "MiddleLeft" => position.middle_left
+        "MiddleCenter" => position.middle_center
+        "MiddleRight" => position.middle_right
+        "BottomLeft" => position.bottom_left
+        "BottomCenter" => position.bottom_center
+        "BottomRight" => position.bottom_right
+        => position.top_left
+
+// ============================================================================
+// PLOT Z-SCORE
+// ============================================================================
+plot(zScore, "Z-Score", color=color.white, linewidth=2)
+hline(0, "Mean", color=color.gray, linestyle=hline.style_solid, linewidth=1)
+hline(entryThreshold, "Entry+", color=color.red, linestyle=hline.style_dashed)
+hline(-entryThreshold, "Entry-", color=color.lime, linestyle=hline.style_dashed)
+hline(exitThreshold, "Exit+", color=color.orange, linestyle=hline.style_dotted)
+hline(-exitThreshold, "Exit-", color=color.orange, linestyle=hline.style_dotted)
+hline(slThreshold, "SL+", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+hline(-slThreshold, "SL-", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+
+bgcolor(zScore > entryThreshold ? color.new(color.red, 92) : na)
+bgcolor(zScore < -entryThreshold ? color.new(color.lime, 92) : na)
+bgcolor(not canTrade ? color.new(color.orange, 95) : na)
+
+// ============================================================================
+// TABLE (DYNAMIC ROW COUNT)
+// ============================================================================
+// Calculer le nombre de lignes nécessaires
+var int mainRows = 0
+var int adfRows = 0
+if barstate.isfirst
+    if showValidation
+        mainRows += 4  // Header + 3 lignes de données
+    if showPosition
+        mainRows += 7  // Header + 6 lignes de données
+    if showADF
+        adfRows += 6  // Header + headers colonnes + 3 tests + critical
+
+// Créer les tableaux
+var table mainTable = na
+if mainRows > 0
+    mainTable := table.new(getTablePosition(), 4, math.max(mainRows, 1), bgcolor=color.new(color.black, 85), border_width=1)
+
+var table adfTable = na
+if adfRows > 0
+    adfTable := table.new(getOppositePosition(), 4, adfRows, bgcolor=color.new(color.black, 85), border_width=1)
+
+if barstate.islast and (showValidation or showPosition)
+    // Nettoyer le tableau principal
+    table.clear(mainTable, 0, 0, 3, math.max(mainRows - 1, 0))
+    
+    int row = 0
+    
+    // ========== VALIDATION ==========
+    if showValidation
+        table.cell(mainTable, 0, row, "VALIDATION", text_color=color.white, 
+                   text_size=size.small, bgcolor=color.new(color.blue, 70))
+        table.merge_cells(mainTable, 0, row, 3, row)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Z-Score", text_color=color.gray, text_size=size.small)
+        zColor = zScore > entryThreshold ? color.red : zScore < -entryThreshold ? color.lime : color.white
+        table.cell(mainTable, 1, row, str.tostring(math.round(zScore * 100) / 100), 
+                   text_color=zColor, text_size=size.normal, text_font_family=font.family_monospace)
+        
+        table.cell(mainTable, 2, row, "Corr", text_color=color.gray, text_size=size.small)
+        corrColor = corrOK ? color.lime : color.red
+        table.cell(mainTable, 3, row, na(correlation) ? "N/A" : str.tostring(math.round(correlation * 1000) / 1000), 
+                   text_color=corrColor, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "P-Val", text_color=color.gray, text_size=size.small)
+        pColor = na(pValue) ? color.gray : (pValue < 0.05 ? color.lime : pValue < 0.10 ? color.yellow : color.red)
+        pText = na(pValue) ? "N/A" : (pValue < 0.001 ? "<0.001" : str.tostring(math.round(pValue * 1000) / 1000))
+        table.cell(mainTable, 1, row, pText, text_color=pColor, text_size=size.small)
+        
+        table.cell(mainTable, 2, row, "Hurst", text_color=color.gray, text_size=size.small)
+        hurstColor = na(hurstValue) ? color.gray : (hurstValue < 0.5 ? color.lime : hurstValue < 0.6 ? color.yellow : color.red)
+        table.cell(mainTable, 3, row, na(hurstValue) ? "N/A" : str.tostring(math.round(hurstValue * 1000) / 1000), 
+                   text_color=hurstColor, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Cointeg", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 1, row, cointegrated ? "✓ YES" : "✗ NO", 
+                   text_color=cointegrated ? color.lime : color.red, text_size=size.small)
+        
+        table.cell(mainTable, 2, row, "Status", text_color=color.gray, text_size=size.small)
+        tradeText = canTrade ? "✓ OK" : "✗ NO"
+        tradeColor = canTrade ? color.lime : color.red
+        tradeBg = canTrade ? color.new(color.lime, 90) : color.new(color.red, 90)
+        table.cell(mainTable, 3, row, tradeText, text_color=tradeColor, text_size=size.small, bgcolor=tradeBg)
+        row += 1
+    
+    // ========== POSITION ==========
+    if showPosition
+        table.cell(mainTable, 0, row, "POSITION", text_color=color.white, 
+                   text_size=size.small, bgcolor=color.new(color.green, 70))
+        table.merge_cells(mainTable, 0, row, 3, row)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Mode", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 1, row, useDollarNeutral ? "Dollar" : "Share", text_color=color.aqua, text_size=size.small)
+        table.cell(mainTable, 2, row, "Hedge", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 3, row, str.tostring(math.round(hedgeRatio * 100) / 100), text_color=color.yellow, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Lots A", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 1, row, str.tostring(baseLotsA), text_color=color.lime, text_size=size.small)
+        table.cell(mainTable, 2, row, "Lots B", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 3, row, str.tostring(lotsB), text_color=color.lime, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Exp A", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 1, row, "$" + str.tostring(math.round(exposureA)), text_color=color.orange, text_size=size.small)
+        table.cell(mainTable, 2, row, "Exp B", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 3, row, "$" + str.tostring(math.round(exposureB)), text_color=color.orange, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Net", text_color=color.gray, text_size=size.small)
+        netColor = neutralityPct < 10 ? color.lime : neutralityPct < 20 ? color.yellow : color.red
+        table.cell(mainTable, 1, row, "$" + str.tostring(math.round(netExposure)), text_color=netColor, text_size=size.small)
+        table.cell(mainTable, 2, row, "Neutral", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 3, row, str.tostring(math.round(neutralityPct * 10) / 10) + "%", text_color=netColor, text_size=size.small)
+        row += 1
+        
+        table.cell(mainTable, 0, row, "Spread", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 1, row, "$" + str.tostring(math.round(spreadDollars)), text_color=color.yellow, text_size=size.small)
+        table.cell(mainTable, 2, row, "Mean", text_color=color.gray, text_size=size.small)
+        table.cell(mainTable, 3, row, "$" + str.tostring(math.round(spreadMean)), text_color=color.white, text_size=size.small)
+        row += 1
+        
+        signal = longEntry ? "🟢 LONG A SHORT B" : 
+                 shortEntry ? "🔴 SHORT A LONG B" : 
+                 exitLong or exitShort ? "⚪ EXIT" :
+                 slLong or slShort ? "🛑 STOP" : 
+                 not canTrade ? "⏸ WAIT" : "⏸ HOLD"
+        
+        signalColor = longEntry ? color.lime : 
+                      shortEntry ? color.red : 
+                      exitLong or exitShort ? color.orange :
+                      slLong or slShort ? color.red : 
+                      not canTrade ? color.orange : color.gray
+        
+        signalBg = longEntry or shortEntry ? color.new(signalColor, 85) : color.new(color.black, 85)
+        
+        table.cell(mainTable, 0, row, signal, text_color=signalColor, text_size=size.small, bgcolor=signalBg)
+        table.merge_cells(mainTable, 0, row, 3, row)
+
+if barstate.islast and showADF
+    // Nettoyer le tableau ADF
+    table.clear(adfTable, 0, 0, 3, math.max(adfRows - 1, 0))
+    
+    int row = 0
+    
+    // ========== ADF ==========
+    table.cell(adfTable, 0, row, "ADF TESTS", text_color=color.white, 
+               text_size=size.small, bgcolor=color.new(color.purple, 70))
+    table.merge_cells(adfTable, 0, row, 3, row)
+    row += 1
+    
+    table.cell(adfTable, 0, row, "Test", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.gray, 90))
+    table.cell(adfTable, 1, row, "t-stat", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.gray, 90))
+    table.cell(adfTable, 2, row, "Status", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.gray, 90))
+    table.cell(adfTable, 3, row, "OK?", text_color=color.gray, text_size=size.tiny, bgcolor=color.new(color.gray, 90))
+    row += 1
+    
+    // Asset A
+    table.cell(adfTable, 0, row, "A", text_color=color.white, text_size=size.small)
+    table.cell(adfTable, 1, row, na(adfP1) ? "N/A" : str.tostring(math.round(adfP1 * 100) / 100), 
+               text_color=color.aqua, text_size=size.small)
+    adfP1Color = na(adfP1) ? color.gray : (stationaryP1 ? color.red : color.lime)
+    table.cell(adfTable, 2, row, na(adfP1) ? "N/A" : (stationaryP1 ? "Stat" : "N-Stat"), 
+               text_color=adfP1Color, text_size=size.small)
+    table.cell(adfTable, 3, row, stationaryP1 ? "✗" : "✓", text_color=adfP1Color, text_size=size.small)
+    row += 1
+    
+    // Asset B
+    table.cell(adfTable, 0, row, "B", text_color=color.white, text_size=size.small)
+    table.cell(adfTable, 1, row, na(adfP2) ? "N/A" : str.tostring(math.round(adfP2 * 100) / 100), 
+               text_color=color.aqua, text_size=size.small)
+    adfP2Color = na(adfP2) ? color.gray : (stationaryP2 ? color.red : color.lime)
+    table.cell(adfTable, 2, row, na(adfP2) ? "N/A" : (stationaryP2 ? "Stat" : "N-Stat"), 
+               text_color=adfP2Color, text_size=size.small)
+    table.cell(adfTable, 3, row, stationaryP2 ? "✗" : "✓", text_color=adfP2Color, text_size=size.small)
+    row += 1
+    
+    // Spread
+    table.cell(adfTable, 0, row, "Spread", text_color=color.white, text_size=size.small)
+    table.cell(adfTable, 1, row, na(adfSpread) ? "N/A" : str.tostring(math.round(adfSpread * 100) / 100), 
+               text_color=color.yellow, text_size=size.small)
+    adfSpreadColor = na(adfSpread) ? color.gray : (stationarySpread ? color.lime : color.red)
+    table.cell(adfTable, 2, row, na(adfSpread) ? "N/A" : (stationarySpread ? "Stat" : "N-Stat"), 
+               text_color=adfSpreadColor, text_size=size.small)
+    table.cell(adfTable, 3, row, stationarySpread ? "✓" : "✗", text_color=adfSpreadColor, text_size=size.small)
+    row += 1
+    
+    // Critical
+    table.cell(adfTable, 0, row, "Critical", text_color=color.gray, text_size=size.tiny)
+    table.cell(adfTable, 1, row, str.tostring(adfCritical), text_color=color.orange, text_size=size.small)
+    table.cell(adfTable, 2, row, "5%", text_color=color.gray, text_size=size.tiny)
+    table.cell(adfTable, 3, row, "", text_color=color.gray, text_size=size.tiny)
+    row += 1
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(longEntry, title="Long", message="🟢 LONG A/SHORT B | Z={{plot_0}}")
+alertcondition(shortEntry, title="Short", message="🔴 SHORT A/LONG B | Z={{plot_0}}")
+alertcondition(exitLong or exitShort, title="Exit", message="⚪ EXIT | Z={{plot_0}}")
+alertcondition(slLong or slShort, title="Stop", message="🛑 SL | Z={{plot_0}}")

@@ -1,0 +1,355 @@
+//@version=5
+// ============================================================================
+// DAO - Demand Advanced Oscillator v1.1
+// ============================================================================
+//
+// DESCRIPTION:
+// The Demand Advanced Oscillator (DAO) measures buying vs selling pressure
+// by analyzing consecutive high-low relationships. It normalizes market
+// pressure into a 0-1 range, making it easy to identify extremes.
+//
+// HOW IT WORKS:
+// 1. Measures buying pressure (when price pushes higher highs)
+// 2. Measures selling pressure (when price pushes lower lows)
+// 3. Calculates ratio: Buying / (Buying + Selling)
+// 4. Smooths result using SMA for stability
+//
+// INTERPRETATION:
+// - Values > 0.70 = Overbought (potential reversal down)
+// - Values < 0.30 = Oversold (potential reversal up)
+// - Value = 0.50 = Neutral (equal buying/selling pressure)
+//
+// KEY FEATURES:
+// - Optional divergence detection (disabled by default)
+// - Signal line for crossover signals
+// - Multi-timeframe capability
+// - Customizable levels and alerts
+// - Real-time statistics table
+//
+// VERSION HISTORY:
+// v1.1 (Nov 2025) - Fixed divergence detection, enhanced middle line
+// v1.0 (Initial)  - Basic oscillator with alerts
+//
+// ============================================================================
+
+indicator("DAO - Demand Advanced Oscillator", shorttitle="DAO", format=format.price, precision=3, overlay=false)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Main Settings
+// The oscillator period determines how many bars are used in the calculation
+// Lower values (5-10) = More sensitive, faster reactions
+// Higher values (20-30) = Smoother, less noise
+demandPeriod = input.int(14, title="Oscillator Period", minval=1, group="Main Settings")
+
+// Signal line is an EMA of the oscillator for trend confirmation
+// When DAO crosses above signal = bullish momentum
+// When DAO crosses below signal = bearish momentum
+showSignalLine = input.bool(true, title="Show Signal Line (EMA)", group="Main Settings")
+signalPeriod = input.int(9, title="Signal Line Period", minval=1, group="Main Settings")
+
+// Divergence Settings
+// Divergences occur when price and oscillator disagree
+// This is DISABLED by default - enable only if you want to use divergence signals
+showDivergence = input.bool(false, title="Enable Divergence Detection", group="Divergence Detection")
+
+// Pivot lookback determines how many bars on each side are needed to confirm a pivot
+// Lower values (3-4) = More pivots detected (more signals, more noise)
+// Higher values (7-10) = Fewer pivots detected (fewer signals, higher quality)
+pivotLookback = input.int(5, title="Pivot Lookback", minval=1, group="Divergence Detection")
+
+// Maximum bars to look back when comparing pivots
+// Prevents comparing pivots that are too far apart
+maxLookback = input.int(60, title="Max Lookback Bars", minval=10, group="Divergence Detection")
+
+// Levels
+// Overbought level (default 0.70) - market may be overextended to the upside
+// Oversold level (default 0.30) - market may be overextended to the downside
+obLevel = input.float(0.70, title="Overbought Level", minval=0.5, maxval=1.0, step=0.05, group="Levels")
+osLevel = input.float(0.30, title="Oversold Level", minval=0.0, maxval=0.5, step=0.05, group="Levels")
+
+// Visualization
+// Show colored zones for overbought/oversold areas
+showZones = input.bool(true, title="Show Overbought/Oversold Zones", group="Visualization")
+
+// Show X markers when oscillator crosses overbought/oversold levels
+showCrossAlerts = input.bool(true, title="Show Level Cross Markers", group="Visualization")
+
+// Multi-Timeframe
+// View a higher timeframe oscillator on your current chart
+// Useful for trend alignment (e.g., trade 15m chart in direction of 4H oscillator)
+useMultiTF = input.bool(false, title="Enable Multi-Timeframe", group="Multi-Timeframe")
+higherTF = input.timeframe("240", title="Higher Timeframe", group="Multi-Timeframe")
+
+// ============================================================================
+// DEMAND OSCILLATOR CALCULATION
+// ============================================================================
+
+// This function calculates the Demand Advanced Oscillator
+// It measures the ratio of buying pressure to total market pressure
+// Result is normalized between 0 and 1
+calcDemandOscillator(period) =>
+    // Step 1: Calculate buying pressure (DemandMax)
+    // If current high is higher than previous high, buyers are pushing price up
+    // We measure how much they pushed it (the difference)
+    // Otherwise, no buying pressure on this bar
+    demandMax = math.max(high - high[1], 0.0)
+    
+    // Step 2: Calculate selling pressure (DemandMin)
+    // If current low is lower than previous low, sellers are pushing price down
+    // We measure how much they pushed it (the difference)
+    // Otherwise, no selling pressure on this bar
+    demandMin = math.max(low[1] - low, 0.0)
+    
+    // Step 3: Smooth out the pressure values over N periods
+    // This reduces noise and gives us the average pressure over time
+    smaDemandMax = ta.sma(demandMax, period)
+    smaDemandMin = ta.sma(demandMin, period)
+    
+    // Step 4: Calculate the oscillator as a ratio
+    // Formula: DAO = Buying Pressure / (Buying Pressure + Selling Pressure)
+    // This normalizes the result to 0-1 range:
+    // - 1.0 = All buying pressure (very bullish)
+    // - 0.5 = Equal buying/selling pressure (neutral)
+    // - 0.0 = All selling pressure (very bearish)
+    denom = smaDemandMax + smaDemandMin
+    demandOsc = denom != 0 ? smaDemandMax / denom : 0.0
+    demandOsc
+
+// Calculate the main oscillator for current timeframe
+demandOsc = calcDemandOscillator(demandPeriod)
+
+// Calculate Signal Line (EMA of the oscillator)
+// This is used for crossover signals and trend confirmation
+signalLine = ta.ema(demandOsc, signalPeriod)
+
+// Calculate Multi-Timeframe Oscillator (optional)
+// This fetches the oscillator value from a higher timeframe
+// Useful for trend alignment strategies
+mtfDemandOsc = useMultiTF ? request.security(syminfo.tickerid, higherTF, calcDemandOscillator(demandPeriod)) : na
+
+// ============================================================================
+// DIVERGENCE DETECTION (OPTIONAL - OFF BY DEFAULT)
+// ============================================================================
+
+// Divergence flags (declared outside if block so alerts can access them)
+// These will be set to true when a divergence is detected
+bullishDiv = false
+bearishDiv = false
+
+// Only run divergence detection if user enabled it in settings
+if showDivergence
+    // Step 1: Find pivot highs and lows on the OSCILLATOR
+    // A pivot high is a peak surrounded by lower values on both sides
+    // A pivot low is a valley surrounded by higher values on both sides
+    // The pivotLookback parameter determines how many bars on each side
+    oscHigh = ta.pivothigh(demandOsc, pivotLookback, pivotLookback)
+    oscLow = ta.pivotlow(demandOsc, pivotLookback, pivotLookback)
+
+    // Step 2: Track the previous pivot values and their bar positions
+    // We need these to compare current pivot with previous pivot
+    // 'var' means these variables persist across bars
+    var float lastOscHigh = na
+    var int lastOscHighBar = na
+    var float lastOscLow = na
+    var int lastOscLowBar = na
+
+    // ========== BEARISH DIVERGENCE DETECTION ==========
+    // When we find a new HIGH pivot on the oscillator
+    if not na(oscHigh)
+        // Calculate the actual bar index where this pivot occurred
+        // We subtract pivotLookback because pivots are confirmed with delay
+        currentBar = bar_index - pivotLookback
+        
+        // If we have a previous high pivot to compare with
+        if not na(lastOscHigh)
+            // Calculate how many bars ago the previous pivot was
+            barsAgo = currentBar - lastOscHighBar
+            
+            // Only compare if pivots are within acceptable range
+            // Not too close together (> pivotLookback)
+            // Not too far apart (< maxLookback)
+            if barsAgo > 0 and barsAgo <= maxLookback
+                // Get the PRICE at the current oscillator high
+                priceNow = high[pivotLookback]
+                
+                // Get the PRICE at the previous oscillator high
+                // This is the key fix - we calculate the correct lookback
+                priceThen = high[currentBar - lastOscHighBar + pivotLookback]
+                
+                // BEARISH DIVERGENCE CONDITION:
+                // Price makes HIGHER high (priceNow > priceThen)
+                // BUT Oscillator makes LOWER high (oscHigh < lastOscHigh)
+                // This suggests uptrend is weakening = potential reversal down
+                if priceNow > priceThen and oscHigh < lastOscHigh
+                    bearishDiv := true
+                    
+                    // Draw a dashed red line connecting the two oscillator highs
+                    line.new(lastOscHighBar, lastOscHigh, currentBar, oscHigh, 
+                             color=color.red, width=2, style=line.style_dashed)
+                    
+                    // Add a "BEAR" label to mark the divergence
+                    label.new(currentBar, oscHigh, "BEAR", style=label.style_label_down, 
+                             color=color.red, textcolor=color.white, size=size.small)
+        
+        // Save this pivot for the next comparison
+        lastOscHigh := oscHigh
+        lastOscHighBar := currentBar
+
+    // ========== BULLISH DIVERGENCE DETECTION ==========
+    // When we find a new LOW pivot on the oscillator
+    if not na(oscLow)
+        // Calculate the actual bar index where this pivot occurred
+        currentBar = bar_index - pivotLookback
+        
+        // If we have a previous low pivot to compare with
+        if not na(lastOscLow)
+            // Calculate how many bars ago the previous pivot was
+            barsAgo = currentBar - lastOscLowBar
+            
+            // Only compare if pivots are within acceptable range
+            if barsAgo > 0 and barsAgo <= maxLookback
+                // Get the PRICE at the current oscillator low
+                priceNow = low[pivotLookback]
+                
+                // Get the PRICE at the previous oscillator low
+                priceThen = low[currentBar - lastOscLowBar + pivotLookback]
+                
+                // BULLISH DIVERGENCE CONDITION:
+                // Price makes LOWER low (priceNow < priceThen)
+                // BUT Oscillator makes HIGHER low (oscLow > lastOscLow)
+                // This suggests downtrend is weakening = potential reversal up
+                if priceNow < priceThen and oscLow > lastOscLow
+                    bullishDiv := true
+                    
+                    // Draw a dashed green line connecting the two oscillator lows
+                    line.new(lastOscLowBar, lastOscLow, currentBar, oscLow, 
+                             color=color.green, width=2, style=line.style_dashed)
+                    
+                    // Add a "BULL" label to mark the divergence
+                    label.new(currentBar, oscLow, "BULL", style=label.style_label_up, 
+                             color=color.green, textcolor=color.white, size=size.small)
+        
+        // Save this pivot for the next comparison
+        lastOscLow := oscLow
+        lastOscLowBar := currentBar
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+
+// Plot the main oscillator line (blue)
+// This is the core indicator showing buying vs selling pressure
+plot(demandOsc, title="DAO", color=color.blue, linewidth=2)
+
+// Plot the signal line (orange) - EMA of the oscillator
+// Used for crossover signals and trend confirmation
+plot(showSignalLine ? signalLine : na, title="Signal", color=color.orange, linewidth=1)
+
+// Plot the multi-timeframe oscillator (purple) if enabled
+// Shows higher timeframe oscillator on current chart
+plot(useMultiTF ? mtfDemandOsc : na, title="MTF", color=color.purple, linewidth=2)
+
+// ========== HORIZONTAL REFERENCE LINES ==========
+// Overbought level (default 0.70) - red dashed line
+obLine = hline(obLevel, "OB", color=color.new(color.red, 50), linestyle=hline.style_dashed, linewidth=1)
+
+// Middle level (0.50) - gray solid line
+// This is the neutral zone - equal buying and selling pressure
+midLine = hline(0.5, "Middle", color=color.new(color.gray, 50), linestyle=hline.style_solid, linewidth=1)
+
+// Oversold level (default 0.30) - green dashed line
+osLine = hline(osLevel, "OS", color=color.new(color.green, 50), linestyle=hline.style_dashed, linewidth=1)
+
+// ========== BOUNDARY LINES ==========
+// Top boundary (1.0) and bottom boundary (0.0)
+// These are invisible but needed for the fill zones
+h1 = hline(1.0, color=color.new(color.white, 100))
+h0 = hline(0.0, color=color.new(color.white, 100))
+
+// ========== COLORED ZONES ==========
+// Fill overbought zone (between overbought level and top) with light red
+fill(h1, obLine, color=showZones ? color.new(color.red, 92) : na)
+
+// Fill oversold zone (between oversold level and bottom) with light green
+fill(osLine, h0, color=showZones ? color.new(color.green, 92) : na)
+
+// ========== LEVEL CROSS MARKERS ==========
+// These X markers show when the oscillator crosses key levels
+
+// Detect when oscillator crosses above overbought level
+crossAboveOB = ta.crossover(demandOsc, obLevel)
+
+// Detect when oscillator crosses below oversold level
+crossBelowOS = ta.crossunder(demandOsc, osLevel)
+
+// Plot red X when crossing above overbought (potential top)
+plotshape(showCrossAlerts and crossAboveOB ? obLevel : na, style=shape.xcross, location=location.absolute, color=color.red, size=size.tiny)
+
+// Plot green X when crossing below oversold (potential bottom)
+plotshape(showCrossAlerts and crossBelowOS ? osLevel : na, style=shape.xcross, location=location.absolute, color=color.green, size=size.tiny)
+
+// ========== BACKGROUND COLORING ==========
+// Optional background color to highlight extreme conditions
+// Light red background when overbought (> 0.70)
+// Light green background when oversold (< 0.30)
+// No background in neutral zone (0.30 - 0.70)
+bgColor = demandOsc > obLevel ? color.new(color.red, 95) : demandOsc < osLevel ? color.new(color.green, 95) : na
+bgcolor(bgColor)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+// Overbought/Oversold Alerts
+// Trigger when oscillator enters extreme zones
+alertcondition(crossAboveOB, "Overbought", "DAO crossed above overbought level")
+alertcondition(crossBelowOS, "Oversold", "DAO crossed below oversold level")
+
+// Divergence Alerts
+// Only trigger when divergence detection is enabled and a divergence is found
+alertcondition(bullishDiv, title="DAO Bullish Divergence", message="Bullish divergence detected on DAO")
+alertcondition(bearishDiv, title="DAO Bearish Divergence", message="Bearish divergence detected on DAO")
+
+// Signal Line Cross Alerts
+// Trigger when oscillator crosses the signal line
+signalCrossUp = ta.crossover(demandOsc, signalLine)
+signalCrossDown = ta.crossunder(demandOsc, signalLine)
+alertcondition(signalCrossUp, title="DAO Signal Cross Up", message="DAO crossed above signal line")
+alertcondition(signalCrossDown, title="DAO Signal Cross Down", message="DAO crossed below signal line")
+
+// ============================================================================
+// STATISTICS TABLE
+// ============================================================================
+
+// Create a table in the top-right corner to display real-time statistics
+// This table shows current DAO value, status, signal value, and trend
+var table infoTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 85), frame_color=color.gray, frame_width=1)
+
+// Only update the table on the last bar (current bar) for performance
+if barstate.islast
+    // Row 0: DAO Value
+    // Shows the current oscillator value (0.000 to 1.000)
+    table.cell(infoTable, 0, 0, "DAO", text_color=color.white, bgcolor=color.new(color.blue, 70))
+    table.cell(infoTable, 1, 0, str.tostring(demandOsc, "#.###"), text_color=color.white, bgcolor=color.new(color.blue, 70))
+    
+    // Row 1: Market Status
+    // Displays "Overbought", "Oversold", or "Neutral" based on current value
+    table.cell(infoTable, 0, 1, "Status", text_color=color.gray)
+    status = demandOsc > obLevel ? "Overbought" : demandOsc < osLevel ? "Oversold" : "Neutral"
+    statusColor = demandOsc > obLevel ? color.red : demandOsc < osLevel ? color.green : color.gray
+    table.cell(infoTable, 1, 1, status, text_color=statusColor)
+    
+    // Row 2: Signal Line Value
+    // Shows the current signal line (EMA) value
+    table.cell(infoTable, 0, 2, "Signal", text_color=color.gray)
+    table.cell(infoTable, 1, 2, str.tostring(signalLine, "#.###"), text_color=color.orange)
+    
+    // Row 3: Trend Direction
+    // Shows "Bullish ↑" if DAO above signal, "Bearish ↓" if DAO below signal
+    table.cell(infoTable, 0, 3, "Trend", text_color=color.gray)
+    trend = demandOsc > signalLine ? "Bullish ↑" : "Bearish ↓"
+    trendColor = demandOsc > signalLine ? color.green : color.red
+    table.cell(infoTable, 1, 3, trend, text_color=trendColor)

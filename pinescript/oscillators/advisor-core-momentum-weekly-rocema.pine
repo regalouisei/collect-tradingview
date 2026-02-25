@@ -1,0 +1,141 @@
+//@version=5
+indicator("Advisor CORE + MOMENTUM (Weekly) - ROC/EMA", shorttitle="Advisor W", overlay=true, precision=2)
+
+// ====== Inputs
+emaLong   = input.int(40, "EMA larga (semanal)", minval=1)
+emaShort  = input.int(10, "EMA corta (semanal)", minval=1)
+
+rocS      = input.int(13, "ROC corto (semanas)", minval=1)
+rocM      = input.int(26, "ROC medio (semanas)", minval=1)
+rocL      = input.int(52, "ROC largo (semanas)", minval=1)
+
+// CORE thresholds (lo que razonamos)
+coreStrongRoc = input.float(5.0, "CORE: ROC largo fuerte (umbral)", minval=0.0, step=0.5)
+
+panelPos  = input.string("Bottom Right", "Posición panel", options=["Top Right","Bottom Right","Top Left","Bottom Left"])
+panelSize = input.string("Tiny", "Tamaño texto", options=["Tiny","Small","Normal"])
+
+// ====== Helpers
+roc(_src, _len) => 100 * (_src / _src[_len] - 1)
+
+// ====== Weekly series (siempre W aunque mires D)
+wClose = request.security(syminfo.tickerid, "W", close, barmerge.gaps_off, barmerge.lookahead_off)
+wEMA10 = request.security(syminfo.tickerid, "W", ta.ema(close, emaShort), barmerge.gaps_off, barmerge.lookahead_off)
+wEMA40 = request.security(syminfo.tickerid, "W", ta.ema(close, emaLong),  barmerge.gaps_off, barmerge.lookahead_off)
+
+wRocS  = request.security(syminfo.tickerid, "W", roc(close, rocS), barmerge.gaps_off, barmerge.lookahead_off)
+wRocM  = request.security(syminfo.tickerid, "W", roc(close, rocM), barmerge.gaps_off, barmerge.lookahead_off)
+wRocL  = request.security(syminfo.tickerid, "W", roc(close, rocL), barmerge.gaps_off, barmerge.lookahead_off)
+
+// pendiente EMA40 (estructura)
+wEMA40Up = request.security(syminfo.tickerid, "W", ta.rising(ta.ema(close, emaLong), 3), barmerge.gaps_off, barmerge.lookahead_off)
+wConf    = request.security(syminfo.tickerid, "W", barstate.isconfirmed, barmerge.gaps_off, barmerge.lookahead_off)
+
+// ======================================================
+// CORE (estructura + ciclo) — AHORA con estado "REVISAR"
+// Estados:
+//  2 = BUY/HOLD (sano)
+//  1 = HOLD (pullback / presión, pero no crítico)
+//  0 = REVISAR (precio < EMA40 + ROC largo débil o EMA40 bajando)
+// -1 = REDUCIR (ROC largo < 0)
+// ======================================================
+core_priceAbove = wClose > wEMA40
+core_cyclePos   = wRocL > 0
+core_cycleNeg   = wRocL < 0
+core_rocWeak    = wRocL > 0 and wRocL <= coreStrongRoc
+
+// "Revisar" cuando el precio ya perdió EMA40 y el ciclo largo se quedó sin colchón,
+// o cuando además la EMA40 ya viene cayendo (estructura deteriorándose).
+core_review = (not core_priceAbove) and (core_rocWeak or not wEMA40Up)
+
+int coreState =
+     core_cycleNeg ? -1 :
+     (core_priceAbove and wEMA40Up and wRocL > coreStrongRoc) ? 2 :
+     core_review ? 0 :
+     core_cyclePos ? 1 : -1
+
+string coreReason =
+     coreState == 2 ? "Precio > EMA40 | EMA40↑ | ROC largo fuerte" :
+     coreState == 1 ? (core_priceAbove ? "Estructura OK, sin fuerza plena" : "Pullback / presión sobre EMA40") :
+     coreState == 0 ? (not core_priceAbove and core_rocWeak ? "Precio < EMA40 + ROC largo débil" : "Precio < EMA40 o EMA40 no asciende") :
+                      "ROC largo < 0"
+
+string coreText =
+     coreState == 2 ? "CORE: BUY/HOLD - " + coreReason :
+     coreState == 1 ? "CORE: HOLD - " + coreReason :
+     coreState == 0 ? "CORE: REVISAR - " + coreReason :
+                      "CORE: REDUCIR - " + coreReason
+
+// ======================================================
+// MOMENTUM / CANSLIM (timing) — CANSLIM PURO (EMA10 manda)
+// BUY  : Precio > EMA10 AND EMA10 > EMA40 AND EMA40 sube
+// HOLD : Precio < EMA10 BUT Precio > EMA40 AND EMA40 sube
+// NO   : Precio < EMA40 (o estructura no acompaña)
+// ======================================================
+mom_buy  = (wClose > wEMA10) and (wEMA10 > wEMA40) and wEMA40Up
+mom_hold = (wClose < wEMA10) and (wClose > wEMA40) and wEMA40Up
+mom_no   = (wClose < wEMA40) or (not wEMA40Up)
+
+int momState = mom_buy ? 1 : mom_hold ? 0 : -1
+
+string momReason =
+     momState == 1 ? "Precio > EMA10 | EMA10>EMA40 | EMA40↑" :
+     momState == 0 ? "Precio < EMA10 pero > EMA40 | EMA40↑" :
+                      (wClose < wEMA40 ? "Precio < EMA40" : "EMA40 no asciende")
+
+string momText =
+     momState == 1 ? "MOMENTUM: BUY - " + momReason :
+     momState == 0 ? "MOMENTUM: HOLD/WAIT - " + momReason :
+                      "MOMENTUM: NO OPERAR - " + momReason
+
+// ====== Colors
+coreBg =
+     coreState == 2 ? color.new(color.green, 0) :
+     coreState == 1 ? color.new(color.yellow, 0) :
+     coreState == 0 ? color.new(color.orange, 0) :
+                      color.new(color.red, 0)
+
+momBg  =
+     momState == 1 ? color.new(color.green, 0) :
+     momState == 0 ? color.new(color.teal, 0) :
+                      color.new(color.red, 0)
+
+// ====== Position + size
+pos =
+     panelPos == "Top Right"    ? position.top_right :
+     panelPos == "Bottom Right" ? position.bottom_right :
+     panelPos == "Top Left"     ? position.top_left :
+                                  position.bottom_left
+
+tSize = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
+
+// ====== Table (recreate on input changes)
+var table t = na
+var string lastPos  = ""
+var string lastSize = ""
+
+if barstate.isfirst or panelPos != lastPos or panelSize != lastSize
+    if not na(t)
+        table.delete(t)
+    t := table.new(pos, 1, 2, border_width=1)
+    lastPos  := panelPos
+    lastSize := panelSize
+
+if barstate.islast
+    table.cell(t, 0, 0, coreText, bgcolor=coreBg, text_color=color.black, text_size=tSize)
+    table.cell(t, 0, 1, momText,  bgcolor=momBg,  text_color=color.black, text_size=tSize)
+
+// ====== Alerts on weekly state change
+var int prevCore = na
+var int prevMom  = na
+
+coreChanged = not na(prevCore) and coreState != prevCore
+momChanged  = not na(prevMom)  and momState  != prevMom
+
+if wConf
+    if coreChanged
+        alert("[" + syminfo.ticker + "] " + coreText, alert.freq_once_per_bar_close)
+    if momChanged
+        alert("[" + syminfo.ticker + "] " + momText, alert.freq_once_per_bar_close)
+    prevCore := coreState
+    prevMom  := momState

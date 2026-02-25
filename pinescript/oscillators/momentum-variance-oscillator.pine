@@ -1,0 +1,815 @@
+//@version=6
+indicator("Momentum Variance Oscillator", "MVO", overlay=false, max_bars_back=5000)
+
+// ===============================
+// UI — Engine (tuned defaults)
+// ===============================
+grpCore   = "Engine"
+lenBase   = input.int(64, "Base Window", minval=5, group=grpCore, tooltip="Anchor lookback for PV basis, stdev, and volume smoothing (FRAMA-adapted).")
+sigLen    = input.int(21, "Signal Length (EMA)", minval=1, group=grpCore)
+volPower  = input.float(0.60, "Volume Power (0-1+)", minval=0.0, step=0.05, group=grpCore, tooltip="Exponent on normalized volume to weight PV.")
+
+// ===============================
+// UI — Volatility & Bands
+// ===============================
+grpBands  = "Volatility & Bands"
+multBand  = input.float(2.20, "Deviation Multiplier", minval=0.1, step=0.05, group=grpBands)
+useATRsc  = input.bool(true, "Scale Deviation by ATR Ratio", group=grpBands, tooltip="Multiplies Deviation Multiplier by clamp(ATRfast/ATRslow).")
+atrFastLn = input.int(10, "ATR Fast Length",  minval=1, group=grpBands)
+atrSlowLn = input.int(30, "ATR Slow Length",  minval=2, group=grpBands)
+atrMin    = input.float(0.75, "ATR Clamp Min", minval=0.10, step=0.05, group=grpBands)
+atrMax    = input.float(1.25, "ATR Clamp Max", minval=0.20, step=0.05, group=grpBands)
+
+// ===============================
+// UI — Visuals: Extremes & Display
+// ===============================
+grpView   = "Visuals — Extremes & Display"
+obLevel   = input.float(2.10, "Extreme Level (+/-)", minval=0.5, step=0.05, group=grpView)
+weakLvl   = input.float(0.80, "Weak Momentum Threshold (abs PV)", minval=0.1, step=0.05, group=grpView)
+showHist  = input.bool(true,  "Show Variance Histogram", group=grpView)
+
+// ===============================
+// UI — Color Palettes
+// ===============================
+grpClrZ   = "Colors — Zero-line Gradient"
+bullStrongClr = input.color(color.new(#00ff08, 0), "Bull Strong", group=grpClrZ)
+bullMidClr    = input.color(color.new(#0037ff, 0), "Bull Mid",    group=grpClrZ)
+bullWeakClr   = input.color(color.new(#9c27b0, 0), "Bull Weak",   group=grpClrZ)
+bearStrongClr = input.color(color.new(#ff0014, 0), "Bear Strong", group=grpClrZ)
+bearMidClr    = input.color(color.new(#ff5c00, 0), "Bear Mid",    group=grpClrZ)
+bearWeakClr   = input.color(color.new(#fdd835, 0), "Bear Weak",   group=grpClrZ)
+
+grpClrLS  = "Colors — PV & Signal"
+pvBullClr     = input.color(color.new(#00ff08, 0),"PV Bull Base", group=grpClrLS)
+pvBearClr     = input.color(color.new(#ff0014, 0),"PV Bear Base", group=grpClrLS)
+sigClr        = input.color(color.new(color.white,30),"Signal",    group=grpClrLS)
+
+grpHist  = "Colors — Histogram & Guides"
+histPosClr    = input.color(color.new(color.green, 0), "Histogram Plus", group=grpHist)
+histNegClr    = input.color(color.new(color.red, 0),  "Histogram Minus", group=grpHist)
+extBaseOpaque = input.int(40, "Extreme Lines Base Opaqueness % (when NOT breached)", minval=0, maxval=100, group=grpHist, tooltip="0% = fully transparent, 100% = fully opaque. On breach, lines become 100% opaque.")
+
+// ===============================
+// UI — Exhaustion Visuals (Rails, Spacing)
+// ===============================
+grpExhClr = "Exhaustion — Rails"
+exhRailBaseClr   = input.color(color.rgb(160,160,160,40), "Rail Base (Gray)", group=grpExhClr)
+railBaseOffPct   = input.float(0.100, "Rail Base Offset (×effOb)", minval=0.05, maxval=0.20, step=0.005, group=grpExhClr, tooltip="Base lift above/below ±effOb for the first rail tier.")
+railTierStepPct  = input.float(0.085, "Rail Tier Step (×effOb)",  minval=0.01, maxval=0.30, step=0.005, group=grpExhClr, tooltip="Extra lift per additional tier (Daily, Weekly, Monthly).")
+railMicroGapPct  = input.float(0.075, "Rail Microgap (×effOb)",  minval=0.000, maxval=0.5, step=0.001, group=grpExhClr, tooltip="Tiny extra gap between tiers so they never touch.")
+railLineWidth    = input.int(5, "Rail Line Width", minval=1, maxval=7, group=grpExhClr)
+
+// ===============================
+// UI — Price Bar Colors (optional)
+// ===============================
+grpBar = "Colors — Price Bars"
+useBarColor      = input.bool(false, "Color Price Bars", group=grpBar)
+barMode          = input.string("Regime+Strength", "Mode", options=["Regime+Strength","Cross Signals","Extremes"], group=grpBar)
+barTrans         = input.int(0, "Bar Color Transparency (0-100)", minval=0, maxval=100, group=grpBar)
+barWeakExtraDim  = input.int(20, "Extra Dimming when abs(PV) < weakLvl", minval=0, maxval=100, group=grpBar)
+
+// ===============================
+// UI — Optimizer (no table, internal only)
+// ===============================
+grpOpt    = "Optimizer"
+autoTune  = input.bool(true,  "Auto-Select Best (Top-1) obLevel/weakLvl", group=grpOpt)
+
+// ===============================
+// UI — Advanced: Squeeze + Ribbon
+// ===============================
+grpSqz   = "Advanced — Squeeze"
+sqzMode        = input.string("Percentile", "Squeeze Mode", options=["Absolute","Percentile"], group=grpSqz)
+adv_sqzLen     = input.int(60,  "Compression Window (for comp ratio)", minval=5, group=grpSqz)
+pctLen         = input.int(252, "Percentile Lookback", minval=20, group=grpSqz)
+pctCompPerc    = input.int(10,  "Comp Percentile (0-100)", minval=1, maxval=99, group=grpSqz)
+pctATRPerc     = input.int(20,  "ATR Ratio Percentile (0-100)", minval=1, maxval=99, group=grpSqz)
+adv_sqzThresh  = input.float(0.70, "ABS: Compression Threshold", step=0.05, group=grpSqz)
+adv_sqzAtrThresh = input.float(0.85, "ABS: ATR Ratio Threshold", step=0.05, group=grpSqz)
+releaseLB      = input.int(10, "Release Lookback Bars", minval=1, group=grpSqz)
+minSqzBars     = input.int(10, "Min Bars In Squeeze Before Release", minval=1, group=grpSqz)
+showSqueezeRibbon = input.bool(true, "Show Squeeze Ribbon", group=grpSqz)
+adv_useSqueezeFilter = input.bool(true, "Gate LIVE Entries to Post-Release Window", group=grpSqz)
+ribbonReleaseClr = input.color(color.rgb(255,215,0), "Ribbon Release (Gold)", group=grpSqz)
+
+// ===============================
+// UI — Slope / Signal / Exhaustion filters
+// ===============================
+grpSlope = "Advanced — PV Slope Alignment"
+adv_useSlopeFilter = input.bool(true, "Require Slope Alignment (LIVE)", group=grpSlope)
+adv_slopeEntry     = input.float(0.35, "Entry Slope Threshold (normalized)", step=0.05, group=grpSlope)
+adv_slopeExit      = input.float(0.05, "Exit Slope Floor (normalized)",     step=0.01, group=grpSlope)
+
+grpSig = "Advanced — Signal Line"
+sigMode       = input.string("FRAMA-EMA", "Mode", options=["EMA","ER-EMA","FRAMA-EMA","LR-Proj","Hybrid"], group=grpSig)
+erFastLen     = input.int(3,  "ER Fast Len", minval=1, group=grpSig)
+erSlowLen     = input.int(34, "ER Slow Len", minval=2, group=grpSig)
+frPVLen       = input.int(20, "FRAMA Window (PV)", minval=5, group=grpSig)
+lrLen         = input.int(28, "Linear Reg Window", minval=5, group=grpSig)
+hyb_wER       = input.float(0.45, "Hybrid Weight ER-EMA", minval=0, maxval=1, step=0.05, group=grpSig)
+hyb_wFR       = input.float(0.35, "Hybrid Weight FRAMA-EMA", minval=0, maxval=1, step=0.05, group=grpSig)
+hyb_wLR       = input.float(0.20, "Hybrid Weight LR-Proj", minval=0, maxval=1, step=0.05, group=grpSig)
+
+// Exhaustion Filter (LIVE)
+grpExh = "Advanced — Exhaustion Filter (LIVE)"
+exhFilterMode = input.string("Base or Extreme", "Exhaustion Requirement", options=["Off","Base or Extreme","Extreme Only"], group=grpExh)
+
+// ===============================
+// UI — Volume Context (new)
+// ===============================
+grpVol = "Volume Context (additive, optional)"
+useVolCtx   = input.bool(true, "Enable Volume Context", group=grpVol, tooltip="Adds OBV/VPT/CMF normalized context; used for info and included in alert text.")
+volCtxLen   = input.int(64, "Volume Context Lookback", minval=10, group=grpVol, tooltip="Lookback for OBV/VPT z-scores and CMF.")
+wOBV        = input.float(0.40, "Weight OBV z-score", minval=0, maxval=1, step=0.05, group=grpVol)
+wVPT        = input.float(0.30, "Weight VPT z-score", minval=0, maxval=1, step=0.05, group=grpVol)
+wCMF        = input.float(0.30, "Weight CMF",         minval=0, maxval=1, step=0.05, group=grpVol)
+
+// ===============================
+// UI — Adaptive Exhaustion Thresholds (RSI)
+// ===============================
+grpAdapt = "Adaptive Exhaustion (RSI-based)"
+adaptRSI_on    = input.bool(true,  "Enable Adaptive RSI Exhaustion", group=grpAdapt, tooltip="Learns RSI levels where price tends to pivot, using recent pivot RSI percentiles.")
+adaptLen       = input.int(500,    "Learning Lookback (bars)", minval=100, group=grpAdapt, tooltip="Window for computing pivot-RSI percentiles.")
+phPercBase     = input.int(80,     "Pivot-High RSI Percentile → Base Top", minval=50, maxval=98, group=grpAdapt)
+phPercExtreme  = input.int(90,     "Pivot-High RSI Percentile → Extreme Top", minval=55, maxval=99, group=grpAdapt)
+plPercBase     = input.int(20,     "Pivot-Low RSI Percentile → Base Bottom", minval=2,  maxval=50, group=grpAdapt)
+plPercExtreme  = input.int(10,     "Pivot-Low RSI Percentile → Extreme Bottom", minval=1,  maxval=45, group=grpAdapt)
+pivotL         = input.int(10,      "Pivot Left Bars", minval=1, maxval=10, group=grpAdapt)
+pivotR         = input.int(10,      "Pivot Right Bars", minval=1, maxval=10, group=grpAdapt)
+
+// ===============================
+// UI — Visual Tuning: Momentum Persistence & Exhaustion Dampening
+// ===============================
+grpMom = "Visuals — Momentum Persistence & Exhaustion Dampening"
+momHalf     = input.int(8,  "Momentum Half-life (bars)", minval=1, group=grpMom, tooltip="How quickly the momentum boost saturates as PV/Signal/Hist stay on the same side of zero.")
+momBoostMax = input.float(0.60, "Max Momentum Boost (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpMom, tooltip="How much extra saturation the zero line & bars can gain from persistence.")
+exhDampMax  = input.float(0.60, "Max Exhaustion Dampening (0-1)", minval=0.0, maxval=1.0, step=0.05, group=grpMom, tooltip="How much exhaustion can desaturate colors (stronger near extremes).")
+slopeWeight = input.float(0.15, "Slope Assist Weight (0-1)", minval=0.0, maxval=0.5, step=0.01, group=grpMom, tooltip="Small bonus when slope supports the regime.")
+
+// ===============================
+// Helpers
+// ===============================
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_framaAlpha(src, window) =>
+    int half = int(math.max(2, math.round(window / 2.0)))
+    n3   = ta.highest(src, window) - ta.lowest(src, window)
+    n1   = ta.highest(src, half)   - ta.lowest(src, half)
+    n2   = ta.highest(src[half], half) - ta.lowest(src[half], half)
+    _n1  = math.max(n1, 1e-10)
+    _n2  = math.max(n2, 1e-10)
+    _n3  = math.max(n3, 1e-10)
+    d    = (math.log(_n1 + _n2) - math.log(_n3)) / math.log(2.0)
+    d    := f_clamp(d, 1.0, 2.0)
+    math.exp(-4.6 * (d - 1.0))
+
+f_lerpColor(c1, c2, t) =>
+    _t = f_clamp(t, 0.0, 1.0)
+    r = math.round(color.r(c1) + (color.r(c2) - color.r(c1)) * _t)
+    g = math.round(color.g(c1) + (color.g(c2) - color.g(c1)) * _t)
+    b = math.round(color.b(c1) + (color.b(c2) - color.b(c1)) * _t)
+    color.rgb(int(r), int(g), int(b))
+
+f_regimeGradient(_s, isBull, bias, cWeakBull, cMidBull, cStrongBull, cWeakBear, cMidBear, cStrongBear) =>
+    s = f_clamp(_s * (1.0 - bias), 0.0, 1.0)
+    t = s * 2.0
+    isFirst = t <= 1.0
+    cA = isBull ? cWeakBull : cWeakBear
+    cB = isBull ? cMidBull  : cMidBear
+    cC = isBull ? cStrongBull : cStrongBear
+    isFirst ? f_lerpColor(cA, cB, t) : f_lerpColor(cB, cC, t - 1.0)
+
+f_r(x, n) =>
+    pow = math.pow(10.0, n)
+    math.round(x * pow) / pow
+
+f_str(x, n) => str.tostring(f_r(x, n))  // string helper
+
+// ===============================
+// Adaptive length (PV basis)
+// ===============================
+alphaEvery  = f_framaAlpha(close, lenBase)
+effLenCalc  = int(f_clamp(math.round(lenBase * (2.0 - alphaEvery)), 5, 300))
+int halfWin = int(math.max(2, math.round(lenBase / 2.0)))
+int needBars= math.max(lenBase, 2 * halfWin)
+effLen      = bar_index >= needBars ? effLenCalc : lenBase
+
+// ===============================
+// Core PV oscillator
+// ===============================
+tp        = hlc3
+basis     = ta.sma(tp, effLen)
+dev       = ta.stdev(tp, effLen)
+atrFast   = ta.atr(atrFastLn)
+atrSlow   = ta.atr(atrSlowLn)
+atrRatio  = atrSlow > 0 ? atrFast / atrSlow : 1.0
+atrScale  = f_clamp(atrRatio, atrMin, atrMax)
+multBandE = useATRsc ? multBand * atrScale : multBand
+bandWidth = multBandE * math.max(dev, 1e-10)
+
+volSma    = ta.sma(volume, effLen)
+volNorm   = volume / math.max(nz(volSma, 0.0), 1e-10)
+volFact   = math.pow(volNorm, volPower)
+
+pvRaw     = (tp - basis) / bandWidth
+pv        = pvRaw * volFact
+
+// ===============================
+// Signal Line Modes
+// ===============================
+pvSignalEMA = ta.ema(pv, sigLen)
+// ER-EMA
+erLen   = math.max(sigLen, 2)
+chgER   = math.abs(pv - nz(pv[erLen]))
+volER   = math.sum(math.abs(pv - pv[1]), erLen)  // math.sum
+erRatio = volER != 0 ? chgER / volER : 0.0
+scFast  = 2.0 / (erFastLen + 1.0)
+scSlow  = 2.0 / (erSlowLen + 1.0)
+scER    = math.pow(erRatio * (scFast - scSlow) + scSlow, 2.0)
+var float pvSignalER = na
+pvSignalER := na(pvSignalER[1]) ? pv : pvSignalER[1] + scER * (pv - pvSignalER[1])
+// FRAMA-EMA
+alphaPV = f_framaAlpha(pv, frPVLen)
+var float pvSignalFR = na
+pvSignalFR := na(pvSignalFR[1]) ? pv : alphaPV * pv + (1 - alphaPV) * pvSignalFR[1]
+// LR-Proj
+pvSignalLR = ta.linreg(pv, lrLen, -1)
+// Hybrid
+sumW   = math.max(hyb_wER + hyb_wFR + hyb_wLR, 1e-9)
+pvSignalHybrid = (hyb_wER * pvSignalER + hyb_wFR * pvSignalFR + hyb_wLR * pvSignalLR) / sumW
+// Select
+pvSignal = sigMode == "EMA" ? pvSignalEMA : sigMode == "ER-EMA" ? pvSignalER : sigMode == "FRAMA-EMA" ? pvSignalFR : sigMode == "LR-Proj" ? pvSignalLR : pvSignalHybrid
+
+// Variance (MACD-like)
+int macdSigLen = int(math.max(3, math.round(sigLen * 1.5)))
+axHist    = pv - ta.ema(pv, macdSigLen)
+
+// ===============================
+// Slope (moved up so it's available to color logic)
+// ===============================
+pvSlope  = ta.ema(pv, 2) - ta.ema(pv, 5)
+pvSlopeNorm = pvSlope / (ta.stdev(pv, math.max(sigLen, 10)) + 1e-10)
+
+// ===============================
+// Crosses (precomputed)
+// ===============================
+bullSignalX   = ta.crossover(pv, pvSignal)
+bearSignalX   = ta.crossunder(pv, pvSignal)
+bullBaseX     = ta.crossover(pv, 0.0)
+bearBaseX     = ta.crossunder(pv, 0.0)
+
+// ===============================
+// Volume Context (manual OBV/VPT/CMF; normalized) — uses math.sum
+// ===============================
+var float obvSeries = na
+obvSeries := nz(obvSeries[1]) + (close > close[1] ? volume : close < close[1] ? -volume : 0)
+
+var float vptSeries = na
+vptSeries := nz(vptSeries[1]) + (nz(close[1]) != 0 ? volume * (close - close[1]) / nz(close[1]) : 0)
+
+mfm = (high != low) ? ((close - low) - (high - close)) / (high - low) : 0.0
+cmf = (math.sum(mfm * volume, volCtxLen)) / math.max(math.sum(volume, volCtxLen), 1e-10)
+
+f_z(s, ln) => (s - ta.sma(s, ln)) / (ta.stdev(s, ln) + 1e-10)
+obvZ = f_z(obvSeries, volCtxLen)
+vptZ = f_z(vptSeries, volCtxLen)
+
+sumWctx = math.max(wOBV + wVPT + wCMF, 1e-9)
+volCtxScore = useVolCtx ? f_clamp((wOBV * obvZ + wVPT * vptZ + wCMF * cmf) / sumWctx, -3.0, 3.0) : na
+
+// ===============================
+// Adaptive RSI Exhaustion — learn from pivots (current TF)
+// ===============================
+exhRSI = ta.rsi(close, 14)
+isPH   = not na(ta.pivothigh(high, pivotL, pivotR))
+isPL   = not na(ta.pivotlow(low,  pivotL, pivotR))
+rsiAtPH = isPH ? exhRSI[pivotR] : na
+rsiAtPL = isPL ? exhRSI[pivotR] : na
+
+topBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiAtPH, adaptLen, phPercBase), 72) : 72.0
+topExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiAtPH, adaptLen, phPercExtreme), 80) : 80.0
+botBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiAtPL, adaptLen, plPercBase), 32) : 32.0
+botExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiAtPL, adaptLen, plPercExtreme), 25) : 25.0
+
+topBaseDyn    := f_clamp(topBaseDyn, 55, 95)
+topExtremeDyn := f_clamp(math.max(topExtremeDyn, topBaseDyn + 2), 57, 99)
+botBaseDyn    := f_clamp(botBaseDyn, 5, 45)
+botExtremeDyn := f_clamp(math.min(botExtremeDyn, botBaseDyn - 2), 1, 43)
+
+// Aroon drives
+exhUpperAroon = 100 * (ta.highestbars(high, 14 + 1) + 14) / 14
+var int exhTopDrives = 0
+var int exhBotDrives = 0
+exhTopDrives := exhUpperAroon == 100 and exhUpperAroon[1] < 100 ? exhTopDrives[1] + 1 : exhUpperAroon == 0 ? 0 : exhTopDrives[1]
+exhBotDrives := exhUpperAroon == 0   and exhUpperAroon[1] > 0   ? exhBotDrives[1] + 1 : exhUpperAroon == 100 ? 0 : exhBotDrives[1]
+
+// Dynamic exhaustion flags (adaptive)
+exhTop           = exhRSI >= topBaseDyn    and exhTopDrives >= 5
+exhBottom        = exhRSI <= botBaseDyn    and exhBotDrives >= 5
+exhTopExtreme    = exhRSI >= topExtremeDyn and exhTopDrives >= 5
+exhBottomExtreme = exhRSI <= botExtremeDyn and exhBotDrives >= 5
+exhAnyTop        = exhTop or exhTopExtreme
+exhAnyBottom     = exhBottom or exhBottomExtreme
+
+// ===============================
+// Squeeze detection (strict) + Min bars before release
+// ===============================
+comp = bandWidth / math.max(ta.sma(bandWidth, 60), 1e-10)
+compQ = ta.percentile_linear_interpolation(comp, pctLen, pctCompPerc)
+atrQ  = ta.percentile_linear_interpolation(atrRatio, pctLen, pctATRPerc)
+
+inSqueeze_abs  = comp < adv_sqzThresh and atrRatio < adv_sqzAtrThresh
+inSqueeze_pct  = comp < compQ         and atrRatio < atrQ
+inSqueeze      = sqzMode == "Absolute" ? inSqueeze_abs : inSqueeze_pct
+
+var int sqzRun = 0
+sqzRun := inSqueeze ? nz(sqzRun[1]) + 1 : 0
+
+crossComp_abs  = ta.crossover(comp, adv_sqzThresh)
+crossAtr_abs   = ta.crossover(atrRatio, adv_sqzAtrThresh)
+crossComp_pct  = ta.crossover(comp, compQ)
+crossAtr_pct   = ta.crossover(atrRatio, atrQ)
+sqzReleaseRaw  = (sqzMode == "Absolute" ? (crossComp_abs or crossAtr_abs) : (crossComp_pct or crossAtr_pct))
+sqzReleaseStrict = sqzReleaseRaw and nz(sqzRun[1]) >= minSqzBars
+recentRelease    = ta.barssince(sqzReleaseStrict) <= releaseLB
+
+prevInSqueeze   = nz(((inSqueeze) ? 1 : 0)[1], 0) == 1
+sqzEnter        = inSqueeze and not prevInSqueeze
+sqzExit         = (not inSqueeze) and prevInSqueeze
+
+// ===============================
+// Optimizer core (internal only; no table)
+// ===============================
+var int   firstBarTime = na
+if na(firstBarTime)
+    firstBarTime := time
+
+var float[] obList = array.new_float()
+var float[] wkList = array.new_float()
+var int[]   posArr = array.new_int()
+var float[] eqArr  = array.new_float()
+var float[] pkArr  = array.new_float()
+var float[] ddArr  = array.new_float()
+var int[]   trArr  = array.new_int()
+
+var float   bestOb = na
+var float   bestWk = na
+var int     best1Idx = -1, best2Idx = -1, best3Idx = -1
+
+if autoTune
+    if array.size(obList) == 0
+        stepsOb = int(math.round((3.00 - 1.50) / 0.05))
+        for i = 0 to stepsOb
+            v = 1.50 + i * 0.05
+            array.push(obList, math.round(v * 100.0) / 100.0)
+    if array.size(wkList) == 0
+        stepsWk = int(math.round((1.00 - 0.50) / 0.05))
+        for j = 0 to stepsWk
+            v2 = 0.50 + j * 0.05
+            array.push(wkList, math.round(v2 * 100.0) / 100.0)
+
+    Nob = array.size(obList)
+    Nwk = array.size(wkList)
+    N   = Nob * Nwk
+
+    if array.size(posArr) != N
+        array.clear(posArr), array.clear(eqArr), array.clear(pkArr), array.clear(ddArr), array.clear(trArr)
+        for ii = 0 to N - 1
+            array.push(posArr, 0), array.push(eqArr, 1.0), array.push(pkArr, 1.0), array.push(ddArr, 0.0), array.push(trArr, 0)
+
+    ret       = bar_index > 0 ? (close / close[1] - 1.0) : 0.0
+    posRegime = pv > 0
+    negRegime = pv < 0
+    absPVopt  = math.abs(pv)
+
+    for idx = 0 to N - 1
+        ob  = array.get(obList, int(math.floor(idx / Nwk)))
+        wk  = array.get(wkList, idx % Nwk)
+
+        longEntry  = bullSignalX and posRegime and absPVopt >= wk and absPVopt <= ob
+        shortEntry = bearSignalX and negRegime and absPVopt >= wk and absPVopt <= ob
+
+        exitLong  = bearSignalX or not posRegime or absPVopt < wk or absPVopt > ob
+        exitShort = bullSignalX or not negRegime or absPVopt < wk or absPVopt > ob
+
+        st = array.get(posArr, idx)
+        if st == 0
+            if longEntry
+                st := 1
+                array.set(trArr, idx, array.get(trArr, idx) + 1)
+            else if shortEntry
+                st := -1
+                array.set(trArr, idx, array.get(trArr, idx) + 1)
+        else if st == 1 and exitLong
+            st := 0
+        else if st == -1 and exitShort
+            st := 0
+        array.set(posArr, idx, st)
+
+        eq_i = array.get(eqArr, idx) * (1.0 + ret * st)
+        array.set(eqArr, idx, eq_i)
+        pk_i = math.max(array.get(pkArr, idx), eq_i)
+        array.set(pkArr, idx, pk_i)
+        dd   = 1.0 - (eq_i / pk_i)
+        array.set(ddArr, idx, math.max(array.get(ddArr, idx), dd))
+
+    years = math.max((time - firstBarTime) / 31557600000.0, 1e-9)
+    best1Score = -1e10, best2Score = -1e10, best3Score = -1e10
+    best1Idx := -1, best2Idx := -1, best3Idx := -1
+
+    for idx = 0 to N - 1
+        R   = array.get(eqArr, idx)
+        DD  = array.get(ddArr, idx)
+        CAGR= R > 0 ? (math.pow(R, 1.0/years) - 1.0) : -1.0
+        score = CAGR / (1.0 + DD + 1e-6)
+        if score > best1Score
+            best3Score := best2Score, best3Idx := best2Idx
+            best2Score := best1Score, best2Idx := best1Idx
+            best1Score := score,      best1Idx := idx
+        else if score > best2Score
+            best3Score := best2Score, best3Idx := best2Idx
+            best2Score := score,      best2Idx := idx
+        else if score > best3Score
+            best3Score := score,      best3Idx := idx
+
+    if best1Idx >= 0
+        bestOb := array.get(obList, int(math.floor(best1Idx / Nwk)))
+        bestWk := array.get(wkList, best1Idx % Nwk)
+
+// Effective params (autoTune)
+effOb   = autoTune and not na(bestOb) ? bestOb : obLevel
+effWeak = autoTune and not na(bestWk) ? bestWk : weakLvl
+
+// ===============================
+// Momentum persistence + exhaustion pressure for color logic
+// ===============================
+bullAgree = (pv > 0 ? 1 : 0) + (pvSignal > 0 ? 1 : 0) + (axHist >= 0 ? 1 : 0)
+bearAgree = (pv < 0 ? 1 : 0) + (pvSignal < 0 ? 1 : 0) + (axHist <= 0 ? 1 : 0)
+
+var int bullRun = 0
+var int bearRun = 0
+bullRun := bullAgree == 3 ? nz(bullRun[1]) + 1 : 0
+bearRun := bearAgree == 3 ? nz(bearRun[1]) + 1 : 0
+
+f_sat(run, k) => 1.0 - math.exp(-run / math.max(k, 1.0))
+momScoreBull = f_sat(bullRun, momHalf)
+momScoreBear = f_sat(bearRun, momHalf)
+
+exhPenaltyBull = exhTopExtreme ? 1.0 : exhTop ? 0.6 : 0.0
+exhPenaltyBear = exhBottomExtreme ? 1.0 : exhBottom ? 0.6 : 0.0
+
+slopeAssistBull = slopeWeight * f_clamp(pvSlopeNorm, 0.0, 1.0)
+slopeAssistBear = slopeWeight * f_clamp(-pvSlopeNorm, 0.0, 1.0)
+
+// Base strength by PV distance from ob + adaptive boost/penalty
+strengthBase = f_clamp(math.abs(pv) / effOb, 0.0, 1.0)
+sBull = f_clamp(strengthBase * (1.0 - exhDampMax * exhPenaltyBull) + momBoostMax * momScoreBull + slopeAssistBull, 0.0, 1.0)
+sBear = f_clamp(strengthBase * (1.0 - exhDampMax * exhPenaltyBear) + momBoostMax * momScoreBear + slopeAssistBear, 0.0, 1.0)
+
+// ===============================
+// Zero-line gradient (behind) — momentum sticky, exhaustion fades
+// ===============================
+bullBias = pv > 0 and pvSlope < 0 ? 0.25 : 0.0
+bearBias = pv < 0 and pvSlope > 0 ? 0.25 : 0.0
+zeroColor = pv >= 0 ? f_regimeGradient(sBull, true,  bullBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr) : f_regimeGradient(sBear, false, bearBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr)
+plot(0, "Zero Line", color=zeroColor, linewidth=2)
+
+// ===============================
+// Extremes (lines only)
+// ===============================
+absPV = math.abs(pv)
+topBreached = pv >= effOb
+botBreached = pv <= -effOb
+strExt   = f_clamp(absPV / effOb, 0.0, 1.0)
+bearGrad = f_regimeGradient(strExt, false, bearBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr)
+bullGrad = f_regimeGradient(strExt, true,  bullBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr)
+baseTrans = 100 - f_clamp(extBaseOpaque, 0, 100)
+topLineCol = topBreached ? color.new(bearGrad, 0) : color.new(bearMidClr, baseTrans)
+botLineCol = botBreached ? color.new(bullGrad, 0) : color.new(bullMidClr, baseTrans)
+plot(effOb,  "Extreme Top",    color=topLineCol, linewidth=2)
+plot(-effOb, "Extreme Bottom", color=botLineCol, linewidth=2)
+
+// Precompute rail cross booleans
+crossAboveTopRail    = ta.crossover(pv,  effOb)
+crossBelowBottomRail = ta.crossunder(pv, -effOb)
+
+// ===============================
+// Squeeze Ribbon Visuals — 2 plots + 1 fill
+// ===============================
+ribbonY = effOb * (1.0 + railBaseOffPct + railTierStepPct * 0)
+rEdgeCol = sqzReleaseStrict ? ribbonReleaseClr : color.new(color.gray, 60)
+rFillCol = sqzReleaseStrict ? color.new(ribbonReleaseClr, 60) : color.new(color.gray, 92)
+topRibbon = plot(showSqueezeRibbon and (inSqueeze or sqzReleaseStrict) ?  ribbonY : na, color=rEdgeCol, style=plot.style_linebr, linewidth=2, title="Squeeze Ribbon Top")
+botRibbon = plot(showSqueezeRibbon and (inSqueeze or sqzReleaseStrict) ? -ribbonY : na, color=rEdgeCol, style=plot.style_linebr, linewidth=2, title="Squeeze Ribbon Bottom")
+fill(topRibbon, botRibbon, color= showSqueezeRibbon and (inSqueeze or sqzReleaseStrict) ? rFillCol : na, title="Squeeze Ribbon Fill")
+
+// ===============================
+// Exhaustion Backgrounds (adaptive thresholds)
+// ===============================
+bgTopBaseCol = color.new(bearStrongClr, 80)
+bgBotBaseCol = color.new(bullStrongClr, 80)
+bgcolor(exhTop            ? bgTopBaseCol : na, title="Exhaustion High Base (Adaptive)")
+bgcolor(exhBottom         ? bgBotBaseCol : na, title="Exhaustion Low Base (Adaptive)")
+bgcolor(exhTopExtreme     ? bgTopBaseCol : na, title="Exhaustion High Extreme Overlay (Adaptive)")
+bgcolor(exhBottomExtreme  ? bgBotBaseCol : na, title="Exhaustion Low Extreme Overlay (Adaptive)")
+
+// ===============================
+// Exhaustion Rails — MERGED (Base TF) with Tunable Spacing & Microgaps
+// ===============================
+microGap = effOb * railMicroGapPct
+f_topY(rank) => effOb * (1.0 + railBaseOffPct + railTierStepPct * rank) + microGap * rank
+f_botY(rank) => -effOb * (1.0 + railBaseOffPct + railTierStepPct * rank) - microGap * rank
+
+topRailBaseY = f_topY(0)
+botRailBaseY = f_botY(0)
+topRailCol = exhTopDrives >= 5 ? bearGrad : exhTopDrives >= 1 ? exhRailBaseClr : na
+botRailCol = exhBotDrives >= 5 ? bullGrad : exhBotDrives >= 1 ? exhRailBaseClr : na
+
+plot(topRailBaseY, title="Exhaustion Top Rail (Merged, Adaptive)",    color=topRailCol, linewidth=railLineWidth, style=plot.style_linebr)
+plot(botRailBaseY, title="Exhaustion Bottom Rail (Merged, Adaptive)", color=botRailCol, linewidth=railLineWidth, style=plot.style_linebr)
+
+// ===============================
+// Higher-Timeframe Exhaustion Rails — adaptive per TF
+// ===============================
+showDailyRails   = (not timeframe.isdaily)  and (not timeframe.isweekly) and (not timeframe.ismonthly)
+showWeeklyRails  = (not timeframe.isweekly) and (not timeframe.ismonthly)
+showMonthlyRails = not timeframe.isintraday
+
+rsiD = request.security(syminfo.tickerid, "D", ta.rsi(close, 14))
+rsiW = request.security(syminfo.tickerid, "W", ta.rsi(close, 14))
+rsiM = request.security(syminfo.tickerid, "M", ta.rsi(close, 14))
+
+dTopBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiD, adaptLen, phPercBase), 72) : 72.0
+dTopExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiD, adaptLen, phPercExtreme), 80) : 80.0
+dBotBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiD, adaptLen, plPercBase), 32) : 32.0
+dBotExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiD, adaptLen, plPercExtreme), 25) : 25.0
+
+wTopBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiW, adaptLen, phPercBase), 72) : 72.0
+wTopExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiW, adaptLen, phPercExtreme), 80) : 80.0
+wBotBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiW, adaptLen, plPercBase), 32) : 32.0
+wBotExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiW, adaptLen, plPercExtreme), 25) : 25.0
+
+mTopBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiM, adaptLen, phPercBase), 72) : 72.0
+mTopExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiM, adaptLen, phPercExtreme), 80) : 80.0
+mBotBaseDyn     = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiM, adaptLen, plPercBase), 32) : 32.0
+mBotExtremeDyn  = adaptRSI_on ? nz(ta.percentile_linear_interpolation(rsiM, adaptLen, plPercExtreme), 25) : 25.0
+
+dTopBaseDyn := f_clamp(dTopBaseDyn, 55, 95)
+dTopExtremeDyn := f_clamp(math.max(dTopExtremeDyn, dTopBaseDyn + 2), 57, 99)
+dBotBaseDyn := f_clamp(dBotBaseDyn, 5, 45)
+dBotExtremeDyn := f_clamp(math.min(dBotExtremeDyn, dBotBaseDyn - 2), 1, 43)
+
+wTopBaseDyn := f_clamp(wTopBaseDyn, 55, 95)
+wTopExtremeDyn := f_clamp(math.max(wTopExtremeDyn, wTopBaseDyn + 2), 57, 99)
+wBotBaseDyn := f_clamp(wBotBaseDyn, 5, 45)
+wBotExtremeDyn := f_clamp(math.min(wBotExtremeDyn, wBotBaseDyn - 2), 1, 43)
+
+mTopBaseDyn := f_clamp(mTopBaseDyn, 55, 95)
+mTopExtremeDyn := f_clamp(math.max(mTopExtremeDyn, mTopBaseDyn + 2), 57, 99)
+mBotBaseDyn := f_clamp(mBotBaseDyn, 5, 45)
+mBotExtremeDyn := f_clamp(math.min(mBotExtremeDyn, mBotBaseDyn - 2), 1, 43)
+
+dTop = rsiD >= dTopBaseDyn
+dBot = rsiD <= dBotBaseDyn
+dTopExtreme = rsiD >= dTopExtremeDyn
+dBotExtreme = rsiD <= dBotExtremeDyn
+
+wkTop = rsiW >= wTopBaseDyn
+wkBot = rsiW <= wBotBaseDyn
+wkTopExtreme = rsiW >= wTopExtremeDyn
+wkBotExtreme = rsiW <= wBotExtremeDyn
+
+moTop = rsiM >= mTopBaseDyn
+moBot = rsiM <= mBotBaseDyn
+moTopExtreme = rsiM >= mTopExtremeDyn
+moBotExtreme = rsiM <= mBotExtremeDyn
+
+topRailD = f_topY(1)
+topRailW = f_topY(2)
+topRailM = f_topY(3)
+botRailD = f_botY(1)
+botRailW = f_botY(2)
+botRailM = f_botY(3)
+
+dTopCol  = dTopExtreme  ? bearGrad : dTop  ? exhRailBaseClr : na
+dBotCol  = dBotExtreme  ? bullGrad : dBot  ? exhRailBaseClr : na
+wkTopCol = wkTopExtreme ? bearGrad : wkTop ? exhRailBaseClr : na
+wkBotCol = wkBotExtreme ? bullGrad : wkBot ? exhRailBaseClr : na
+moTopCol = moTopExtreme ? bearGrad : moTop ? exhRailBaseClr : na
+moBotCol = moBotExtreme ? bullGrad : moBot ? exhRailBaseClr : na
+
+plot(showDailyRails   ? topRailD : na, title="Daily Exhaustion Top Rail (Merged, Adaptive)",    color=dTopCol,  linewidth=railLineWidth, style=plot.style_linebr)
+plot(showWeeklyRails  ? topRailW : na, title="Weekly Exhaustion Top Rail (Merged, Adaptive)",   color=wkTopCol, linewidth=railLineWidth, style=plot.style_linebr)
+plot(showMonthlyRails ? topRailM : na, title="Monthly Exhaustion Top Rail (Merged, Adaptive)",  color=moTopCol, linewidth=railLineWidth, style=plot.style_linebr)
+
+plot(showDailyRails   ? botRailD : na, title="Daily Exhaustion Bottom Rail (Merged, Adaptive)",   color=dBotCol,  linewidth=railLineWidth, style=plot.style_linebr)
+plot(showWeeklyRails  ? botRailW : na, title="Weekly Exhaustion Bottom Rail (Merged, Adaptive)",  color=wkBotCol, linewidth=railLineWidth, style=plot.style_linebr)
+plot(showMonthlyRails ? botRailM : na, title="Monthly Exhaustion Bottom Rail (Merged, Adaptive)", color=moBotCol, linewidth=railLineWidth, style=plot.style_linebr)
+
+// ===============================
+// LIVE gates (exhaustion/slope/squeeze) — adaptive exhaustion flags
+// ===============================
+liveLongOK  = (exhFilterMode == "Off" ? true : exhFilterMode == "Extreme Only" ? exhBottomExtreme : exhAnyBottom) and (not adv_useSlopeFilter or pvSlopeNorm >  adv_slopeEntry) and (not adv_useSqueezeFilter or recentRelease)
+liveShortOK = (exhFilterMode == "Off" ? true : exhFilterMode == "Extreme Only" ? exhTopExtreme    : exhAnyTop)    and (not adv_useSlopeFilter or pvSlopeNorm < -adv_slopeEntry) and (not adv_useSqueezeFilter or recentRelease)
+
+// ===============================
+// PV Signal + Histogram (hide Signal when FRAMA-EMA selected)
+// ===============================
+transpLine = int(f_clamp(100 - math.round(90 * strengthBase), 10, 100))
+colPV_base = pv >= 0 ? color.new(pvBullClr, transpLine) : color.new(pvBearClr, transpLine)
+colPVline  = topBreached ? color.new(bearStrongClr, transpLine) : botBreached ? color.new(bullStrongClr, transpLine) : colPV_base
+plot(pv,       "PV",     color=colPVline, linewidth=2)
+plot(sigMode == "FRAMA-EMA" ? na : pvSignal, "Signal", color=sigClr, linewidth=1)
+plot(showHist ? axHist   : na, "Variance", style=plot.style_histogram, linewidth=2, color=axHist >= 0 ? color.new(histPosClr, 75) : color.new(histNegClr, 75))
+
+// ===============================
+// Alerts — toggles & messages
+// ===============================
+grpAlerts = "Alerts — Toggles"
+alMaster      = input.bool(true,  "Enable Alerts (Master)", group=grpAlerts, tooltip="Master enable for all alerts below.")
+alCloseOnly   = input.bool(true,  "Alert on Bar Close Only", group=grpAlerts, tooltip="If true, alerts only fire once after bar close; otherwise they can trigger intrabar.")
+alBullXRaw    = input.bool(false,  "PV×Signal Bull RAW",       group=grpAlerts, tooltip="PV crosses ABOVE its signal line (no filters). Early signal.")
+alBearXRaw    = input.bool(false,  "PV×Signal Bear RAW",       group=grpAlerts, tooltip="PV crosses BELOW its signal line (no filters). Early signal.")
+alBullXConf   = input.bool(false,  "PV×Signal Bull CONFIRMED", group=grpAlerts, tooltip="Bull RAW cross that ALSO passes live gates: exhaustion/slope/squeeze filters.")
+alBearXConf   = input.bool(false,  "PV×Signal Bear CONFIRMED", group=grpAlerts, tooltip="Bear RAW cross that ALSO passes live gates: exhaustion/slope/squeeze filters.")
+alBull0Raw    = input.bool(false, "PV×Zero Bull RAW",         group=grpAlerts, tooltip="PV crosses ABOVE zero (no filters). Regime flip toward bullish.")
+alBear0Raw    = input.bool(false, "PV×Zero Bear RAW",         group=grpAlerts, tooltip="PV crosses BELOW zero (no filters). Regime flip toward bearish.")
+alBull0Conf   = input.bool(false,  "PV×Zero Bull CONFIRMED",   group=grpAlerts, tooltip="Bull zero cross with live gates OK. Stronger bullish confirmation.")
+alBear0Conf   = input.bool(false,  "PV×Zero Bear CONFIRMED",   group=grpAlerts, tooltip="Bear zero cross with live gates OK. Stronger bearish confirmation.")
+alBreachTop   = input.bool(true, "PV×Extreme Cross ABOVE +Ob", group=grpAlerts, tooltip="PV pushes beyond +Ob. Potential exhaustion or blow-off; caution for longs.")
+alBreachBot   = input.bool(true, "PV×Extreme Cross BELOW -Ob", group=grpAlerts, tooltip="PV pushes beyond -Ob. Potential exhaustion flush; caution for shorts.")
+alExhTop      = input.bool(true,  "Exhaustion TOP base",      group=grpAlerts, tooltip="RSI high & persistent up-drives; warns of upside exhaustion risk.")
+alExhBot      = input.bool(true,  "Exhaustion BOTTOM base",   group=grpAlerts, tooltip="RSI low & persistent down-drives; warns of downside exhaustion risk.")
+alExhTopX     = input.bool(true,  "Exhaustion TOP EXTREME",   group=grpAlerts, tooltip="Stronger version of top exhaustion (higher RSI threshold).")
+alExhBotX     = input.bool(true,  "Exhaustion BOTTOM EXTREME",group=grpAlerts, tooltip="Stronger version of bottom exhaustion (lower RSI threshold).")
+alSqzEnter    = input.bool(true,  "Squeeze ENTER",            group=grpAlerts, tooltip="Compression & ATR ratio below thresholds. Coiled conditions.")
+alSqzExit     = input.bool(true, "Squeeze EXIT generic",     group=grpAlerts, tooltip="No longer in squeeze. Expansion may be underway.")
+alSqzRelease  = input.bool(true,  "Squeeze STRICT RELEASE",   group=grpAlerts, tooltip="Breakout of compression after minimum bars in squeeze. Higher-quality release.")
+alSlopeUp     = input.bool(false, "Slope Bull Alignment Cross", group=grpAlerts, tooltip="PV slope crosses above entry threshold; alignment with upside momentum.")
+alSlopeDn     = input.bool(false, "Slope Bear Alignment Cross", group=grpAlerts, tooltip="PV slope crosses below -entry threshold; alignment with downside momentum.")
+
+alFreq = alCloseOnly ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+symTF  = syminfo.ticker + " " + timeframe.period
+pvStr      = f_str(pv,3)
+sigStr     = f_str(pvSignal,3)
+strStr     = f_str(strengthBase,2)
+obStr      = f_str(effOb,2)
+compStr    = f_str(comp,2)
+atrStr     = f_str(atrRatio,2)
+pvSlopeStr = f_str(pvSlopeNorm,2)
+sqzRunStr  = str.tostring(sqzRun)
+relStr     = recentRelease ? "Yes" : "No"
+volCtxStr  = useVolCtx and not na(volCtxScore) ? f_str(volCtxScore,2) : "N/A"
+
+exhTextBull = exhBottomExtreme ? "Bottom EXTREME" : exhBottom ? "Bottom BASE" : "None"
+exhTextBear = exhTopExtreme    ? "Top EXTREME"    : exhTop    ? "Top BASE"    : "None"
+
+prevExhTop      = nz(((exhTop)           ? 1 : 0)[1], 0) == 1
+prevExhBottom   = nz(((exhBottom)        ? 1 : 0)[1], 0) == 1
+prevExhTopX     = nz(((exhTopExtreme)    ? 1 : 0)[1], 0) == 1
+prevExhBottomX  = nz(((exhBottomExtreme) ? 1 : 0)[1], 0) == 1
+exhTopOn        = exhTop           and not prevExhTop
+exhBotOn        = exhBottom        and not prevExhBottom
+exhTopXOn       = exhTopExtreme    and not prevExhTopX
+exhBotXOn       = exhBottomExtreme and not prevExhBottomX
+
+slopeUpX        = ta.crossover(pvSlopeNorm,  adv_slopeEntry)
+slopeDnX        = ta.crossunder(pvSlopeNorm, -adv_slopeEntry)
+
+// Alerts — conditions & triggers (same as before)
+cond_bx_raw = alMaster and alBullXRaw and (not alCloseOnly or barstate.isconfirmed) and bullSignalX
+alertcondition(cond_bx_raw, "PV×Signal Bull RAW", "{{ticker}} {{interval}}: PV crossed ABOVE Signal (RAW).")
+if cond_bx_raw
+    alert(symTF + " - PV×Signal BULL RAW"
+         + "\nPV: " + pvStr + "  Sig: " + sigStr + "  Strength: " + strStr
+         + "\nExhaustion: " + exhTextBull + "  Ob(+/-): " + obStr
+         + "\nSqueeze bars: " + sqzRunStr + "  ReleaseWindow: " + relStr
+         + "\nComp: " + compStr + "  ATRr: " + atrStr + "  SlopeN: " + pvSlopeStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_sx_raw = alMaster and alBearXRaw and (not alCloseOnly or barstate.isconfirmed) and bearSignalX
+alertcondition(cond_sx_raw, "PV×Signal Bear RAW", "{{ticker}} {{interval}}: PV crossed BELOW Signal (RAW).")
+if cond_sx_raw
+    alert(symTF + " - PV×Signal BEAR RAW"
+         + "\nPV: " + pvStr + "  Sig: " + sigStr + "  Strength: " + strStr
+         + "\nExhaustion: " + exhTextBear + "  Ob(+/-): " + obStr
+         + "\nSqueeze bars: " + sqzRunStr + "  ReleaseWindow: " + relStr
+         + "\nComp: " + compStr + "  ATRr: " + atrStr + "  SlopeN: " + pvSlopeStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_bx_conf = alMaster and alBullXConf and (not alCloseOnly or barstate.isconfirmed) and (bullSignalX and liveLongOK)
+alertcondition(cond_bx_conf, "PV×Signal Bull CONFIRMED", "{{ticker}} {{interval}}: PV crossed ABOVE Signal (CONFIRMED).")
+if cond_bx_conf
+    alert(symTF + " - PV×Signal BULL CONFIRMED"
+         + "\nPV: " + pvStr + "  Sig: " + sigStr + "  Strength: " + strStr
+         + "\nExhaustion: " + exhTextBull + "  Gate OK  Ob(+/-): " + obStr
+         + "\nSqueeze bars: " + sqzRunStr + "  ReleaseWindow: " + relStr
+         + "\nComp: " + compStr + "  ATRr: " + atrStr + "  SlopeN: " + pvSlopeStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_sx_conf = alMaster and alBearXConf and (not alCloseOnly or barstate.isconfirmed) and (bearSignalX and liveShortOK)
+alertcondition(cond_sx_conf, "PV×Signal Bear CONFIRMED", "{{ticker}} {{interval}}: PV crossed BELOW Signal (CONFIRMED).")
+if cond_sx_conf
+    alert(symTF + " - PV×Signal BEAR CONFIRMED"
+         + "\nPV: " + pvStr + "  Sig: " + sigStr + "  Strength: " + strStr
+         + "\nExhaustion: " + exhTextBear + "  Gate OK  Ob(+/-): " + obStr
+         + "\nSqueeze bars: " + sqzRunStr + "  ReleaseWindow: " + relStr
+         + "\nComp: " + compStr + "  ATRr: " + atrStr + "  SlopeN: " + pvSlopeStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_b0_raw = alMaster and alBull0Raw and (not alCloseOnly or barstate.isconfirmed) and bullBaseX
+alertcondition(cond_b0_raw, "PV×Zero Bull RAW", "{{ticker}} {{interval}}: PV crossed ABOVE zero (RAW).")
+if cond_b0_raw
+    alert(symTF + " - PV×Zero BULL RAW"
+         + "\nPV: " + pvStr + "  Strength: " + strStr + "  Ob(+/-): " + obStr
+         + "\nExhaustion: " + exhTextBull + "  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_s0_raw = alMaster and alBear0Raw and (not alCloseOnly or barstate.isconfirmed) and bearBaseX
+alertcondition(cond_s0_raw, "PV×Zero Bear RAW", "{{ticker}} {{interval}}: PV crossed BELOW zero (RAW).")
+if cond_s0_raw
+    alert(symTF + " - PV×Zero BEAR RAW"
+         + "\nPV: " + pvStr + "  Strength: " + strStr + "  Ob(+/-): " + obStr
+         + "\nExhaustion: " + exhTextBear + "  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_b0_conf = alMaster and alBull0Conf and (not alCloseOnly or barstate.isconfirmed) and (bullBaseX and liveLongOK)
+alertcondition(cond_b0_conf, "PV×Zero Bull CONFIRMED", "{{ticker}} {{interval}}: PV crossed ABOVE zero (CONFIRMED).")
+if cond_b0_conf
+    alert(symTF + " - PV×Zero BULL CONFIRMED"
+         + "\nPV: " + pvStr + "  Strength: " + strStr + "  Ob(+/-): " + obStr
+         + "\nExhaustion: " + exhTextBull + "  Gate OK  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_s0_conf = alMaster and alBear0Conf and (not alCloseOnly or barstate.isconfirmed) and (bearBaseX and liveShortOK)
+alertcondition(cond_s0_conf, "PV×Zero Bear CONFIRMED", "{{ticker}} {{interval}}: PV crossed BELOW zero (CONFIRMED).")
+if cond_s0_conf
+    alert(symTF + " - PV×Zero BEAR CONFIRMED"
+         + "\nPV: " + pvStr + "  Strength: " + strStr + "  Ob(+/-): " + obStr
+         + "\nExhaustion: " + exhTextBear + "  Gate OK  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_top_breach = alMaster and alBreachTop and (not alCloseOnly or barstate.isconfirmed) and crossAboveTopRail
+alertcondition(cond_top_breach, "PV×Extreme Cross ABOVE +Ob", "{{ticker}} {{interval}}: PV crossed ABOVE +Ob rail.")
+if cond_top_breach
+    alert(symTF + " - PV×Extreme ABOVE +Ob"
+         + "\nPV: " + pvStr + "  Ob+: " + obStr + "  Strength: " + strStr
+         + "\nExhaustionTop: " + exhTextBear + "  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_bot_breach = alMaster and alBreachBot and (not alCloseOnly or barstate.isconfirmed) and crossBelowBottomRail
+alertcondition(cond_bot_breach, "PV×Extreme Cross BELOW -Ob", "{{ticker}} {{interval}}: PV crossed BELOW -Ob rail.")
+if cond_bot_breach
+    alert(symTF + " - PV×Extreme BELOW -Ob"
+         + "\nPV: " + pvStr + "  Ob-: -" + obStr + "  Strength: " + strStr
+         + "\nExhaustionBottom: " + exhTextBull + "  Comp: " + compStr + "  ATRr: " + atrStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_sqz_enter   = alMaster and alSqzEnter   and (not alCloseOnly or barstate.isconfirmed) and sqzEnter
+alertcondition(cond_sqz_enter, "Squeeze ENTER", "{{ticker}} {{interval}}: Entered squeeze (compression & ATR ratio below thresholds).")
+if cond_sqz_enter
+    alert(symTF + " - SQUEEZE ENTER"
+         + "\nComp: " + compStr + "  ATRr: " + atrStr
+         + "\nBars in squeeze: " + sqzRunStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_sqz_exit    = alMaster and alSqzExit    and (not alCloseOnly or barstate.isconfirmed) and sqzExit
+alertcondition(cond_sqz_exit, "Squeeze EXIT", "{{ticker}} {{interval}}: Exited squeeze (no longer compressed).")
+if cond_sqz_exit
+    alert(symTF + " - SQUEEZE EXIT"
+         + "\nComp: " + compStr + "  ATRr: " + atrStr
+         + "\nBars in prior squeeze: " + sqzRunStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_sqz_release = alMaster and alSqzRelease and (not alCloseOnly or barstate.isconfirmed) and sqzReleaseStrict
+alertcondition(cond_sqz_release, "Squeeze STRICT RELEASE", "{{ticker}} {{interval}}: Squeeze released (min bars met, breakout of thresholds).")
+if cond_sqz_release
+    alert(symTF + " - SQUEEZE STRICT RELEASE"
+         + "\nComp: " + compStr + "  ATRr: " + atrStr
+         + "\nBars in squeeze pre-release: " + sqzRunStr
+         + "\nVolContext: " + volCtxStr, alFreq)
+
+cond_slope_up = alMaster and alSlopeUp and (not alCloseOnly or barstate.isconfirmed) and slopeUpX
+alertcondition(cond_slope_up, "Slope Bull Alignment Cross", "{{ticker}} {{interval}}: PV slope crossed ABOVE entry threshold.")
+if cond_slope_up
+    alert(symTF + " - SLOPE BULL ALIGNMENT"
+         + "\nSlopeN: " + pvSlopeStr + "  EntryThr: " + f_str(adv_slopeEntry,2), alFreq)
+
+cond_slope_dn = alMaster and alSlopeDn and (not alCloseOnly or barstate.isconfirmed) and slopeDnX
+alertcondition(cond_slope_dn, "Slope Bear Alignment Cross", "{{ticker}} {{interval}}: PV slope crossed BELOW -entry threshold.")
+if cond_slope_dn
+    alert(symTF + " - SLOPE BEAR ALIGNMENT"
+         + "\nSlopeN: " + pvSlopeStr + "  EntryThr: -" + f_str(adv_slopeEntry,2), alFreq)
+
+// ===============================
+// Price Bar Coloring — Base by regime score (sticks under momentum, flips faster under heavy exhaustion)
+// ===============================
+isWeak = math.abs(pv) < effWeak
+regScoreBull = sBull
+regScoreBear = sBear
+barBaseColor = barMode == "Regime+Strength" ? (pv >= 0 ? f_regimeGradient(regScoreBull, true,  bullBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr) : f_regimeGradient(regScoreBear, false, bearBias, bullWeakClr, bullMidClr, bullStrongClr, bearWeakClr, bearMidClr, bearStrongClr)) : barMode == "Cross Signals" ? (topBreached and crossAboveTopRail ? topLineCol : botBreached and crossBelowBottomRail ? botLineCol : na) : (topBreached ? topLineCol : botBreached ? botLineCol : na)
+exhBarColor  = exhTopExtreme ? bearStrongClr : exhTop ? bearMidClr : exhBottomExtreme ? bullStrongClr : exhBottom ? bullMidClr : na
+barRawColor  = na(exhBarColor) ? barBaseColor : exhBarColor
+barTransApplied = barMode == "Regime+Strength" and isWeak ? f_clamp(barTrans + barWeakExtraDim, 0, 100) : barTrans
+barColorFinal   = na(barRawColor) ? na : color.new(barRawColor, barTransApplied)
+barcolor(useBarColor ? barColorFinal : na)

@@ -1,0 +1,225 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+//@version=6
+indicator("Hot Zone Radar [LuxAlgo]", "LuxAlgo - Hot Zone Radar", overlay = true, max_bars_back = 1000, max_boxes_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants & Styling
+//---------------------------------------------------------------------------------------------------------------------{
+color DATA        = #DBDBDB
+color HEADERS     = #808080
+color BACKGROUND  = #161616
+color BORDERS     = #2E2E2E
+color TRACE_COLOR = #ffffff
+
+string TOP_RIGHT    = 'Top Right'
+string BOTTOM_RIGHT = 'Bottom Right'
+string BOTTOM_LEFT  = 'Bottom Left'
+
+string TINY   = 'Tiny'
+string SMALL  = 'Small'
+string NORMAL = 'Normal'
+string LARGE  = 'Large'
+string HUGE   = 'Huge'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+string G_RADAR = "Radar Logic"
+int lookbackInput      = input.int(200, "Profile Lookback", minval = 50, group = G_RADAR)
+int resolutionInput    = input.int(30, "Resolution (Heatmap Grid)", minval = 10, maxval = 60, group = G_RADAR)
+int blurRadiusInput    = input.int(3, "Diffusion Blur", minval = 1, maxval = 5, group = G_RADAR)
+float gammaInput       = input.float(0.7, "Intensity Gamma", minval = 0.1, maxval = 2.0, group = G_RADAR)
+
+string G_SR = "Support/Resistance Zones"
+bool showSRInput       = input.bool(true, "Show Gradient S/R Zones", group = G_SR)
+float srThreshold      = input.float(80.0, "S/R Sensitivity %", minval = 50.0, maxval = 100.0, group = G_SR)
+int srLayers           = input.int(3, "Gradient Steps", minval = 1, maxval = 5, group = G_SR, tooltip = "Number of layered boxes used to simulate the gradient look.")
+
+string G_DASH = "Dashboard Styling"
+string dashboardPositionInput  = input.string(BOTTOM_RIGHT, 'Position', group = G_DASH, options = [TOP_RIGHT, BOTTOM_RIGHT, BOTTOM_LEFT])
+string dashboardSizeInput      = input.string(SMALL, 'Overall Panel Size', group = G_DASH, options = [TINY, SMALL, NORMAL, LARGE, HUGE])
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+var parsedPos = switch dashboardPositionInput
+    TOP_RIGHT       => position.top_right
+    BOTTOM_RIGHT    => position.bottom_right
+    BOTTOM_LEFT     => position.bottom_left
+
+var parsedSize = switch dashboardSizeInput
+    TINY   => size.tiny
+    SMALL  => size.small
+    NORMAL => size.normal
+    LARGE  => size.large
+    HUGE   => size.huge
+
+float totalWidth  = switch dashboardSizeInput
+    TINY   => 10.0
+    SMALL  => 16.0
+    NORMAL => 24.0
+    LARGE  => 34.0
+    HUGE   => 44.0
+
+float cellDim = totalWidth / resolutionInput
+
+// --- Thermal Data Engine ---
+var float[] currentProfile = array.new_float(resolutionInput, 0.0)
+var matrix<float> historyMatrix = matrix.new<float>(resolutionInput, resolutionInput, 0.0)
+
+float hi = ta.highest(high, lookbackInput)
+float lo = ta.lowest(low, lookbackInput)
+float binSize = (hi - lo) / resolutionInput
+
+get_bin(float p) =>
+    int idx = int((p - lo) / binSize)
+    math.max(0, math.min(resolutionInput - 1, idx))
+
+if bar_index >= lookbackInput
+    int curS = get_bin(low), curE = get_bin(high)
+    float curV = volume / (curE - curS + 1)
+    for i = curS to curE
+        array.set(currentProfile, i, array.get(currentProfile, i) + curV)
+    
+    int oldS = get_bin(low[lookbackInput]), oldE = get_bin(high[lookbackInput])
+    float oldV = volume[lookbackInput] / (oldE - oldS + 1)
+    for i = oldS to oldE
+        array.set(currentProfile, i, math.max(0, array.get(currentProfile, i) - oldV))
+
+    for c = 0 to resolutionInput - 2
+        for r = 0 to resolutionInput - 1
+            matrix.set(historyMatrix, c, r, matrix.get(historyMatrix, c + 1, r))
+    for r = 0 to resolutionInput - 1
+        matrix.set(historyMatrix, resolutionInput - 1, r, array.get(currentProfile, r))
+
+float tracePrice = ta.ema(close, 3)
+float slope = ta.linreg(tracePrice, 5, 0) - ta.linreg(tracePrice, 5, 1)
+
+get_thermal_color(float norm) =>
+    float v = math.pow(norm, gammaInput)
+    color res = #000033
+    if v < 0.15
+        res := color.from_gradient(v, 0.0, 0.15, #000033, #008080)
+    else if v < 0.35
+        res := color.from_gradient(v, 0.15, 0.35, #008080, #00ff00)
+    else if v < 0.60
+        res := color.from_gradient(v, 0.35, 0.60, #00ff00, #ffff00)
+    else if v < 0.85
+        res := color.from_gradient(v, 0.60, 0.85, #ffff00, #ff8c00)
+    else
+        res := color.from_gradient(v, 0.85, 1.0, #ff8c00, #ff0000)
+    res
+
+get_status(int pBin, float[] profile, float pSlope) =>
+    float maxV = array.max(profile)
+    float curV = array.get(profile, pBin)
+    float relV = curV / (maxV + 1e-10)
+    int targetBin = math.max(0, math.min(resolutionInput - 1, pBin + (pSlope > 0 ? 1 : -1)))
+    float targetV = array.get(profile, targetBin) / (maxV + 1e-10)
+    
+    string msg = ""
+    color c = DATA
+    if relV > 0.80
+        msg := "HOT"
+        c := #ff0000
+    else if relV < 0.20
+        msg := "COLD"
+        c := #00ffff
+    else if targetV > relV
+        msg := "WARM"
+        c := #ffff00
+    else
+        msg := "STABLE"
+        c := #00ff00
+    [msg, c]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Gradient S/R Zone Logic
+//---------------------------------------------------------------------------------------------------------------------{
+var box[] srBoxes = array.new_box()
+
+if barstate.islast and showSRInput
+    for b in srBoxes
+        box.delete(b)
+    array.clear(srBoxes)
+    
+    float maxV = array.max(currentProfile)
+    float threshVal = maxV * (srThreshold / 100.0)
+    
+    int i = 0
+    while i < resolutionInput
+        if array.get(currentProfile, i) >= threshVal
+            int startBin = i
+            while i < resolutionInput and array.get(currentProfile, i) >= threshVal
+                i += 1
+            int endBin = i - 1
+            
+            // Cluster boundaries
+            float topPrice = lo + (endBin + 1) * binSize
+            float botPrice = lo + startBin * binSize
+            float centerPrice = (topPrice + botPrice) / 2
+            float fullHeight = topPrice - botPrice
+            
+            bool isInside = close <= topPrice and close >= botPrice
+            color baseColor = isInside ? #ffff00 : #ff0000
+
+            // Create gradient effect using layered boxes
+            for layer = 1 to srLayers
+                float layerScale = float(layer) / srLayers
+                float layerHeight = fullHeight * layerScale
+                float lTop = centerPrice + (layerHeight / 2)
+                float lBot = centerPrice - (layerHeight / 2)
+                
+                // Transparency increases (gets lighter) as we move away from center
+                int transp = 85 + (layer * 2) 
+                
+                box b = box.new(bar_index - lookbackInput, lTop, bar_index, lBot, 
+                     bgcolor = color.new(baseColor, math.min(100, transp)), 
+                     border_color = #00000000, 
+                     xloc = xloc.bar_index)
+                array.push(srBoxes, b)
+        else
+            i += 1
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Rendering Logic
+//---------------------------------------------------------------------------------------------------------------------{
+int totalRows = resolutionInput + 3
+var table t = table.new(parsedPos, resolutionInput, totalRows, BACKGROUND, BORDERS, 1, BORDERS, 0)
+
+if barstate.islast
+    float maxV = array.max(currentProfile)
+    table.merge_cells(t, 0, 0, resolutionInput - 1, 0)
+    table.cell(t, 0, 0, "HOT ZONE RADAR", text_color = DATA, text_size = parsedSize, bgcolor = BORDERS, height = 3.5)
+
+    for c = 0 to resolutionInput - 1
+        color legCol = get_thermal_color(float(c) / (resolutionInput - 1))
+        string txt = (c == 0) ? "COLD" : (c == resolutionInput - 1 ? "HOT" : "")
+        table.cell(t, c, 1, txt, text_color = DATA, text_size = size.tiny, bgcolor = legCol, height = 1.5)
+
+    for r = 0 to resolutionInput - 1
+        int binIdx = (resolutionInput - 1) - r
+        for c = 0 to resolutionInput - 1
+            float sVol = 0.0, int kW = 0
+            for k = -blurRadiusInput to blurRadiusInput
+                int tI = binIdx + k
+                if tI >= 0 and tI < resolutionInput
+                    float val = matrix.get(historyMatrix, c, tI)
+                    int w = blurRadiusInput - math.abs(k) + 1
+                    sVol += val * w, kW += w
+            float norm = (sVol / kW) / (maxV + 1e-10)
+            color bg = get_thermal_color(norm)
+            int pBin = get_bin(tracePrice[resolutionInput - 1 - c])
+            string char = "", color tc = TRACE_COLOR
+            if pBin == binIdx
+                tc := color.new(TRACE_COLOR, int(100.0 * (1.0 - float(c)/(resolutionInput-1))))
+                char := (c == resolutionInput - 1) ? "▶" : "●"
+                bg := color.from_gradient(0.5, 0.0, 1.0, bg, TRACE_COLOR)
+            table.cell(t, c, r + 2, char, text_color = tc, bgcolor = bg, width = cellDim, height = cellDim)
+
+    [msg, clr] = get_status(get_bin(close), currentProfile, slope)
+    table.merge_cells(t, 0, totalRows - 1, resolutionInput - 1, totalRows - 1)
+    table.cell(t, 0, totalRows - 1, msg, text_color = clr, text_size = parsedSize, bgcolor = BACKGROUND, height = 3.5)
+
+//---------------------------------------------------------------------------------------------------------------------}

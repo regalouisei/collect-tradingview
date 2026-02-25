@@ -1,0 +1,2685 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Ki11a_B
+
+//@version=6
+indicator("BK AK-Pivot Wolf", shorttitle="🐺", overlay=false, precision=2, max_labels_count=500, max_lines_count=500)
+
+// INPUTS — CORE MOMENTUM
+groupCore      = "Core Momentum"
+rFast          = input.int(13,  "Fast TSI R",  minval=2, group=groupCore)
+sFast          = input.int(25,  "Fast TSI S",  minval=2, group=groupCore)
+rSlow          = input.int(25,  "Slow TSI R",  minval=2, group=groupCore)
+sSlow          = input.int(50,  "Slow TSI S",  minval=2, group=groupCore)
+sigLen         = input.int(7,   "Signal EMA",  minval=1, group=groupCore)
+useAdaptive    = input.bool(true, "Adaptive blend (volatility-weighted)", group=groupCore)
+volLook        = input.int(200, "Volatility lookback (for weighting)", minval=50, group=groupCore)
+atrLen         = input.int(14,  "ATR Length (vol basis)", minval=2, group=groupCore)
+
+// INPUTS — BANDS / EXTREMES
+groupBands     = "Bands/Extremes"
+bandMode       = input.string("Dynamic", "Band Mode", options=["Dynamic","Static"], group=groupBands)
+dynLook        = input.int(100, "Dynamic band lookback", minval=20, group=groupBands)
+dynMult        = input.float(1.6, "Dynamic band stdev x", minval=0.5, step=0.1, group=groupBands)
+staticLevel    = input.int(40, "Static band level (±)", minval=10, group=groupBands)
+edgeDetect     = input.string("Inclusive (>=/<=)", "Edge detect rule", options=["Strict (>/<)","Inclusive (>=/<=)"], group=groupBands)
+edgeTolPct     = input.float(0.0, "Edge tolerance (% of band)", minval=0.0, maxval=5.0, step=0.05, group=groupBands)
+
+fillBands      = input.bool(false, "Fill between bands", group=groupBands)
+bandFillColor  = input.color(color.new(color.gray, 90), "Band fill color", group=groupBands)
+
+fillExtremes   = input.bool(true, "Fill at extremes (mom vs band)", group=groupBands)
+extBullFill    = input.color(color.new(color.teal, 88), "Extreme fill (above upper)", group=groupBands)
+extBearFill    = input.color(color.new(color.navy, 88), "Extreme fill (below lower)", group=groupBands)
+
+bandCalc = input.string("StdDev", "Dynamic band basis", options=["StdDev","MAD (robust)"], group=groupBands)
+madMult  = input.float(2.2, "MAD k (robust)", minval=0.5, step=0.1, group=groupBands)
+
+// NEW: Band smoothing option
+useBandSmooth = input.bool(false, "Smooth bands (reduce noise)", group=groupBands)
+bandSmoothLen = input.int(3, "Band smoothing length", minval=2, maxval=10, group=groupBands)
+
+// Signal↔Momentum fill
+groupSigMom    = "Signal↔Momentum Fill"
+fillSigMom     = input.bool(true, "Fill between Momentum and Signal", group=groupSigMom)
+fillSigMomAbove= input.color(color.new(color.lime, 85), "Fill when Momentum > Signal", group=groupSigMom)
+fillSigMomBelow= input.color(color.new(color.red,  85), "Fill when Momentum < Signal", group=groupSigMom)
+
+// INPUTS — CROSS STARS
+groupCross     = "Cross Stars"
+showCrossStars = input.bool(true, "Show tiny stars on crosses", group=groupCross)
+crossStarSize  = input.string("Normal", "Star size", options=["Tiny","Small","Normal"], group=groupCross)
+crossBullCol   = input.color(color.new(color.lime, 0), "Bull star color", group=groupCross)
+crossBearCol   = input.color(color.new(color.red,  0), "Bear star color", group=groupCross)
+
+// INPUTS — SESSION OPEN LINE
+groupSess      = "Session-Open Line"
+showSessLine   = input.bool(true, "Show session-open horizontal line", group=groupSess)
+useRTH         = input.bool(false, "Use RTH session", group=groupSess, inline="rth")
+rthSession     = input.session("0930-1600", "", group=groupSess, inline="rth")
+ethSession     = input.session("1700-1600", "ETH session (if RTH off)", group=groupSess, inline="eth")
+sessShortForm  = input.bool(true, "Short form (start N bars left, extend RIGHT)", group=groupSess)
+sessShortBars  = input.int(0, "Short form: N bars back", minval=0, group=groupSess)
+sessExtendRight= input.bool(true, "Extend right (standard form)", group=groupSess)
+sessLineColor  = input.color(color.new(color.white, 0), "Line color", group=groupSess)
+sessLineWidth  = input.int(1, "Line width", minval=1, maxval=4, group=groupSess)
+sessLineStyle  = input.string("Solid", "Line style", options=["Solid","Dashed","Dotted"], group=groupSess)
+
+// INPUTS — PIVOTS & DIVERGENCE
+groupPivDiv    = "Pivots & Divergence"
+pivotLen       = input.int(5,  "Pivot sensitivity (osc)", minval=2, group=groupPivDiv)
+pricePivotLen  = input.int(5,  "Pivot sensitivity (price)", minval=2, group=groupPivDiv)
+divMaxBars     = input.int(60, "Max bars between pivots (divergence)", minval=10, group=groupPivDiv)
+showDiv        = input.bool(true,  "Show divergences (markers/lines)", group=groupPivDiv)
+showDivMarkers = input.bool(true,  "— Show divergence markers", group=groupPivDiv)
+divRequireExtreme = input.bool(false, "Require oscillator extreme for divergence", group=groupPivDiv)
+divLineCap   = input.int(100, "Max divergence lines", minval=20, maxval=400, group=groupPivDiv)
+
+groupDivStyle  = "Divergence Line Styling — OSCILLATOR"
+showOscDivLines= input.bool(true,  "Draw OSCILLATOR divergence lines", group=groupDivStyle)
+divWidthOsc    = input.int(2, "Oscillator connector width", minval=1, maxval=8, group=groupDivStyle)
+divAlphaOsc    = input.int(20, "Oscillator connector transparency (0–100)", minval=0, maxval=100, group=groupDivStyle)
+colDivBull     = input.color(color.new(color.lime, 0),   "Bull divergence line color (osc)", group=groupDivStyle)
+colDivBear     = input.color(color.new(color.red,  0),   "Bear divergence line color (osc)", group=groupDivStyle)
+
+groupDivPrice  = "Divergence Line Styling — PRICE"
+showPriceDivLines = input.bool(true,  "Draw PRICE divergence lines (mapped)", group=groupDivPrice)
+divWidthPrice     = input.int(2, "Price connector width", minval=1, maxval=8, group=groupDivPrice)
+divAlphaPrice     = input.int(30, "Price connector transparency (0–100)", minval=0, maxval=100, group=groupDivPrice)
+colDivBullPrice   = input.color(color.new(color.teal,  0), "Bull divergence line color (price)", group=groupDivPrice)
+colDivBearPrice   = input.color(color.new(color.navy,  0), "Bear divergence line color (price)", group=groupDivPrice)
+
+// INPUTS — DERIVATIVE GATING (Scoring)
+groupDeriv = "Derivative Gating (Scoring)"
+useDerivGates = input.bool(false, "Use normalized velocity/accel gates", group=groupDeriv)
+velDead = input.float(0.02, "Velocity deadzone (normalized)", minval=0.0, step=0.005, group=groupDeriv)
+accDead = input.float(0.02, "Acceleration deadzone (normalized)", minval=0.0, step=0.005, group=groupDeriv)
+
+// INPUTS — FILTERS
+groupFilters   = "Filter Settings (for scoring & legacy)"
+useMTF         = input.bool(false, "Enable HTF momentum bias", group=groupFilters)
+autoMTF        = input.bool(true, "Auto-select HTF (next timeframe multiple)", group=groupFilters)
+htfManual      = input.timeframe("240", "Manual HTF timeframe (if auto off)", group=groupFilters)
+useGannSwing   = input.bool(true, "Enable Gann-style swing", group=groupFilters)
+swingN         = input.int(2, "Swing N (break prior N-bar high/low)", minval=1, group=groupFilters)
+
+vwapPosRule = input.string("Below=Long", "VWAP position rule", options=["Above=Long","Below=Long"], group=groupFilters)
+
+useVWAPGate    = input.bool(true, "Enable VWAP gate", group=groupFilters)
+vwapGateMode   = input.string("PositionOnly", "VWAP Gate Mode", options=["PositionOnly","SlopeOnly","Both (AND)","Either (OR)"], group=groupFilters)
+vwapSlopeLen   = input.int(10, "VWAP slope lookback (bars)", minval=1, group=groupFilters)
+vwapSlopeUnit  = input.string("Percent", "Slope unit", options=["Percent","Points"], group=groupFilters)
+threshPct      = input.float(0.05, "Slope threshold % (abs)", step=0.01, minval=0.0, group=groupFilters)
+threshPts      = input.float(0.50, "Slope threshold pts (abs)", step=0.05, minval=0.0, group=groupFilters)
+
+htfBiasMode = input.string("Recompute (accurate)", "HTF bias mode", options=["Recompute (accurate)","Resample (legacy)"], group=groupFilters)
+
+// NEW: SNR Filter
+groupSNR = "SNR Filter (Signal-to-Noise Ratio)"
+useSNR = input.bool(true, "Enable SNR filter", group=groupSNR, tooltip="Filters out signals in noisy/choppy conditions")
+snrThresh = input.float(1.5, "Min SNR ratio", minval=1.0, maxval=5.0, step=0.1, group=groupSNR)
+snrLookback = input.int(10, "SNR calculation period", minval=5, maxval=50, group=groupSNR)
+
+// NEW: Whipsaw Guard
+groupWhipsaw = "Whipsaw Protection"
+useWhipsaw = input.bool(true, "Enable whipsaw guard", group=groupWhipsaw, tooltip="Prevents rapid signal flips")
+minBarsBetween = input.int(3, "Min bars between opposite signals", minval=1, maxval=20, group=groupWhipsaw)
+
+groupVol       = "Volume Settings"
+useVolConf     = input.bool(true, "Enable volume confirmation", group=groupVol)
+volLookback    = input.int(20, "Volume average period", minval=5, group=groupVol)
+volBullThresh  = input.float(1.5, "Bullish volume threshold (x avg)", minval=0.5, step=0.1, group=groupVol)
+volBearExhaust = input.float(0.8, "Bearish exhaustion threshold (x avg)", minval=0.3, step=0.1, group=groupVol)
+volBearSpike   = input.float(1.2, "Bearish reversal spike (x avg)", minval=0.5, step=0.1, group=groupVol)
+volRegimeAdjust= input.bool(true, "Adjust signal scoring based on volume regime", group=groupVol)
+
+groupAccel     = "Momentum Acceleration Settings"
+useAccel       = input.bool(true, "Enable acceleration warnings", group=groupAccel)
+showAccelWarn  = input.bool(true, "Show early warning markers", group=groupAccel)
+accelSensitivity = input.float(0.7, "Acceleration sensitivity", minval=0.1, step=0.1, group=groupAccel)
+earlyWarnCooldown = input.int(4, "Early warning cooldown (bars)", minval=2, maxval=50, group=groupAccel, tooltip="Cooldown for 🔥❄️ early warning markers")
+accelRiskCooldown = input.int(4, "Acceleration risk cooldown (bars)", minval=2, maxval=50, group=groupAccel, tooltip="Cooldown for 💥🛑 accel/decel risk markers")
+
+// Acceleration icon customization
+bullEarlyIcon = input.string("△", "Bull early warning icon", options=["△","▵","⬆","↑","⇧"], group=groupAccel)
+bearEarlyIcon = input.string("▽", "Bear early warning icon", options=["▽","▿","⬇","↓","⇩"], group=groupAccel)
+bullAccelIcon = input.string("⚡", "Bull acceleration risk icon", options=["⚡","⬆","▲","◆","⇑"], group=groupAccel)
+bearAccelIcon = input.string("⚡", "Bear acceleration risk icon", options=["⚡","⬇","▼","◆","⇓"], group=groupAccel)
+bullDecelIcon = input.string("◼", "Bull deceleration icon", options=["◼","◾","▪","⊘","⊗"], group=groupAccel)
+bearDecelIcon = input.string("◼", "Bear deceleration icon", options=["◼","◾","▪","⊘","⊗"], group=groupAccel)
+
+groupConsol    = "Consolidation Settings"
+useConsFilter  = input.bool(true, "Enable consolidation filter", group=groupConsol)
+consolThresh   = input.float(0.7, "Consolidation threshold (ATR ratio)", minval=0.3, maxval=0.9, step=0.05, group=groupConsol)
+consolLookback = input.int(50, "ATR comparison period", minval=20, group=groupConsol)
+consolPenalty  = input.int(7, "Score penalty during consolidation", minval=3, maxval=15, group=groupConsol)
+consolTimeframes = input.string("5,15,60,240", "Apply only on these timeframes (minutes, comma-separated)", group=groupConsol)
+
+groupSetup     = "High-Probability Setup Zone"
+useSetupZone   = input.bool(true, "Enable setup zone detection", group=groupSetup)
+setupBandThresh = input.float(0.8, "Band position threshold (0.0-1.0)", minval=0.5, maxval=0.95, step=0.05, group=groupSetup, tooltip="How close to band edge (0.8 = 80% toward band)")
+setupAccelMult  = input.float(0.5, "Acceleration sensitivity multiplier", minval=0.1, maxval=2.0, step=0.1, group=groupSetup)
+setupVolThresh  = input.float(1.1, "Volume ratio threshold", minval=0.8, maxval=2.0, step=0.1, group=groupSetup)
+setupVwapBars   = input.int(10, "VWAP change lookback", minval=3, maxval=30, group=groupSetup)
+
+groupStruct    = "Price Structure Settings"
+usePriceStruct = input.bool(true, "Enable price structure check", group=groupStruct)
+structLookback = input.int(10, "Price structure lookback", minval=5, group=groupStruct)
+
+groupStrength  = "Signal Scoring System"
+useScoring     = input.bool(true, "Use dynamic scoring (vs hard filters)", group=groupStrength)
+minScore       = input.int(50, "Minimum signal score (0-100)", minval=0, maxval=100, group=groupStrength)
+showWeakSignals= input.bool(true, "Show weak signals (50-69)", group=groupStrength)
+weakSignalAlpha= input.int(50, "Weak signal transparency", minval=0, maxval=90, group=groupStrength)
+scoreShape = input.string("Linear", "Score shaping", options=["Linear","Logistic"], group=groupStrength)
+scoreK     = input.float(0.12, "Logistic slope k", minval=0.02, maxval=0.5, step=0.01, group=groupStrength)
+
+// Legacy filter toggles
+groupFiltersLegacy = "Legacy Filters (if scoring disabled)"
+useMTFLegacy   = input.bool(false, "Use HTF momentum bias", group=groupFiltersLegacy)
+useGannLegacy  = input.bool(false, "Use Gann swing filter", group=groupFiltersLegacy)
+useVWAPLegacy  = input.bool(true, "Use VWAP gate", group=groupFiltersLegacy)
+useVolLegacy   = input.bool(false, "Use volume confirmation", group=groupFiltersLegacy)
+useConsLegacy  = input.bool(false, "Filter consolidation", group=groupFiltersLegacy)
+useStructLegacy= input.bool(false, "Require price structure", group=groupFiltersLegacy)
+
+groupTargets   = "Target Zones (ML Projections)"
+showTargets    = input.bool(true, "Show ML projection targets", group=groupTargets)
+targetLookback = input.int(10, "Sample last N pivots", minval=3, maxval=50, group=groupTargets)
+targetWeighting= input.bool(true, "Weight recent pivots heavier", group=groupTargets)
+targetVolAdj   = input.bool(true, "Adjust targets for volatility regime", group=groupTargets)
+targetVolPeriod= input.int(50, "Volatility regime period", minval=20, group=groupTargets)
+showTarget1    = input.bool(true, "Show Projected Pivot (Valley)", group=groupTargets)
+showTarget2    = input.bool(true, "Show Projected Pivot (Peak)",   group=groupTargets)
+targetShortBars= input.int(10, "Display from N bars back (default)", minval=0, group=groupTargets)
+targetFullHistory= input.bool(false, "Show full history from signal (vs N bars back)", group=groupTargets)
+targetLineStyle= input.string("Dashed", "Target line style", options=["Solid","Dashed","Dotted"], group=groupTargets)
+targetRevealPct = input.float(18.0, "Reveal lines when Momentum is within % of target (band %)", minval=0.0, maxval=100.0, step=0.5, group=groupTargets)
+
+// INPUTS — FIBONACCI
+groupFib       = "Fibonacci Retracement Levels"
+fib618Source   = input.string("Major Pivots", "Fibonacci calculation source", options=["Signals","Major Pivots"], group=groupFib)
+fibPivotSource = input.string("Last Two (Price)", "Pivot set for Fibs", options=["Last Two (Price)","Last Two (Osc)"], group=groupFib)
+fib618Extend   = input.bool(true, "Extend fib lines right", group=groupFib)
+fib618Width    = input.int(1, "Fib line width", minval=1, maxval=4, group=groupFib)
+fib618Style    = input.string("Solid", "Fib line style", options=["Solid","Dashed","Dotted"], group=groupFib)
+
+showFib236     = input.bool(false, "Show 0.236", group=groupFib, inline="236")
+fib236Color    = input.color(color.new(color.rgb(244,214,77), 40), "", group=groupFib, inline="236")
+showFib382     = input.bool(false, "Show 0.382", group=groupFib, inline="382")
+fib382Color    = input.color(color.new(color.rgb(255,152,0), 40),  "", group=groupFib, inline="382")
+showFib50      = input.bool(false, "Show 0.50",  group=groupFib, inline="50")
+fib50Color     = input.color(color.new(color.rgb(158,158,158), 40),"", group=groupFib, inline="50")
+showFib618     = input.bool(true, "Show 0.618 (PRIMARY)", group=groupFib, inline="618")
+fib618BullColor= input.color(color.new(color.green, 40), "Bull", group=groupFib, inline="618")
+fib618BearColor= input.color(color.new(color.red, 40), "Bear", group=groupFib, inline="618")
+showFib786     = input.bool(false, "Show 0.786", group=groupFib, inline="786")
+fib786Color    = input.color(color.new(color.rgb(3,169,244), 40),  "", group=groupFib, inline="786")
+
+fibCustom1     = input.float(0.886, "Custom A level (default 0.886)", minval=0.0, step=0.001, group=groupFib, inline="c1")
+showFibC1      = input.bool(false,  "", group=groupFib, inline="c1")
+fibC1Color     = input.color(color.new(color.rgb(171,71,188), 40),   "", group=groupFib, inline="c1")
+fibCustom2     = input.float(1.000, "Custom B level (default 1.000)", minval=0.0, step=0.001, group=groupFib, inline="c2")
+showFibC2      = input.bool(false,  "", group=groupFib, inline="c2")
+fibC2Color     = input.color(color.new(color.rgb(233,30,99), 40),    "", group=groupFib, inline="c2")
+
+// INPUTS — VWAP VISUALS (SIMPLIFIED - REMOVED AUTO RESIZE & COMPARATOR)
+groupVWVis     = "VWAP Visuals (normalized)"
+showVWAPHisto  = input.bool(true, "Show VWAP slope histogram (norm.)", group=groupVWVis)
+histScalePct   = input.float(0.05, "Histogram height as % of band", minval=0.02, maxval=1.00, step=0.01, group=groupVWVis)
+histPosColor   = input.color(color.new(color.green,  20), "Histogram color +", group=groupVWVis)
+histNegColor   = input.color(color.new(color.red,    20), "Histogram color −", group=groupVWVis)
+histWidth      = input.int(2, "Histogram column width", minval=1, maxval=6, group=groupVWVis)
+
+showVWThresh   = input.bool(false, "Show VWAP threshold band (norm.)", group=groupVWVis)
+vwThreshColor  = input.color(color.new(color.gray, 60), "Threshold band color", group=groupVWVis)
+vwThreshFill   = input.bool(false, "Fill between VWAP thresholds", group=groupVWVis)
+vwThreshAlpha  = input.int(70, "VWAP threshold fill transparency (0-100)", minval=0, maxval=100, group=groupVWVis)
+vwThreshWidth  = input.int(1, "VWAP threshold line width", minval=1, maxval=6, group=groupVWVis)
+normMode       = input.string("Soft (Log)", "VWAP normalization mode", options=["Hard (Clamp)","Soft (Log)"], group=groupVWVis)
+normLimit      = input.float(6.0, "VWAP normalization limit (abs)", minval=1.0, step=0.5, group=groupVWVis)
+
+// INPUTS — VISUALS & MARKERS
+groupViz       = "Visualization / Styling"
+showSignal     = input.bool(true, "Show Signal", group=groupViz)
+useGradient    = input.bool(true, "Use dynamic gradient on momentum line", group=groupViz)
+gradientIntensity = input.float(1.0, "Gradient intensity (0.0-1.0)", minval=0.0, maxval=1.0, step=0.1, group=groupViz)
+extremeDisplay = input.string("Dots", "Momentum extreme display", options=["Dots","Thicken Line","Both"], group=groupViz)
+extremeDotFreq = input.int(7, "Show extreme dots every N bars", minval=1, maxval=10, group=groupViz)
+bringMomTop    = input.bool(true, "Bring Momentum line to top", group=groupViz)
+showExtremeEdges = input.bool(true, "Show Momentum Above/Below edge lines (blue)", group=groupViz)
+edgeWidth      = input.int(2, "Edge line width", minval=1, maxval=8, group=groupViz)
+showDebug      = input.bool(false, "Show debug (scoring breakdown)", group=groupViz)
+
+momWidth       = input.int(2, "Momentum width", minval=1, maxval=8, group=groupViz)
+momThickWidth  = input.int(3, "Extreme overlay width", minval=1, maxval=10, group=groupViz)
+sigWidth       = input.int(1, "Signal width", minval=1, maxval=8, group=groupViz)
+bandWidth      = input.int(1, "Band line width", minval=1, maxval=6, group=groupViz)
+
+colMomOB       = input.color(color.new(color.green, 0),  "Momentum color: OB (above upper)", group=groupViz)
+colMomOS       = input.color(color.new(color.red,   0),  "Momentum color: OS (below lower)", group=groupViz)
+colMomPos      = input.color(color.new(color.lime,  0),  "Momentum color: >0 & <upper",      group=groupViz)
+colMomNeg      = input.color(color.new(color.orange,0),  "Momentum color: <0 & >lower",      group=groupViz)
+colSignal      = input.color(color.new(color.white,15),  "Signal color", group=groupViz)
+colBand        = input.color(color.new(color.gray, 50),  "Band line color", group=groupViz)
+colEdgeAbove   = input.color(color.new(color.blue,  0),  "Edge line: Momentum Above", group=groupViz)
+colEdgeBelow   = input.color(color.new(color.aqua,  0),  "Edge line: Momentum Below", group=groupViz)
+
+groupSignals   = "Signal Markers (Pivot Icons)"
+signalStyle    = input.string("Triangles", "Marker style", options=["Stars","Arrows","Triangles","Circles"], group=groupSignals)
+signalSize     = input.string("Large", "Marker size", options=["Tiny","Small","Normal","Large","Huge"], group=groupSignals)
+signalBgAlpha  = input.int(90, "Signal marker background transparency", minval=0, maxval=100, group=groupSignals)
+bullSignalColor= input.color(color.lime, "Bullish signal color", group=groupSignals)
+bearSignalColor= input.color(color.red,  "Bearish signal color", group=groupSignals)
+
+groupRes       = "Resource & Label Controls"
+limitLabels    = input.bool(true,  "Limit number of labels", group=groupRes)
+maxLabels      = input.int(25,     "Max labels to keep", minval=5, maxval=300, group=groupRes)
+fxLabelCap     = input.int(150, "Max aux labels (FX/stars/etc.)", minval=20, maxval=400, group=groupRes)
+
+groupAlert     = "Alert Settings"
+alertThrottle  = input.bool(true, "Enable alert throttling", group=groupAlert)
+alertMinGap    = input.int(5, "Minimum bars between same-type alerts", minval=2, maxval=50, group=groupAlert)
+
+// INPUTS — ML TARGETS
+groupML        = "Dynamic ML Projections"
+useMLTargets   = input.bool(true,  "Use ML-style dynamic projections", group=groupML)
+mlAdaptLen     = input.int(20,     "ML calibration length (EWMA)", minval=5, maxval=200, group=groupML)
+mlStrength     = input.float(1.0,  "ML aggressiveness (multiplier)", minval=0.2, maxval=2.5, step=0.1, group=groupML)
+mlFloor        = input.float(0.5,  "Projection floor (× avg run)", minval=0.2, maxval=1.0, step=0.1, group=groupML)
+mlCeil         = input.float(2.0,  "Projection ceiling (× avg run)", minval=1.0, maxval=4.0, group=groupML)
+
+groupMA        = "Support/Resistance MAs (normalized)"
+showMA1        = input.bool(false, "Show MA #1", group=groupMA)
+ma1Type        = input.string("EMA", "MA #1 Type", options=["EMA","RMA","SMA","WMA","VWMA"], group=groupMA)
+ma1Len         = input.int(21,   "MA #1 Length", minval=1, group=groupMA)
+ma1Color       = input.color(color.new(color.lime, 0), "MA #1 Color", group=groupMA)
+ma1Width       = input.int(2, "MA #1 Width", minval=1, maxval=6, group=groupMA)
+
+showMA2        = input.bool(false, "Show MA #2", group=groupMA)
+ma2Type        = input.string("EMA", "MA #2 Type", options=["EMA","RMA","SMA","WMA","VWMA"], group=groupMA)
+ma2Len         = input.int(50,   "MA #2 Length", minval=1, group=groupMA)
+ma2Color       = input.color(color.new(color.purple, 0), "MA #2 Color", group=groupMA)
+ma2Width       = input.int(2, "MA #2 Width", minval=1, maxval=6, group=groupMA)
+
+showPOC        = input.bool(true, "Show POC (Session VWAP proxy, normalized)", group=groupMA)
+pocColor       = input.color(color.rgb(255,241,118), "POC Color (#FFF176)", group=groupMA)
+pocWidth       = input.int(2, "POC Width", minval=1, maxval=6, group=groupMA)
+pocShortForm   = input.bool(true, "POC short form (start N bars left, extend RIGHT)", group=groupMA)
+pocShortBars   = input.int(0, "POC short form: N bars back", minval=0, group=groupMA)
+pocExtendRight = input.bool(true, "POC extend right", group=groupMA)
+
+groupInfo = "Info Panel (Overlay)"
+showInfoPanel   = input.bool(true, "Show info panel", group=groupInfo, tooltip="Display real-time meter dashboard")
+horizontalTable = input.bool(true, "Horizontal table layout", group=groupInfo, tooltip="Horizontal = 8 columns, Vertical = 2 columns")
+panelAnchor     = input.string("Bottom Left", "Panel position", options=["Top Left","Top Right","Bottom Left","Bottom Right","Top Center","Bottom Center","Middle Left","Middle Right"], group=groupInfo)
+panelSize       = input.string("Tiny", "Panel text size", options=["Tiny","Small","Normal"], group=groupInfo, tooltip="Size of meter bars and values")
+
+// Meter Customization
+meterColorScheme = input.string("Traffic Light", "Meter color scheme", options=["Traffic Light","Blue-Red","Lime-Orange","Purple-Yellow","Monochrome"], group=groupInfo, tooltip="Color theme for all meters")
+showMeterValues = input.bool(true, "Show numeric values", group=groupInfo, tooltip="Display percentages below meter bars")
+meterThreshHigh = input.int(70, "High threshold %", minval=50, maxval=90, group=groupInfo, tooltip="Green zone starts here")
+meterThreshLow = input.int(40, "Low threshold %", minval=10, maxval=50, group=groupInfo, tooltip="Red zone ends here")
+vwapMeterRangePct = input.float(2.0, "VWAP meter range (%)", minval=0.5, step=0.25, group=groupInfo, tooltip="Distance from VWAP that maps to 0/100% on meter")
+
+// Individual Meter Toggles
+showBullMeter = input.bool(true, "Show Bull Score", group=groupInfo, inline="m1")
+showBearMeter = input.bool(true, "Show Bear Score", group=groupInfo, inline="m1")
+showNetMeter = input.bool(true, "Show Net Bias", group=groupInfo, inline="m2")
+showOscMeter = input.bool(true, "Show Osc Position", group=groupInfo, inline="m2")
+showMTFMeter = input.bool(true, "Show MTF Confluence", group=groupInfo, inline="m3")
+showQualMeter = input.bool(true, "Show Signal Quality", group=groupInfo, inline="m3")
+showRegimeMeter = input.bool(true, "Show Regime Power", group=groupInfo, inline="m4")
+showVWAPMeter = input.bool(true, "Show VWAP Pressure", group=groupInfo, inline="m4")
+
+// INPUTS — PERFORMANCE
+groupPerf = "Performance Optimization"
+perfMode = input.bool(false, "Performance mode (reduce visual updates)", group=groupPerf)
+perfUpdateFreq = input.int(2, "Visual update frequency (bars)", minval=1, maxval=5, group=groupPerf)
+
+// INPUTS — REGIME DETECTION
+groupRegime = "Market Regime Detection"
+useRegime   = input.bool(true, "Enable regime detection", group=groupRegime)
+showRegimeBg = input.bool(true, "Show High-Probability Setup Zone background", group=groupRegime)
+setupBullColor = input.color(color.new(color.lime, 95), "Bull setup zone color", group=groupRegime)
+setupBearColor = input.color(color.new(color.red, 95), "Bear setup zone color", group=groupRegime)
+regimeMethod = input.string("Momentum Only", "Regime method", options=["Composite","ADX Only","Momentum Only"], group=groupRegime)
+trendColor   = input.color(color.new(color.green, 93), "Bullish background", group=groupRegime)
+rangeColor   = input.color(color.new(color.red,   93), "Bearish background", group=groupRegime)
+neutralColor = input.color(color.new(color.gray,  95), "Neutral background", group=groupRegime)
+useDynamicBackflash = input.bool(true, "Enable dynamic backflash (opacity by momentum gap)", group=groupRegime)
+backflashIntensity  = input.float(0.7, "Backflash intensity (0-1)", minval=0, maxval=1, step=0.1, group=groupRegime)
+flashMethod = input.string("Momentum Only", "Flash basis", options=["Follow regimeMethod","Composite","ADX Only","Momentum Only"], group=groupRegime)
+showRegimePeakFlash = input.bool(true, "Flash on peak/valley switch", group=groupRegime)
+peakFlashDuration   = input.int(1, "Flash duration (bars)", minval=1, maxval=10, group=groupRegime)
+peakFlashColor      = input.color(color.new(color.yellow, 0), "Flash color", group=groupRegime)
+alertOnRegimePeak   = input.bool(false, "Alert on peak/valley flash", group=groupRegime)
+showRegimeSwitch = input.bool(true, "Flash on regime switch (color change)", group=groupRegime)
+regimeSwitchDuration = input.int(1, "Regime switch flash duration (bars)", minval=1, maxval=10, group=groupRegime)
+regimeSwitchColor = input.color(color.new(color.orange, 0), "Regime switch flash color", group=groupRegime)
+adxLen       = input.int(14, "ADX length", minval=3, group=groupRegime)
+trendThresh  = input.float(25.0, "Trend threshold (ADX)", minval=5.0, maxval=60.0, step=0.5, group=groupRegime)
+showVelocityLine = input.bool(false, "Show Momentum Velocity line", group=groupRegime)
+velocityColor = input.color(color.new(color.purple, 30), "Velocity line color", group=groupRegime)
+
+// INPUTS — MTF DASHBOARD (WITH MTF ALIGNMENT VISUAL)
+groupMTFDash = "MTF Dashboard"
+showMTFDash  = input.bool(true, "Show MTF momentum dashboard", group=groupMTFDash)
+mtfHorizontal = input.bool(true, "Horizontal layout", group=groupMTFDash)
+mtfPosition  = input.string("Top Left", "Dashboard position", options=["Top Left","Top Right","Bottom Left","Bottom Right"], group=groupMTFDash)
+dashSize     = input.string("Tiny", "Dashboard size", options=["Tiny","Small","Normal","Auto"], group=groupMTFDash)
+tf1 = input.timeframe("1", "TF 1", group=groupMTFDash)
+tf2 = input.timeframe("5", "TF 2", group=groupMTFDash)
+tf3 = input.timeframe("15", "TF 3", group=groupMTFDash)
+tf4 = input.timeframe("60", "TF 4", group=groupMTFDash)
+tf5 = input.timeframe("240", "TF 5", group=groupMTFDash)
+tf6 = input.timeframe("D", "TF 6", group=groupMTFDash)
+
+mtfStrLogic   = input.string("Composite (Regime-weighted)", "STR logic", options=["Legacy (Basis Only)","Composite (Static 60/40)","Composite (Regime-weighted)"], group=groupMTFDash)
+mtfStrSmooth  = input.int(1, "STR smoothing (bars)", minval=1, maxval=10, group=groupMTFDash)
+mtfWeakCut    = input.float(0.33, "STR weak cut (Gap basis, 0..1)", minval=0, maxval=1, step=0.01, group=groupMTFDash)
+mtfStrongCut  = input.float(0.66, "STR strong cut (Gap basis, 0..1)", minval=0, maxval=1, step=0.01, group=groupMTFDash)
+mtfADXweak    = input.float(20.0, "ADX weak cut (%, 0..100)", minval=0, maxval=100, step=0.5, group=groupMTFDash)
+mtfADXstrong  = input.float(35.0, "ADX strong cut (%, 0..100)", minval=0, maxval=100, step=0.5, group=groupMTFDash)
+mtfStrengthBasis = input.string("MomentumGap", "Legacy basis (if selected)", options=["MomentumGap","ADX"], group=groupMTFDash)
+
+// NEW: MTF Alignment visual
+showMTFAlignment = input.bool(true, "Show MTF alignment visual (color-coded)", group=groupMTFDash, tooltip="Color codes cells based on alignment strength")
+
+// INPUTS — ADVANCED FEATURES
+groupHeatmap = "Signal Quality Heatmap"
+showHeatmap  = input.bool(false, "Show signal quality heatmap (background)", group=groupHeatmap)
+heatmapAlpha = input.int(95, "Heatmap transparency", minval=85, maxval=98, group=groupHeatmap)
+
+groupStats = "Performance Statistics"
+showStats  = input.bool(true, "Track signal performance", group=groupStats)
+trackPeriod = input.int(100, "Track last N signals", minval=20, maxval=500, group=groupStats)
+
+groupSmartAlerts = "Smart Alerts"
+useSmartAlerts   = input.bool(true, "Enable context-aware alerts", group=groupSmartAlerts)
+minConfidence    = input.int(70, "Minimum confidence for alert", minval=50, maxval=100, group=groupSmartAlerts)
+
+groupStops = "Dynamic Stop Loss"
+showStops  = input.bool(false, "Show suggested stop levels", group=groupStops)
+stopATRMult = input.float(1.5, "ATR multiplier for stops", minval=0.5, maxval=4.0, step=0.1, group=groupStops)
+stopMethod  = input.string("ATR", "Stop calculation method", options=["ATR","Swing","Pivot","Band"], group=groupStops)
+
+groupAwareness = "Awareness (tooltip only)"
+showAwareness  = input.bool(true, "Include awareness in tooltips", group=groupAwareness)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ENHANCED TOOLTIP ICON (v2 Style with Full Details)
+// ══════════════════════════════════════════════════════════════════════════
+groupTooltip = "Enhanced Tooltip System"
+showTooltip = input.bool(true, "Show info tooltip icon", group=groupTooltip)
+warnNearPct = input.float(0.15, "Near-band warning threshold (%)", minval=0.05, maxval=0.30, step=0.05, group=groupTooltip)
+tipLeftOffset = input.int(15, "Tooltip left offset (bars)", minval=0, group=groupTooltip)
+tipPadRight = input.int(5, "Tooltip right padding (bars)", minval=0, group=groupTooltip)
+
+var label tipLbl = na
+
+// Prep; we'll compute barsSince* after setup* are assigned later
+atrVal = ta.atr(atrLen)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ML HISTORICAL LEARNING SYSTEM
+// ══════════════════════════════════════════════════════════════════════════
+
+groupMLBack = "🤖 ML Historical Learning"
+useMLBacklearn = input.bool(true, "Enable ML historical learning", group=groupMLBack, tooltip="Automatically optimize parameters from historical pivot performance")
+mlHistoryBars  = input.int(500, "History lookback (bars)", minval=100, maxval=2000, group=groupMLBack, tooltip="Number of bars to analyze for learning")
+mlForwardBars  = input.int(20, "Forward test period (bars)", minval=5, maxval=50, group=groupMLBack, tooltip="Bars to wait before marking pivot as win/loss")
+mlTargetWinRate= input.float(65.0, "Target win rate %", minval=50, maxval=85, group=groupMLBack, tooltip="Minimum win rate to consider learning valid")
+mlProfitThresh = input.float(0.5, "Min profit % for win", minval=0.1, maxval=2.0, step=0.1, group=groupMLBack, tooltip="Minimum price move % to count as winning trade")
+mlMinSamples   = input.int(100, "Min pivots required", minval=50, maxval=200, group=groupMLBack, tooltip="Minimum historical pivots needed before learning activates")
+mlOverfitThresh= input.float(15.0, "Max overfitting % delta", minval=5.0, maxval=30.0, step=1.0, group=groupMLBack, tooltip="Maximum acceptable difference between training and validation win rates")
+
+// ══════════════════════════════════════════════════════════════════════════
+// ML STORAGE ARRAYS (Parallel arrays for pivot history)
+// ══════════════════════════════════════════════════════════════════════════
+
+var array<float> mlScores      = array.new_float(0)    // Bull or bear score at pivot
+var array<float> mlSNRs        = array.new_float(0)    // SNR at pivot
+var array<float> mlVolRatios   = array.new_float(0)    // Volume ratio at pivot
+var array<float> mlATRratios   = array.new_float(0)    // ATR regime at pivot
+var array<bool>  mlIsBull      = array.new_bool(0)     // Direction (true=bull, false=bear)
+var array<float> mlEntryPrices = array.new_float(0)    // Price at pivot
+var array<bool>  mlWasWin      = array.new_bool(0)     // Did it win? (set after N bars)
+var array<float> mlPnLs        = array.new_float(0)    // P&L percentage
+var array<int>   mlPivotBars   = array.new_int(0)      // Bar index of pivot
+
+// ══════════════════════════════════════════════════════════════════════════
+// LEARNED PARAMETERS (ML overrides)
+// ══════════════════════════════════════════════════════════════════════════
+
+var float learnedMinScore    = float(minScore)
+var float learnedSNR         = float(snrThresh)
+var float learnedVolBull     = float(volBullThresh)
+var float learnedVolBear     = float(volBearExhaust)
+var float learnedWhipsaw     = float(minBarsBetween)
+var bool  learningValid      = false
+
+// Performance metrics (for tooltip)
+var float trainingWinRate    = 0.0
+var float validationWinRate  = 0.0
+var int   validationSignals  = 0
+var float avgATRregime       = 1.0
+var string learningFailReason = ""
+
+// HELPERS
+clamp(x, lo, hi) =>
+    math.max(lo, math.min(hi, x))
+
+tsi(src, r, s) =>
+    m  = ta.change(src)
+    e1 = ta.ema(m, r)
+    e2 = ta.ema(e1, s)
+    a1 = ta.ema(math.abs(m), r)
+    a2 = ta.ema(a1, s)
+    100.0 * (a2 != 0 ? e2 / a2 : 0)
+
+maOf(type, src, len) =>
+    if type == "EMA"
+        ta.ema(src, len)
+    else if type == "RMA"
+        ta.rma(src, len)
+    else if type == "SMA"
+        ta.sma(src, len)
+    else if type == "WMA"
+        ta.wma(src, len)
+    else if type == "VWMA"
+        ta.vwma(src, len)
+    else
+        ta.ema(src, len)
+
+arrSum(_arr) =>
+    float s = 0.0
+    for i = 0 to array.size(_arr) - 1
+        s += array.get(_arr, i)
+    s
+
+getAdaptiveHTF() =>
+    string result = htfManual
+    if autoMTF
+        mins = timeframe.in_seconds(timeframe.period) / 60
+        if mins <= 1
+            result := "5"
+        else if mins <= 3
+            result := "15"
+        else if mins <= 10
+            result := "60"
+        else if mins <= 30
+            result := "240"
+        else if mins <= 120
+            result := "D"
+        else if mins <= 360
+            result := "W"
+        else
+            result := "M"
+    result
+
+consolidationApplies() =>
+    if not useConsFilter
+        false
+    else
+        tfList = str.split(consolTimeframes, ",")
+        currentTFmins = timeframe.in_seconds(timeframe.period) / 60
+        applies = false
+        for i = 0 to array.size(tfList) - 1
+            tfMinStr = str.trim(array.get(tfList, i))
+            tfMins = str.tonumber(tfMinStr)
+            if not na(tfMins) and currentTFmins == tfMins
+                applies := true
+                break
+        applies
+
+var array<label> __lblq = array.new<label>()
+mkLabel(_x, _y, _text, _tcol, _bgcol, _style, _size, _xloc, _yloc, _tip) =>
+    l = label.new(_x, _y, text=_text, textcolor=_tcol, color=_bgcol, style=_style, size=_size, xloc=_xloc, yloc=_yloc, tooltip=_tip)
+    if limitLabels
+        array.push(__lblq, l)
+        if array.size(__lblq) > maxLabels
+            old = array.shift(__lblq)
+            if not na(old)
+                label.delete(old)
+    l
+
+var array<label> __lblq_fx = array.new<label>()
+mkLabelFX(_x,_y,_txt,_tc,_bg,_style,_size,_xloc,_yloc,_tip) =>
+    l = label.new(_x,_y,text=_txt,textcolor=_tc,color=_bg,style=_style,size=_size,xloc=_xloc,yloc=_yloc,tooltip=_tip)
+    array.push(__lblq_fx, l)
+    if array.size(__lblq_fx) > fxLabelCap
+        old = array.shift(__lblq_fx)
+        if not na(old)
+            label.delete(old)
+    l
+
+// NEW: Score progress bar helper
+meterBar(score) =>
+    filled = int(math.round(score / 16.67))  // 100 ÷ 6 segments
+    filled := math.max(0, math.min(6, filled))
+    bar = ""
+    for i = 0 to 5
+        bar += (i < filled ? "█" : "░")
+    bar
+
+// TOOLTIP HELPER FUNCTIONS
+clampLocal(x, mn, mx) =>
+    math.max(mn, math.min(mx, x))
+
+meterFrom01(n01) =>
+    n = clampLocal(n01, 0.0, 1.0)
+    filled = int(math.round(n * 6))
+    filled := math.max(0, math.min(6, filled))
+    s = ""
+    for i = 0 to 5
+        s += (i < filled ? "█" : "░")
+    s
+
+fmtPct(p) =>
+    na(p) ? "—" : str.tostring(p, "#.##") + "%"
+
+fmtNum(n, fmt) =>
+    na(n) ? "—" : str.tostring(n, fmt)
+
+fmtBarsSince(bs) =>
+    bs >= 1000000000 ? "—" : str.tostring(bs)
+
+fmtMSS(sec) =>
+    s = math.max(0, int(math.floor(sec)))
+    m = int(math.floor(s / 60))
+    r = s % 60
+    str.tostring(m) + ":" + str.tostring(r, "00")
+
+// CORE CALC
+tsiFast = tsi(close, rFast, sFast)
+tsiSlow = tsi(close, rSlow, sSlow)
+
+atrp   = ta.atr(atrLen) / close
+atrMin = ta.lowest(atrp, volLook)
+atrMax = ta.highest(atrp, volLook)
+wRaw   = (atrMax != atrMin) ? ((atrp - atrMin) / (atrMax - atrMin)) : 0.5
+w      = useAdaptive ? clamp(wRaw, 0.0, 1.0) : 0.5
+
+rMid   = int(math.round((rFast + rSlow) / 2.0))
+sMid   = int(math.round((sFast + sSlow) / 2.0))
+mom    = useAdaptive ? (w*tsiFast + (1.0 - w)*tsiSlow) : tsi(close, rMid, sMid)
+signal = ta.ema(mom, sigLen)
+
+// BANDS (with optional smoothing)
+med     = ta.percentile_linear_interpolation(mom, dynLook, 50)
+mad     = ta.percentile_linear_interpolation(math.abs(mom - med), dynLook, 50)
+robBand = mad * 1.4826 * madMult
+stdevMom= ta.stdev(mom, dynLook)
+
+baseBand= bandCalc=="StdDev" ? (stdevMom * dynMult) : robBand
+dynBand = math.max(baseBand, 5)
+upper   = bandMode=="Dynamic" ? dynBand : staticLevel
+lower   = -upper
+
+// Apply band smoothing if enabled
+if useBandSmooth
+    upper := ta.ema(upper, bandSmoothLen)
+    lower := -upper
+
+bandReady = (bandMode=="Static" ? upper>0 : not na(stdevMom)) and upper>0 and (upper-lower)>=1.0
+
+momVelocity = ta.change(mom)
+momAccel    = momVelocity - momVelocity[1]
+velocityNorm = na(upper) ? na : (momVelocity / math.max(upper, 1.0)) * 50.0  // Normalized to ±50 range
+velocityPlot = showVelocityLine and useRegime ? velocityNorm : na
+
+// DERIVATIVES — normalized & smoothed (used only if useDerivGates)
+velRaw = momVelocity
+accRaw = momAccel
+velN = ta.ema(upper != 0 ? velRaw/upper : 0.0, 3)
+accN = ta.ema(upper != 0 ? accRaw/upper : 0.0, 3)
+deadzone(x, z) => math.abs(x) > z ? x : 0.0
+velZ = deadzone(velN, velDead)
+accZ = deadzone(accN, accDead)
+// For price↔osc mapping
+priceToOsc(price) =>
+    pMean = ta.sma(close, dynLook)
+    pStd  = ta.stdev(close, dynLook)
+    nz(pStd) != 0 and not na(upper) ? clamp(((price - pMean) / pStd) * stdevMom, -upper*0.95, upper*0.95) : 0.0
+
+oscToPrice(osc) =>
+    pMean = ta.sma(close, dynLook)
+    pStd  = ta.stdev(close, dynLook)
+    stdev = stdevMom
+    nz(pStd) != 0 and nz(stdev) != 0 ? (pMean + (osc / stdev) * pStd) : na
+
+// ══════════════════════════════════════════════════════════════════════════
+// SECTION A: DIVERGENCE DETECTION (replaces ~lines 650-750)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 1: Detect Oscillator Pivots
+// ─────────────────────────────────────────────────────────────────────────
+oscPH = ta.pivothigh(mom, pivotLen, pivotLen)
+oscPL = ta.pivotlow(mom, pivotLen, pivotLen)
+
+foundPivotHigh = not na(oscPH)
+foundPivotLow = not na(oscPL)
+
+// Signal Pivots (used for filtering strong signals at extremes)
+bullPivot = foundPivotLow and oscPL < lower
+bearPivot = foundPivotHigh and oscPH > upper
+
+// Price Pivots - Used for Fibonacci calculations
+prPH = ta.pivothigh(high, pricePivotLen, pricePivotLen)
+prPL = ta.pivotlow(low, pricePivotLen, pricePivotLen)
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 2: Store Pivot HIGH History (for bearish divergence)
+// ─────────────────────────────────────────────────────────────────────────
+var int   pivotHighBar1 = na
+var int   pivotHighBar2 = na
+var float pivotHighOsc1 = na
+var float pivotHighOsc2 = na
+var float pivotHighPrice1 = na
+var float pivotHighPrice2 = na
+
+if foundPivotHigh
+    pivotHighBar2   := pivotHighBar1
+    pivotHighOsc2   := pivotHighOsc1
+    pivotHighPrice2 := pivotHighPrice1
+    pivotHighBar1   := bar_index - pivotLen
+    pivotHighOsc1   := oscPH
+    pivotHighPrice1 := high[pivotLen]
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 3: Store Pivot LOW History (for bullish divergence)
+// ─────────────────────────────────────────────────────────────────────────
+var int   pivotLowBar1 = na
+var int   pivotLowBar2 = na
+var float pivotLowOsc1 = na
+var float pivotLowOsc2 = na
+var float pivotLowPrice1 = na
+var float pivotLowPrice2 = na
+
+if foundPivotLow
+    pivotLowBar2   := pivotLowBar1
+    pivotLowOsc2   := pivotLowOsc1
+    pivotLowPrice2 := pivotLowPrice1
+    pivotLowBar1   := bar_index - pivotLen
+    pivotLowOsc1   := oscPL
+    pivotLowPrice1 := low[pivotLen]
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 4: Calculate Bar Distance
+// ─────────────────────────────────────────────────────────────────────────
+lowPivotDistance = pivotLowBar1 - pivotLowBar2
+highPivotDistance = pivotHighBar1 - pivotHighBar2
+
+lowDistanceValid = not na(lowPivotDistance) and lowPivotDistance > 0 and lowPivotDistance <= divMaxBars
+highDistanceValid = not na(highPivotDistance) and highPivotDistance > 0 and highPivotDistance <= divMaxBars
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 5: Check Price Conditions
+// ─────────────────────────────────────────────────────────────────────────
+priceMadeLowerLow = not na(pivotLowPrice1) and not na(pivotLowPrice2) and pivotLowPrice1 < pivotLowPrice2
+priceMadeHigherLow = not na(pivotLowPrice1) and not na(pivotLowPrice2) and pivotLowPrice1 > pivotLowPrice2
+priceMadeHigherHigh = not na(pivotHighPrice1) and not na(pivotHighPrice2) and pivotHighPrice1 > pivotHighPrice2
+priceMadeLowerHigh = not na(pivotHighPrice1) and not na(pivotHighPrice2) and pivotHighPrice1 < pivotHighPrice2
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 6: Check Oscillator Conditions
+// ─────────────────────────────────────────────────────────────────────────
+oscMadeHigherLow = not na(pivotLowOsc1) and not na(pivotLowOsc2) and pivotLowOsc1 > pivotLowOsc2
+oscMadeLowerLow = not na(pivotLowOsc1) and not na(pivotLowOsc2) and pivotLowOsc1 < pivotLowOsc2
+oscMadeLowerHigh = not na(pivotHighOsc1) and not na(pivotHighOsc2) and pivotHighOsc1 < pivotHighOsc2
+oscMadeHigherHigh = not na(pivotHighOsc1) and not na(pivotHighOsc2) and pivotHighOsc1 > pivotHighOsc2
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 7: Final Divergence Signals
+// ─────────────────────────────────────────────────────────────────────────
+bullDiv = foundPivotLow and lowDistanceValid and priceMadeLowerLow and oscMadeHigherLow
+bearDiv = foundPivotHigh and highDistanceValid and priceMadeHigherHigh and oscMadeLowerHigh
+hiddenBullDiv = foundPivotLow and lowDistanceValid and priceMadeHigherLow and oscMadeLowerLow
+hiddenBearDiv = foundPivotHigh and highDistanceValid and priceMadeLowerHigh and oscMadeHigherHigh
+
+// ─────────────────────────────────────────────────────────────────────────
+// STEP 8: Optional Extreme Filter
+// ─────────────────────────────────────────────────────────────────────────
+if divRequireExtreme
+    bullDiv := bullDiv and pivotLowOsc1 < lower
+    bearDiv := bearDiv and pivotHighOsc1 > upper
+    hiddenBullDiv := hiddenBullDiv and pivotLowOsc1 < lower
+    hiddenBearDiv := hiddenBearDiv and pivotHighOsc1 > upper
+
+// ══════════════════════════════════════════════════════════════════════════
+// ML WIN/LOSS MARKING — FIX: Use BAR-COUNT instead of PIVOT-COUNT
+// ══════════════════════════════════════════════════════════════════════════
+
+if useMLBacklearn and array.size(mlPivotBars) > 0
+    // Scan all unmarked pivots and mark those where enough bars have elapsed
+    for idx = 0 to array.size(mlPivotBars) - 1
+        // Safety check: ensure idx is valid for ALL parallel arrays
+        if idx < array.size(mlScores) and idx < array.size(mlEntryPrices) and idx < array.size(mlIsBull) and idx < array.size(mlWasWin) and idx < array.size(mlPnLs) and idx < array.size(mlPivotBars)
+            // Only mark if not already marked (PnL still at initial 0.0 AND wasWin still false)
+            alreadyMarked = array.get(mlPnLs, idx) != 0.0
+            pivotBarIdx   = array.get(mlPivotBars, idx)
+            barsElapsed   = bar_index - pivotBarIdx
+
+            if not alreadyMarked and barsElapsed >= mlForwardBars
+                entryPrice  = array.get(mlEntryPrices, idx)
+                isBullPivot = array.get(mlIsBull, idx)
+
+                // Calculate price change from entry to NOW (first bar that meets threshold)
+                priceChangePct = (close - entryPrice) / entryPrice * 100.0
+
+                wasWin = false
+                pnl    = 0.0
+
+                if isBullPivot
+                    pnl    := priceChangePct
+                    wasWin := priceChangePct >= mlProfitThresh
+                else
+                    pnl    := -priceChangePct
+                    wasWin := -priceChangePct >= mlProfitThresh
+
+                array.set(mlWasWin, idx, wasWin)
+                array.set(mlPnLs, idx, pnl)
+
+// FILTERS
+string htf = getAdaptiveHTF()
+
+f_calcMomSig() =>
+    _tsiF   = tsi(close, rFast, sFast)
+    _tsiS   = tsi(close, rSlow, sSlow)
+    _atrp   = ta.atr(atrLen) / close
+    _atrMin = ta.lowest(_atrp, volLook)
+    _atrMax = ta.highest(_atrp, volLook)
+    _wRaw   = _atrMax != _atrMin ? (_atrp - _atrMin) / (_atrMax - _atrMin) : 0.5
+    _w      = useAdaptive ? math.max(0.0, math.min(1.0, _wRaw)) : 0.5
+    _rMid   = int(math.round((rFast + rSlow) / 2.0))
+    _sMid   = int(math.round((sFast + sSlow) / 2.0))
+    _mom    = useAdaptive ? (_w * _tsiF + (1 - _w) * _tsiS) : tsi(close, _rMid, _sMid)
+    _sig    = ta.ema(_mom, sigLen)
+    [_mom, _sig]
+
+calcMomSig_htf(_tf) =>
+    request.security(syminfo.tickerid, _tf, f_calcMomSig(), lookahead = barmerge.lookahead_off)
+
+float mHTF = na
+float sHTF = na
+
+if useMTF
+    if htfBiasMode == "Recompute (accurate)"
+        [mTmp, sTmp] = calcMomSig_htf(htf)
+        mHTF := mTmp
+        sHTF := sTmp
+    else
+        mHTF := request.security(syminfo.tickerid, htf, mom,                lookahead = barmerge.lookahead_off)
+        sHTF := request.security(syminfo.tickerid, htf, ta.ema(mom, sigLen), lookahead = barmerge.lookahead_off)
+
+biasUp   = useMTF ? (mHTF > sHTF) : true
+biasDown = useMTF ? (mHTF < sHTF) : true
+
+swingUp   = useGannSwing ? close > ta.highest(high, swingN)[1] : true
+swingDown = useGannSwing ? close < ta.lowest(low,  swingN)[1]  : true
+
+volAvg         = ta.sma(volume, volLookback)
+volRatio       = nz(volAvg) != 0 ? volume / volAvg : 1.0
+volIncreasing  = volume > volume[1] and volume[1] > volume[2]
+volBullConfirm = (volRatio > volBullThresh) or volIncreasing
+volPeakExhaust = volRatio < volBearExhaust
+volReverseStart= volRatio > volBearSpike and volIncreasing
+volBearConfirm = volPeakExhaust or volReverseStart
+
+atrCurrent       = ta.atr(atrLen)
+atrSlow          = ta.sma(atrCurrent, consolLookback)
+isConsolidating  = consolidationApplies() and nz(atrSlow) != 0 ? atrCurrent < atrSlow * consolThresh : false
+
+priceHH = high == ta.highest(high, structLookback)
+priceLL = low  == ta.lowest(low,  structLookback)
+
+// VWAP GATE
+vwapVal      = ta.vwap(hlc3)
+vwapReady    = not na(vwapVal[vwapSlopeLen])
+
+vwapSlopePts = vwapReady ? (vwapVal - vwapVal[vwapSlopeLen]) : 0.0
+vwapSlopePct = vwapReady and vwapVal != 0 ? (vwapSlopePts / vwapVal) * 100.0 : 0.0
+thAbs        = vwapSlopeUnit == "Percent" ? threshPct : threshPts
+slopeMetric  = vwapSlopeUnit == "Percent" ? vwapSlopePct : vwapSlopePts
+
+posLongOK  = vwapReady ? (vwapPosRule=="Above=Long" ? close > vwapVal : close < vwapVal) : true
+posShortOK = vwapReady ? (vwapPosRule=="Above=Long" ? close < vwapVal : close > vwapVal) : true
+
+slopeLongOK  = vwapReady ? (slopeMetric <= -thAbs) : true
+slopeShortOK = vwapReady ? (slopeMetric >= +thAbs) : true
+
+vwLongGateByMode(mode)  => (mode == "PositionOnly") ? posLongOK  : (mode == "SlopeOnly") ? slopeLongOK  : (mode == "Both (AND)") ? (posLongOK  and slopeLongOK)  : (posLongOK  or slopeLongOK)
+vwShortGateByMode(mode) => (mode == "PositionOnly") ? posShortOK : (mode == "SlopeOnly") ? slopeShortOK : (mode == "Both (AND)") ? (posShortOK and slopeShortOK) : (posShortOK or slopeShortOK)
+
+gateLong  = not useVWAPGate ? true : vwLongGateByMode(vwapGateMode)
+gateShort = not useVWAPGate ? true : vwShortGateByMode(vwapGateMode)
+
+// HIGH-PROBABILITY SETUP ZONE
+vwapChangeSetup = ta.change(vwapVal, setupVwapBars)
+
+// NOTE: compute once; do NOT overwrite with `var` later.
+bool setupBull = useSetupZone and useRegime and mom < 0 and mom > lower * setupBandThresh and momAccel > accelSensitivity * setupAccelMult and volRatio > setupVolThresh and vwapChangeSetup < 0 and not isConsolidating
+bool setupBear = useSetupZone and useRegime and mom > 0 and mom < upper * setupBandThresh and momAccel < -accelSensitivity * setupAccelMult and volRatio > setupVolThresh and vwapChangeSetup > 0 and not isConsolidating
+
+// Whipsaw memory (declare once globally; keep as-is if already declared above)
+var int lastBullPivotBar = na
+var int lastBearPivotBar = na
+
+// ACCELERATION
+isAccelUp = momAccel >  accelSensitivity and momVelocity > 0
+isAccelDn = momAccel < -accelSensitivity and momVelocity < 0
+
+var int lastBullWarnBar = na
+var int lastBearWarnBar = na
+bullEarlyWarning = useAccel and isAccelUp and mom <= 0 and (na(lastBullWarnBar) or (bar_index - lastBullWarnBar) >= earlyWarnCooldown)
+bearEarlyWarning = useAccel and isAccelDn and mom >= 0 and (na(lastBearWarnBar) or (bar_index - lastBearWarnBar) >= earlyWarnCooldown)
+
+if bullEarlyWarning
+    lastBullWarnBar := bar_index
+if bearEarlyWarning
+    lastBearWarnBar := bar_index
+
+// NEW: SNR FILTER — FIX: use >= for consistency with override
+signalMag = math.abs(mom - signal)
+noiseMag = ta.stdev(mom - signal, snrLookback)
+snr = noiseMag > 0 ? signalMag / noiseMag : 0
+snrOK = not useSNR or snr >= snrThresh
+
+
+// MTF DASHBOARD CALCULATIONS
+getMomDirection(tf) =>
+    request.security(syminfo.tickerid, tf, mom > signal ? 1 : -1, lookahead=barmerge.lookahead_off)
+
+getMomStrength(tf) =>
+    request.security(syminfo.tickerid, tf, clamp(math.abs(mom - signal) / math.max(1.0, upper), 0.0, 1.0), lookahead=barmerge.lookahead_off)
+
+// Always calculate MTF directions (independent of dashboard display - needed for tooltip & scoring)
+mtf1Dir = getMomDirection(tf1)
+mtf2Dir = getMomDirection(tf2)
+mtf3Dir = getMomDirection(tf3)
+mtf4Dir = getMomDirection(tf4)
+mtf5Dir = getMomDirection(tf5)
+mtf6Dir = getMomDirection(tf6)
+
+mtf1Str = getMomStrength(tf1)
+mtf2Str = getMomStrength(tf2)
+mtf3Str = getMomStrength(tf3)
+mtf4Str = getMomStrength(tf4)
+mtf5Str = getMomStrength(tf5)
+mtf6Str = getMomStrength(tf6)
+
+mtfScore = (mtf1Dir + mtf2Dir + mtf3Dir + mtf4Dir + mtf5Dir + mtf6Dir) / 6.0
+mtfStrength = math.abs(mtfScore)
+mtfBullish = mtfScore > 0
+mtfStrengthPct = mtfStrength * 100
+
+// REAL-TIME SCORING
+baseBull = bullPivot
+baseBear = bearPivot
+
+momInOB = mom > upper
+momInOS = mom < lower
+sigCrossUp = mom > signal
+
+volScoreAdjust = 0.0
+if volRegimeAdjust and useScoring
+    if volRatio < 0.8
+        volScoreAdjust := -5
+    else if volRatio > 1.5
+        volScoreAdjust := 5
+
+setupScoreAdjust = 0.0
+if useRegime and useScoring
+    if setupBull
+        setupScoreAdjust := 10
+    else if setupBear
+        setupScoreAdjust := -10
+
+// MTF confluence boost (independent of dashboard display - used in scoring)
+mtfConfluenceBoost = 0.0
+if useScoring
+    if mtfBullish and mtfStrength > 0.7
+        mtfConfluenceBoost := 12
+    else if mtfBullish and mtfStrength > 0.5
+        mtfConfluenceBoost := 6
+    else if not mtfBullish and mtfStrength > 0.7
+        mtfConfluenceBoost := -12
+    else if not mtfBullish and mtfStrength > 0.5
+        mtfConfluenceBoost := -6
+
+// VWAP credit helpers (exclusive logic)
+longVWcredit() =>
+    gateLong and not gateShort ? 20 : gateLong and gateShort ? 10 : 0
+
+shortVWcredit() =>
+    gateShort and not gateLong ? 20 : gateLong and gateShort ? 10 : 0
+
+// ══════════════════════════════════════════════════════════════════════════
+// ML PARAMETER APPLICATION - Override mechanism
+// ══════════════════════════════════════════════════════════════════════════
+
+// Calculate effective parameters (ML overrides manual when valid)
+effectiveMinScore = (useMLBacklearn and learningValid) ? learnedMinScore : float(minScore)
+effectiveSNR = (useMLBacklearn and learningValid) ? learnedSNR : float(snrThresh)
+effectiveVolBull = (useMLBacklearn and learningValid) ? learnedVolBull : volBullThresh
+effectiveVolBear = (useMLBacklearn and learningValid) ? learnedVolBear : volBearExhaust
+effectiveWhipsaw = (useMLBacklearn and learningValid) ? int(learnedWhipsaw) : minBarsBetween
+
+// ══════════════════════════════════════════════════════════════════════════
+// APPLY EFFECTIVE PARAMETERS (After ML learning, before signals)
+// ══════════════════════════════════════════════════════════════════════════
+
+// Override SNR check with learned threshold
+snrOK := not useSNR or snr >= effectiveSNR
+
+// Override volume confirmation with learned thresholds
+volBullConfirm := (volRatio > effectiveVolBull) or volIncreasing
+volBearConfirm := (volRatio < effectiveVolBear) or (volRatio > volBearSpike and volIncreasing)
+
+// Recalculate whipsaw-gated signals with learned cooldown
+bullOK = baseBull and (not useWhipsaw or na(lastBearPivotBar) or (bar_index - lastBearPivotBar >= effectiveWhipsaw))
+bearOK = baseBear and (not useWhipsaw or na(lastBullPivotBar) or (bar_index - lastBullPivotBar >= effectiveWhipsaw))
+
+// ══════════════════════════════════════════════════════════════════════════
+// SCORE CALCULATION FUNCTIONS (Must be after all filter variables)
+// ══════════════════════════════════════════════════════════════════════════
+
+calcBullScore() =>
+    float score = 0.0
+    if mom < 0
+        prox = clamp((0 - mom) / math.max(1.0, (0 - lower)), 0.0, 1.0)
+        score += 15.0 * prox
+    if useMTF
+        score += biasUp ? 15 : 0
+    else
+        score += 7.5
+    if useVWAPGate
+        score += longVWcredit()
+    else
+        score += 10
+    // Volume contribution (bull side)
+    if useVolConf
+        // Use the same baseline ML/manual threshold
+        volBase = effectiveVolBull
+
+        if volBullConfirm
+            // Above base: give bigger bonus if it's well above
+            score += volRatio >= volBase * 1.25 ? 15 : 10
+        else
+            // You explicitly asked for volume confirmation but didn't get it → penalize
+            score -= 10
+    else
+        // No strict confirmation: use softer heuristic on raw volume
+        score += volRatio > 1.2 ? 12 : volRatio > 1.0 ? 8 : 5
+    if momAccel > 0.5
+        score += 10
+    else if momAccel > 0
+        score += 5
+    if bullDiv
+        score += 10
+    if hiddenBullDiv
+        score += 8
+    score += sigCrossUp ? 8 : 0
+    if usePriceStruct
+        score += priceLL ? 7 : 0
+    else
+        score += 3.5
+    if useGannSwing
+        score += swingUp ? 5 : 0
+    else
+        score += 2.5
+    if isConsolidating
+        score -= consolPenalty
+    score += volScoreAdjust
+    score += setupScoreAdjust
+    score += mtfConfluenceBoost
+    if useSNR and snr < effectiveSNR
+        score -= 10
+    score := math.max(0, math.min(100, score))
+    score
+
+calcBearScore() =>
+    float score = 0.0
+    if mom > 0
+        prox = clamp((mom - 0) / math.max(1.0, (upper - 0)), 0.0, 1.0)
+        score += 15.0 * prox
+    if useMTF
+        score += biasDown ? 15 : 0
+    else
+        score += 7.5
+    if useVWAPGate
+        score += shortVWcredit()
+    else
+        score += 10
+    // Volume contribution (bear side)
+    if useVolConf
+        volBase = effectiveVolBear
+
+        if volBearConfirm
+            // Confirmation can come from exhaustion (low vol) or spike (high vol)
+            // We still give extra if absolute vol is large
+            score += volRatio >= volBase * 1.25 ? 15 : 10
+        else
+            // Volume did NOT confirm the short idea
+            score -= 10
+    else
+        // Legacy heuristic when not using vol confirmation
+        score += volRatio > 1.5 ? 12 : volRatio < 0.8 ? 10 : 5
+    if momAccel < -0.5
+        score += 10
+    else if momAccel < 0
+        score += 5
+    if bearDiv
+        score += 10
+    if hiddenBearDiv
+        score += 8
+    score += not sigCrossUp ? 8 : 0
+    if usePriceStruct
+        score += priceHH ? 7 : 0
+    else
+        score += 3.5
+    if useGannSwing
+        score += swingDown ? 5 : 0
+    else
+        score += 2.5
+    if isConsolidating
+        score -= consolPenalty
+    score += volScoreAdjust
+    score -= setupScoreAdjust
+    score -= mtfConfluenceBoost
+    if useSNR and snr < effectiveSNR
+        score -= 10
+    score := math.max(0, math.min(100, score))
+    score
+
+// ══════════════════════════════════════════════════════════════════════════
+// ML DATA COLLECTION - Record every pivot for learning
+// ══════════════════════════════════════════════════════════════════════════
+
+if useMLBacklearn
+    // Collect BULL pivots
+    if foundPivotLow and not na(prPL)
+        scoreAtPivot = calcBullScore()
+        
+        array.push(mlScores, scoreAtPivot)
+        array.push(mlSNRs, snr)
+        array.push(mlVolRatios, volRatio)
+        array.push(mlATRratios, nz(atrSlow) != 0 ? atrCurrent / atrSlow : 1.0)
+        array.push(mlIsBull, true)
+        array.push(mlEntryPrices, close)
+        array.push(mlWasWin, false)
+        array.push(mlPnLs, 0.0)
+        array.push(mlPivotBars, bar_index)
+        
+        if array.size(mlScores) > mlHistoryBars
+            array.shift(mlScores)
+            array.shift(mlSNRs)
+            array.shift(mlVolRatios)
+            array.shift(mlATRratios)
+            array.shift(mlIsBull)
+            array.shift(mlEntryPrices)
+            array.shift(mlWasWin)
+            array.shift(mlPnLs)
+            array.shift(mlPivotBars)
+    
+    // Collect BEAR pivots
+    if foundPivotHigh and not na(prPH)
+        scoreAtPivot = calcBearScore()
+        
+        array.push(mlScores, scoreAtPivot)
+        array.push(mlSNRs, snr)
+        array.push(mlVolRatios, volRatio)
+        array.push(mlATRratios, nz(atrSlow) != 0 ? atrCurrent / atrSlow : 1.0)
+        array.push(mlIsBull, false)
+        array.push(mlEntryPrices, close)
+        array.push(mlWasWin, false)
+        array.push(mlPnLs, 0.0)
+        array.push(mlPivotBars, bar_index)
+        
+        if array.size(mlScores) > mlHistoryBars
+            array.shift(mlScores)
+            array.shift(mlSNRs)
+            array.shift(mlVolRatios)
+            array.shift(mlATRratios)
+            array.shift(mlIsBull)
+            array.shift(mlEntryPrices)
+            array.shift(mlWasWin)
+            array.shift(mlPnLs)
+            array.shift(mlPivotBars)
+
+// NEW: Whipsaw guard
+// (Do not redeclare lastBullPivotBar/lastBearPivotBar here — they were created earlier.)
+
+bullOK_legacy = baseBull and biasUp and swingUp and gateLong and (
+     not useWhipsaw or na(lastBearPivotBar) or bar_index - lastBearPivotBar >= effectiveWhipsaw)
+
+bearOK_legacy = baseBear and biasDown and swingDown and gateShort and (
+     not useWhipsaw or na(lastBullPivotBar) or bar_index - lastBullPivotBar >= effectiveWhipsaw)
+
+if useVolLegacy
+    bullOK_legacy := bullOK_legacy and volBullConfirm
+    bearOK_legacy := bearOK_legacy and volBearConfirm
+if useConsLegacy
+    bullOK_legacy := bullOK_legacy and not isConsolidating
+    bearOK_legacy := bearOK_legacy and not isConsolidating
+if useStructLegacy
+    bullOK_legacy := bullOK_legacy and priceLL
+    bearOK_legacy := bearOK_legacy and priceHH
+
+var float currentBullScore = 0.0
+var float currentBearScore = 0.0
+var bool  finalBullSignal  = false
+var bool  finalBearSignal  = false
+
+if useScoring
+    currentBullScore := calcBullScore()
+    currentBearScore := calcBearScore()
+    
+// ══════════════════════════════════════════════════════════════════════════
+// ML LEARNING ALGORITHM - Optimize parameters from history (last bar only)
+// ══════════════════════════════════════════════════════════════════════════
+
+f_mlLearn() =>
+    totalPivots = array.size(mlScores)
+    trainSize = int(totalPivots * 0.70)
+    valSize = totalPivots - trainSize
+    bestMinScore = float(minScore)
+    bestValWR = 0.0
+    bestValCount = 0
+    float bestTrainWR = 0.0
+    for testScore = 50 to 85 by 5
+        trainWins = 0
+        trainTotal = 0
+        for i = 0 to trainSize - 1
+            if array.get(mlScores, i) >= testScore
+                trainTotal += 1
+                if array.get(mlWasWin, i)
+                    trainWins += 1
+        valWins = 0
+        valTotal = 0
+        for i = trainSize to totalPivots - 1
+            if array.get(mlScores, i) >= testScore
+                valTotal += 1
+                if array.get(mlWasWin, i)
+                    valWins += 1
+        trainWR = trainTotal > 0 ? (float(trainWins) / float(trainTotal)) * 100.0 : 0.0
+        valWR = valTotal > 0 ? (float(valWins) / float(valTotal)) * 100.0 : 0.0
+        meetsMinSignals = valTotal >= 20
+        meetsTargetWR = valWR >= mlTargetWinRate
+        notOverfit = math.abs(trainWR - valWR) <= mlOverfitThresh
+        isBetter = valWR > bestValWR
+        if meetsMinSignals and meetsTargetWR and notOverfit and isBetter
+            bestMinScore := float(testScore)
+            bestValWR := valWR
+            bestValCount := valTotal
+            bestTrainWR := trainWR
+    bestSNR = float(snrThresh)
+    bestSNR_WR = bestValWR
+    for testSNR = 10 to 35 by 5
+        snrVal = float(testSNR) / 10.0
+        valWins = 0
+        valTotal = 0
+        for i = trainSize to totalPivots - 1
+            if array.get(mlScores, i) >= bestMinScore and array.get(mlSNRs, i) >= snrVal
+                valTotal += 1
+                if array.get(mlWasWin, i)
+                    valWins += 1
+        valWR = valTotal > 0 ? (float(valWins) / float(valTotal)) * 100.0 : 0.0
+        if valTotal >= 15 and valWR > bestSNR_WR
+            bestSNR_WR := valWR
+            bestSNR := snrVal
+    sumATR = 0.0
+    for i = trainSize to totalPivots - 1
+        sumATR += array.get(mlATRratios, i)
+    avgATR = valSize > 0 ? sumATR / float(valSize) : 1.0
+    volBullAdj = volBullThresh
+    volBearAdj = volBearExhaust
+    if avgATR > 1.2
+        volBullAdj := volBullThresh * 0.85
+        volBearAdj := volBearExhaust * 0.85
+    else if avgATR < 0.8
+        volBullAdj := volBullThresh * 1.15
+        volBearAdj := volBearExhaust * 1.15
+    whipsawAdj = float(minBarsBetween)
+    if avgATR > 1.2
+        whipsawAdj := math.min(float(minBarsBetween) * 1.5, 15.0)
+    else if avgATR < 0.8
+        whipsawAdj := math.max(float(minBarsBetween) * 0.7, 3.0)
+    finalWins = 0
+    finalTotal = 0
+    for i = trainSize to totalPivots - 1
+        passScore = array.get(mlScores, i) >= bestMinScore
+        passSNR = array.get(mlSNRs, i) >= bestSNR
+        isBullPiv = array.get(mlIsBull, i)
+        vol = array.get(mlVolRatios, i)
+        volCheck = isBullPiv ? (vol >= volBullAdj) : (vol <= volBearAdj or vol >= volBearSpike)
+        if passScore and passSNR and volCheck
+            finalTotal += 1
+            if array.get(mlWasWin, i)
+                finalWins += 1
+    finalWR = finalTotal > 0 ? (float(finalWins) / float(finalTotal)) * 100.0 : 0.0
+    validEnough = finalTotal >= 20
+    meetsTarget = finalWR >= mlTargetWinRate
+    notOverfitFinal = math.abs(bestTrainWR - finalWR) <= mlOverfitThresh
+    isValid = validEnough and meetsTarget and notOverfitFinal
+    fMinScore = isValid ? bestMinScore : float(minScore)
+    fSNR = isValid ? bestSNR : float(snrThresh)
+    fVolBull = isValid ? volBullAdj : volBullThresh
+    fVolBear = isValid ? volBearAdj : volBearExhaust
+    fWhipsaw = isValid ? whipsawAdj : float(minBarsBetween)
+    fReason = isValid ? "" : (not validEnough ? "Too few signals (" + str.tostring(finalTotal) + " < 20)" : not meetsTarget ? "Win rate below target (" + str.tostring(finalWR, "#.#") + "% < " + str.tostring(mlTargetWinRate, "#.#") + "%)" : not notOverfitFinal ? "Overfitting detected (Δ " + str.tostring(math.abs(bestTrainWR - finalWR), "#.#") + "% > " + str.tostring(mlOverfitThresh, "#.#") + "%)" : "Unknown validation failure")
+    [isValid, fMinScore, fSNR, fVolBull, fVolBear, fWhipsaw, bestTrainWR, finalWR, finalTotal, avgATR, fReason]
+
+if useMLBacklearn and barstate.islast and array.size(mlScores) >= mlMinSamples
+    [_v, _ms, _sn, _vb, _vbr, _w, _twr, _vwr, _vs, _aa, _fr] = f_mlLearn()
+    learningValid := _v
+    learnedMinScore := _ms
+    learnedSNR := _sn
+    learnedVolBull := _vb
+    learnedVolBear := _vbr
+    learnedWhipsaw := _w
+    trainingWinRate := _twr
+    validationWinRate := _vwr
+    validationSignals := _vs
+    avgATRregime := _aa
+    learningFailReason := _fr
+else if useMLBacklearn and barstate.islast
+    learningValid := false
+    learnedMinScore := float(minScore)
+    learnedSNR := float(snrThresh)
+    learnedVolBull := volBullThresh
+    learnedVolBear := volBearExhaust
+    learnedWhipsaw := float(minBarsBetween)
+    learningFailReason := "Insufficient data (" + str.tostring(array.size(mlScores)) + " < " + str.tostring(mlMinSamples) + " pivots)"
+
+// ══════════════════════════════════════════════════════════════════════════
+// FINAL SIGNAL GENERATION (Using ML-optimized parameters)
+// ══════════════════════════════════════════════════════════════════════════
+
+if useScoring
+    // Strong = final trade signal (score + SNR + whipsaw-gated pivots)
+    finalBullSignal := bullOK and snrOK and currentBullScore >= effectiveMinScore
+    finalBearSignal := bearOK and snrOK and currentBearScore >= effectiveMinScore
+else
+    // Legacy mode (no scoring)
+    finalBullSignal := bullOK_legacy
+    finalBearSignal := bearOK_legacy
+    currentBullScore := finalBullSignal ? 100 : 0
+    currentBearScore := finalBearSignal ? 100 : 0
+
+// FIX: Mutual exclusion — prevent simultaneous bull + bear signals
+if finalBullSignal and finalBearSignal
+    if currentBullScore >= currentBearScore
+        finalBearSignal := false
+    else
+        finalBullSignal := false
+
+// Whipsaw memory (both modes)
+if finalBullSignal
+    lastBullPivotBar := bar_index
+if finalBearSignal
+    lastBearPivotBar := bar_index
+
+// Categorize signal strength (respect SNR + whipsaw + score)
+weakBullSignal   = useScoring and showWeakSignals and bullOK and snrOK and
+                   currentBullScore >= 50 and currentBullScore < effectiveMinScore
+
+weakBearSignal   = useScoring and showWeakSignals and bearOK and snrOK and
+                   currentBearScore >= 50 and currentBearScore < effectiveMinScore
+
+// Strong markers = same thing as final signals in scoring mode
+strongBullSignal = useScoring and finalBullSignal
+strongBearSignal = useScoring and finalBearSignal
+
+// Apply logistic transformation if enabled (display only)
+toPct(_x) => 100.0/(1.0 + math.exp(-scoreK*(_x - 50.0)))
+if useScoring and scoreShape=="Logistic"
+    currentBullScore := toPct(currentBullScore)
+    currentBearScore := toPct(currentBearScore)
+
+// Calculate net bias for display
+netBias01 = clamp((currentBullScore - currentBearScore + 100.0) / 200.0, 0.0, 1.0)
+netBiasBar = meterFrom01(netBias01)
+netBiasColor = netBias01 > 0.6 ? color.lime : netBias01 < 0.4 ? color.red : color.yellow
+
+// FIX: Signal bar tracking — moved OUTSIDE showStats gate so tooltip timing always works
+var int lastBullSignalBar = na
+var int lastBearSignalBar = na
+
+if strongBullSignal or finalBullSignal
+    lastBullSignalBar := bar_index
+if strongBearSignal or finalBearSignal
+    lastBearSignalBar := bar_index
+
+// PERFORMANCE STATISTICS
+var array<bool> bullResults = array.new_bool(0)
+var array<bool> bearResults = array.new_bool(0)
+var array<float> bullPnL = array.new_float(0)
+var array<float> bearPnL = array.new_float(0)
+var float lastBullEntry = na
+var float lastBearEntry = na
+
+if showStats
+    if strongBullSignal or finalBullSignal
+        lastBullEntry := close
+    
+    if not na(lastBullEntry) and (strongBearSignal or (bar_index - lastBullSignalBar > 50))
+        wasProfit = close > lastBullEntry
+        array.push(bullResults, wasProfit)
+        array.push(bullPnL, close - lastBullEntry)
+        if array.size(bullResults) > trackPeriod
+            array.shift(bullResults)
+            array.shift(bullPnL)
+        lastBullEntry := na
+    
+    if strongBearSignal or finalBearSignal
+        lastBearEntry := close
+    
+    if not na(lastBearEntry) and (strongBullSignal or (bar_index - lastBearSignalBar > 50))
+        wasProfit = close < lastBearEntry
+        array.push(bearResults, wasProfit)
+        array.push(bearPnL, lastBearEntry - close)
+        if array.size(bearResults) > trackPeriod
+            array.shift(bearResults)
+            array.shift(bearPnL)
+        lastBearEntry := na
+
+f_winRate(arr) =>
+    float wr = 0.0
+    if array.size(arr) > 0
+        wins = 0
+        for i = 0 to array.size(arr) - 1
+            if array.get(arr, i)
+                wins += 1
+        wr := (float(wins) / float(array.size(arr))) * 100.0
+    wr
+
+bullWinRate = f_winRate(bullResults)
+bearWinRate = f_winRate(bearResults)
+
+avgBullPnL = array.size(bullPnL) > 0 ? arrSum(bullPnL) / array.size(bullPnL) : 0.0
+avgBearPnL = array.size(bearPnL) > 0 ? arrSum(bearPnL) / array.size(bearPnL) : 0.0
+
+// SIGNAL QUALITY HEATMAP
+var array<float> qualityHistory = array.new_float(0)
+if useScoring and showHeatmap
+    currentQuality = math.max(currentBullScore, currentBearScore)
+    array.push(qualityHistory, currentQuality)
+    if array.size(qualityHistory) > 20
+        array.shift(qualityHistory)
+
+avgQuality = array.size(qualityHistory) > 0 ? arrSum(qualityHistory)/array.size(qualityHistory) : 50.0
+
+heatmapColor = avgQuality >= 70 ? color.new(color.green, 95) :
+               avgQuality >= 50 ? color.new(color.yellow, 95) :
+               avgQuality >= 30 ? color.new(color.orange, 95) :
+               color.new(color.red, 95)
+
+bgcolor(showHeatmap ? heatmapColor : na, title="Quality Heatmap")
+
+// TOOLTIP BUILDER FUNCTIONS (marker labels)
+// ══════════════════════════════════════════════════════════════════════════
+
+f_crossStarTip(isBull) =>
+    vd = vwapReady and vwapVal!=0 ? ((close - vwapVal) / vwapVal) * 100.0 : na
+    bpStr = str.tostring(clamp(((mom - lower) / (upper - lower)) * 100, 0, 100), "#.#")
+    vStr = na(vd) ? "—" : str.tostring(vd, "#.##") + "%"
+    string t = ""
+    if isBull
+        t := "★ BULLISH MOMENTUM CROSS\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMomentum: " + str.tostring(mom, "#.##") + " crossed above Signal: " + str.tostring(signal, "#.##") + "\nGap: +" + str.tostring(mom - signal, "#.##") + "\nBand Position: " + bpStr + "%\nVWAP Δ: " + vStr + "\n\n📖 WHY THIS MATTERS:\nMomentum crossing above signal = buying pressure\nnow exceeds the smoothed average. This is the\nfundamental SHIFT in market character.\n\n🏛️ INSTITUTIONAL CONTEXT:\n" + (mom < 0 ? "Cross in NEGATIVE territory (below zero).\nThis is the HIGHEST probability long setup.\nMomentum turning bullish from oversold = early\naccumulation phase. Smart money enters HERE.\n\n✅ STRONG BUY ZONE — Full conviction" : "Cross in POSITIVE territory (above zero).\nTrend continuation signal. Momentum already\nbullish, this confirms re-acceleration.\n\n⚠️ Good but LESS powerful than negative cross\n✅ Look for pullback entry, not chase") + "\n\n🎯 ACTION ITEMS:\n✅ Prepare long entry on pullback to signal\n✅ Stop: Below the signal line or recent swing low\n✅ Target: Upper band (" + str.tostring(upper, "#.#") + ")\n⚠️ Watch for volume confirmation"
+    else
+        t := "★ BEARISH MOMENTUM CROSS\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMomentum: " + str.tostring(mom, "#.##") + " crossed below Signal: " + str.tostring(signal, "#.##") + "\nGap: " + str.tostring(mom - signal, "#.##") + "\nBand Position: " + bpStr + "%\nVWAP Δ: " + vStr + "\n\n📖 WHY THIS MATTERS:\nMomentum crossing below signal = selling pressure\nnow exceeds the smoothed average. Fundamental\nSHIFT from buying to selling dominance.\n\n🏛️ INSTITUTIONAL CONTEXT:\n" + (mom > 0 ? "Cross in POSITIVE territory (above zero).\nThis is the HIGHEST probability short setup.\nMomentum turning bearish from overbought = early\ndistribution phase. Smart money exits longs HERE.\n\n✅ STRONG SELL ZONE — Full conviction" : "Cross in NEGATIVE territory (below zero).\nTrend continuation signal. Momentum already\nbearish, this confirms re-acceleration down.\n\n⚠️ Good but LESS powerful than positive cross\n✅ Look for bounce entry to short, not chase") + "\n\n🎯 ACTION ITEMS:\n✅ Prepare short entry on bounce to signal\n✅ Stop: Above the signal line or recent swing high\n✅ Target: Lower band (" + str.tostring(lower, "#.#") + ")\n⚠️ Watch for volume confirmation"
+    t
+
+f_earlyWarnTip(isBull) =>
+    icon = isBull ? bullEarlyIcon : bearEarlyIcon
+    dir = isBull ? "BULL" : "BEAR"
+    desc = isBull ? "Momentum accelerating upward from negative zone" : "Momentum accelerating downward from positive zone"
+    interp = isBull ? "Potential bullish reversal brewing\nMomentum building from oversold\nWatch for signal cross confirmation" : "Potential bearish reversal brewing\nMomentum weakening from overbought\nWatch for signal cross confirmation"
+    act = isBull ? "Prepare for long entry\nSet alerts for signal cross\nIdentify key support levels" : "Prepare for short entry or exit longs\nSet alerts for signal cross\nIdentify key resistance levels"
+    icon + " " + dir + " EARLY WARNING\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + desc + "\n\n📊 METRICS:\nMomentum: " + str.tostring(mom, "#.##") + "\nVelocity: " + str.tostring(momVelocity, "#.##") + "\nAcceleration: " + str.tostring(momAccel, "#.##") + "\nSignal: " + str.tostring(signal, "#.##") + "\n\n🎯 INTERPRETATION:\n" + interp + "\n\n⚡ ACTION:\n" + act
+
+f_accelTip(isBull) =>
+    icon = isBull ? bullAccelIcon : bearAccelIcon
+    dir = isBull ? "BULLISH" : "BEARISH"
+    desc = isBull ? "Strong bullish momentum acceleration detected" : "Strong bearish momentum acceleration detected"
+    comp = isBull ? ">" + str.tostring(accelSensitivity * 2, "#.##") : "<" + str.tostring(-accelSensitivity * 2, "#.##")
+    risks = isBull ? "• Explosive price moves likely" : "• Explosive downside moves likely"
+    avoid = isBull ? "✓ Avoid FOMO entries" : "✓ Avoid panic selling"
+    icon + " ACCELERATION RISK (" + dir + ")\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + desc + "\n\n📊 METRICS:\nMomentum: " + str.tostring(mom, "#.##") + "\nVelocity: " + str.tostring(momVelocity, "#.##") + "\nAcceleration: " + str.tostring(momAccel, "#.##") + " (" + comp + ")\nVolume Ratio: " + str.tostring(volRatio, "#.##") + "x\n\n⚠️ RISK FACTORS:\n" + risks + "\n• Increased slippage potential\n• Gap risk elevated\n• Volatility expanding rapidly\n\n🎯 RISK MANAGEMENT:\n✓ Scale position size (50-75%)\n✓ Widen stops (1.5-2x normal)\n✓ Take partial profits quickly\n✓ Trail stops aggressively\n" + avoid
+
+f_decelTip(isBull) =>
+    icon = isBull ? bullDecelIcon : bearDecelIcon
+    dir = isBull ? "BULLISH" : "BEARISH"
+    desc = isBull ? "Bullish momentum weakening - trend deceleration detected" : "Bearish momentum weakening - trend deceleration detected"
+    posNote = isBull ? " (still positive)" : " (still negative)"
+    accelNote = isBull ? " (strong negative)" : " (strong positive)"
+    bandNote = isBull ? "Upper Band: " + str.tostring(upper, "#.##") : "Lower Band: " + str.tostring(lower, "#.##")
+    crossNote = isBull ? "✓ Watch for bear cross" : "✓ Watch for bull cross"
+    icon + " DECELERATION RISK (" + dir + " TREND)\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + desc + "\n\n📊 METRICS:\nMomentum: " + str.tostring(mom, "#.##") + posNote + "\nVelocity: " + str.tostring(momVelocity, "#.##") + "\nAcceleration: " + str.tostring(momAccel, "#.##") + accelNote + "\n" + bandNote + "\n\n⚠️ WARNING SIGNS:\n• Momentum rolling over\n• " + (isBull ? "Buying" : "Selling") + " pressure fading\n• Potential exhaustion\n• Reversal or consolidation likely\n\n🎯 DEFENSIVE ACTIONS:\n✓ Tighten stops immediately\n✓ Take partial profits (30-50%)\n✓ Move stops to breakeven\n✓ Prepare for exit signal\n✓ Don't add to positions\n" + crossNote
+
+f_extremeDotTip(isAbove) =>
+    if isAbove
+        overshootPct = ((mom - upper) / upper * 100.0)
+        "● OVERBOUGHT EXTREME — DISTRIBUTION ZONE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMomentum: " + str.tostring(mom, "#.##") + " | Upper Band: " + str.tostring(upper, "#.##") + "\nOvershoot: +" + str.tostring(overshootPct, "#.#") + "% beyond band\nVelocity: " + str.tostring(momVelocity, "#.##") + " | Accel: " + str.tostring(momAccel, "#.##") + "\n\n🏛️ WHAT INSTITUTIONS SEE:\nMomentum has broken ABOVE the dynamic upper band.\nThis is the zone where smart money DISTRIBUTES\n(sells into strength). Retail is chasing.\n\n" + (overshootPct > 10 ? "🔴 EXTREME OVERSHOOT (>" + str.tostring(overshootPct, "#.#") + "%)\nThis is parabolic territory. The rubber band\nis stretched far — snapback risk is VERY HIGH.\nDO NOT initiate new longs here." : overshootPct > 5 ? "🟡 SIGNIFICANT OVERSHOOT\nMomentum extended well beyond normal.\nTrail existing longs tightly.\nPrepare for reversal setup." : "⚠️ INITIAL BREACH\nMomentum just broke above band.\nCould extend further or reverse.\nWatch velocity for clues.") + "\n\n📖 THE INSTITUTIONAL PLAYBOOK:\n• This is where MMs sell into retail FOMO\n• Parabolic moves END here, they don't start\n• The BEST short setups form in this zone\n• Wait for deceleration + bearish divergence\n\n🎯 RIGHT NOW:\n" + (momAccel < 0 ? "⚡ DECELERATION detected — reversal forming\n✅ Watch for signal cross below\n✅ Prepare short entry plan" : "⏳ Still accelerating — don't fight it yet\n⚠️ Wait for momentum to DECELERATE\n⚠️ Premature shorts get destroyed here")
+    else
+        undershootPct = ((lower - mom) / math.abs(lower) * 100.0)
+        "● OVERSOLD EXTREME — ACCUMULATION ZONE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMomentum: " + str.tostring(mom, "#.##") + " | Lower Band: " + str.tostring(lower, "#.##") + "\nUndershoot: -" + str.tostring(undershootPct, "#.#") + "% beyond band\nVelocity: " + str.tostring(momVelocity, "#.##") + " | Accel: " + str.tostring(momAccel, "#.##") + "\n\n🏛️ WHAT INSTITUTIONS SEE:\nMomentum has broken BELOW the dynamic lower band.\nThis is the zone where smart money ACCUMULATES\n(buys the fear). Retail is panic selling.\n\n" + (undershootPct > 10 ? "🔴 EXTREME UNDERSHOOT (>" + str.tostring(undershootPct, "#.#") + "%)\nCapitulation territory. The rubber band\nis stretched far down — bounce risk is VERY HIGH.\nDO NOT initiate new shorts here." : undershootPct > 5 ? "🟡 SIGNIFICANT UNDERSHOOT\nMomentum extended well below normal.\nTrail existing shorts tightly.\nPrepare for reversal setup." : "⚠️ INITIAL BREACH\nMomentum just broke below band.\nCould extend further or reverse.\nWatch velocity for clues.") + "\n\n📖 THE INSTITUTIONAL PLAYBOOK:\n• This is where MMs buy retail panic\n• Capitulation moves END here, they don't start\n• The BEST long setups form in this zone\n• Wait for deceleration + bullish divergence\n\n🎯 RIGHT NOW:\n" + (momAccel > 0 ? "⚡ DECELERATION detected — reversal forming\n✅ Watch for signal cross above\n✅ Prepare long entry plan" : "⏳ Still accelerating down — don't catch knives\n⚠️ Wait for momentum to DECELERATE\n⚠️ Premature longs get destroyed here")
+
+f_divTip(isBull, isHidden) =>
+    if isBull and not isHidden
+        "◆ BULLISH DIVERGENCE — SMART MONEY ACCUMULATION\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nPrice: Lower Low (" + str.tostring(pivotLowPrice2, "#.##") + " → " + str.tostring(pivotLowPrice1, "#.##") + ")\nOsc:   Higher Low (" + str.tostring(pivotLowOsc2, "#.##") + " → " + str.tostring(pivotLowOsc1, "#.##") + ")\nSpan: " + str.tostring(lowPivotDistance) + " bars between pivots\n\n📖 WHAT THIS MEANS:\nPrice made a NEW LOW but momentum DID NOT.\nSelling pressure is WEAKENING even as price drops.\nThis is the footprint of institutional accumulation —\nsmart money buying while retail panic sells.\n\n🏛️ WHY INSTITUTIONS CARE:\n• Retail sees lower price = more bearish\n• Smart money sees weaker momentum = sellers exhausted\n• The divergence reveals the HIDDEN demand\n• This is how bottoms form — silently, while everyone\n  is focused on the lower price\n\n⚡ PROBABILITY:\nBullish divergence is one of the HIGHEST probability\nreversal patterns when confirmed. Confirmation =\nmomentum crossing above signal line.\n\n🎯 TRADE PLAN:\n✅ Wait for signal cross ABOVE for entry\n✅ Stop: Below the lower pivot low (" + str.tostring(pivotLowPrice1, "#.##") + ")\n✅ Target 1: Prior swing high\n✅ Target 2: Upper band\n⚠️ Divergence can EXTEND — don't front-run\n⚠️ Volume confirmation strengthens the signal"
+    else if not isBull and not isHidden
+        "◆ BEARISH DIVERGENCE — SMART MONEY DISTRIBUTION\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nPrice: Higher High (" + str.tostring(pivotHighPrice2, "#.##") + " → " + str.tostring(pivotHighPrice1, "#.##") + ")\nOsc:   Lower High (" + str.tostring(pivotHighOsc2, "#.##") + " → " + str.tostring(pivotHighOsc1, "#.##") + ")\nSpan: " + str.tostring(highPivotDistance) + " bars between pivots\n\n📖 WHAT THIS MEANS:\nPrice made a NEW HIGH but momentum DID NOT.\nBuying pressure is WEAKENING even as price rises.\nThis is the footprint of institutional distribution —\nsmart money selling while retail chases the breakout.\n\n🏛️ WHY INSTITUTIONS CARE:\n• Retail sees higher price = more bullish\n• Smart money sees weaker momentum = buyers exhausted\n• The divergence reveals the HIDDEN supply\n• This is how tops form — while everyone is\n  celebrating the new high\n\n⚡ PROBABILITY:\nBearish divergence is one of the HIGHEST probability\nreversal patterns when confirmed. Confirmation =\nmomentum crossing below signal line.\n\n🎯 TRADE PLAN:\n✅ Wait for signal cross BELOW for entry\n✅ Stop: Above the upper pivot high (" + str.tostring(pivotHighPrice1, "#.##") + ")\n✅ Target 1: Prior swing low\n✅ Target 2: Lower band\n⚠️ Divergence can EXTEND — don't front-run\n⚠️ Volume confirmation strengthens the signal"
+    else if isBull and isHidden
+        "◇ HIDDEN BULLISH DIVERGENCE — TREND CONTINUATION\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nPrice: Higher Low (" + str.tostring(pivotLowPrice2, "#.##") + " → " + str.tostring(pivotLowPrice1, "#.##") + ")\nOsc:   Lower Low (" + str.tostring(pivotLowOsc2, "#.##") + " → " + str.tostring(pivotLowOsc1, "#.##") + ")\n\n📖 WHAT THIS MEANS:\nPrice held a HIGHER LOW but oscillator made a LOWER LOW.\nThe oscillator is 'resetting' while price maintains\nits bullish structure. This is a HIDDEN signal that\nthe uptrend still has fuel.\n\n🏛️ INSTITUTIONAL PERSPECTIVE:\nHidden divergence = the TREND is your friend.\n• The pullback shook out weak hands\n• Oscillator 'reloaded' from oversold\n• Price structure remained bullish (higher lows)\n• Smart money used the dip to ADD to positions\n\nThis is LESS common than regular divergence but\nOFTEN more powerful because it signals trend\ncontinuation rather than reversal.\n\n🎯 TRADE PLAN:\n✅ BUY the dip — trend is intact\n✅ Stop: Below the higher low\n✅ Target: New highs above prior swing\n✅ This is a trend-following setup, not reversal\n⚠️ Works best when HTF bias confirms bullish"
+    else
+        "◇ HIDDEN BEARISH DIVERGENCE — TREND CONTINUATION\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nPrice: Lower High (" + str.tostring(pivotHighPrice2, "#.##") + " → " + str.tostring(pivotHighPrice1, "#.##") + ")\nOsc:   Higher High (" + str.tostring(pivotHighOsc2, "#.##") + " → " + str.tostring(pivotHighOsc1, "#.##") + ")\n\n📖 WHAT THIS MEANS:\nPrice held a LOWER HIGH but oscillator made a HIGHER HIGH.\nThe oscillator bounced but price couldn't clear resistance.\nThis is a HIDDEN signal that the downtrend still has fuel.\n\n🏛️ INSTITUTIONAL PERSPECTIVE:\nHidden divergence = the TREND is your friend.\n• The bounce trapped eager longs\n• Oscillator 'reset' from overbought\n• Price structure remained bearish (lower highs)\n• Smart money used the bounce to ADD shorts\n\nThis is LESS common than regular divergence but\nOFTEN more powerful because it signals trend\ncontinuation rather than reversal.\n\n🎯 TRADE PLAN:\n✅ SELL the rip — trend is intact\n✅ Stop: Above the lower high\n✅ Target: New lows below prior swing\n✅ This is a trend-following setup, not reversal\n⚠️ Works best when HTF bias confirms bearish"
+// PLOTTING — BANDS & MOMENTUM
+pUpper = plot(upper, "Upper", color=colBand, linewidth=bandWidth)
+pLower = plot(lower, "Lower", color=colBand, linewidth=bandWidth)
+fill(pUpper, pLower, color = fillBands ? bandFillColor : na)
+
+tol      = (edgeTolPct / 100.0) * upper
+isAbove  = (edgeDetect == "Strict (>/<)") ? (mom > upper + tol) : (mom >= upper - tol)
+isBelow  = (edgeDetect == "Strict (>/<)") ? (mom < lower - tol) : (mom <= lower + tol)
+
+calcGradientIntensity() =>
+    if not useGradient
+        0
+    else
+        positionScore = (math.abs(mom) / upper) * 40
+        qualityScore = useScoring ? (math.max(currentBullScore, currentBearScore) * 0.35) : 20
+        alignmentScore = math.abs(mom - signal) < upper * 0.2 ? 15 : 0
+        accelBonus = (mom > 0 and momAccel > 0) or (mom < 0 and momAccel < 0) ? 10 : -10
+        
+        totalIntensity = positionScore + qualityScore + alignmentScore + accelBonus
+        transparency = 100 - clamp(totalIntensity, 10, 100) * gradientIntensity
+        int(clamp(transparency, 0, 90))
+
+gradientAlpha   = calcGradientIntensity()
+colMomOB_grad   = color.new(colMomOB, gradientAlpha)
+colMomOS_grad   = color.new(colMomOS, gradientAlpha)
+colMomPos_grad  = color.new(colMomPos, gradientAlpha)
+colMomNeg_grad  = color.new(colMomNeg, gradientAlpha)
+colMom          = mom > upper ? colMomOB_grad : mom < lower ? colMomOS_grad : mom >= 0 ? colMomPos_grad : colMomNeg_grad
+
+pMom   = plot(mom, "Momentum", color=colMom, linewidth=momWidth)
+showThickLine = (extremeDisplay == "Thicken Line" or extremeDisplay == "Both")
+plot(showThickLine and bandReady and (isAbove or isBelow) ? mom : na, "Momentum (thick overlay)", color=colMom, linewidth=momThickWidth)
+
+showDots = (extremeDisplay == "Dots" or extremeDisplay == "Both")
+if showDots and bandReady and isAbove and (bar_index % extremeDotFreq == 0)
+    mkLabel(bar_index, mom, "●", colEdgeAbove, color.new(color.black,100), label.style_none, size.tiny, xloc.bar_index, yloc.price, f_extremeDotTip(true))
+    
+if showDots and bandReady and isBelow and (bar_index % extremeDotFreq == 0)
+    mkLabel(bar_index, mom, "●", colEdgeBelow, color.new(color.black,100), label.style_none, size.tiny, xloc.bar_index, yloc.price, f_extremeDotTip(false))
+
+edgeAbove = bandReady and isAbove ? mom : na
+edgeBelow = bandReady and isBelow ? mom : na
+pAbove = plot(showExtremeEdges ? edgeAbove : na, title="Momentum Above", color=colEdgeAbove, linewidth=edgeWidth)
+pBelow = plot(showExtremeEdges ? edgeBelow : na, title="Momentum Below", color=colEdgeBelow, linewidth=edgeWidth)
+fill(pAbove, pUpper, color = (fillExtremes and bandReady) ? extBullFill : na)
+fill(pBelow, pLower, color = (fillExtremes and bandReady) ? extBearFill : na)
+
+hline(0, "Zero", color=color.new(color.gray,70))
+
+// Velocity Line (normalized momentum rate of change)
+plot(velocityPlot, "Momentum Velocity", color=velocityColor, linewidth=1)
+
+bullCross = ta.crossover(mom, signal)
+bearCross = ta.crossunder(mom, signal)
+
+var bool lastCrossUp = false
+var bool lastCrossDn = false
+if bullCross
+    lastCrossUp := true
+    lastCrossDn := false
+if bearCross
+    lastCrossDn := true
+    lastCrossUp := false
+
+signalDisplay = showSignal ? signal : na
+pSig = plot(signalDisplay, "Signal", color=colSignal, linewidth=sigWidth)
+
+fill(pMom, pSig, color = fillSigMom ? (mom >= signal ? fillSigMomAbove : fillSigMomBelow) : na)
+setupColor = setupBull ? setupBullColor : setupBear ? setupBearColor : na
+
+bgcolor(setupColor, title="High-Probability Setup Zone")
+
+// ══════════════════════════════════════════════════════════════════════════
+
+// CROSS STARS
+starTxt   = "★"
+starSz    = crossStarSize == "Tiny" ? size.tiny : crossStarSize == "Small" ? size.small : size.normal
+if showCrossStars and bullCross
+    mkLabelFX(bar_index, mom, starTxt, crossBullCol, color.new(color.black, 100), label.style_none, starSz, xloc.bar_index, yloc.price, f_crossStarTip(true))
+if showCrossStars and bearCross
+    mkLabelFX(bar_index, mom, starTxt, crossBearCol, color.new(color.black, 100), label.style_none, starSz, xloc.bar_index, yloc.price, f_crossStarTip(false))
+// EARLY WARNING MARKERS
+if useAccel and showAccelWarn and bullEarlyWarning
+    mkLabelFX(bar_index, mom, bullEarlyIcon, color.new(color.lime, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_earlyWarnTip(true))
+if useAccel and showAccelWarn and bearEarlyWarning
+    mkLabelFX(bar_index, mom, bearEarlyIcon, color.new(color.red, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_earlyWarnTip(false))
+
+// ACCELERATION RISK MARKERS (ENHANCED TOOLTIPS)
+var int lastAccelWarnBar = na
+showAccelRisk = useAccel and showAccelWarn
+
+strongBullAccel = momAccel > accelSensitivity * 2 and mom > 0 and (na(lastAccelWarnBar) or (bar_index - lastAccelWarnBar) >= accelRiskCooldown)
+strongBearAccel = momAccel < -accelSensitivity * 2 and mom < 0 and (na(lastAccelWarnBar) or (bar_index - lastAccelWarnBar) >= accelRiskCooldown)
+
+strongBullDecel = momAccel < -accelSensitivity * 2 and mom > 0 and not momInOB and (na(lastAccelWarnBar) or (bar_index - lastAccelWarnBar) >= accelRiskCooldown)
+strongBearDecel = momAccel > accelSensitivity * 2 and mom < 0 and not momInOS and (na(lastAccelWarnBar) or (bar_index - lastAccelWarnBar) >= accelRiskCooldown)
+
+if showAccelRisk and strongBullAccel
+    mkLabelFX(bar_index, mom, bullAccelIcon, color.new(color.yellow, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_accelTip(true))
+    lastAccelWarnBar := bar_index
+    
+if showAccelRisk and strongBearAccel
+    mkLabelFX(bar_index, mom, bearAccelIcon, color.new(color.orange, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_accelTip(false))
+    lastAccelWarnBar := bar_index
+
+if showAccelRisk and strongBullDecel
+    mkLabelFX(bar_index, mom, bullDecelIcon, color.new(color.fuchsia, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_decelTip(true))
+    lastAccelWarnBar := bar_index
+    
+if showAccelRisk and strongBearDecel
+    mkLabelFX(bar_index, mom, bearDecelIcon, color.new(color.blue, 0), color.new(color.black, 100), label.style_none, size.small, xloc.bar_index, yloc.price, f_decelTip(false))
+    lastAccelWarnBar := bar_index
+
+// MAIN PIVOT ICONS
+bullIcon = signalStyle == "Stars" ? "★" : signalStyle == "Arrows" ? "▲" : signalStyle == "Triangles" ? "▲" : "●"
+bearIcon = signalStyle == "Stars" ? "★" : signalStyle == "Arrows" ? "▼" : signalStyle == "Triangles" ? "▼" : "●"
+sigSz  = signalSize == "Tiny" ? size.tiny : signalSize == "Small" ? size.small : signalSize == "Normal" ? size.normal : signalSize == "Large" ? size.large : size.huge
+sigBgCol = color.new(color.black, signalBgAlpha)
+
+vwapDistNow   = vwapReady and vwapVal!=0 ? (close - vwapVal) : na
+vwapDistNowPc = vwapReady and vwapVal!=0 ? (vwapDistNow / vwapVal)*100.0 : na
+
+if (strongBullSignal or (not useScoring and finalBullSignal)) and foundPivotLow
+    bullTip = "🟢 STRONG BULLISH PIVOT SIGNAL\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nScore: " + str.tostring(math.round(currentBullScore)) + "/100 | Momentum: " + str.tostring(oscPL, "#.##") + "\nLower Band: " + str.tostring(lower, "#.##") + "\nVWAP Δ: " + (na(vwapDistNowPc) ? "—" : str.tostring(vwapDistNowPc, "#.##") + "%") + "\n\n✅ ENTRY CONDITIONS MET:\n  • Oscillator pivot in oversold zone\n  • " + (gateLong ? "✓ VWAP gate aligned" : "✗ VWAP misaligned") + "\n  • " + (biasUp ? "✓ HTF bias bullish" : "○ HTF neutral/bearish") + "\n  • Volume: " + str.tostring(volRatio, "#.##") + "x avg\n  • " + (bullDiv ? "💎 Bullish divergence active" : "") + (hiddenBullDiv ? "\n  • 💎 Hidden bullish divergence" : "") + (useSNR ? "\n  • SNR: " + str.tostring(snr, "#.##") : "") + "\n\n🎯 ACTION: Consider long entries\n⚠️  Stop: Below recent swing low"
+    bullTip += "\n\nBreakdown:\n" +
+          "MTF: " + (useMTF ? (biasUp ? "+15" : "0") : "+7.5") + "\n" +
+          "VWAP: " + (useVWAPGate ? (gateLong ? "+20" : "0") : "+10") + "\n" +
+          "Vol: " + (useVolConf ? (volBullConfirm ? "+10" : "0") : (volRatio>1.2?"+12":volRatio>1.0?"+8":"+5")) + "\n" +
+          "Accel: " + (momAccel>0.5?"+10":momAccel>0?"+5":"+0") + (bullDiv? "\nDiv: +10" : "") + (hiddenBullDiv ? "\nHidDiv: +8" : "") + (isConsolidating? "\nConsol: -" + str.tostring(consolPenalty) : "")
+    if showAwareness
+        gannBars = not na(lastBullSignalBar) ? (bar_index - lastBullSignalBar) : na
+        gannNote = na(gannBars) ? "" : ("GannBars: " + str.tostring(gannBars))
+        so9Target = not na(pivotHighPrice1) and not na(pivotLowPrice1) ? (pivotLowPrice1 + (pivotHighPrice1 - pivotLowPrice1)*0.786) : na
+        so9Note   = na(so9Target) ? "" : ("So9: " + str.tostring(so9Target, "#.##"))
+        avwapNote = "AVWAP: " + str.tostring(vwapVal, "#.##")
+        bullTip += (gannNote==""?"":"\n"+gannNote) + (so9Note==""?"":"\n"+so9Note) + ("\n"+avwapNote)
+    mkLabel(bar_index - pivotLen, oscPL, bullIcon, color.new(bullSignalColor, 0), sigBgCol, label.style_none, sigSz, xloc.bar_index, yloc.price, bullTip)
+    
+if (strongBearSignal or (not useScoring and finalBearSignal)) and foundPivotHigh
+    bearTip = "🔴 STRONG BEARISH PIVOT SIGNAL\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nScore: " + str.tostring(math.round(currentBearScore)) + "/100 | Momentum: " + str.tostring(oscPH, "#.##") + "\nUpper Band: " + str.tostring(upper, "#.##") + "\nVWAP Δ: " + (na(vwapDistNowPc) ? "—" : str.tostring(vwapDistNowPc, "#.##") + "%") + "\n\n✅ ENTRY CONDITIONS MET:\n  • Oscillator pivot in overbought zone\n  • " + (gateShort ? "✓ VWAP gate aligned" : "✗ VWAP misaligned") + "\n  • " + (biasDown ? "✓ HTF bias bearish" : "○ HTF neutral/bullish") + "\n  • Volume: " + str.tostring(volRatio, "#.##") + "x avg\n  • " + (bearDiv ? "💎 Bearish divergence active" : "") + (hiddenBearDiv ? "\n  • 💎 Hidden bearish divergence" : "") + (useSNR ? "\n  • SNR: " + str.tostring(snr, "#.##") : "") + "\n\n🎯 ACTION: Consider short entries\n⚠️  Stop: Above recent swing high"
+    bearTip += "\n\nBreakdown:\n" +
+          "MTF: " + (useMTF ? (biasDown ? "+15" : "0") : "+7.5") + "\n" +
+          "VWAP: " + (useVWAPGate ? (gateShort ? "+20" : "0") : "+10") + "\n" +
+          "Vol: " + (useVolConf ? (volBearConfirm ? "+10" : "0") : (volRatio>1.5?"+12":volRatio<0.8?"+10":"+5")) + "\n" +
+          "Accel: " + (momAccel<-0.5?"+10":momAccel<0?"+5":"+0") + (bearDiv? "\nDiv: +10" : "") + (hiddenBearDiv ? "\nHidDiv: +8" : "") + (isConsolidating? "\nConsol: -" + str.tostring(consolPenalty) : "")
+    if showAwareness
+        gannBarsB = not na(lastBearSignalBar) ? (bar_index - lastBearSignalBar) : na
+        gannNoteB = na(gannBarsB) ? "" : ("GannBars: " + str.tostring(gannBarsB))
+        so9TargetB = not na(pivotHighPrice1) and not na(pivotLowPrice1) ? (pivotLowPrice1 + (pivotHighPrice1 - pivotLowPrice1)*0.786) : na
+        so9NoteB   = na(so9TargetB) ? "" : ("So9: " + str.tostring(so9TargetB, "#.##"))
+        avwapNoteB = "AVWAP: " + str.tostring(vwapVal, "#.##")
+        bearTip += (gannNoteB==""?"":"\n"+gannNoteB) + (so9NoteB==""?"":"\n"+so9NoteB) + ("\n"+avwapNoteB)
+    mkLabel(bar_index - pivotLen, oscPH, bearIcon, color.new(bearSignalColor, 0), sigBgCol, label.style_none, sigSz, xloc.bar_index, yloc.price, bearTip)
+
+if weakBullSignal and foundPivotLow
+    weakBullTip = "▲ WEAK BULLISH PIVOT — CONDITIONAL SETUP\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nScore: " + str.tostring(math.round(currentBullScore)) + "/100 (below " + str.tostring(minScore) + " threshold)\nMomentum: " + str.tostring(oscPL, "#.##") + "\nVWAP Δ: " + (na(vwapDistNowPc) ? "—" : str.tostring(vwapDistNowPc, "#.##") + "%") + "\n\n📖 WHAT THIS MEANS:\nA bullish pivot was detected and SOME conditions\nare met, but the setup lacks full confirmation.\nThe score is in the 50-69 range — tradeable but\nnot ideal.\n\n⚠️ WHAT'S MISSING:\nOne or more key factors are working against:\n• VWAP gate may not be aligned\n• HTF bias may be neutral/bearish\n• Volume confirmation may be absent\n• Band position may not be extreme enough\n• SNR may be below threshold\n\n🏛️ INSTITUTIONAL APPROACH:\nWeak signals are SCOUT positions, not full entries.\n\n🎯 IF YOU TRADE THIS:\n✅ Reduce size to 25-50% of normal\n✅ Tighter stop (below signal line)\n✅ Faster profit-taking (don't hold for full target)\n✅ Upgrade to full size ONLY if score improves\n\n🎯 IF YOU SKIP THIS:\n✅ Also valid — waiting for A+ setups preserves capital\n✅ Mark this level and re-evaluate in 2-3 bars"
+    mkLabel(bar_index - pivotLen, oscPL, bullIcon, color.new(bullSignalColor, weakSignalAlpha), sigBgCol, label.style_none, sigSz, xloc.bar_index, yloc.price, weakBullTip)
+    
+if weakBearSignal and foundPivotHigh
+    weakBearTip = "▼ WEAK BEARISH PIVOT — CONDITIONAL SETUP\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nScore: " + str.tostring(math.round(currentBearScore)) + "/100 (below " + str.tostring(minScore) + " threshold)\nMomentum: " + str.tostring(oscPH, "#.##") + "\nVWAP Δ: " + (na(vwapDistNowPc) ? "—" : str.tostring(vwapDistNowPc, "#.##") + "%") + "\n\n📖 WHAT THIS MEANS:\nA bearish pivot was detected and SOME conditions\nare met, but the setup lacks full confirmation.\nThe score is in the 50-69 range — tradeable but\nnot ideal.\n\n⚠️ WHAT'S MISSING:\nOne or more key factors are working against:\n• VWAP gate may not be aligned\n• HTF bias may be neutral/bullish\n• Volume confirmation may be absent\n• Band position may not be extreme enough\n• SNR may be below threshold\n\n🏛️ INSTITUTIONAL APPROACH:\nWeak signals are SCOUT positions, not full entries.\n\n🎯 IF YOU TRADE THIS:\n✅ Reduce size to 25-50% of normal\n✅ Tighter stop (above signal line)\n✅ Faster profit-taking (don't hold for full target)\n✅ Upgrade to full size ONLY if score improves\n\n🎯 IF YOU SKIP THIS:\n✅ Also valid — waiting for A+ setups preserves capital\n✅ Mark this level and re-evaluate in 2-3 bars"
+    mkLabel(bar_index - pivotLen, oscPH, bearIcon, color.new(bearSignalColor, weakSignalAlpha), sigBgCol, label.style_none, sigSz, xloc.bar_index, yloc.price, weakBearTip)
+
+// ══════════════════════════════════════════════════════════════════════════
+// SECTION B: DIVERGENCE DRAWING (replaces ~lines 1710-1810)
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────
+// DRAW MARKERS
+// ─────────────────────────────────────────────────────────────────────────
+if showDiv and showDivMarkers and bullDiv
+    mkLabelFX(pivotLowBar1, pivotLowOsc1, "◆", colDivBull, color.new(color.black,100), label.style_none, size.small, xloc.bar_index, yloc.price, f_divTip(true, false))
+
+if showDiv and showDivMarkers and bearDiv
+    mkLabelFX(pivotHighBar1, pivotHighOsc1, "◆", colDivBear, color.new(color.black,100), label.style_none, size.small, xloc.bar_index, yloc.price, f_divTip(false, false))
+
+if showDiv and showDivMarkers and hiddenBullDiv
+    mkLabelFX(pivotLowBar1, pivotLowOsc1, "◇", colDivBull, color.new(color.black,100), label.style_none, size.small, xloc.bar_index, yloc.price, f_divTip(true, true))
+
+if showDiv and showDivMarkers and hiddenBearDiv
+    mkLabelFX(pivotHighBar1, pivotHighOsc1, "◇", colDivBear, color.new(color.black,100), label.style_none, size.small, xloc.bar_index, yloc.price, f_divTip(false, true))
+
+// ─────────────────────────────────────────────────────────────────────────
+// DRAW OSCILLATOR LINES
+// ─────────────────────────────────────────────────────────────────────────
+var array<line> divLines = array.new_line(0)
+
+addDivLine(x1, y1, x2, y2, col, wid, sty) =>
+    ln = line.new(x1, y1, x2, y2, color=col, width=wid, style=sty)
+    array.push(divLines, ln)
+    if array.size(divLines) > divLineCap
+        line.delete(array.shift(divLines))
+
+if showDiv and showOscDivLines and bullDiv
+    addDivLine(pivotLowBar2, pivotLowOsc2, pivotLowBar1, pivotLowOsc1, color.new(colDivBull, divAlphaOsc), divWidthOsc, line.style_solid)
+
+if showDiv and showOscDivLines and bearDiv
+    addDivLine(pivotHighBar2, pivotHighOsc2, pivotHighBar1, pivotHighOsc1, color.new(colDivBear, divAlphaOsc), divWidthOsc, line.style_solid)
+
+if showDiv and showOscDivLines and hiddenBullDiv
+    addDivLine(pivotLowBar2, pivotLowOsc2, pivotLowBar1, pivotLowOsc1, color.new(colDivBull, divAlphaOsc), divWidthOsc, line.style_dotted)
+
+if showDiv and showOscDivLines and hiddenBearDiv
+    addDivLine(pivotHighBar2, pivotHighOsc2, pivotHighBar1, pivotHighOsc1, color.new(colDivBear, divAlphaOsc), divWidthOsc, line.style_dotted)
+
+// ─────────────────────────────────────────────────────────────────────────
+// DRAW PRICE LINES (mapped to oscillator scale)
+// ─────────────────────────────────────────────────────────────────────────
+priceLow1_mapped = priceToOsc(pivotLowPrice1)
+priceLow2_mapped = priceToOsc(pivotLowPrice2)
+priceHigh1_mapped = priceToOsc(pivotHighPrice1)
+priceHigh2_mapped = priceToOsc(pivotHighPrice2)
+
+if showDiv and showPriceDivLines and bullDiv and not na(priceLow1_mapped) and not na(priceLow2_mapped)
+    addDivLine(pivotLowBar2, priceLow2_mapped, pivotLowBar1, priceLow1_mapped, color.new(colDivBullPrice, divAlphaPrice), divWidthPrice, line.style_solid)
+
+if showDiv and showPriceDivLines and bearDiv and not na(priceHigh1_mapped) and not na(priceHigh2_mapped)
+    addDivLine(pivotHighBar2, priceHigh2_mapped, pivotHighBar1, priceHigh1_mapped, color.new(colDivBearPrice, divAlphaPrice), divWidthPrice, line.style_solid)
+
+if showDiv and showPriceDivLines and hiddenBullDiv and not na(priceLow1_mapped) and not na(priceLow2_mapped)
+    addDivLine(pivotLowBar2, priceLow2_mapped, pivotLowBar1, priceLow1_mapped, color.new(colDivBullPrice, divAlphaPrice), divWidthPrice, line.style_dotted)
+
+if showDiv and showPriceDivLines and hiddenBearDiv and not na(priceHigh1_mapped) and not na(priceHigh2_mapped)
+    addDivLine(pivotHighBar2, priceHigh2_mapped, pivotHighBar1, priceHigh1_mapped, color.new(colDivBearPrice, divAlphaPrice), divWidthPrice, line.style_dotted)
+
+// VWAP VISUALS (SIMPLIFIED)
+float normBandHst = upper * histScalePct
+rawNS       = (thAbs > 0 and vwapReady) ? (slopeMetric / thAbs) : na
+
+float normSlope = na
+if not na(rawNS)
+    float clip = normLimit
+    if normMode == "Hard (Clamp)"
+        normSlope := clamp(rawNS, -clip, clip)
+    else
+        a = math.abs(rawNS)
+        if a <= 1.0
+            normSlope := rawNS
+        else
+            over   = a - 1.0
+            denom  = math.log(1.0 + (clip - 1.0))
+            comp   = denom != 0 ? (math.log(1.0 + over) / denom) : 1.0
+            fmag   = 1.0 + comp * (clip - 1.0)
+            normSlope := (rawNS >= 0 ? 1.0 : -1.0) * fmag
+
+plot(showVWAPHisto and not na(normSlope) ? normSlope * normBandHst : na, title="VWAP Slope Histogram", style=plot.style_columns, color=(nz(normSlope) >= 0 ? histPosColor : histNegColor), linewidth=histWidth)
+
+float normBandH = upper * 1.0
+thrTop  = (showVWThresh and not na(normSlope)) ? +1.0 * normBandH : na
+thrBot  = (showVWThresh and not na(normSlope)) ? -1.0 * normBandH : na
+pThrTop = plot(thrTop, "VWAP +Threshold", color=vwThreshColor, linewidth=vwThreshWidth)
+pThrBot = plot(thrBot, "VWAP -Threshold", color=vwThreshColor, linewidth=vwThreshWidth)
+fill(pThrTop, pThrBot, color = (showVWThresh and vwThreshFill and not na(normSlope)) ? color.new(vwThreshColor, vwThreshAlpha) : na)
+
+// SESSION-OPEN LINE
+var float sessOpenVal = na
+var int   sessStartBar = na
+var line  sessLine = na
+
+inSess  = false
+newSess = false
+
+if useRTH
+    inSess  := not na(time(timeframe.period, rthSession, "America/New_York"))
+    newSess := na(time(timeframe.period, rthSession, "America/New_York")[1]) and inSess
+else
+    inETH    = not na(time(timeframe.period, ethSession, "America/New_York"))
+    wasInETH = not na(time(timeframe.period, ethSession, "America/New_York")[1])
+    newSess := not wasInETH and inETH
+    inSess  := inETH
+
+if newSess
+    sessOpenVal  := mom
+    sessStartBar := bar_index
+
+if showSessLine and not na(sessOpenVal)
+    _style  = sessLineStyle == "Solid" ? line.style_solid : sessLineStyle == "Dashed" ? line.style_dashed : line.style_dotted
+    _extend = sessShortForm ? extend.right : (sessExtendRight ? extend.right : extend.none)
+    x1 = sessShortForm ? (bar_index - math.max(1, sessShortBars)) : sessStartBar
+    if na(sessLine)
+        sessLine := line.new(x1, sessOpenVal, bar_index, sessOpenVal, extend=_extend, color=sessLineColor, style=_style, width=sessLineWidth)
+    else
+        line.set_xy1(sessLine, x1, sessOpenVal)
+        line.set_xy2(sessLine, bar_index, sessOpenVal)
+        line.set_extend(sessLine, _extend)
+        line.set_color(sessLine, sessLineColor)
+        line.set_width(sessLine, sessLineWidth)
+        line.set_style(sessLine, _style)
+else if not showSessLine and not na(sessLine)
+    line.delete(sessLine)
+    sessLine := na
+
+// NORMALIZED MAs & POC
+ma1Raw = maOf(ma1Type, close, ma1Len)
+ma2Raw = maOf(ma2Type, close, ma2Len)
+ma1Osc = priceToOsc(ma1Raw)
+ma2Osc = priceToOsc(ma2Raw)
+pocRaw = ta.vwap(hlc3)
+pocOsc = priceToOsc(pocRaw)
+
+plot(showMA1 and bandReady ? ma1Osc : na, title="MA #1 (normalized)", color=ma1Color, linewidth=ma1Width)
+plot(showMA2 and bandReady ? ma2Osc : na, title="MA #2 (normalized)", color=ma2Color, linewidth=ma2Width)
+
+var line pocLine = na
+if showPOC and bandReady
+    pocLineValue = pocOsc
+    _extend = pocExtendRight ? extend.right : extend.none
+    x1 = pocShortForm ? (bar_index - math.max(1, pocShortBars)) : (bar_index - 100)
+    if na(pocLine)
+        pocLine := line.new(x1, pocLineValue, bar_index, pocLineValue, xloc=xloc.bar_index, extend=_extend, color=pocColor, style=line.style_solid, width=pocWidth)
+    else
+        line.set_xy1(pocLine, x1, pocLineValue)
+        line.set_xy2(pocLine, bar_index, pocLineValue)
+        line.set_extend(pocLine, _extend)
+        line.set_color(pocLine, pocColor)
+        line.set_width(pocLine, pocWidth)
+else if not showPOC and not na(pocLine)
+    line.delete(pocLine)
+    pocLine := na
+
+plot(mom, "Momentum (Top Overlay)", color=colMom, linewidth=momWidth, display=bringMomTop ? display.all : display.none)
+
+// TARGET ZONES — ML PROJECTIONS
+var float lastBullPivotVal = na
+var float lastBearPivotVal = na
+var float bullT1Val = na
+var float bullT2Val = na
+var float bearT1Val = na
+var float bearT2Val = na
+var int bullTargetBar = na
+var int bearTargetBar = na
+var array<float> bullRunSizes = array.new_float(0)
+var array<float> bearRunSizes = array.new_float(0)
+
+calcWeightedAvg(arr) =>
+    float sum = 0.0
+    float weightSum = 0.0
+    int sz = array.size(arr)
+    if sz > 0
+        for i = 0 to sz - 1
+            weight = targetWeighting ? (i + 1) : 1.0
+            sum += array.get(arr, i) * weight
+            weightSum += weight
+        weightSum != 0 ? sum / weightSum : 0.0
+    else
+        30.0
+
+avgBullRun = calcWeightedAvg(bullRunSizes)
+avgBearRun = calcWeightedAvg(bearRunSizes)
+
+volRegimeMultiplier = 1.0
+if targetVolAdj
+    currentVol = ta.stdev(mom, targetVolPeriod)
+    historicalVol = ta.sma(ta.stdev(mom, targetVolPeriod), targetVolPeriod)
+    volRes = nz(historicalVol) != 0 ? currentVol / historicalVol : 1.0
+    volRegimeMultiplier := clamp(volRes, 0.5, 2.0)
+
+baseBullRun = avgBullRun * volRegimeMultiplier
+baseBearRun = avgBearRun * volRegimeMultiplier
+
+momMag   = clamp(math.abs(mom) / math.max(1.0, upper), 0.0, 1.0)
+slopePos = vwapReady ? clamp((slopeMetric > 0 ? slopeMetric / math.max(thAbs, 0.0001) : 0.0), 0.0, 2.0) : 0.0
+slopeNeg = vwapReady ? clamp((slopeMetric < 0 ? -slopeMetric / math.max(thAbs, 0.0001) : 0.0), 0.0, 2.0) : 0.0
+accPos   = clamp(momAccel > 0 ? momAccel : 0.0, 0.0, 2.0)
+accNeg   = clamp(momAccel < 0 ? -momAccel : 0.0, 0.0, 2.0)
+volAdj   = clamp((volRatio - 1.0), -0.5, 1.5)
+
+var float calBullSeries = 1.0
+var float calBearSeries = 1.0
+var float lastProjBull = na
+var float lastProjBear = na
+
+bullCondition = finalBearSignal and not na(lastProjBull) and not na(lastBullPivotVal) and useMLTargets
+bullRatioCalc = nz(lastProjBull) != 0 ? (mom - lastBullPivotVal) / lastProjBull : 1.0
+bullRatio = bullCondition ? bullRatioCalc : 1.0
+
+bearCondition = finalBullSignal and not na(lastProjBear) and not na(lastBearPivotVal) and useMLTargets
+bearRatioCalc = nz(lastProjBear) != 0 ? (lastBearPivotVal - mom) / lastProjBear : 1.0
+bearRatio = bearCondition ? bearRatioCalc : 1.0
+
+calBullEMA = ta.ema(bullRatio, mlAdaptLen)
+calBearEMA = ta.ema(bearRatio, mlAdaptLen)
+
+if bullCondition
+    calBullSeries := clamp(calBullEMA, 0.5, 1.6)
+    lastProjBull := na
+if bearCondition
+    calBearSeries := clamp(calBearEMA, 0.5, 1.6)
+    lastProjBear := na
+
+projBullRaw = baseBullRun * (1.0 + 0.40 * momMag + 0.30 * slopePos + 0.20 * accPos + 0.10 * volAdj)
+projBearRaw = baseBearRun * (1.0 + 0.40 * momMag + 0.30 * slopeNeg + 0.20 * accNeg + 0.10 * (-volAdj))
+
+projBullRaw := clamp(projBullRaw, mlFloor * math.abs(avgBullRun), mlCeil * math.abs(avgBullRun))
+projBearRaw := clamp(projBearRaw, mlFloor * math.abs(avgBearRun), mlCeil * math.abs(avgBearRun))
+
+projBull = useMLTargets ? projBullRaw * calBullSeries * mlStrength : baseBullRun
+projBear = useMLTargets ? projBearRaw * calBearSeries * mlStrength : baseBearRun
+
+if finalBullSignal and bandReady
+    lastBullPivotVal := mom
+    bullTargetBar := bar_index
+    bullT1Val := mom + 0.618 * projBull
+    bullT2Val := mom + 1.000 * projBull
+    lastProjBull := projBull
+    bearT1Val := na
+    bearT2Val := na
+
+if finalBearSignal and not na(lastBullPivotVal)
+    runSize = mom - lastBullPivotVal
+    array.push(bullRunSizes, runSize)
+    if array.size(bullRunSizes) > targetLookback
+        array.shift(bullRunSizes)
+
+if finalBearSignal and bandReady
+    lastBearPivotVal := mom
+    bearTargetBar := bar_index
+    bearT1Val := mom - 0.618 * projBear
+    bearT2Val := mom - 1.000 * projBear
+    lastProjBear := projBear
+    bullT1Val := na
+    bullT2Val := na
+
+if finalBullSignal and not na(lastBearPivotVal)
+    runSize = lastBearPivotVal - mom
+    array.push(bearRunSizes, runSize)
+    if array.size(bearRunSizes) > targetLookback
+        array.shift(bearRunSizes)
+
+var line mlBullT1Line = na
+var line mlBullT2Line = na
+var line mlBearT1Line = na
+var line mlBearT2Line = na
+
+mlLineStyle = targetLineStyle == "Solid" ? line.style_solid : targetLineStyle == "Dashed" ? line.style_dashed : line.style_dotted
+revealThresh = (targetRevealPct / 100.0) * (upper - lower)
+
+revealBullT1 = showTargets and bandReady and not na(bullT1Val) and math.abs(mom - bullT1Val) <= revealThresh
+revealBullT2 = showTargets and bandReady and not na(bullT2Val) and math.abs(mom - bullT2Val) <= revealThresh
+revealBearT1 = showTargets and bandReady and not na(bearT1Val) and math.abs(mom - bearT1Val) <= revealThresh
+revealBearT2 = showTargets and bandReady and not na(bearT2Val) and math.abs(mom - bearT2Val) <= revealThresh
+
+bullT1Plot = revealBullT1 ? clamp(bullT1Val, lower, upper) : na
+bullT2Plot = revealBullT2 ? clamp(bullT2Val, lower, upper) : na
+bearT1Plot = revealBearT1 ? clamp(bearT1Val, lower, upper) : na
+bearT2Plot = revealBearT2 ? clamp(bearT2Val, lower, upper) : na
+
+int startBarBull = na
+int startBarBear = na
+if targetFullHistory
+    startBarBull := not na(bullTargetBar) ? bullTargetBar : bar_index
+    startBarBear := not na(bearTargetBar) ? bearTargetBar : bar_index
+else
+    effTargetBars = math.max(0, targetShortBars)
+    startBarBull := bar_index - effTargetBars
+    startBarBear := bar_index - effTargetBars
+
+f_manageLine(ln, hasVal, val, startB, col, sty, wid) =>
+    result = ln
+    if hasVal
+        if na(result)
+            result := line.new(startB, val, bar_index, val, extend=extend.right, color=col, style=sty, width=wid)
+        else
+            line.set_xy1(result, startB, val)
+            line.set_xy2(result, bar_index, val)
+            line.set_color(result, col)
+            line.set_style(result, sty)
+            line.set_width(result, wid)
+    else if not na(result)
+        line.delete(result)
+        result := na
+    result
+
+if showTargets
+    mlBullT1Line := f_manageLine(mlBullT1Line, not na(bullT1Plot), bullT1Plot, startBarBull, color.new(color.green, 50), mlLineStyle, 1)
+    mlBullT2Line := f_manageLine(mlBullT2Line, not na(bullT2Plot), bullT2Plot, startBarBull, color.new(color.green, 30), mlLineStyle, 2)
+    mlBearT1Line := f_manageLine(mlBearT1Line, not na(bearT1Plot), bearT1Plot, startBarBear, color.new(color.red, 50), mlLineStyle, 1)
+    mlBearT2Line := f_manageLine(mlBearT2Line, not na(bearT2Plot), bearT2Plot, startBarBear, color.new(color.red, 30), mlLineStyle, 2)
+else
+    mlBullT1Line := f_manageLine(mlBullT1Line, false, float(na), 0, color.black, line.style_solid, 0)
+    mlBullT2Line := f_manageLine(mlBullT2Line, false, float(na), 0, color.black, line.style_solid, 0)
+    mlBearT1Line := f_manageLine(mlBearT1Line, false, float(na), 0, color.black, line.style_solid, 0)
+    mlBearT2Line := f_manageLine(mlBearT2Line, false, float(na), 0, color.black, line.style_solid, 0)
+
+// FIBONACCI RETRACEMENTS
+var int   lastPBar  = na
+var int   prevPBar  = na
+var float lastPVal  = na
+var float prevPVal  = na
+var string lastPTyp = na
+var string prevPTyp = na
+
+if not na(prPH)
+    prevPBar := lastPBar
+    prevPVal := lastPVal
+    prevPTyp := lastPTyp
+    lastPBar := bar_index[pricePivotLen]
+    lastPVal := high[pricePivotLen]
+    lastPTyp := "H"
+if not na(prPL)
+    prevPBar := lastPBar
+    prevPVal := lastPVal
+    prevPTyp := lastPTyp
+    lastPBar := bar_index[pricePivotLen]
+    lastPVal := low[pricePivotLen]
+    lastPTyp := "L"
+
+var int   lastOBar  = na
+var int   prevOBar  = na
+var float lastOVal  = na
+var float prevOVal  = na
+var string lastOTyp = na
+var string prevOTyp = na
+
+if foundPivotHigh
+    prevOBar := lastOBar
+    prevOVal := lastOVal
+    prevOTyp := lastOTyp
+    lastOBar := bar_index[pivotLen]
+    lastOVal := oscPH
+    lastOTyp := "H"
+if foundPivotLow
+    prevOBar := lastOBar
+    prevOVal := lastOVal
+    prevOTyp := lastOTyp
+    lastOBar := bar_index[pivotLen]
+    lastOVal := oscPL
+    lastOTyp := "L"
+
+calcRetr(_L, _H, _lastType, _r) =>
+    float b = na
+    float s = na
+    if not na(_L) and not na(_H) and _H > _L
+        if _lastType == "L"
+            b := _L + _r * (_H - _L)
+        if _lastType == "H"
+            s := _H - _r * (_H - _L)
+    [b, s]
+
+toOsc(v, convertToOsc) =>
+    convertToOsc ? priceToOsc(v) : v
+
+useOscSet   = fib618Source == "Signals" or (fib618Source == "Major Pivots" and fibPivotSource == "Last Two (Osc)")
+usePriceSet = fib618Source == "Major Pivots" and fibPivotSource == "Last Two (Price)"
+
+float Lsrc = na
+float Hsrc = na
+string lastType = na
+int anchorBar = na
+bool haveSwing = false
+
+if usePriceSet and not na(lastPTyp) and not na(prevPTyp) and lastPTyp != prevPTyp
+    Lsrc := lastPTyp == "L" ? lastPVal : prevPVal
+    Hsrc := lastPTyp == "H" ? lastPVal : prevPVal
+    lastType := lastPTyp
+    anchorBar := lastPBar
+    haveSwing := true
+else if useOscSet and not na(lastOTyp) and not na(prevOTyp) and lastOTyp != prevOTyp
+    Lsrc := lastOTyp == "L" ? lastOVal : prevOVal
+    Hsrc := lastOTyp == "H" ? lastOVal : prevOVal
+    lastType := lastOTyp
+    anchorBar := lastOBar
+    haveSwing := true
+
+var float _b236 = na
+var float _s236 = na
+var float _b382 = na
+var float _s382 = na
+var float _b500 = na
+var float _s500 = na
+var float _b618 = na
+var float _s618 = na
+var float _b786 = na
+var float _s786 = na
+var float _bC1  = na
+var float _sC1  = na
+var float _bC2  = na
+var float _sC2  = na
+
+if haveSwing
+    [__b236, __s236] = calcRetr(Lsrc, Hsrc, lastType, 0.236)
+    _b236 := __b236
+    _s236 := __s236
+
+    [__b382, __s382] = calcRetr(Lsrc, Hsrc, lastType, 0.382)
+    _b382 := __b382
+    _s382 := __s382
+
+    [__b500, __s500] = calcRetr(Lsrc, Hsrc, lastType, 0.500)
+    _b500 := __b500
+    _s500 := __s500
+
+    [__b618, __s618] = calcRetr(Lsrc, Hsrc, lastType, 0.618)
+    _b618 := __b618
+    _s618 := __s618
+
+    [__b786, __s786] = calcRetr(Lsrc, Hsrc, lastType, 0.786)
+    _b786 := __b786
+    _s786 := __s786
+
+    [__bC1, __sC1] = calcRetr(Lsrc, Hsrc, lastType, fibCustom1)
+    _bC1 := __bC1
+    _sC1 := __sC1
+
+    [__bC2, __sC2] = calcRetr(Lsrc, Hsrc, lastType, fibCustom2)
+    _bC2 := __bC2
+    _sC2 := __sC2
+
+fib236Bull = haveSwing and not na(_b236) ? clamp(toOsc(_b236, usePriceSet), lower, upper) : na
+fib236Bear = haveSwing and not na(_s236) ? clamp(toOsc(_s236, usePriceSet), lower, upper) : na
+fib382Bull = haveSwing and not na(_b382) ? clamp(toOsc(_b382, usePriceSet), lower, upper) : na
+fib382Bear = haveSwing and not na(_s382) ? clamp(toOsc(_s382, usePriceSet), lower, upper) : na
+fib500Bull = haveSwing and not na(_b500) ? clamp(toOsc(_b500, usePriceSet), lower, upper) : na
+fib500Bear = haveSwing and not na(_s500) ? clamp(toOsc(_s500, usePriceSet), lower, upper) : na
+
+var float fib618Bull = na
+var float fib618Bear = na
+var int   fib618BullBar = na
+var int   fib618BearBar = na
+
+fib618Bull := haveSwing and not na(_b618) ? clamp(toOsc(_b618, usePriceSet), lower, upper) : na
+fib618Bear := haveSwing and not na(_s618) ? clamp(toOsc(_s618, usePriceSet), lower, upper) : na
+
+fib786Bull = haveSwing and not na(_b786) ? clamp(toOsc(_b786, usePriceSet), lower, upper) : na
+fib786Bear = haveSwing and not na(_s786) ? clamp(toOsc(_s786, usePriceSet), lower, upper) : na
+fibC1Bull  = haveSwing and not na(_bC1 ) ? clamp(toOsc(_bC1 , usePriceSet), lower, upper) : na
+fibC1Bear  = haveSwing and not na(_sC1 ) ? clamp(toOsc(_sC1 , usePriceSet), lower, upper) : na
+fibC2Bull  = haveSwing and not na(_bC2 ) ? clamp(toOsc(_bC2 , usePriceSet), lower, upper) : na
+fibC2Bear  = haveSwing and not na(_sC2 ) ? clamp(toOsc(_sC2 , usePriceSet), lower, upper) : na
+
+int fibAnchorBull = anchorBar
+int fibAnchorBear = anchorBar
+
+fibStyleLine  = fib618Style == "Solid" ? line.style_solid : fib618Style == "Dashed" ? line.style_dashed : line.style_dotted
+fibExtendMode = fib618Extend ? extend.right : extend.none
+
+var line fib236BullLine = na
+var line fib236BearLine = na
+var line fib382BullLine = na
+var line fib382BearLine = na
+var line fib500BullLine = na
+var line fib500BearLine = na
+var line fib618BullLine = na
+var line fib618BearLine = na
+var line fib786BullLine = na
+var line fib786BearLine = na
+var line fibC1BullLine  = na
+var line fibC1BearLine  = na
+var line fibC2BullLine  = na
+var line fibC2BearLine  = na
+
+drawOrDelete(_show, _val, _bar, _lineRef, _col) =>
+    line ln = _lineRef
+    if _show and not na(_val) and not na(_bar)
+        if na(ln)
+            ln := line.new(_bar, _val, bar_index, _val, extend=fibExtendMode, color=_col, style=fibStyleLine, width=fib618Width)
+        else
+            line.set_xy1(ln, _bar, _val)
+            line.set_xy2(ln, bar_index, _val)
+            line.set_extend(ln, fibExtendMode)
+            line.set_color(ln, _col)
+            line.set_style(ln, fibStyleLine)
+            line.set_width(ln, fib618Width)
+    else
+        if not na(ln)
+            line.delete(ln)
+            ln := na
+    ln
+
+fib236BullLine := drawOrDelete(showFib236, fib236Bull, fibAnchorBull, fib236BullLine, fib236Color)
+fib236BearLine := drawOrDelete(showFib236, fib236Bear, fibAnchorBear, fib236BearLine, fib236Color)
+fib382BullLine := drawOrDelete(showFib382, fib382Bull, fibAnchorBull, fib382BullLine, fib382Color)
+fib382BearLine := drawOrDelete(showFib382, fib382Bear, fibAnchorBear, fib382BearLine, fib382Color)
+fib500BullLine := drawOrDelete(showFib50,  fib500Bull, fibAnchorBull, fib500BullLine, fib50Color)
+fib500BearLine := drawOrDelete(showFib50,  fib500Bear, fibAnchorBear, fib500BearLine, fib50Color)
+fib618BullBar := haveSwing and not na(fib618Bull) ? anchorBar : na
+fib618BearBar := haveSwing and not na(fib618Bear) ? anchorBar : na
+fib618BullLine := drawOrDelete(showFib618, fib618Bull, fib618BullBar, fib618BullLine, fib618BullColor)
+fib618BearLine := drawOrDelete(showFib618, fib618Bear, fib618BearBar, fib618BearLine, fib618BearColor)
+fib786BullLine := drawOrDelete(showFib786, fib786Bull, fibAnchorBull, fib786BullLine, fib786Color)
+fib786BearLine := drawOrDelete(showFib786, fib786Bear, fibAnchorBear, fib786BearLine, fib786Color)
+fibC1BullLine  := drawOrDelete(showFibC1,  fibC1Bull,  fibAnchorBull, fibC1BullLine,  fibC1Color)
+fibC1BearLine  := drawOrDelete(showFibC1,  fibC1Bear,  fibAnchorBear,  fibC1BearLine,  fibC1Color)
+fibC2BullLine  := drawOrDelete(showFibC2,  fibC2Bull,  fibAnchorBull,  fibC2BullLine,  fibC2Color)
+fibC2BearLine  := drawOrDelete(showFibC2,  fibC2Bear,  fibAnchorBear,  fibC2BearLine,  fibC2Color)
+
+
+// MTF DASHBOARD (WITH ALIGNMENT VISUAL + INSTITUTIONAL TOOLTIPS)
+dirToIcon(d) => d > 0 ? "🟢" : "🔴"
+strengthBar01(str01) => str01 > mtfStrongCut ? "▰▰▰" : str01 > mtfWeakCut ? "▰▰▱" : str01 > 0 ? "▰▱▱" : "▱▱▱"
+
+getMTFAlignmentColor(strength) =>
+    showMTFAlignment ? (strength > 0.8 ? color.new(color.lime, 70) : strength > 0.5 ? color.new(color.yellow, 70) : strength > 0.3 ? color.new(color.orange, 70) : color.new(color.red, 70)) : color.new(color.black, 90)
+
+// ── MTF Tooltip Builders ──
+mtfTFtip(tfLabel, dir, tfIdx) =>
+    dirWord = dir > 0 ? "BULLISH" : "BEARISH"
+    icon    = dir > 0 ? "🟢" : "🔴"
+    edgeTip = dir > 0 ? "Buyers control this timeframe — momentum > signal.\nInstitutions accumulating on this horizon." : "Sellers control this timeframe — momentum < signal.\nDistribution or short positioning on this horizon."
+    action  = dir > 0 ? "✅ Supports LONG bias on lower timeframes\n✅ Dip-buying is higher-probability here" : "✅ Supports SHORT bias on lower timeframes\n✅ Rally-selling is higher-probability here"
+    context = "📖 WHAT THIS MEANS:\nEach timeframe captures a different class of participant:\n• 1m-5m: Scalpers & HFT\n• 15m: Intraday swing traders\n• 60m: Session-level institutional flow\n• 4H: Multi-day positioning\n• D: Swing & portfolio managers"
+    icon + " " + tfLabel + " TIMEFRAME — " + dirWord + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + edgeTip + "\n\n🎯 ACTIONABLE:\n" + action + "\n\n" + context
+
+mtfDirTip(dir) =>
+    dirWord = dir > 0 ? "BULLISH" : "BEARISH"
+    icon    = dir > 0 ? "🟢" : "🔴"
+    icon + " Direction: " + dirWord + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nMomentum is " + (dir > 0 ? "ABOVE" : "BELOW") + " signal line.\n\n📖 EDGE:\n" + (dir > 0 ? "When momentum > signal, buyers are in control.\nThe longer this persists, the stronger the trend.\nPullbacks to signal line = potential entries." : "When momentum < signal, sellers are in control.\nThe longer this persists, the stronger the downtrend.\nRallies to signal line = potential short entries.") + "\n\n⚠️ WATCH FOR:\nSignal cross = momentum shift imminent"
+
+mtfStrTip(dir) =>
+    word = dir > 0 ? "STRONG BULL" : dir < 0 ? "STRONG BEAR" : "NEUTRAL"
+    "📊 Strength: " + word + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n" + (dir > 0 ? "Full bars = strong bullish momentum.\nGap between momentum and signal is wide.\n\n🎯 ACTION:\n✅ Hold longs with confidence\n✅ Trail stops, don't tighten prematurely\n✅ Add on pullbacks to signal" : dir < 0 ? "Full bars = strong bearish momentum.\nGap between momentum and signal is wide.\n\n🎯 ACTION:\n✅ Hold shorts with confidence\n✅ Trail stops, don't cover too early\n✅ Add on rallies to signal" : "Momentum ≈ signal line.\nNo clear directional conviction.\n\n🎯 ACTION:\n⚠️ Reduce position size\n⚠️ Wait for breakout/breakdown\n⚠️ Focus on range-bound strategies")
+
+mtfConfTip(score, strength, isBull) =>
+    pct = math.round(strength * 100)
+    tier = pct > 80 ? "EXTREME" : pct > 60 ? "STRONG" : pct > 40 ? "MODERATE" : pct > 20 ? "WEAK" : "NONE"
+    dir  = isBull ? "BULLISH" : "BEARISH"
+    "🌐 MTF CONFLUENCE: " + str.tostring(pct) + "% " + dir + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nAlignment Tier: " + tier + "\nRaw Score: " + str.tostring(score, "#.##") + " (-1 to +1)\n\n📖 WHAT THIS MEANS:\nMeasures how many timeframes agree on direction.\n+1.0 = All 6 TFs bullish (rare, powerful)\n-1.0 = All 6 TFs bearish (rare, powerful)\n 0.0 = Mixed signals (choppy, reduce size)\n\n🏛️ INSTITUTIONAL EDGE:\n" + (pct > 60 ? "HIGH CONFLUENCE — " + dir + "\n✅ Full position sizing justified\n✅ " + (isBull ? "Longs" : "Shorts") + " have multi-TF wind at their back\n✅ Countertrend trades are HIGH RISK\n✅ Smart money is aligned — follow the flow" : pct > 30 ? "MODERATE CONFLUENCE\n⚠️ Reduce to 50-75% position size\n⚠️ Some TFs disagree — expect chop\n⚠️ Tighter stops, faster profit-taking\n⚠️ Wait for alignment to improve" : "LOW/NO CONFLUENCE\n🛑 Sit on hands or reduce to 25% size\n🛑 Timeframes are fighting each other\n🛑 This is where retail gets chopped up\n🛑 Wait for 3+ TFs to align before entering") + "\n\n⏱️ TIMING RULE:\nTrade direction of HIGHER timeframes.\nTime entries on LOWER timeframes.\nConfluence > 60% = green light."
+
+var table mtfTable = na
+if showMTFDash and na(mtfTable)
+    dashPos = mtfPosition == "Top Left" ? position.top_left : mtfPosition == "Bottom Left" ? position.bottom_left : mtfPosition == "Bottom Right" ? position.bottom_right : position.top_right
+    if mtfHorizontal
+        mtfTable := table.new(dashPos, 8, 3, border_width=1, border_color=color.gray, bgcolor=color.new(color.black, 90))
+    else
+        mtfTable := table.new(dashPos, 3, 8, border_width=1, border_color=color.gray, bgcolor=color.new(color.black, 90))
+
+if showMTFDash and not na(mtfTable) and barstate.islast
+    txtSz = dashSize == "Auto" ? size.auto : dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : size.normal
+    
+    confTip = mtfConfTip(mtfScore, mtfStrength, mtfBullish)
+    
+    if mtfHorizontal
+        // Row 0: TF Headers
+        table.cell(mtfTable, 0, 0, "MTF", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="🌐 MULTI-TIMEFRAME MOMENTUM DASHBOARD\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nShows momentum direction across 6 timeframes.\n\n📖 HOW TO READ:\n🟢 = Momentum > Signal (bullish)\n🔴 = Momentum < Signal (bearish)\n\n🏛️ INSTITUTIONAL PRINCIPLE:\nThe more timeframes that agree, the higher\nprobability of a sustained move.\n\n3/6 aligned = Weak signal\n4/6 aligned = Tradeable\n5/6 aligned = Strong\n6/6 aligned = Rare — maximum conviction")
+        table.cell(mtfTable, 1, 0, tf1, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf1Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf1, mtf1Dir, 1))
+        table.cell(mtfTable, 2, 0, tf2, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf2Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf2, mtf2Dir, 2))
+        table.cell(mtfTable, 3, 0, tf3, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf3Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf3, mtf3Dir, 3))
+        table.cell(mtfTable, 4, 0, tf4, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf4Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf4, mtf4Dir, 4))
+        table.cell(mtfTable, 5, 0, tf5, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf5Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf5, mtf5Dir, 5))
+        table.cell(mtfTable, 6, 0, tf6, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf6Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf6, mtf6Dir, 6))
+        table.cell(mtfTable, 7, 0, "CONF", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=txtSz, tooltip=confTip)
+        
+        // Row 1: Direction icons
+        table.cell(mtfTable, 0, 1, "DIR", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="📊 DIRECTION ROW\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 = Momentum ABOVE signal (buyers)\n🔴 = Momentum BELOW signal (sellers)\n\n📖 EDGE:\nDirection shows WHO controls each timeframe.\nWhen all circles are same color = maximum flow.\nMixed colors = conflicting orders = chop zone.\n\n🎯 QUICK READ:\nAll green? → Buy dips aggressively\nAll red? → Sell rips aggressively\nMixed? → Reduce size, trade range")
+        table.cell(mtfTable, 1, 1, dirToIcon(mtf1Dir), text_size=txtSz, tooltip=mtfDirTip(mtf1Dir))
+        table.cell(mtfTable, 2, 1, dirToIcon(mtf2Dir), text_size=txtSz, tooltip=mtfDirTip(mtf2Dir))
+        table.cell(mtfTable, 3, 1, dirToIcon(mtf3Dir), text_size=txtSz, tooltip=mtfDirTip(mtf3Dir))
+        table.cell(mtfTable, 4, 1, dirToIcon(mtf4Dir), text_size=txtSz, tooltip=mtfDirTip(mtf4Dir))
+        table.cell(mtfTable, 5, 1, dirToIcon(mtf5Dir), text_size=txtSz, tooltip=mtfDirTip(mtf5Dir))
+        table.cell(mtfTable, 6, 1, dirToIcon(mtf6Dir), text_size=txtSz, tooltip=mtfDirTip(mtf6Dir))
+        table.cell(mtfTable, 7, 1, mtfBullish ? "🟢" : "🔴", text_size=txtSz, tooltip=confTip)
+        
+        // Row 2: Strength bars
+        table.cell(mtfTable, 0, 2, "STR", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="💪 STRENGTH ROW\n━━━━━━━━━━━━━━━━━━━━━━━━━━\nShows HOW STRONG momentum is on each TF.\n\n▰▰▰ = Strong (wide gap between mom & signal)\n▰▱▱ = Moderate\n▱▱▱ = Weak (momentum ≈ signal)\n\n📖 INSTITUTIONAL EDGE:\nStrong bars + right direction = HIGH CONVICTION.\nWeak bars = momentum fading, potential reversal.\n\n🎯 POSITION SIZING RULE:\nAll strong same direction → Full size\nMixed strength → Half size\nAll weak → Sit on hands")
+        table.cell(mtfTable, 1, 2, strengthBar01(mtf1Str), text_color=mtf1Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf1Dir))
+        table.cell(mtfTable, 2, 2, strengthBar01(mtf2Str), text_color=mtf2Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf2Dir))
+        table.cell(mtfTable, 3, 2, strengthBar01(mtf3Str), text_color=mtf3Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf3Dir))
+        table.cell(mtfTable, 4, 2, strengthBar01(mtf4Str), text_color=mtf4Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf4Dir))
+        table.cell(mtfTable, 5, 2, strengthBar01(mtf5Str), text_color=mtf5Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf5Dir))
+        table.cell(mtfTable, 6, 2, strengthBar01(mtf6Str), text_color=mtf6Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf6Dir))
+        confluenceText = str.tostring(math.round(mtfStrengthPct)) + "%"
+        confluenceColor = mtfStrength > 0.8 ? color.lime : mtfStrength > 0.5 ? color.yellow : mtfStrength > 0.3 ? color.orange : color.red
+        table.cell(mtfTable, 7, 2, confluenceText, text_color=confluenceColor, text_size=txtSz, tooltip=confTip)
+    else
+        // ── VERTICAL LAYOUT ──
+        table.cell(mtfTable, 0, 0, "MTF", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="🌐 MULTI-TIMEFRAME DASHBOARD\nShows momentum across 6 timeframes.\n🟢=Bull 🔴=Bear | More alignment = higher probability")
+        table.cell(mtfTable, 1, 0, "DIR", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="📊 Direction: Who controls each timeframe")
+        table.cell(mtfTable, 2, 0, "STR", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=txtSz, tooltip="💪 Strength: How strong momentum is")
+        
+        table.cell(mtfTable, 0, 1, tf1, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf1Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf1, mtf1Dir, 1))
+        table.cell(mtfTable, 1, 1, dirToIcon(mtf1Dir), text_size=txtSz, tooltip=mtfDirTip(mtf1Dir))
+        table.cell(mtfTable, 2, 1, strengthBar01(mtf1Str), text_color=mtf1Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf1Dir))
+        
+        table.cell(mtfTable, 0, 2, tf2, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf2Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf2, mtf2Dir, 2))
+        table.cell(mtfTable, 1, 2, dirToIcon(mtf2Dir), text_size=txtSz, tooltip=mtfDirTip(mtf2Dir))
+        table.cell(mtfTable, 2, 2, strengthBar01(mtf2Str), text_color=mtf2Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf2Dir))
+        
+        table.cell(mtfTable, 0, 3, tf3, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf3Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf3, mtf3Dir, 3))
+        table.cell(mtfTable, 1, 3, dirToIcon(mtf3Dir), text_size=txtSz, tooltip=mtfDirTip(mtf3Dir))
+        table.cell(mtfTable, 2, 3, strengthBar01(mtf3Str), text_color=mtf3Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf3Dir))
+        
+        table.cell(mtfTable, 0, 4, tf4, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf4Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf4, mtf4Dir, 4))
+        table.cell(mtfTable, 1, 4, dirToIcon(mtf4Dir), text_size=txtSz, tooltip=mtfDirTip(mtf4Dir))
+        table.cell(mtfTable, 2, 4, strengthBar01(mtf4Str), text_color=mtf4Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf4Dir))
+        
+        table.cell(mtfTable, 0, 5, tf5, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf5Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf5, mtf5Dir, 5))
+        table.cell(mtfTable, 1, 5, dirToIcon(mtf5Dir), text_size=txtSz, tooltip=mtfDirTip(mtf5Dir))
+        table.cell(mtfTable, 2, 5, strengthBar01(mtf5Str), text_color=mtf5Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf5Dir))
+        
+        table.cell(mtfTable, 0, 6, tf6, text_color=color.gray, bgcolor=showMTFAlignment ? getMTFAlignmentColor(mtf6Str) : na, text_size=txtSz, tooltip=mtfTFtip(tf6, mtf6Dir, 6))
+        table.cell(mtfTable, 1, 6, dirToIcon(mtf6Dir), text_size=txtSz, tooltip=mtfDirTip(mtf6Dir))
+        table.cell(mtfTable, 2, 6, strengthBar01(mtf6Str), text_color=mtf6Dir>0?color.lime:color.red, text_size=txtSz, tooltip=mtfStrTip(mtf6Dir))
+        
+        confluenceText = str.tostring(math.round(mtfStrengthPct)) + "%"
+        confluenceColor = mtfStrength > 0.8 ? color.lime : mtfStrength > 0.5 ? color.yellow : mtfStrength > 0.3 ? color.orange : color.red
+        table.cell(mtfTable, 0, 7, "CONF", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=txtSz, tooltip=confTip)
+        table.cell(mtfTable, 1, 7, mtfBullish ? "🟢" : "🔴", text_size=txtSz, tooltip=confTip)
+        table.cell(mtfTable, 2, 7, confluenceText, text_color=confluenceColor, text_size=txtSz, tooltip=confTip)
+
+// ✅ FIXED - ta.rma called unconditionally every bar:
+f_dmi(_len) =>
+    up   = ta.change(high)
+    down = -ta.change(low)
+    plusDM  = (up > down and up > 0) ? up : 0.0
+    minusDM = (down > up and down > 0) ? down : 0.0
+    trur = ta.rma(ta.tr, _len)
+    
+    // Extract ta.rma calls BEFORE the ternary
+    plusDMrma  = ta.rma(plusDM, _len)
+    minusDMrma = ta.rma(minusDM, _len)
+    
+    // Now use the pre-calculated values in the ternary
+    diP = trur != 0 ? 100.0 * plusDMrma / trur : 0.0
+    diM = trur != 0 ? 100.0 * minusDMrma / trur : 0.0
+    
+    sum = diP + diM
+    dx  = sum != 0 ? 100.0 * math.abs(diP - diM) / sum : 0.0
+    adx = ta.rma(dx, _len)
+    [adx, diP, diM]
+
+// ← CALL THE FUNCTION to create adxVal, diPlus, diMinus
+[adxVal, diPlus, diMinus] = f_dmi(adxLen)
+
+string _flashBasis = flashMethod=="Follow regimeMethod" ? regimeMethod : flashMethod
+gapScore = clamp((mom - signal) / math.max(1.0, upper), -1.0, 1.0)
+
+diBal   = (diPlus + diMinus) != 0 ? (diPlus - diMinus) / (diPlus + diMinus) : 0.0
+adxNorm = (adxVal - trendThresh) / math.max(1.0, (100 - trendThresh))
+adxScore= clamp(diBal * adxNorm, -1.0, 1.0)
+
+vwapSlopeC = clamp((vwapReady and thAbs>0) ? (slopeMetric / thAbs) : 0.0, -1.0, 1.0)
+htfBiasC   = useMTF ? (biasUp ? 1.0 : biasDown ? -1.0 : 0.0) : 0.0
+compScore  = clamp(0.35*diBal + 0.25*adxNorm*math.sign(diBal) + 0.20*gapScore + 0.10*vwapSlopeC + 0.10*htfBiasC, -1.0, 1.0)
+
+regScoreRaw = regimeMethod=="Momentum Only" ? gapScore : regimeMethod=="ADX Only" ? adxScore : compScore
+
+momGapNormalized  = math.abs(mom - signal) / math.max(1.0, upper)
+backflashOpacity  = useDynamicBackflash ? clamp(momGapNormalized * backflashIntensity, 0.0, 1.0) : 0.0
+
+// Calculate regime strength with multiple tiers
+regimeStrength = math.abs(regScoreRaw)
+strengthTier = regimeStrength > 0.7 ? 3 : regimeStrength > 0.4 ? 2 : regimeStrength > 0.1 ? 1 : 0
+
+// Dynamic transparency based on strength + momentum gap
+baseTransparency = 97
+strengthBonus = strengthTier * 8  // 0, 8, 16, or 24
+gapBonus = backflashOpacity * 20  // 0 to 20
+dynamicTransparency = int(baseTransparency - strengthBonus - gapBonus)
+dynamicTransparency := clamp(dynamicTransparency, 70, 96)  // Keep readable
+
+color regimeBgColor = na
+if showRegimeBg
+    if regScoreRaw > 0.10
+        regimeBgColor := color.new(trendColor, dynamicTransparency)
+    else if regScoreRaw < -0.10
+        regimeBgColor := color.new(rangeColor, dynamicTransparency)
+
+// PEAK FLASH LOGIC
+flashScore = _flashBasis=="Momentum Only" ? gapScore : _flashBasis=="ADX Only" ? adxScore : compScore
+var float lastFlashScore = 0.0
+var bool  wasExtreme     = false
+var int   flashCountdown = 0
+inExtreme = math.abs(flashScore) > 0.3
+regimePeakSwitch = wasExtreme and inExtreme and ((lastFlashScore > 0 and flashScore < 0) or (lastFlashScore < 0 and flashScore > 0))
+
+if showRegimePeakFlash and regimePeakSwitch
+    flashCountdown := peakFlashDuration
+else if flashCountdown > 0
+    flashCountdown -= 1
+
+isFlashing = flashCountdown > 0
+
+color peakFlashBG = na
+if isFlashing
+    int flashTrans = int(70 - (float(flashCountdown) / float(peakFlashDuration)) * 40)
+    peakFlashBG := color.new(peakFlashColor, flashTrans)
+
+lastFlashScore := flashScore
+wasExtreme := inExtreme
+
+// REGIME SWITCH FLASH LOGIC (KEEP ONLY ONE)
+var string lastRegimeState = "neutral"
+string currentRegimeState = regScoreRaw > 0.10 ? "bullish" : regScoreRaw < -0.10 ? "bearish" : "neutral"
+var int regimeSwitchCountdown = 0
+
+regimeColorSwitch = showRegimeSwitch and currentRegimeState != lastRegimeState and lastRegimeState != "neutral"
+
+if regimeColorSwitch
+    regimeSwitchCountdown := regimeSwitchDuration
+else if regimeSwitchCountdown > 0
+    regimeSwitchCountdown -= 1
+
+isFlashingRegimeSwitch = regimeSwitchCountdown > 0
+
+color regimeSwitchFlashBG = na
+if isFlashingRegimeSwitch
+    int switchTrans = int(50 - (float(regimeSwitchCountdown) / float(regimeSwitchDuration)) * 30)
+    regimeSwitchFlashBG := color.new(regimeSwitchColor, switchTrans)
+
+lastRegimeState := currentRegimeState
+
+// COMBINED BACKGROUND COLOR
+color finalBgColor = na
+if isFlashingRegimeSwitch
+    finalBgColor := regimeSwitchFlashBG
+else if isFlashing
+    finalBgColor := peakFlashBG
+else
+    finalBgColor := regimeBgColor
+
+bgcolor(finalBgColor, title="Regime Background + Flashes")
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// INFO PANEL (Overlay Meters — INSTITUTIONAL TOOLTIPS)
+// ══════════════════════════════════════════════════════════════════════════
+
+getMeterColor(pct, scheme) =>
+    if scheme == "Blue-Red"
+        pct >= meterThreshHigh ? color.blue : pct <= meterThreshLow ? color.red : color.gray
+    else if scheme == "Lime-Orange"
+        pct >= meterThreshHigh ? color.lime : pct <= meterThreshLow ? color.orange : color.gray
+    else if scheme == "Purple-Yellow"
+        pct >= meterThreshHigh ? color.purple : pct <= meterThreshLow ? color.yellow : color.gray
+    else if scheme == "Monochrome"
+        pct >= meterThreshHigh ? color.white : pct <= meterThreshLow ? color.new(color.white, 60) : color.new(color.white, 30)
+    else
+        pct >= meterThreshHigh ? color.green : pct <= meterThreshLow ? color.red : color.yellow
+
+// ── Info Panel Tooltip Builders ──
+bullMeterTip(pct, rawScore) =>
+    tier = pct >= 80 ? "🔥 ELITE" : pct >= 70 ? "✅ STRONG" : pct >= 50 ? "⚠️ MODERATE" : pct >= 30 ? "🟡 WEAK" : "❌ NO SETUP"
+    "🟢 BULL SCORE: " + str.tostring(math.round(pct)) + "/100 — " + tier + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 CURRENT READING:\n" + (pct >= 80 ? "Multiple bullish factors converging.\nThis is what institutional entries look like.\nHigh probability of sustained upside move." : pct >= 70 ? "Strong bullish setup. Most filters aligned.\nGood entry opportunity with proper risk management." : pct >= 50 ? "Partial bullish conditions present.\nSome factors aligned, some missing.\nConsider smaller position or wait for improvement." : pct >= 30 ? "Weak bullish signal. More factors against than for.\nHigh risk of failure. Wait for better setup." : "No bullish setup detected.\nDo NOT force long entries here.") + "\n\n📖 WHAT BUILDS THIS SCORE:\n• Band position (closer to oversold = higher)\n• HTF momentum alignment (+15 max)\n• VWAP gate confirmation (+20 max)\n• Volume confirmation (+15 max)\n• Momentum acceleration (+10 max)\n• Divergence presence (+10/+8)\n• Signal cross alignment (+8)\n• Price structure (+7)\n• Gann swing (+5)\n\n🎯 RIGHT NOW:\n" + (pct >= 70 ? "✅ ACTIONABLE — Look for long entries\n✅ Size: " + (pct >= 80 ? "Full position" : "75% position") + "\n✅ Stop: Below recent swing low\n✅ Target: Upper band / prior peak" : pct >= 50 ? "⚠️ CONDITIONAL — Reduce size to 50%\n⚠️ Need additional confirmation\n⚠️ Tighter stops required\n⚠️ Watch for score to improve above 70" : "🛑 NO ACTION — Wait for setup\n🛑 Score too low for quality entry\n🛑 Patience IS a position")
+
+bearMeterTip(pct, rawScore) =>
+    tier = pct >= 80 ? "🔥 ELITE" : pct >= 70 ? "✅ STRONG" : pct >= 50 ? "⚠️ MODERATE" : pct >= 30 ? "🟡 WEAK" : "❌ NO SETUP"
+    "🔴 BEAR SCORE: " + str.tostring(math.round(pct)) + "/100 — " + tier + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 CURRENT READING:\n" + (pct >= 80 ? "Multiple bearish factors converging.\nDistribution or capitulation pattern forming.\nHigh probability of sustained downside." : pct >= 70 ? "Strong bearish setup. Most filters aligned.\nGood short entry opportunity." : pct >= 50 ? "Partial bearish conditions present.\nConsider smaller position or wait." : pct >= 30 ? "Weak bearish signal. Wait for better setup." : "No bearish setup. Do NOT force shorts.") + "\n\n📖 SCORING FACTORS:\n• Band position (closer to overbought = higher)\n• HTF momentum alignment (+15 max)\n• VWAP gate confirmation (+20 max)\n• Volume exhaustion/spike (+15 max)\n• Momentum deceleration (+10 max)\n• Divergence presence (+10/+8)\n• Signal cross alignment (+8)\n• Price structure (+7)\n\n🎯 RIGHT NOW:\n" + (pct >= 70 ? "✅ ACTIONABLE — Look for short entries\n✅ Size: " + (pct >= 80 ? "Full position" : "75% position") + "\n✅ Stop: Above recent swing high\n✅ Target: Lower band / prior valley" : pct >= 50 ? "⚠️ CONDITIONAL — Half size only\n⚠️ Wait for confirmation" : "🛑 NO ACTION — Wait for setup")
+
+netMeterTip(pct, bullS, bearS) =>
+    bias = pct > 65 ? "BULLISH" : pct < 35 ? "BEARISH" : "NEUTRAL"
+    icon = pct > 65 ? "🟢" : pct < 35 ? "🔴" : "🟡"
+    delta = bullS - bearS
+    icon + " NET BIAS: " + bias + " (" + str.tostring(math.round(pct)) + "%)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 CURRENT STATE:\nBull Score: " + str.tostring(math.round(bullS)) + " | Bear Score: " + str.tostring(math.round(bearS)) + "\nNet Delta: " + (delta >= 0 ? "+" : "") + str.tostring(math.round(delta)) + "\n\n" + (pct > 65 ? "Bulls dominate. More factors favor upside.\nInstitutional flow is net positive." : pct < 35 ? "Bears dominate. More factors favor downside.\nInstitutional flow is net negative." : "Balanced market. Neither side has clear edge.\nThis is the DANGER ZONE for directional trades.") + "\n\n📖 HOW TO USE NET BIAS:\nThink of this as the market's GRAVITY.\n• Strong bias (>70 or <30): Trade WITH gravity\n• Neutral (35-65): Gravity is weak — range trade\n• Extreme (>85 or <15): Watch for exhaustion reversal\n\n🏛️ MARKET MAKER PERSPECTIVE:\nWhen net bias is extreme, MMs are likely positioned.\nReversals from extremes catch retail on wrong side.\nThe strongest moves start from extreme bias readings\nthat FAIL to produce follow-through.\n\n🎯 RIGHT NOW:\n" + (pct > 65 ? "✅ Favor LONGS | Avoid new shorts\n✅ Buy dips, don't sell rips" : pct < 35 ? "✅ Favor SHORTS | Avoid new longs\n✅ Sell rips, don't buy dips" : "⚠️ NO DIRECTIONAL EDGE\n⚠️ Reduce size or trade range\n⚠️ Wait for bias to develop")
+
+oscMeterTip(pct, momVal, upperVal, lowerVal) =>
+    zone = pct > 80 ? "OVERBOUGHT" : pct > 60 ? "UPPER NEUTRAL" : pct > 40 ? "MID RANGE" : pct > 20 ? "LOWER NEUTRAL" : "OVERSOLD"
+    icon = pct > 80 ? "🔴" : pct > 60 ? "🟡" : pct > 40 ? "⚪" : pct > 20 ? "🟡" : "🟢"
+    icon + " OSCILLATOR POSITION: " + zone + " (" + str.tostring(math.round(pct)) + "%)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMomentum: " + str.tostring(momVal, "#.##") + "\nBands: [" + str.tostring(lowerVal, "#.#") + " → " + str.tostring(upperVal, "#.#") + "]\nPosition in band: " + str.tostring(math.round(pct)) + "%\n\n📖 BAND POSITION TELLS YOU:\n• 0-20% (Oversold): Price stretched to downside.\n  Smart money ACCUMULATES here. Retail panics.\n• 20-40%: Recovery zone. Momentum rebuilding.\n• 40-60%: Equilibrium. No extreme — choppy.\n• 60-80%: Momentum hot. Trend in progress.\n• 80-100% (Overbought): Price stretched to upside.\n  Smart money DISTRIBUTES here. Retail chases.\n\n🏛️ INSTITUTIONAL PLAYBOOK:\n" + (pct > 80 ? "⚠️ OVERBOUGHT — Distribution zone.\nInstitutions selling into retail FOMO.\nDO NOT chase longs here.\nWatch for divergence + deceleration = SHORT setup.\nIf you're long, TIGHTEN stops aggressively." : pct < 20 ? "⚠️ OVERSOLD — Accumulation zone.\nInstitutions buying retail panic.\nDO NOT chase shorts here.\nWatch for divergence + acceleration = LONG setup.\nIf you're short, TIGHTEN stops aggressively." : "Momentum in mid-range.\nNo extreme positioning warranted.\nFollow the trend direction until extreme is reached.") + "\n\n⚡ KEY INSIGHT:\nExtremes are WHERE trades set up.\nMid-range is WHERE trends run.\nDon't enter at extremes — wait for the TURN."
+
+mtfMeterTip(pct, score) =>
+    align = pct > 75 ? "STRONG" : pct > 55 ? "MODERATE" : pct > 45 ? "NEUTRAL" : pct > 25 ? "MODERATE (BEARISH)" : "STRONG (BEARISH)"
+    "🌐 MTF CONFLUENCE: " + align + " (" + str.tostring(math.round(pct)) + "%)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nMTF Score: " + str.tostring(score, "#.##") + " (-1 to +1)\nNormalized: " + str.tostring(math.round(pct)) + "%\n\n📖 MULTI-TIMEFRAME ALIGNMENT:\nThis condenses 6 timeframes into one number.\n50% = Dead neutral (half bull, half bear)\n100% = All timeframes bullish\n0% = All timeframes bearish\n\n🏛️ WHY THIS MATTERS:\nInstitutions operate across MULTIPLE timeframes.\nA scalper on 1m who ignores the daily trend\nis swimming against the current.\n\n🎯 POSITION SIZING RULES:\n• >75%: Full size LONGS, no shorts\n• 55-75%: 75% size longs, tight short scalps OK\n• 45-55%: REDUCE all positions — no edge\n• 25-45%: 75% size shorts, tight long scalps OK\n• <25%: Full size SHORTS, no longs\n\n⚡ THE GOLDEN RULE:\nNEVER trade against 5+ aligned timeframes.\nThat's fighting the entire market structure."
+
+qualMeterTip(pct) =>
+    grade = pct >= 80 ? "A+ (ELITE)" : pct >= 70 ? "A (HIGH)" : pct >= 50 ? "B (MODERATE)" : pct >= 30 ? "C (LOW)" : "F (NONE)"
+    "💎 SIGNAL QUALITY: " + grade + " — " + str.tostring(math.round(pct)) + "%\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 WHAT THIS IS:\nThe HIGHER of bull or bear score.\nRepresents the best available setup quality\nregardless of direction.\n\n📖 QUALITY GRADES:\n• A+ (80-100): Rare. Multiple confluences.\n  These are the setups you BUILD your P&L on.\n  Take EVERY one with full size.\n\n• A (70-79): Strong setup. Most factors aligned.\n  Standard institutional entry quality.\n  Size normally, manage risk normally.\n\n• B (50-69): Decent but missing elements.\n  Reduce size. Consider it a probe/scout position.\n  Be quick to exit if it doesn't work immediately.\n\n• C (30-49): Weak. More noise than signal.\n  SIT ON HANDS. Seriously.\n  This is where overtrading kills accounts.\n\n• F (0-29): No setup. Dead zone.\n  If you trade this, you're gambling, not trading.\n\n🏛️ PROFESSIONAL EDGE:\n" + (pct >= 70 ? "✅ GREEN LIGHT — Quality setup present\n✅ Execute your plan with confidence\n✅ This is what you wait for" : pct >= 50 ? "🟡 YELLOW LIGHT — Proceed with caution\n⚠️ Reduce size 50%\n⚠️ Tighter stops\n⚠️ Faster profit-taking" : "🔴 RED LIGHT — NO TRADE\n🛑 Best trade is NO trade\n🛑 Protect capital for A+ setups\n🛑 Quality > quantity ALWAYS")
+
+regMeterTip(pct, rawScore) =>
+    regime = pct > 65 ? "BULLISH TREND" : pct < 35 ? "BEARISH TREND" : "RANGE/CHOP"
+    icon = pct > 65 ? "📈" : pct < 35 ? "📉" : "↔️"
+    icon + " REGIME: " + regime + " (" + str.tostring(math.round(pct)) + "%)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nRaw Score: " + str.tostring(rawScore, "#.##") + " (-1 to +1)\nComposite of: Momentum gap, ADX, VWAP slope, HTF\n\n📖 MARKET REGIMES EXPLAINED:\n\n📈 TRENDING (>65%):\nDirectional moves. Breakouts follow through.\n✅ Strategy: Trend-following, momentum\n✅ Entries: Pullbacks to signal/VWAP\n✅ Stops: Below/above prior swing\n✅ Targets: Let winners run, trail stops\n\n↔️ RANGE/CHOP (35-65%):\nNo sustained direction. Mean-reversion rules.\n✅ Strategy: Fade extremes, scalp\n✅ Entries: At band extremes only\n✅ Stops: Tight — beyond band\n✅ Targets: Opposite band or midline\n\n📉 BEARISH TREND (<35%):\nDownward pressure dominates.\n✅ Strategy: Short rallies, sell strength\n✅ Entries: Bounces to signal/VWAP\n✅ Stops: Above prior swing high\n\n🏛️ REGIME = STRATEGY SELECTOR:\nThe #1 mistake retail makes is using\nTREND strategies in RANGE markets.\nThis meter tells you WHICH playbook to use.\n\n🎯 RIGHT NOW → Use the " + (pct > 65 ? "TREND" : pct < 35 ? "TREND (SHORT)" : "RANGE") + " playbook."
+
+vwapMeterTip(pct, vwapV, priceV) =>
+    side = pct > 60 ? "ABOVE VWAP (BULL)" : pct < 40 ? "BELOW VWAP (BEAR)" : "AT VWAP (NEUTRAL)"
+    dist = priceV - vwapV
+    distPct = vwapV != 0 ? (dist / vwapV) * 100 : 0
+    "📏 VWAP PRESSURE: " + side + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 LIVE DATA:\nPrice: " + str.tostring(priceV, "#.##") + "\nVWAP: " + str.tostring(vwapV, "#.##") + "\nDistance: " + (dist >= 0 ? "+" : "") + str.tostring(dist, "#.##") + " (" + str.tostring(distPct, "#.##") + "%)\nMeter: " + str.tostring(math.round(pct)) + "%\n\n📖 VWAP = INSTITUTIONAL FAIR VALUE:\nVWAP is the volume-weighted average price.\nIt represents where the AVERAGE dollar was transacted.\nInstitutions use VWAP as their benchmark execution price.\n\n🏛️ INSTITUTIONAL RULES:\n\n📈 Price ABOVE VWAP:\n• Buyers are in control\n• Institutions are net long or covering shorts\n• VWAP acts as SUPPORT on pullbacks\n• Dip-buying toward VWAP = institutional behavior\n\n📉 Price BELOW VWAP:\n• Sellers are in control\n• Institutions are net short or liquidating longs\n• VWAP acts as RESISTANCE on bounces\n• Rally-selling toward VWAP = institutional behavior\n\n⚡ THE VWAP MAGNET EFFECT:\nPrice tends to revert to VWAP during low-conviction periods.\nExtreme distance from VWAP = stretched rubber band.\nThe further away, the stronger the pull back.\n\n🎯 RIGHT NOW:\n" + (pct > 60 ? "✅ Price above VWAP — favor LONGS\n✅ Use VWAP as trailing support\n✅ If price rejects VWAP from above = strong" : pct < 40 ? "✅ Price below VWAP — favor SHORTS\n✅ Use VWAP as trailing resistance\n✅ If price rejects VWAP from below = strong" : "⚠️ Price AT VWAP — decision point\n⚠️ Wait for direction to develop\n⚠️ Breakout or rejection imminent")
+
+renderMeterCell(tbl, pos, isH, lbl, pct, tip, scheme, sz, showVal) =>
+    mCol = getMeterColor(pct, scheme)
+    bg85 = color.new(color.black, 85)
+    if isH
+        table.cell(tbl, pos, 0, lbl, text_color=color.gray, text_size=sz, bgcolor=bg85, tooltip=tip)
+        table.cell(tbl, pos, 1, meterBar(pct), text_color=mCol, text_size=sz, bgcolor=bg85, tooltip=tip)
+        if showVal
+            table.cell(tbl, pos, 2, str.tostring(math.round(pct)) + "%", text_color=mCol, text_size=sz, bgcolor=bg85, tooltip=tip)
+    else
+        table.cell(tbl, 0, pos, lbl, text_color=color.gray, text_size=sz, bgcolor=bg85, tooltip=tip)
+        table.cell(tbl, 1, pos, meterBar(pct), text_color=mCol, text_size=sz, bgcolor=bg85, tooltip=tip)
+        if showVal
+            table.cell(tbl, 2, pos, str.tostring(math.round(pct)) + "%", text_color=mCol, text_size=sz, bgcolor=bg85, tooltip=tip)
+
+var table infoTable = na
+
+if showInfoPanel and barstate.islast
+    infoPos = panelAnchor == "Top Left" ? position.top_left : panelAnchor == "Top Right" ? position.top_right : panelAnchor == "Bottom Left" ? position.bottom_left : panelAnchor == "Bottom Right" ? position.bottom_right : panelAnchor == "Top Center" ? position.top_center : panelAnchor == "Bottom Center" ? position.bottom_center : panelAnchor == "Middle Left" ? position.middle_left : position.middle_right
+    infoSz = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
+    
+    meterCount = 0
+    if showBullMeter
+        meterCount += 1
+    if showBearMeter
+        meterCount += 1
+    if showNetMeter
+        meterCount += 1
+    if showOscMeter
+        meterCount += 1
+    if showMTFMeter
+        meterCount += 1
+    if showQualMeter
+        meterCount += 1
+    if showRegimeMeter
+        meterCount += 1
+    if showVWAPMeter
+        meterCount += 1
+    
+    if na(infoTable)
+        infoTable := table.new(infoPos, horizontalTable ? meterCount : 3, horizontalTable ? 3 : meterCount, border_width=0, bgcolor=color.new(color.black, 85))
+    
+    pos = 0
+    if showBullMeter
+        bullPct = clamp(currentBullScore, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "🟢 BULL", bullPct, bullMeterTip(bullPct, currentBullScore), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showBearMeter
+        bearPct = clamp(currentBearScore, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "🔴 BEAR", bearPct, bearMeterTip(bearPct, currentBearScore), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showNetMeter
+        netPct = clamp((currentBullScore - currentBearScore + 100) / 2, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "⚖️ NET", netPct, netMeterTip(netPct, currentBullScore, currentBearScore), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showOscMeter
+        oscPct = clamp(((mom - lower) / (upper - lower)) * 100, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "📊 OSC", oscPct, oscMeterTip(oscPct, mom, upper, lower), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showMTFMeter
+        mtfPct = clamp((mtfScore + 1) / 2 * 100, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "🌐 MTF", mtfPct, mtfMeterTip(mtfPct, mtfScore), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showQualMeter
+        qualPct = clamp(math.max(currentBullScore, currentBearScore), 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "💎 QUAL", qualPct, qualMeterTip(qualPct), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showRegimeMeter
+        regPct = clamp((regScoreRaw + 1) / 2 * 100, 0, 100)
+        renderMeterCell(infoTable, pos, horizontalTable, "🏛️ REG", regPct, regMeterTip(regPct, regScoreRaw), meterColorScheme, infoSz, showMeterValues)
+        pos += 1
+    if showVWAPMeter
+        vwapPressurePct = vwapReady and vwapVal != 0 ? ((clamp(((close - vwapVal) / vwapVal * 100.0) / vwapMeterRangePct, -1.0, 1.0) + 1.0) * 50.0) : 50
+        renderMeterCell(infoTable, pos, horizontalTable, "📏 VWAP", vwapPressurePct, vwapMeterTip(vwapPressurePct, vwapVal, close), meterColorScheme, infoSz, showMeterValues)
+
+// STOP LOSS
+if showStops
+    if finalBullSignal
+        float stopLevel = na
+        if stopMethod == "ATR"
+            stopLevel := close - stopATRMult * atrVal
+        else if stopMethod == "Swing"
+            stopLevel := ta.lowest(low, 10)
+        else if stopMethod == "Pivot"
+            stopLevel := pivotLowPrice1
+        else if stopMethod == "Band"
+            stopLevel := oscToPrice(lower)
+        
+        if not na(stopLevel)
+            riskPct = (close - stopLevel) / close * 100
+            riskPts = close - stopLevel
+            rr1 = riskPts * 2
+            rr2 = riskPts * 3
+            stopTip = "◈ BULL STOP LEVEL — " + stopMethod + " METHOD\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 TRADE PARAMETERS:\nEntry: " + str.tostring(close, "#.##") + "\nStop: " + str.tostring(stopLevel, "#.##") + "\nRisk: " + str.tostring(riskPct, "#.##") + "% (" + str.tostring(riskPts, "#.##") + " pts)\nATR(" + str.tostring(atrLen) + "): " + str.tostring(atrVal, "#.##") + "\n\n🎯 REWARD TARGETS (Risk:Reward):\nT1 (2R): " + str.tostring(close + rr1, "#.##") + " (+$" + str.tostring(rr1, "#.##") + ")\nT2 (3R): " + str.tostring(close + rr2, "#.##") + " (+$" + str.tostring(rr2, "#.##") + ")\n\n📖 WHY " + stopMethod + ":\n" + (stopMethod == "ATR" ? "ATR-based stops adapt to current VOLATILITY.\n" + str.tostring(stopATRMult, "#.#") + "x ATR gives enough room for normal noise\nwhile protecting against adverse moves.\nBest for: Trending markets with consistent volatility." : stopMethod == "Swing" ? "Swing-based stops use the lowest low of\nthe last 10 bars as the invalidation level.\nBest for: Markets with clear swing structure.\nPrice below this = your thesis is WRONG." : stopMethod == "Pivot" ? "Pivot-based stops use the most recent pivot low\nas the invalidation level. If price breaks this\nstructural point, the bullish setup is invalid.\nBest for: Precise structural trading." : "Band-based stops use the lower oscillator band\nmapped to price. Momentum breaking below the\nband = the oversold thesis is invalid.\nBest for: Mean-reversion strategies.") + "\n\n🏛️ POSITION SIZING:\nIf risking 1% of capital per trade:\nPosition = (Account × 0.01) / " + str.tostring(riskPts, "#.##") + "\n\n⚠️ NEVER move stop FURTHER from entry.\nOnly trail in direction of profit."
+            mkLabelFX(bar_index, lower - 3, "◈", color.green, color.new(color.black,100), label.style_none, size.tiny, xloc.bar_index, yloc.price, stopTip)
+    
+    if finalBearSignal
+        float stopLevel = na
+        if stopMethod == "ATR"
+            stopLevel := close + stopATRMult * atrVal
+        else if stopMethod == "Swing"
+            stopLevel := ta.highest(high, 10)
+        else if stopMethod == "Pivot"
+            stopLevel := pivotHighPrice1
+        else if stopMethod == "Band"
+            stopLevel := oscToPrice(upper)
+        
+        if not na(stopLevel)
+            riskPct = (stopLevel - close) / close * 100
+            riskPts = stopLevel - close
+            rr1 = riskPts * 2
+            rr2 = riskPts * 3
+            stopTip = "◈ BEAR STOP LEVEL — " + stopMethod + " METHOD\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 TRADE PARAMETERS:\nEntry: " + str.tostring(close, "#.##") + "\nStop: " + str.tostring(stopLevel, "#.##") + "\nRisk: " + str.tostring(riskPct, "#.##") + "% (" + str.tostring(riskPts, "#.##") + " pts)\nATR(" + str.tostring(atrLen) + "): " + str.tostring(atrVal, "#.##") + "\n\n🎯 REWARD TARGETS (Risk:Reward):\nT1 (2R): " + str.tostring(close - rr1, "#.##") + " (-$" + str.tostring(rr1, "#.##") + ")\nT2 (3R): " + str.tostring(close - rr2, "#.##") + " (-$" + str.tostring(rr2, "#.##") + ")\n\n📖 WHY " + stopMethod + ":\n" + (stopMethod == "ATR" ? "ATR-based stops adapt to current VOLATILITY.\n" + str.tostring(stopATRMult, "#.#") + "x ATR gives enough room for normal noise\nwhile protecting against adverse moves.\nBest for: Trending markets with consistent volatility." : stopMethod == "Swing" ? "Swing-based stops use the highest high of\nthe last 10 bars as the invalidation level.\nBest for: Markets with clear swing structure.\nPrice above this = your thesis is WRONG." : stopMethod == "Pivot" ? "Pivot-based stops use the most recent pivot high\nas the invalidation level. If price breaks this\nstructural point, the bearish setup is invalid.\nBest for: Precise structural trading." : "Band-based stops use the upper oscillator band\nmapped to price. Momentum breaking above the\nband = the overbought thesis is invalid.\nBest for: Mean-reversion strategies.") + "\n\n🏛️ POSITION SIZING:\nIf risking 1% of capital per trade:\nPosition = (Account × 0.01) / " + str.tostring(riskPts, "#.##") + "\n\n⚠️ NEVER move stop FURTHER from entry.\nOnly trail in direction of profit."
+            mkLabelFX(bar_index, upper + 3, "◈", color.red, color.new(color.black,100), label.style_none, size.tiny, xloc.bar_index, yloc.price, stopTip)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ENHANCED TOOLTIP (v2 — Full Details)
+// ══════════════════════════════════════════════════════════════════════════
+
+barsSinceBull = not na(lastBullSignalBar) ? bar_index - lastBullSignalBar : 1000000000
+barsSinceBear = not na(lastBearSignalBar) ? bar_index - lastBearSignalBar : 1000000000
+
+f_buildStatusTooltip() =>
+    bandPos = clamp(((mom - lower) / (upper - lower)), 0.0, 1.0)
+    nearStr  = (bandPos > (1.0 - warnNearPct)) ? " ⚠️ Near Top" : (bandPos < warnNearPct) ? " ⚠️ Near Bottom" : ""
+    string t = "🐺 MOMENTUM WOLF — STATUS REPORT\n"
+    t += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    t += (mom > signal ? "🟢 BULLISH" : "🔴 BEARISH") + " | Regime: " + currentRegimeState + "\n\n"
+    t += "📊 CORE METRICS:\n"
+    t += "Mom: " + fmtNum(mom, "#.##") + " | Sig: " + fmtNum(signal, "#.##") + " | Gap: " + fmtNum(mom - signal, "#.##") + "\n"
+    t += "Band: [" + fmtNum(lower, "#.#") + " → " + fmtNum(upper, "#.#") + "] | Pos: " + fmtPct(bandPos * 100) + nearStr + "\n"
+    t += "Vel: " + fmtNum(momVelocity, "#.##") + " | Accel: " + fmtNum(momAccel, "#.##") + "\n\n"
+    t += "🎯 SCORES:\n"
+    t += "Bull " + meterBar(currentBullScore) + " " + fmtPct(currentBullScore) + "\n"
+    t += "Bear " + meterBar(currentBearScore) + " " + fmtPct(currentBearScore) + "\n"
+    t += "Net  " + netBiasBar + " " + (netBias01 > 0.6 ? "BULLISH" : netBias01 < 0.4 ? "BEARISH" : "NEUTRAL") + "\n"
+    t += "SNR: " + fmtNum(snr, "#.##") + (useSNR ? " (req: " + fmtNum(effectiveSNR, "#.##") + ")" : "") + "\n\n"
+    t += "🔧 FILTERS:\n"
+    t += "VWAP: " + (gateLong ? "✓Long" : "✗Long") + " | " + (gateShort ? "✓Short" : "✗Short") + (vwapReady ? " | Slope: " + fmtNum(slopeMetric, "#.###") : "") + "\n"
+    t += "MTF: " + (biasUp ? "✓Bull" : "✗Bull") + " | " + (biasDown ? "✓Bear" : "✗Bear") + " | Score: " + fmtNum(mtfScore, "#.##") + "\n"
+    t += "Vol: " + fmtNum(volRatio, "#.##") + "x | Consol: " + (isConsolidating ? "YES ⚠️" : "No") + "\n"
+    t += "Whipsaw: " + fmtNum(effectiveWhipsaw, "#") + " bars\n\n"
+    t += "⏱️ TIMING:\n"
+    t += "Last Bull: " + fmtBarsSince(barsSinceBull) + " bars ago\n"
+    t += "Last Bear: " + fmtBarsSince(barsSinceBear) + " bars ago\n\n"
+    if useMLBacklearn
+        t += "🤖 ML LEARNING:\n"
+        if learningValid
+            t += "ML OVERRIDES ACTIVE (current bar only)\nHistorical signals use manual parameters\n"
+            t += "Train WR: " + fmtPct(trainingWinRate) + " | Val WR: " + fmtPct(validationWinRate) + "\n"
+            t += "Signals: " + str.tostring(validationSignals) + " | ATR Regime: " + fmtNum(avgATRregime, "#.##") + "\n"
+            t += "Learned: MinScore=" + fmtNum(learnedMinScore, "#.#") + " SNR=" + fmtNum(learnedSNR, "#.##") + "\n"
+            t += "  VolBull=" + fmtNum(learnedVolBull, "#.##") + " VolBear=" + fmtNum(learnedVolBear, "#.##") + "\n"
+            t += "  Whipsaw=" + fmtNum(learnedWhipsaw, "#") + " bars\n\n"
+        else
+            t += "❌ LEARNING INACTIVE\nReason: " + learningFailReason + "\n"
+            t += "Pivots collected: " + str.tostring(array.size(mlScores)) + "/" + str.tostring(mlMinSamples) + "\n\n"
+    if showStats
+        t += "📈 PERFORMANCE:\n"
+        t += "Bull WR: " + fmtPct(bullWinRate) + " | Avg P&L: " + fmtNum(avgBullPnL, "#.##") + "\n"
+        t += "Bear WR: " + fmtPct(bearWinRate) + " | Avg P&L: " + fmtNum(avgBearPnL, "#.##") + "\n"
+    if showTargets
+        t += "\n🎯 TARGETS:\n"
+        if not na(bullT1Val)
+            t += "Bull T1: " + fmtNum(bullT1Val, "#.##") + " | T2: " + fmtNum(bullT2Val, "#.##") + "\n"
+        if not na(bearT1Val)
+            t += "Bear T1: " + fmtNum(bearT1Val, "#.##") + " | T2: " + fmtNum(bearT2Val, "#.##") + "\n"
+    t
+
+if showTooltip and barstate.islast
+    tipText = f_buildStatusTooltip()
+    tipBarPos = bar_index + tipPadRight
+    tipYPos   = upper * 0.85
+    if not na(tipLbl)
+        label.delete(tipLbl)
+    tipLbl := label.new(tipBarPos, tipYPos, text="ℹ️", textcolor=color.new(color.white, 20), color=color.new(color.black, 100), style=label.style_none, size=size.normal, xloc=xloc.bar_index, yloc=yloc.price, tooltip=tipText)
+
+// ══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════
+
+var int lastBullAlertBar = na
+var int lastBearAlertBar = na
+var int lastDivAlertBar  = na
+var int lastAccelAlertBar = na
+var int lastRegimeAlertBar = na
+
+canAlert(lastBar) => not alertThrottle or na(lastBar) or (bar_index - lastBar) >= alertMinGap
+
+if finalBullSignal and canAlert(lastBullAlertBar)
+    alertMsg = "🟢 BULLISH SIGNAL | Score: " + str.tostring(math.round(currentBullScore)) + "/100 | Mom: " + str.tostring(mom, "#.##")
+    if useSmartAlerts and currentBullScore >= minConfidence
+        alertMsg += " | HIGH CONFIDENCE"
+    alert(alertMsg, alert.freq_once_per_bar_close)
+    lastBullAlertBar := bar_index
+
+if finalBearSignal and canAlert(lastBearAlertBar)
+    alertMsg = "🔴 BEARISH SIGNAL | Score: " + str.tostring(math.round(currentBearScore)) + "/100 | Mom: " + str.tostring(mom, "#.##")
+    if useSmartAlerts and currentBearScore >= minConfidence
+        alertMsg += " | HIGH CONFIDENCE"
+    alert(alertMsg, alert.freq_once_per_bar_close)
+    lastBearAlertBar := bar_index
+
+if (bullDiv or bearDiv) and canAlert(lastDivAlertBar)
+    divType = bullDiv ? "BULLISH" : "BEARISH"
+    alert("💎 " + divType + " DIVERGENCE DETECTED", alert.freq_once_per_bar_close)
+    lastDivAlertBar := bar_index
+
+if (bullEarlyWarning or bearEarlyWarning) and canAlert(lastAccelAlertBar)
+    warnType = bullEarlyWarning ? "BULL" : "BEAR"
+    alert("⚡ " + warnType + " EARLY WARNING | Momentum accelerating", alert.freq_once_per_bar_close)
+    lastAccelAlertBar := bar_index
+
+if alertOnRegimePeak and regimePeakSwitch and canAlert(lastRegimeAlertBar)
+    alert("⚡ REGIME PEAK/VALLEY SWITCH | Score: " + str.tostring(flashScore, "#.##"), alert.freq_once_per_bar_close)
+    lastRegimeAlertBar := bar_index
+
+// ══════════════════════════════════════════════════════════════════════════
+// DEBUG OVERLAY
+// ══════════════════════════════════════════════════════════════════════════
+
+f_buildDebugText() =>
+    string d = "═══ DEBUG ═══\n"
+    d += "Bull Score: " + str.tostring(currentBullScore, "#.#") + "\n"
+    d += "Bear Score: " + str.tostring(currentBearScore, "#.#") + "\n"
+    d += "SNR: " + str.tostring(snr, "#.##") + " (eff: " + str.tostring(effectiveSNR, "#.##") + ")\n"
+    d += "Vol Ratio: " + str.tostring(volRatio, "#.##") + "\n"
+    d += "Mom: " + str.tostring(mom, "#.##") + " Sig: " + str.tostring(signal, "#.##") + "\n"
+    d += "Upper: " + str.tostring(upper, "#.##") + " Lower: " + str.tostring(lower, "#.##") + "\n"
+    d += "VWAP Gate: L=" + (gateLong?"Y":"N") + " S=" + (gateShort?"Y":"N") + "\n"
+    d += "Whipsaw: " + str.tostring(effectiveWhipsaw, "#") + " bars\n"
+    d += "Regime: " + currentRegimeState + " (" + str.tostring(regScoreRaw, "#.##") + ")\n"
+    if useMLBacklearn
+        d += "ML Valid: " + (learningValid?"YES":"NO") + "\n"
+        d += "ML Pivots: " + str.tostring(array.size(mlScores)) + "\n"
+        if learningValid
+            d += "Learned: min=" + str.tostring(learnedMinScore, "#.#") + " snr=" + str.tostring(learnedSNR, "#.##") + "\n"
+    d
+
+if showDebug and barstate.islast
+    mkLabelFX(bar_index + 2, lower - 5, f_buildDebugText(), color.yellow, color.new(color.black, 80), label.style_label_right, size.tiny, xloc.bar_index, yloc.price, "Debug overlay — disable in settings")

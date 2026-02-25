@@ -1,0 +1,288 @@
+//@version=6
+strategy("Supertrend + MACD + EMA200 (Pro) V2 — Strict & Trailing",
+     overlay=true, calc_on_order_fills=true, calc_on_every_tick=false,
+     initial_capital=50000,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     pyramiding=0, max_labels_count=500,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+//============================== INPUTS ==============================//
+grpCore   = "Core: Signaux"
+stLen     = input.int(10,  "Supertrend ATR Length", group=grpCore, minval=1)
+stMult    = input.float(3.0,"Supertrend Multiplier", group=grpCore, step=0.1)
+emaLen    = input.int(200,  "EMA Trend Length",      group=grpCore, minval=1)
+emaConf   = input.bool(false,"Exiger EMA50 alignée ?",group=grpCore)
+ema50Len  = input.int(50,  "EMA50 Length", group=grpCore, minval=1)
+
+macdFast  = input.int(12, "MACD Fast", group=grpCore, minval=1)
+macdSlow  = input.int(26, "MACD Slow", group=grpCore, minval=1)
+macdSig   = input.int(9,  "MACD Signal", group=grpCore, minval=1)
+macdAccel = input.bool(true,"Exiger MACD Hist en accélération ?", group=grpCore)
+
+useStoch  = input.bool(false, "Utiliser Stochastique en confirmation ?", group=grpCore)
+stochLen  = input.int(14, "Stoch Length", group=grpCore, minval=1)
+stochKs   = input.int(3,  "Stoch %K Smoothing", group=grpCore, minval=1)
+stochDs   = input.int(3,  "Stoch %D Smoothing", group=grpCore, minval=1)
+stochOS   = input.int(20, "Survente (OS)", group=grpCore, minval=0, maxval=50)
+
+useRetest = input.bool(true,"Exiger retest ST avant entrée ?", group=grpCore)
+rtLookback= input.int(6,   "Retest: lookback (barres)", group=grpCore, minval=1)
+rtBuffATR = input.float(0.2,"Retest: tolérance (xATR)", group=grpCore, step=0.05)
+
+//------------------ Filtres anti-range ------------------//
+grpFilt   = "Filtres Anti-Range"
+useADX    = input.bool(true, "Filtre ADX (portable, sans ta.adx)", group=grpFilt)
+adxLen    = input.int(14, "ADX Length", group=grpFilt, minval=2)
+minADX    = input.float(20.0, "Seuil ADX", group=grpFilt, step=0.5)
+useBBW    = input.bool(true, "Bollinger Width > moyenne", group=grpFilt)
+bbLen     = input.int(20, "BB Period", group=grpFilt)
+bbMult    = input.float(2.0,"BB Mult", group=grpFilt)
+useATRexp = input.bool(true, "ATR > moyenne ATR", group=grpFilt)
+atrLen    = input.int(14, "ATR Length", group=grpFilt)
+useDC     = input.bool(true, "Donchian Width > moyenne", group=grpFilt)
+dcLen     = input.int(20, "Donchian Period", group=grpFilt)
+useSlope  = input.bool(true, "Pente EMA200 & Distance min", group=grpFilt)
+slopeLB   = input.int(5,  "Bars pour pente EMA", group=grpFilt, minval=1)
+minDistATR= input.float(0.5,"Distance min prix-EMA200 (x ATR)", group=grpFilt, step=0.1)
+useCHOP   = input.bool(false,"Filtre Choppiness (range)", group=grpFilt)
+chopLen   = input.int(14, "Chop Length", group=grpFilt)
+chopMax   = input.float(60, "Ne pas trader si CHOP >", group=grpFilt, step=1)
+
+//------------------ MTF & Sessions ------------------//
+grpMTF    = "Biais MTF & Sessions"
+useHTF    = input.bool(true, "Exiger un biais HTF (EMA200 + Supertrend) ?", group=grpMTF)
+htfTf     = input.timeframe("60", "HTF (ex: 60=H1, 240=H4, D)", group=grpMTF)
+useSess   = input.bool(true, "Limiter aux sessions (Paris)", group=grpMTF)
+sessLon   = input.session("0800-1200", "Session Londres", group=grpMTF)
+sessNY    = input.session("1300-1700", "Session New York", group=grpMTF)
+
+//------------------ Asian Box Breakout ------------------//
+grpAsian  = "Asian Box"
+useAsian  = input.bool(true, "N'entrer qu'après sortie du range asiatique ?", group=grpAsian)
+asianSess = input.session("0000-0800", "Plage Asie (Paris)", group=grpAsian)
+
+//------------------ Risque & Sorties ------------------//
+grpRisk   = "Risque & Sorties"
+slMode    = input.string("ATR", "Stop-Loss basé sur", options=["ATR","Supertrend"], group=grpRisk)
+slATRmult = input.float(1.5, "Si ATR: SL = ATR *", step=0.1, group=grpRisk)
+tpRR      = input.float(2.0, "Take Profit = R multiple", step=0.1, group=grpRisk)
+beEnable  = input.bool(true, "Passage Break-Even à +1R", group=grpRisk)
+beAfterR  = input.float(1.0, "BE après (R)", step=0.1, group=grpRisk)
+trailOn   = input.bool(true, "Activer trailing ATR après BE ?", group=grpRisk)
+trailMult = input.float(1.5, "Trailing ATR (xATR)", step=0.1, group=grpRisk)
+timeStopOn= input.bool(false,"Time stop (sortie après N barres) ?", group=grpRisk)
+timeBars  = input.int(60, "N barres max en position", group=grpRisk)
+
+//============================== SUPERTRAND & CORE ==============================//
+f_supertrend(_len, _mult) =>
+    _atr  = ta.atr(_len)
+    _hl2  = (high + low) / 2.0
+    _ub   = _hl2 + _mult * _atr
+    _lb   = _hl2 - _mult * _atr
+    var float _fub = na
+    var float _flb = na
+    _fub := (_ub < nz(_fub[1]) or close[1] > nz(_fub[1])) ? _ub : nz(_fub[1])
+    _flb := (_lb > nz(_flb[1]) or close[1] < nz(_flb[1])) ? _lb : nz(_flb[1])
+    var int _trend = 1
+    _trend := nz(_trend[1], 1)
+    _trend := close > nz(_fub[1]) ? 1 : close < nz(_flb[1]) ? -1 : _trend
+    _st = _trend == 1 ? _flb : _fub
+    [_st, _trend]
+
+// Wrappers pour HTF (pas d'indexation de tuple dans security)
+f_st_line_only(_len, _mult) =>
+    [st, _tr] = f_supertrend(_len, _mult)
+    st
+f_st_trend_only(_len, _mult) =>
+    [_st, tr] = f_supertrend(_len, _mult)
+    tr
+
+[stLine, stTrend] = f_supertrend(stLen, stMult)
+ema200   = ta.ema(close, emaLen)
+ema50    = ta.ema(close, ema50Len)
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+
+// Stochastic (optionnel)
+rawStoch = ta.stoch(high, low, close, stochLen)
+k = ta.sma(rawStoch, stochKs)
+d = ta.sma(k, stochDs)
+stochLongOK  = (k > d) and (k > stochOS)
+stochShortOK = (k < d) and (k < 100 - stochOS)
+
+//============================== ANTI-RANGE (portable) ==============================//
+// ADX "maison"
+trueRange = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+atrWild  = ta.rma(trueRange, adxLen)
+upMove   = ta.change(high)
+downMove = -ta.change(low)
+plusDM   = (upMove > downMove and upMove > 0)  ? upMove  : 0.0
+minusDM  = (downMove > upMove and downMove > 0)? downMove: 0.0
+plusDMs  = ta.rma(plusDM, adxLen)
+minusDMs = ta.rma(minusDM, adxLen)
+plusDI   = 100 * plusDMs  / math.max(atrWild, 1e-10)
+minusDI  = 100 * minusDMs / math.max(atrWild, 1e-10)
+dx       = 100 * math.abs(plusDI - minusDI) / math.max(plusDI + minusDI, 1e-10)
+adxVal   = ta.rma(dx, adxLen)
+
+// BBW / ATR / Donchian
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+bbU   = basis + dev
+bbL   = basis - dev
+bbw   = (bbU - bbL) / close
+bbwMA = ta.sma(bbw, 50)
+
+atr    = ta.atr(atrLen)
+atrMA  = ta.sma(atr, 50)
+
+dcHi   = ta.highest(high, dcLen)
+dcLo   = ta.lowest(low,  dcLen)
+dcw    = (dcHi - dcLo) / close
+dcwMA  = ta.sma(dcw, 50)
+
+// Pente & distance EMA
+emaSlope    = (ema200 - ema200[slopeLB]) / slopeLB
+distFromEMA = math.abs(close - ema200)
+
+// Choppiness (optionnel)
+trSum = ta.rma(trueRange, chopLen) * chopLen
+chop  = 100 * math.log10(trSum / (ta.highest(high, chopLen) - ta.lowest(low, chopLen))) / math.log10(chopLen)
+
+//============================== ASIAN BOX ==============================//
+inAsian = not na(time(timeframe.period, asianSess))
+var float aHigh = na
+var float aLow  = na
+var bool  boxReady = false
+
+newAsianStart = inAsian and not inAsian[1]
+asianEnded    = not inAsian and inAsian[1]
+
+// reset au début de la session asiatique
+if newAsianStart
+    aHigh := high
+    aLow  := low
+    boxReady := false
+// MAJ high/low pendant Asie
+if inAsian
+    aHigh := math.max(aHigh, high)
+    aLow  := math.min(aLow,  low)
+if asianEnded
+    boxReady := true  // box figée jusqu'à la prochaine Asie
+
+brokeAsianUp   = boxReady and close > aHigh
+brokeAsianDown = boxReady and close < aLow
+
+//============================== CONDITIONS GLOBALES ==============================//
+f_trending() =>
+    _okADX  = not useADX    or (adxVal > minADX)
+    _okBBW  = not useBBW    or (bbw > bbwMA)
+    _okATR  = not useATRexp or (atr > atrMA)
+    _okDC   = not useDC     or (dcw > dcwMA)
+    _okCHOP = not useCHOP   or (chop < chopMax)
+    _okADX and _okBBW and _okATR and _okDC and _okCHOP
+
+f_slopeDistLong()  => not useSlope or (emaSlope > 0 and distFromEMA >= minDistATR * atr)
+f_slopeDistShort() => not useSlope or (emaSlope < 0 and distFromEMA >= minDistATR * atr)
+
+// Biais HTF
+htfEma200  = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfStTrend = request.security(syminfo.tickerid, htfTf, f_st_trend_only(stLen, stMult), barmerge.gaps_off, barmerge.lookahead_off)
+htfLongBias  = (close > htfEma200) and (htfStTrend == 1)
+htfShortBias = (close < htfEma200) and (htfStTrend == -1)
+
+// Sessions (Paris)
+inSession = not useSess or (not na(time(timeframe.period, sessLon)) or not na(time(timeframe.period, sessNY)))
+
+// Retest Supertrend (tolérance ATR) dans le lookback
+touchSTLong  = ta.lowest(low, rtLookback) <= stLine + rtBuffATR * atr
+touchSTShort = ta.highest(high, rtLookback) >= stLine - rtBuffATR * atr
+okRetestL    = not useRetest or touchSTLong
+okRetestS    = not useRetest or touchSTShort
+
+// MACD côté 0 + accélération histo
+macdLongBase  = (macdLine > macdSignal) and (macdLine > 0)
+macdShortBase = (macdLine < macdSignal) and (macdLine < 0)
+macdAccelUp   = not macdAccel or (macdHist > macdHist[1])
+macdAccelDn   = not macdAccel or (macdHist < macdHist[1])
+
+// EMA50 alignée (optionnelle)
+ema50OKL = not emaConf or (close > ema50 and ema50 > ema200)
+ema50OKS = not emaConf or (close < ema50 and ema50 < ema200)
+
+// Conditions finales
+trendUp   = stTrend == 1 and close > ema200
+trendDown = stTrend == -1 and close < ema200
+okStochL  = not useStoch or stochLongOK
+okStochS  = not useStoch or stochShortOK
+okTrendEnv = f_trending()
+okLongEnv  = okTrendEnv and f_slopeDistLong()
+okShortEnv = okTrendEnv and f_slopeDistShort()
+okHTFLong  = not useHTF or htfLongBias
+okHTFShort = not useHTF or htfShortBias
+okAsianL   = not useAsian or brokeAsianUp
+okAsianS   = not useAsian or brokeAsianDown
+
+longCond  = inSession and trendUp   and macdLongBase  and macdAccelUp  and okStochL  and okRetestL and okLongEnv  and okHTFLong and ema50OKL and okAsianL
+shortCond = inSession and trendDown and macdShortBase and macdAccelDn  and okStochS  and okRetestS and okShortEnv and okHTFShort and ema50OKS and okAsianS
+
+//============================== SL / TP ==============================//
+longSL  = slMode == "ATR" ? close - slATRmult * atr : stLine
+shortSL = slMode == "ATR" ? close + slATRmult * atr : stLine
+longRiskPts  = math.max(close - longSL,  syminfo.mintick)
+shortRiskPts = math.max(shortSL - close, syminfo.mintick)
+longTP = close + tpRR * longRiskPts
+shortTP= close - tpRR * shortRiskPts
+
+//============================== ORDERS ==============================//
+if (longCond) and (strategy.position_size <= 0)
+    strategy.entry("L", strategy.long)
+    strategy.exit("LX", "L", stop=longSL, limit=longTP)
+
+if (shortCond) and (strategy.position_size >= 0)
+    strategy.entry("S", strategy.short)
+    strategy.exit("SX", "S", stop=shortSL, limit=shortTP)
+
+//============================== BE + TRAILING + TIME STOP ==============================//
+var int barsInPos = 0
+barsInPos := strategy.position_size == 0 ? 0 : barsInPos + 1
+
+if beEnable and strategy.position_size != 0
+    avg = strategy.position_avg_price
+    curR = strategy.position_size > 0 ? (close - avg) / longRiskPts : (avg - close) / shortRiskPts
+
+    // BE
+    var bool isBE = false
+    if curR >= beAfterR and not isBE
+        isBE := true
+        if strategy.position_size > 0
+            strategy.exit("LX", "L", stop=avg, limit=avg + tpRR * longRiskPts)
+        else
+            strategy.exit("SX", "S", stop=avg, limit=avg - tpRR * shortRiskPts)
+
+    // Trailing ATR après BE
+    if trailOn and isBE
+        if strategy.position_size > 0
+            trailStop = math.max(avg, close - trailMult * atr)
+            strategy.exit("LX", "L", stop=trailStop, limit=avg + tpRR * longRiskPts)
+        else
+            trailStop = math.min(avg, close + trailMult * atr)
+            strategy.exit("SX", "S", stop=trailStop, limit=avg - tpRR * shortRiskPts)
+
+    // Time stop
+    if timeStopOn and barsInPos >= timeBars
+        if strategy.position_size > 0
+            strategy.exit("LX", "L", stop=close)
+        else
+            strategy.exit("SX", "S", stop=close)
+
+//============================== PLOTS ==============================//
+plot(ema200, "EMA200", color=color.new(color.blue, 0), linewidth=2)
+plot(ema50,  "EMA50",  color=color.new(color.orange, 0), linewidth=1)
+plot(stLine, "Supertrend", color=stTrend==1? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+plotshape(longCond,  title="Long",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(shortCond, title="Short", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny)
+
+// Debug visuel Asian Box
+plot(aHigh, "Asian High", color=color.new(color.green, 60), style=plot.style_stepline)
+plot(aLow,  "Asian Low",  color=color.new(color.red,   60), style=plot.style_stepline)

@@ -1,0 +1,469 @@
+// file: indicators/apex_all_in_one_stacked_with_tdi_auto_proportional_cleanui_dashed_levels_tdi_fixed_v2.pine
+//@version=5
+indicator("www.Apex-Wallet.fr - Oscillateurs Stoch, RSI, StochRSI, MACD, MACD ZL, Andean, TDI et la Tendance du Marché", format=format.price, precision=2, overlay=false)
+
+// ============================ INPUTS ============================
+mode = input.string("Day-Trading", "Mode de Trading", options=["Scalping", "Day-Trading", "Swing-Trading"])
+affichage = input.string("Brut", "Affichage", options=["Brut", "Empilé", "Empilé Proportionnellement"], tooltip="Brut: valeurs originales. / Empilé: zones fixes. / Empilé Proportionnellement: blocs auto selon oscillateurs actifs.")
+
+afficherSignaux     = input.bool(true, "Afficher la Tendance du Marché")
+
+afficherStoch       = input.bool(false, "Afficher le Stochastic")
+afficherRSI         = input.bool(false, "Afficher le RSI")
+afficherStochRSI    = input.bool(false, "Afficher le StochRSI")
+afficherMACD        = input.bool(true, "Afficher le MACD")
+afficherMACDZeroLag = input.bool(false, "Afficher le MACD Zero Lag")
+
+afficherAndean = input.bool(false, "Afficher l'Andean Oscillator")
+andeanShowFill = input.bool(false, "Andean: Remplissage Bull/Bear")
+
+afficherTDI   = input.bool(false, "Afficher le Traders Dynamic Index (TDI)")
+showBiasBG    = input.bool(false, "TDI: Remplir le fond selon le biais")
+showBandwidth = input.bool(false, "TDI: Afficher la Bandwidth")
+
+// ✅ Defaults fixes (non affichés)
+float empileGap = 5.0
+float empileInnerPaddingPct = 5.0
+bool isProp = affichage == "Empilé Proportionnellement"
+
+// ============================ CONSTANTS ============================
+normLen = 25
+
+// ============================ PRESETS ============================
+periodK        = mode == "Scalping" ? 7  : mode == "Swing-Trading" ? 21  : 14
+smoothK        = mode == "Scalping" ? 3  : mode == "Swing-Trading" ? 6   : 4
+periodD        = mode == "Scalping" ? 3  : mode == "Swing-Trading" ? 6   : 4
+rsiPeriod      = mode == "Scalping" ? 7  : mode == "Swing-Trading" ? 21  : 14
+smaTrendPeriod = mode == "Scalping" ? 50 : mode == "Swing-Trading" ? 200 : 100
+
+macdFast   = mode == "Scalping" ? 6  : mode == "Swing-Trading" ? 24 : 12
+macdSlow   = mode == "Scalping" ? 13 : mode == "Swing-Trading" ? 52 : 26
+macdSignal = 9
+
+andeanLength = mode == "Scalping" ? 21 : mode == "Day-Trading" ? 50 : 100
+andeanSigLen = mode == "Scalping" ? 5  : mode == "Day-Trading" ? 9  : 14
+
+// ----- Presets TDI -----
+tdiRsiLen = mode == "Scalping" ? 7  : mode == "Day-Trading" ? 14 : 21
+tdiPlLen  = mode == "Scalping" ? 2  : mode == "Day-Trading" ? 2  : 3
+tdiSigLen = mode == "Scalping" ? 5  : mode == "Day-Trading" ? 9  : 20
+tdiMblLen = mode == "Scalping" ? 13 : mode == "Day-Trading" ? 26 : 50
+tdiBbLen  = mode == "Scalping" ? 20 : mode == "Day-Trading" ? 34 : 50
+tdiBbMult = mode == "Scalping" ? 1.4 : mode == "Day-Trading" ? 1.618 : 1.6
+
+tdiLevelHigh = mode == "Scalping" ? 70.0 : mode == "Day-Trading" ? 68.0 : 66.0
+tdiLevelLow  = mode == "Scalping" ? 30.0 : mode == "Day-Trading" ? 32.0 : 34.0
+
+tdiCtr = mode == "Scalping" ? 0.90 : mode == "Day-Trading" ? 0.85 : 0.80
+tdiExp = mode == "Scalping" ? 1.10 : mode == "Day-Trading" ? 1.15 : 1.20
+
+// ============================ HELPERS ============================
+absMax3(a, b, c) => math.max(math.max(math.abs(a), math.abs(b)), math.abs(c))
+max3(a, b, c) => math.max(math.max(a, b), c)
+min3(a, b, c) => math.min(math.min(a, b), c)
+sqrt_safe(x) => math.sqrt(math.max(x, 0.0))
+clamp01(x) => math.max(0.0, math.min(1.0, x))
+
+makeColor(color c, bool show) => show ? c : color.new(c, 100)
+
+// ============================ LAYOUT ============================
+macdGroupOn   = afficherMACD or afficherMACDZeroLag
+midGroupOn    = afficherRSI or afficherStoch or afficherStochRSI or afficherTDI
+andeanGroupOn = afficherAndean
+
+macdCenterFixed = -50.0
+macdAmpFixed    = 40.0
+midBaseFixed    = 10.0
+midAmpFixed     = 40.0
+andeanBaseFixed = 60.0
+andeanAmpFixed  = 40.0
+
+nGroups  = (macdGroupOn ? 1 : 0) + (midGroupOn ? 1 : 0) + (andeanGroupOn ? 1 : 0)
+gapTotal = nGroups > 1 ? (nGroups - 1) * empileGap : 0.0
+avail    = math.max(0.0, 100.0 - gapTotal)
+blockH   = nGroups > 0 ? (avail / nGroups) : 0.0
+
+padPct   = clamp01(empileInnerPaddingPct / 100.0)
+blockPad = blockH * padPct
+
+float cursor = 0.0
+float bMacd = na
+float bMid  = na
+float bAnd  = na
+
+if isProp and affichage != "Brut"
+    if macdGroupOn
+        bMacd := cursor
+        cursor += blockH + empileGap
+    if midGroupOn
+        bMid := cursor
+        cursor += blockH + empileGap
+    if andeanGroupOn
+        bAnd := cursor
+
+macdCenter = isProp and affichage != "Brut" and macdGroupOn ? (bMacd + blockPad + (blockH - 2.0 * blockPad) / 2.0) : macdCenterFixed
+macdAmp    = isProp and affichage != "Brut" and macdGroupOn ? math.max(0.0, (blockH - 2.0 * blockPad) / 2.0) : macdAmpFixed
+
+midBase = isProp and affichage != "Brut" and midGroupOn ? (bMid + blockPad) : midBaseFixed
+midAmp  = isProp and affichage != "Brut" and midGroupOn ? math.max(0.0, (blockH - 2.0 * blockPad)) : midAmpFixed
+
+andeanBase = isProp and affichage != "Brut" and andeanGroupOn ? (bAnd + blockPad) : andeanBaseFixed
+andeanAmp  = isProp and affichage != "Brut" and andeanGroupOn ? math.max(0.0, (blockH - 2.0 * blockPad)) : andeanAmpFixed
+
+midY(x_0_100) => affichage == "Brut" ? x_0_100 : (midBase + midAmp * (x_0_100 / 100.0))
+
+// ============================ NIVEAUX RSI/STOCH/STOCHRSI - TIRETS (comme TDI) ============================
+var line lRsi70 = na
+var line lRsi30 = na
+var line lSt80  = na
+var line lSt20  = na
+var line lMid50 = na
+
+showRsiLevels   = afficherRSI
+showStochLevels = afficherStoch or afficherStochRSI
+showMid50       = afficherRSI or afficherStoch or afficherStochRSI
+
+yRsi70 = midY(70.0)
+yRsi30 = midY(30.0)
+ySt80  = midY(80.0)
+ySt20  = midY(20.0)
+yMid50 = midY(50.0)
+
+// ✅ même rendu que TDI d'origine : rouge 30 / gris 60 / vert 30
+cRsi70 = color.new(color.red, 30)
+cRsi30 = color.new(color.lime, 30)
+cSt80  = color.new(color.red, 30)
+cSt20  = color.new(color.lime, 30)
+cMid50 = color.new(color.gray, 60)
+
+if na(lRsi70)
+    lRsi70 := line.new(bar_index, yRsi70, bar_index + 1, yRsi70, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cRsi70, showRsiLevels))
+else
+    line.set_xy1(lRsi70, bar_index, yRsi70)
+    line.set_xy2(lRsi70, bar_index + 1, yRsi70)
+    line.set_style(lRsi70, line.style_dashed)
+    line.set_width(lRsi70, 1)
+    line.set_color(lRsi70, makeColor(cRsi70, showRsiLevels))
+
+if na(lRsi30)
+    lRsi30 := line.new(bar_index, yRsi30, bar_index + 1, yRsi30, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cRsi30, showRsiLevels))
+else
+    line.set_xy1(lRsi30, bar_index, yRsi30)
+    line.set_xy2(lRsi30, bar_index + 1, yRsi30)
+    line.set_style(lRsi30, line.style_dashed)
+    line.set_width(lRsi30, 1)
+    line.set_color(lRsi30, makeColor(cRsi30, showRsiLevels))
+
+if na(lSt80)
+    lSt80 := line.new(bar_index, ySt80, bar_index + 1, ySt80, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cSt80, showStochLevels))
+else
+    line.set_xy1(lSt80, bar_index, ySt80)
+    line.set_xy2(lSt80, bar_index + 1, ySt80)
+    line.set_style(lSt80, line.style_dashed)
+    line.set_width(lSt80, 1)
+    line.set_color(lSt80, makeColor(cSt80, showStochLevels))
+
+if na(lSt20)
+    lSt20 := line.new(bar_index, ySt20, bar_index + 1, ySt20, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cSt20, showStochLevels))
+else
+    line.set_xy1(lSt20, bar_index, ySt20)
+    line.set_xy2(lSt20, bar_index + 1, ySt20)
+    line.set_style(lSt20, line.style_dashed)
+    line.set_width(lSt20, 1)
+    line.set_color(lSt20, makeColor(cSt20, showStochLevels))
+
+if na(lMid50)
+    lMid50 := line.new(bar_index, yMid50, bar_index + 1, yMid50, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cMid50, showMid50))
+else
+    line.set_xy1(lMid50, bar_index, yMid50)
+    line.set_xy2(lMid50, bar_index + 1, yMid50)
+    line.set_style(lMid50, line.style_dashed)
+    line.set_width(lMid50, 1)
+    line.set_color(lMid50, makeColor(cMid50, showMid50))
+
+// ============================ NIVEAUX TDI - TIRETS (rouge/gris/vert) ============================
+var line lTdiHi  = na
+var line lTdiMid = na
+var line lTdiLo  = na
+
+showTdiLevels = afficherTDI
+
+yTdiHi  = affichage == "Brut" ? tdiLevelHigh : midY(tdiLevelHigh)
+yTdiMid = affichage == "Brut" ? 50.0         : midY(50.0)
+yTdiLo  = affichage == "Brut" ? tdiLevelLow  : midY(tdiLevelLow)
+
+cTdiHi  = color.new(color.red, 30)
+cTdiMid = color.new(color.gray, 60)
+cTdiLo  = color.new(color.lime, 30)
+
+if na(lTdiHi)
+    lTdiHi := line.new(bar_index, yTdiHi, bar_index + 1, yTdiHi, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cTdiHi, showTdiLevels))
+else
+    line.set_xy1(lTdiHi, bar_index, yTdiHi)
+    line.set_xy2(lTdiHi, bar_index + 1, yTdiHi)
+    line.set_style(lTdiHi, line.style_dashed)
+    line.set_width(lTdiHi, 1)
+    line.set_color(lTdiHi, makeColor(cTdiHi, showTdiLevels))
+
+if na(lTdiMid)
+    lTdiMid := line.new(bar_index, yTdiMid, bar_index + 1, yTdiMid, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cTdiMid, showTdiLevels))
+else
+    line.set_xy1(lTdiMid, bar_index, yTdiMid)
+    line.set_xy2(lTdiMid, bar_index + 1, yTdiMid)
+    line.set_style(lTdiMid, line.style_dashed)
+    line.set_width(lTdiMid, 1)
+    line.set_color(lTdiMid, makeColor(cTdiMid, showTdiLevels))
+
+if na(lTdiLo)
+    lTdiLo := line.new(bar_index, yTdiLo, bar_index + 1, yTdiLo, extend=extend.both, style=line.style_dashed, width=1, color=makeColor(cTdiLo, showTdiLevels))
+else
+    line.set_xy1(lTdiLo, bar_index, yTdiLo)
+    line.set_xy2(lTdiLo, bar_index + 1, yTdiLo)
+    line.set_style(lTdiLo, line.style_dashed)
+    line.set_width(lTdiLo, 1)
+    line.set_color(lTdiLo, makeColor(cTdiLo, showTdiLevels))
+
+// Base for MACD/ZL fills (no hline)
+pBaseCenter = plot((affichage != "Brut" and macdGroupOn) ? macdCenter : na, "Base Center (Empilé)", color.new(color.white, 100))
+
+// ============================ RSI ============================
+rsi = ta.rsi(close, rsiPeriod)
+rsiColor = (afficherRSI and afficherSignaux) ? (rsi > 50 ? color.rgb(0, 255, 0) : color.rgb(255, 0, 0)) : color.white
+plot(afficherRSI ? midY(rsi) : na, title="RSI", color=afficherRSI ? rsiColor : na, linewidth=2)
+
+// ============================ STOCHASTIC ============================
+stochRaw = ta.stoch(high, low, close, periodK)
+k = ta.ema(stochRaw, smoothK)
+d = ta.ema(k, periodD)
+
+crossUpStoch   = ta.crossover(k, d)
+crossDownStoch = ta.crossunder(k, d)
+
+var color lineColorStoch = color.gray
+lineColorStoch := crossUpStoch ? color.rgb(0, 255, 0) : crossDownStoch ? color.rgb(255, 0, 0) : lineColorStoch
+
+int stochKW = 2
+int stochDW = afficherSignaux ? 1 : 2  // ✅ quand signaux OFF: rouge = même épaisseur que vert
+
+plot(afficherStoch ? midY(k) : na,
+     title="Stoch %K",
+     color=(afficherStoch and afficherSignaux) ? lineColorStoch : color.rgb(0, 255, 0),
+     linewidth=stochKW)
+
+plot(afficherStoch ? midY(d) : na,
+     title="Stoch %D",
+     color=(afficherStoch and afficherSignaux) ? color.new(color.white, 75) : color.rgb(255, 0, 0),
+     linewidth=stochDW)
+
+// ============================ STOCH RSI ============================
+stochRsiLength = rsiPeriod
+rsiLL = ta.lowest(rsi, stochRsiLength)
+rsiHH = ta.highest(rsi, stochRsiLength)
+stochRsiRaw = rsiHH != rsiLL ? (rsi - rsiLL) / (rsiHH - rsiLL) * 100.0 : 0.0
+kSR = ta.ema(stochRsiRaw, smoothK)
+dSR = ta.ema(kSR, periodD)
+
+stochRsiColorK = (afficherStochRSI and afficherSignaux) ? (kSR > 50 ? color.rgb(0, 255, 0) : color.rgb(255, 0, 0)) : color.rgb(0, 255, 0)
+stochRsiColorD = (afficherStochRSI and afficherSignaux) ? color.new(color.white, 75) : color.rgb(255, 0, 0)
+
+int srKW = 2
+int srDW = afficherSignaux ? 1 : 2     // ✅ quand signaux OFF: rouge = même épaisseur que vert
+
+plot(afficherStochRSI ? midY(kSR) : na,
+     title="StochRSI %K",
+     color=stochRsiColorK,
+     linewidth=srKW)
+
+plot(afficherStochRSI ? midY(dSR) : na,
+     title="StochRSI %D",
+     color=stochRsiColorD,
+     linewidth=srDW)
+
+// ============================ TDI (tendance = afficherSignaux) ============================
+tdiTrendEnabled = afficherSignaux
+
+tdi_rsi = ta.rsi(close, tdiRsiLen)
+tdi_pl  = mode == "Scalping" ? ta.ema(tdi_rsi, tdiPlLen) : ta.sma(tdi_rsi, tdiPlLen)
+tdi_sig = mode == "Scalping" ? ta.ema(tdi_pl,  tdiSigLen) : ta.sma(tdi_pl,  tdiSigLen)
+tdi_mbl = ta.sma(tdi_rsi, tdiMblLen)
+
+tdi_bb_mid   = ta.sma(tdi_pl, tdiBbLen)
+tdi_bb_dev   = ta.stdev(tdi_pl, tdiBbLen) * tdiBbMult
+tdi_bb_upper = tdi_bb_mid + tdi_bb_dev
+tdi_bb_lower = tdi_bb_mid - tdi_bb_dev
+
+tdi_width    = tdi_bb_upper - tdi_bb_lower
+tdi_widthSma = ta.sma(tdi_width, tdiBbLen)
+tdi_bw_raw   = (na(tdi_bb_mid) or tdi_bb_mid == 0.0) ? na : tdi_width / math.abs(tdi_bb_mid)
+tdi_wRel     = (na(tdi_widthSma) or tdi_widthSma == 0.0) ? na : tdi_width / tdi_widthSma
+tdi_colBW    = na(tdi_wRel) ? na : (tdi_wRel < tdiCtr ? color.rgb(255, 0, 0) : (tdi_wRel <= tdiExp ? color.gray : color.rgb(0, 200, 0)))
+
+var int tdi_rel = 0
+tdi_rel := tdi_pl > tdi_sig ? 1 : tdi_pl < tdi_sig ? -1 : nz(tdi_rel[1], 0)
+tdi_bias = tdi_pl > tdi_mbl ? 1 : tdi_pl < tdi_mbl ? -1 : 0
+
+bgcolor(afficherTDI and showBiasBG ? (tdi_bias > 0 ? color.new(color.green, 92) : (tdi_bias < 0 ? color.new(color.red, 92) : color.new(color.gray, 94))) : na)
+
+tdi_pl_plot  = afficherTDI ? midY(tdi_pl)  : na
+tdi_sig_plot = afficherTDI ? midY(tdi_sig) : na
+tdi_mbl_plot = afficherTDI ? midY(tdi_mbl) : na
+
+tdi_bbu_plot = afficherTDI ? midY(tdi_bb_upper) : na
+tdi_bbm_plot = afficherTDI ? midY(tdi_bb_mid)   : na
+tdi_bbl_plot = afficherTDI ? midY(tdi_bb_lower) : na
+
+pTdiU = plot(tdi_bbu_plot, title="TDI BB Upper", color=color.new(color.blue, 0))
+pTdiM = plot(tdi_bbm_plot, title="TDI BB Mid",   color=color.new(color.blue, 70))
+pTdiL = plot(tdi_bbl_plot, title="TDI BB Lower", color=color.new(color.blue, 0))
+fill(pTdiU, pTdiL, color=afficherTDI ? color.new(color.blue, 90) : na, title="TDI BB Fill")
+
+tdi_pl_col  = tdiTrendEnabled ? (tdi_rel >= 0 ? color.rgb(0, 200, 0) : color.rgb(220, 0, 0)) : color.rgb(0, 200, 0)
+tdi_sig_col = tdiTrendEnabled ? color.new(color.white, 75) : color.rgb(255, 0, 0)
+
+plot(tdi_pl_plot,  title="TDI Price Line",       color=tdi_pl_col,  linewidth=tdiTrendEnabled ? 2 : 1)
+plot(tdi_sig_plot, title="TDI Signal",           color=tdi_sig_col, linewidth=tdiTrendEnabled ? 1 : 2)
+plot(tdi_mbl_plot, title="TDI Market Base Line", color=color.yellow, linewidth=1)
+
+tdi_bw_max = ta.highest(tdi_bw_raw, normLen)
+tdi_bw_max := (tdi_bw_max == 0.0 or na(tdi_bw_max)) ? na : tdi_bw_max
+tdi_bw_0_100 = na(tdi_bw_raw) or na(tdi_bw_max) ? na : (tdi_bw_raw / tdi_bw_max) * 100.0
+tdi_bw_plot = (afficherTDI and showBandwidth) ? (affichage == "Brut" ? tdi_bw_raw : midY(tdi_bw_0_100)) : na
+plot(tdi_bw_plot, title="TDI Bandwidth", style=plot.style_columns, color=tdi_colBW, linewidth=2)
+
+// ============================ MACD ============================
+[macdLine, signalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+histogram = macdLine - signalLine
+
+macdCrossUp   = ta.crossover(macdLine, signalLine)
+macdCrossDown = ta.crossunder(macdLine, signalLine)
+
+var color macdLineColor = color.gray
+macdLineColor := macdCrossUp ? color.rgb(0, 255, 0) : macdCrossDown ? color.rgb(255, 0, 0) : macdLineColor
+
+macdAbsMax = ta.highest(absMax3(macdLine, signalLine, histogram), normLen)
+macdAbsMax := macdAbsMax == 0.0 ? 1.0 : macdAbsMax
+
+macdN = macdLine / macdAbsMax
+sigN  = signalLine / macdAbsMax
+hisN  = histogram / macdAbsMax
+
+macdPlot = afficherMACD ? (affichage == "Brut" ? macdLine : (macdCenter + macdAmp * macdN)) : na
+sigPlot  = afficherMACD ? (affichage == "Brut" ? signalLine : (macdCenter + macdAmp * sigN)) : na
+hisPlot  = afficherMACD ? (affichage == "Brut" ? histogram : (macdCenter + macdAmp * hisN)) : na
+
+plot(macdPlot, title="MACD Line", color=(afficherMACD and afficherSignaux) ? macdLineColor : color.rgb(0, 255, 0), linewidth=2)
+plot(sigPlot,  title="Signal Line", color=(afficherMACD and afficherSignaux) ? color.new(color.white, 75) : color.rgb(255, 0, 0), linewidth=2)
+
+histColor = histogram >= 0 ? color.new(color.green, 20) : color.new(color.red, 20)
+plot(afficherMACD and affichage == "Brut" ? histogram : na, title="MACD Histogram", style=plot.style_columns, color=histColor)
+
+pMacdHistEmp = plot(afficherMACD and affichage != "Brut" ? hisPlot : na, title="MACD Histogram (Empilé)", color=histColor, linewidth=1)
+fill(pBaseCenter, pMacdHistEmp, title="MACD Fill (Empilé)", color=(histogram >= 0 ? color.new(color.green, 80) : color.new(color.red, 80)))
+
+// ============================ MACD ZERO LAG ============================
+emaFast   = ta.ema(close, macdFast)
+emaFastZL = emaFast + (emaFast - ta.ema(emaFast, macdFast))
+emaSlow   = ta.ema(close, macdSlow)
+emaSlowZL = emaSlow + (emaSlow - ta.ema(emaSlow, macdSlow))
+
+macdZL   = emaFastZL - emaSlowZL
+signalZL = ta.ema(macdZL, macdSignal)
+histZL   = macdZL - signalZL
+
+macdZLUp   = ta.crossover(macdZL, signalZL)
+macdZLDown = ta.crossunder(macdZL, signalZL)
+
+var color macdZLColor = color.gray
+macdZLColor := macdZLUp ? color.rgb(0, 255, 0) : macdZLDown ? color.rgb(255, 0, 0) : macdZLColor
+
+zlAbsMax = ta.highest(absMax3(macdZL, signalZL, histZL), normLen)
+zlAbsMax := zlAbsMax == 0.0 ? 1.0 : zlAbsMax
+
+macdZLN = macdZL / zlAbsMax
+sigZLN  = signalZL / zlAbsMax
+hisZLN  = histZL / zlAbsMax
+
+macdZLPlot = afficherMACDZeroLag ? (affichage == "Brut" ? macdZL : (macdCenter + macdAmp * macdZLN)) : na
+sigZLPlot  = afficherMACDZeroLag ? (affichage == "Brut" ? signalZL : (macdCenter + macdAmp * sigZLN)) : na
+hisZLPlot  = afficherMACDZeroLag ? (affichage == "Brut" ? histZL : (macdCenter + macdAmp * hisZLN)) : na
+
+plot(macdZLPlot, title="MACD Zero Lag", color=(afficherMACDZeroLag and afficherSignaux) ? macdZLColor : color.rgb(0, 255, 0), linewidth=2)
+plot(sigZLPlot,  title="Signal Zero Lag", color=(afficherMACDZeroLag and afficherSignaux) ? color.new(color.white, 75) : color.rgb(255, 0, 0), linewidth=2)
+
+histZLColor = histZL >= 0 ? color.new(color.green, 20) : color.new(color.red, 20)
+plot(afficherMACDZeroLag and affichage == "Brut" ? histZL : na, title="ZL Histogram", style=plot.style_columns, color=histZLColor)
+
+pZLHistEmp = plot(afficherMACDZeroLag and affichage != "Brut" ? hisZLPlot : na, title="ZL Histogram (Empilé)", color=histZLColor, linewidth=1)
+fill(pBaseCenter, pZLHistEmp, title="ZL Fill (Empilé)", color=(histZL >= 0 ? color.new(color.green, 80) : color.new(color.red, 80)))
+
+// ============================ ANDEAN ============================
+andeanAlpha = 2.0 / (andeanLength + 1.0)
+
+var float andeanUp1 = na
+var float andeanUp2 = na
+var float andeanDn1 = na
+var float andeanDn2 = na
+
+float C = close
+float O = open
+float C2 = C * C
+float O2 = O * O
+
+andeanUp1 := nz(max3(C, O, andeanUp1[1] - (andeanUp1[1] - C) * andeanAlpha), C)
+andeanUp2 := nz(max3(C2, O2, andeanUp2[1] - (andeanUp2[1] - C2) * andeanAlpha), C2)
+andeanDn1 := nz(min3(C, O, andeanDn1[1] + (C - andeanDn1[1]) * andeanAlpha), C)
+andeanDn2 := nz(min3(C2, O2, andeanDn2[1] + (C2 - andeanDn2[1]) * andeanAlpha), C2)
+
+andeanBull   = sqrt_safe(andeanDn2 - andeanDn1 * andeanDn1)
+andeanBear   = sqrt_safe(andeanUp2 - andeanUp1 * andeanUp1)
+andeanSignal = ta.ema(math.max(andeanBull, andeanBear), andeanSigLen)
+
+andeanMax = ta.highest(math.max(andeanBull, andeanBear), normLen)
+andeanMax := andeanMax == 0.0 ? 1.0 : andeanMax
+
+bullN = andeanBull / andeanMax
+bearN = andeanBear / andeanMax
+sigAN = andeanSignal / andeanMax
+
+andeanY(v) => affichage == "Brut" ? v : (andeanBase + andeanAmp * v)
+
+bullPlot = afficherAndean ? andeanY(bullN) : na
+bearPlot = afficherAndean ? andeanY(bearN) : na
+sigAPlot = afficherAndean ? andeanY(sigAN) : na
+
+var string state = "NEUTRE"
+var color  stateColor = color.gray
+
+isBull = andeanBull > andeanBear
+isBear = andeanBear > andeanBull
+isRange = (isBull and andeanSignal > andeanBull) or (isBear and andeanSignal > andeanBear)
+isCross = ta.cross(andeanBull, andeanBear)
+
+if isCross
+    state := "RETOURNEMENT"
+    stateColor := color.rgb(138, 43, 226)
+else
+    if isBull and not isRange
+        state := "HAUSSIER"
+        stateColor := color.rgb(0, 255, 0)
+    else if isBear and not isRange
+        state := "BAISSIER"
+        stateColor := color.rgb(255, 0, 0)
+    else
+        state := "RANGE"
+        stateColor := color.orange
+
+pBull = plot(afficherAndean ? bullPlot : na, title="Andean Bull", color=color.green, linewidth=1)
+pBear = plot(afficherAndean ? bearPlot : na, title="Andean Bear", color=color.red, linewidth=1)
+
+color andeanSignalColor = afficherSignaux ? stateColor : color.orange
+int andeanSignalWidth   = afficherSignaux ? 2 : 1
+plot(afficherAndean ? sigAPlot : na, title="Andean Signal", color=andeanSignalColor, linewidth=andeanSignalWidth)
+
+fillColor = (afficherAndean and andeanShowFill) ? (andeanBull >= andeanBear ? color.new(color.green, 85) : color.new(color.red, 85)) : na
+fill(pBull, pBear, title="Andean Fill", color=fillColor)
+
+stateChanged = state != state[1]
+alertcondition(afficherAndean and stateChanged and state == "HAUSSIER", title="Alerte Andean Haussier", message="Andean: Tendance HAUSSIERE confirmée")
+alertcondition(afficherAndean and stateChanged and state == "BAISSIER", title="Alerte Andean Baissier", message="Andean: Tendance BAISSIERE confirmée")
+alertcondition(afficherAndean and stateChanged and state == "RETOURNEMENT", title="Alerte Andean Retournement", message="Andean: ZONE DE RETOURNEMENT")

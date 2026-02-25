@@ -1,0 +1,156 @@
+// © hibinomasakazu1991
+//@version=6
+//@version=6
+indicator('Minervini TT + IBD RS + ENTRY (Pivot/Vol/VCP) + RS Break (vs TOPIX)', overlay = true, max_labels_count = 500)
+
+// =====================
+// Inputs: Trend Template (TT)
+// =====================
+len50 = input.int(50, 'SMA 50', minval = 1)
+len150 = input.int(150, 'SMA 150', minval = 1)
+len200 = input.int(200, 'SMA 200', minval = 1)
+
+lookback52w = input.int(252, '52-week lookback (days)', minval = 50)
+minAboveLowPct = input.float(30.0, 'Min % above 52w low', step = 0.5)
+maxOffHighPct = input.float(25.0, 'Max % off 52w high', step = 0.5)
+slopeLookback = input.int(20, '200SMA slope lookback (days)', minval = 1)
+
+// =====================
+// Inputs: RS proxy vs TOPIX (IBD-ish)
+// =====================
+useRsProxy = input.bool(true, 'Use RS proxy vs TOPIX')
+benchSym = input.symbol('TVC:TOPIX', 'Benchmark (TOPIX)')
+rsLen = input.int(252, 'RS lookback (days)', minval = 20)
+rsMinPct = input.float(0.0, 'Min RS % vs TOPIX', step = 0.5)
+
+rsMaLen = input.int(50, 'RS MA length', minval = 2)
+rsHighLen = input.int(63, 'RS new high lookback', minval = 10)
+
+// RS break (No-ADD / Exit watch)
+useRsBreak = input.bool(true, 'Enable RS break (No-ADD / Exit warning)')
+breakIfBelowRsMa = input.bool(true, 'RS break if RS < RS_MA')
+breakIfRsMaDown = input.bool(true, 'RS break if RS_MA turns down')
+
+// BUY label behavior
+signalOnlyOnFirstPass = input.bool(true, 'Show BUY only on first pass')
+
+// =====================
+// Inputs: ENTRY (Pivot / Volume / VCP)
+// =====================
+pivotLen = input.int(50, 'Pivot lookback N (days)', minval = 20)
+
+volLen = input.int(50, 'Volume MA length', minval = 10)
+volMult = input.float(1.5, 'Breakout vol multiplier', minval = 1.0, step = 0.1)
+
+atrLen = input.int(14, 'ATR length', minval = 1)
+atrShort = input.int(10, 'ATR% short MA', minval = 2)
+atrLong = input.int(50, 'ATR% long MA', minval = 10)
+atrRatio = input.float(0.90, 'Contraction ratio (short < long * ratio)', minval = 0.50, maxval = 1.00, step = 0.01)
+
+// “BUYが点灯した日だけ” ENTRYを許可するか、
+// “BUY条件がONの期間中ずっと” ENTRYを許可するか
+entryMode = input.string('BUY condition ON', 'ENTRY gate mode', options = ['BUY condition ON', 'BUY signal day only'])
+
+// =====================
+// Calculations: MAs
+// =====================
+sma50 = ta.sma(close, len50)
+sma150 = ta.sma(close, len150)
+sma200 = ta.sma(close, len200)
+
+hi52 = ta.highest(high, lookback52w)
+lo52 = ta.lowest(low, lookback52w)
+
+// =====================
+// TT conditions
+// =====================
+c1 = close > sma150 and close > sma200
+c2 = sma150 > sma200
+c3 = sma200 > nz(sma200[slopeLookback])
+
+c4 = sma50 > sma150 and sma50 > sma200
+c5 = close > sma50
+
+c6 = close >= lo52 * (1.0 + minAboveLowPct / 100.0)
+c7 = close >= hi52 * (1.0 - maxOffHighPct / 100.0)
+
+ttPass = c1 and c2 and c3 and c4 and c5 and c6 and c7
+
+// =====================
+// RS proxy vs TOPIX
+// =====================
+benchClose = request.security(benchSym, timeframe.period, close)
+
+stockRet = close / nz(close[rsLen]) - 1.0
+benchRet = benchClose / nz(benchClose[rsLen]) - 1.0
+rsPct = (stockRet - benchRet) * 100.0
+
+rsBaseOK = not useRsProxy or rsPct >= rsMinPct
+
+rsMa = ta.sma(rsPct, rsMaLen)
+rsTrendUp = rsPct > rsMa and rsMa > rsMa[1]
+rsNewHigh = rsPct >= ta.highest(rsPct[1], rsHighLen)
+
+rsIBD = rsTrendUp and rsNewHigh
+
+// =====================
+// RS Break (Exit watch / No-ADD)
+// =====================
+rsBreakCond1 = breakIfBelowRsMa ? rsPct < rsMa : false
+rsBreakCond2 = breakIfRsMaDown ? rsMa < rsMa[1] : false
+
+rsBroken = useRsBreak and (rsBreakCond1 or rsBreakCond2)
+rsBreakEvent = rsBroken and not rsBroken[1]
+
+// =====================
+// Quality pass (BUY condition)
+// =====================
+allPass = ttPass and rsBaseOK and rsIBD
+
+buy = signalOnlyOnFirstPass ? allPass and not allPass[1] : allPass
+
+// =====================
+// ENTRY conditions (Pivot / Volume / VCP)
+// =====================
+// (1) Pivot breakout: highest high of last N days excluding today
+pivot = ta.highest(high[1], pivotLen)
+pivotBreak = ta.crossover(close, pivot)
+
+// (2) Volume surge on breakout
+volMA = ta.sma(volume, volLen)
+volOK = volume >= volMA * volMult
+
+// (4) VCP-ish contraction via ATR%
+atr = ta.atr(atrLen)
+atrPct = atr / close * 100.0
+atrPctShort = ta.sma(atrPct, atrShort)
+atrPctLong = ta.sma(atrPct, atrLong)
+vcpOK = atrPctShort < atrPctLong * atrRatio
+
+// Gate: only allow ENTRY when BUY condition is ON (and RS not broken)
+entryGate = entryMode == 'BUY signal day only' ? buy : allPass
+entry = entryGate and not rsBroken and pivotBreak and volOK and vcpOK
+
+// =====================
+// Visuals
+// =====================
+bgcolor(allPass ? color.new(color.green, 90) : na)
+bgcolor(rsBroken ? color.new(color.red, 88) : na)
+
+plotshape(buy, title = 'BUY (Quality Pass)', style = shape.labelup, text = 'BUY', location = location.belowbar, size = size.tiny)
+plotshape(entry, title = 'ENTRY (Pivot+Vol+VCP)', style = shape.labelup, text = 'ENTRY', location = location.belowbar, size = size.tiny)
+plotshape(rsBreakEvent, title = 'RS BREAK (Exit watch)', style = shape.labeldown, text = 'RS BREAK', location = location.abovebar, size = size.tiny)
+
+plot(pivot, 'Pivot', color = color.new(color.orange, 0))
+
+showMAs = input.bool(true, 'Plot MAs')
+plot(showMAs ? sma50 : na, 'SMA 50', color = color.new(color.blue, 0))
+plot(showMAs ? sma150 : na, 'SMA 150', color = color.new(color.orange, 0))
+plot(showMAs ? sma200 : na, 'SMA 200', color = color.new(color.red, 0))
+
+// =====================
+// Alerts
+// =====================
+alertcondition(buy, title = 'BUY (TT + IBD RS)', message = 'BUY: TT + IBD-style RS (vs TOPIX): {{ticker}}')
+alertcondition(entry, title = 'ENTRY (Pivot+Vol+VCP)', message = 'ENTRY: Pivot+Volume+VCP (vs TOPIX gate): {{ticker}}')
+alertcondition(rsBreakEvent, title = 'EXIT WATCH (RS BREAK)', message = 'EXIT WATCH: RS BREAK detected (vs TOPIX): {{ticker}}')

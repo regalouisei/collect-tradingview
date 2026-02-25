@@ -1,0 +1,427 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Trinity Signal [Cythos]", shorttitle="Cythos - Trinity Signal", overlay=true, max_bars_back=5000, max_labels_count=500)
+
+// Cythos Trinity — 3-signal regime-adaptive indicator (VB / DIV / MR)
+// by Cythos | non-repainting (barstate.isconfirmed guard)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+GRP_REG = "Regime Detection"
+i_adxLen     = input.int(14,    "ADX Length",           minval=5,  maxval=50, group=GRP_REG)
+i_adxThresh  = input.int(25,    "ADX Threshold",        minval=10, maxval=40, group=GRP_REG)
+i_useHysteresis = input.bool(true, "Regime Hysteresis", group=GRP_REG)
+i_adxEntryTh = input.int(22,    "Hysteresis Entry ADX", minval=15, maxval=35, group=GRP_REG)
+i_adxExitTh  = input.int(16,    "Hysteresis Exit ADX",  minval=8,  maxval=25, group=GRP_REG)
+i_pctThresh  = input.int(35,    "Percentile Threshold", minval=10, maxval=80, group=GRP_REG)
+i_rsiLen     = input.int(14,    "RSI Length",           minval=5,  maxval=30, group=GRP_REG)
+
+GRP_DIV = "RSI Divergence"
+i_useDiv       = input.bool(true,  "Enable Divergence",   group=GRP_DIV)
+i_pivotLeft    = input.int(14,     "Pivot Lookback (L)",  minval=3,   maxval=50,  group=GRP_DIV)
+i_pivotRight   = input.int(1,      "Pivot Confirm (R)",   minval=1,   maxval=10,  group=GRP_DIV)
+i_minPriceDiff = input.float(0.3,  "Min Price Diff %",    minval=0.0, maxval=5.0, step=0.1, group=GRP_DIV)
+i_minRsiDiff   = input.float(2.0,  "Min RSI Diff",        minval=0.0, maxval=20,  step=0.5, group=GRP_DIV)
+
+GRP_ST = "SuperTrend Filter"
+i_useST     = input.bool(false,  "Enable SuperTrend Filter", group=GRP_ST)
+i_stPeriod  = input.int(10,     "ST ATR Period",   minval=5,  maxval=50,  group=GRP_ST)
+i_stMult    = input.float(3.0,  "ST Multiplier",   minval=1.0, maxval=5.0, step=0.5, group=GRP_ST)
+
+GRP_BO = "Volume Breakout"
+i_useBo      = input.bool(true,  "Enable Breakout",     group=GRP_BO)
+i_dcLen      = input.int(20,     "Donchian Length",      minval=5,  maxval=100, group=GRP_BO)
+i_volMult    = input.float(2.5,  "Volume Multiplier",   minval=1.0, maxval=5.0, step=0.1, group=GRP_BO)
+i_boAdxMin   = input.int(25,     "BO ADX Min",          minval=10, maxval=40,  group=GRP_BO)
+i_atrExpMult = input.float(1.2,  "ATR Expansion Mult",  minval=1.0, maxval=2.5, step=0.1, group=GRP_BO)
+
+GRP_MR = "Mean Reversion (Z-Score)"
+i_useMr      = input.bool(true,  "Enable Mean Reversion", group=GRP_MR)
+i_bbLen      = input.int(20,     "BB Lookback",           minval=10, maxval=50,  group=GRP_MR)
+i_bbMult     = input.float(2.0,  "BB StdDev Mult",        minval=1.0, maxval=3.0, step=0.1, group=GRP_MR)
+i_mrLowVolZ  = input.float(1.5,  "Low Vol Entry Z",       minval=0.5, maxval=3.0, step=0.1, group=GRP_MR)
+i_mrHighVolZ = input.float(2.5,  "High Vol Entry Z",      minval=1.0, maxval=4.0, step=0.1, group=GRP_MR)
+i_mrStopZ    = input.float(3.0,  "Stop Z (extreme block)", minval=1.5, maxval=5.0, step=0.1, group=GRP_MR)
+i_mrVolMult  = input.float(0.8,  "Min Volume Ratio",      minval=0.1, maxval=3.0, step=0.1, group=GRP_MR)
+i_mrAtrPct   = input.float(65,   "Max ATR Percentile",    minval=20,  maxval=95,  step=1,   group=GRP_MR)
+
+GRP_TP = "TP / SL (ATR multiples)"
+i_boTp  = input.float(5.0,  "BO:  TP", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_boSl  = input.float(4.0,  "BO:  SL", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_divTp = input.float(3.5,  "DIV: TP", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_divSl = input.float(2.5,  "DIV: SL", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_mrTp  = input.float(3.0,  "MR:  TP", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_mrSl  = input.float(7.0,  "MR:  SL", minval=0.5, maxval=15, step=0.5, group=GRP_TP)
+i_mrSlMaxPct = input.float(2.0, "MR: SL Cap %", minval=0.5, maxval=5.0, step=0.1, group=GRP_TP)
+
+GRP_CD = "Cooldown & Entry"
+i_cooldown   = input.int(8,    "BO / DIV Cooldown (bars)", minval=0, maxval=200, group=GRP_CD)
+i_mrCooldown = input.int(25,   "MR Cooldown (bars)",       minval=5, maxval=200, group=GRP_CD)
+i_maxHoldBars = input.int(200, "Max Hold Bars",            minval=50, maxval=500, group=GRP_CD)
+i_minTpPct   = input.float(0.5, "Min TP %",               minval=0.0, maxval=2.0, step=0.1, group=GRP_CD)
+
+GRP_QUAL = "Signal Quality"
+i_useVbLongTrend = input.bool(true,  "VB LONG: EMA Trend Filter", group=GRP_QUAL)
+i_useVbRsiFilter = input.bool(true,  "VB: RSI Extreme Filter",    group=GRP_QUAL)
+i_vbRsiHigh      = input.int(75,     "  VB LONG Block RSI >",     minval=65, maxval=85, group=GRP_QUAL)
+i_vbRsiLow       = input.int(25,     "  VB SHORT Block RSI <",    minval=15, maxval=35, group=GRP_QUAL)
+i_useOiFilter    = input.bool(true,  "VB: OI Confirmation",       group=GRP_QUAL)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CORE INDICATORS
+// ══════════════════════════════════════════════════════════════════════════════
+
+rsiVal = ta.rsi(close, i_rsiLen)
+[diPlus, diMinus, adxVal] = ta.dmi(i_adxLen, i_adxLen)
+atrVal   = ta.atr(14)
+atrPct   = atrVal / close * 100
+atrSma50 = ta.sma(atrVal, 50)
+atrRank  = ta.percentrank(atrVal, 200)
+
+bbBasis  = ta.sma(close, i_bbLen)
+bbStdev  = ta.stdev(close, i_bbLen)
+float zscore = bbStdev > 0 ? (close - bbBasis) / bbStdev : 0.0
+
+bbWidth20  = ta.sma(close, 20) > 0 ? (2 * ta.stdev(close, 20)) / ta.sma(close, 20) : 0.0
+bbWRank    = ta.percentrank(bbWidth20, 200)
+
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+
+volSma20 = ta.sma(volume, 20)
+volRatio = volSma20 > 0 ? volume / volSma20 : 1.0
+volSpike = volume > volSma20 * i_volMult
+
+dcHigh = ta.highest(high, i_dcLen)[1]
+dcLow  = ta.lowest(low, i_dcLen)[1]
+
+[stValue, stDir] = ta.supertrend(i_stMult, i_stPeriod)
+stBullish = stDir < 0
+stBearish = stDir > 0
+
+// OI (Open Interest)
+string baseSymbol = str.replace(syminfo.ticker, ".P", "")
+baseSymbol := str.replace(baseSymbol, "PERP", "")
+string oiSymbol = syminfo.prefix + ":" + baseSymbol + "PERP_OI"
+float oiVal = request.security(oiSymbol, timeframe.period, close, ignore_invalid_symbol=true)
+float oiSma20 = ta.sma(oiVal, 20)
+int oiTrend = oiVal > oiSma20 ? 1 : oiVal < oiSma20 ? -1 : 0
+
+// Anti-repainting: only evaluate signals on confirmed (closed) bars
+// Historical bars: barstate.isconfirmed == true (no behavior change)
+// Realtime bars: signals only fire after bar close (prevents label flicker)
+bool confirmed = barstate.isconfirmed
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REGIME DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool adxTrendState = false
+if i_useHysteresis and confirmed
+    if not adxTrendState and adxVal > i_adxEntryTh
+        adxTrendState := true
+    else if adxTrendState and adxVal < i_adxExitTh
+        adxTrendState := false
+adxVote = i_useHysteresis ? adxTrendState : adxVal > i_adxThresh
+bbVote  = bbWRank > i_pctThresh
+atrVote = ta.percentrank(atrPct, 200) > i_pctThresh
+allTrend = adxVote and bbVote and atrVote
+
+regime     = allTrend ? (close > ema50 ? 1 : 2) : 0
+isSideways = regime == 0
+isTrending = regime == 1 or regime == 2
+isBull     = regime == 1
+isBear     = regime == 2
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL 1: RSI DIVERGENCE
+// ══════════════════════════════════════════════════════════════════════════════
+
+pricePivLow  = ta.pivotlow(low, i_pivotLeft, i_pivotRight)
+pricePivHigh = ta.pivothigh(high, i_pivotLeft, i_pivotRight)
+var float prevLowPrice  = na
+var float prevLowRsi    = na
+var float prevHighPrice = na
+var float prevHighRsi   = na
+bool bullDiv = false
+bool bearDiv = false
+
+if i_useDiv and confirmed
+    bool regOkBull = regime != 2
+    bool regOkBear = regime != 1
+    bool stOkBull = not i_useST or stBullish
+    bool stOkBear = not i_useST or stBearish
+
+    if not na(pricePivLow)
+        float cp = low[i_pivotRight]
+        float cr = rsiVal[i_pivotRight]
+        if not na(prevLowPrice) and regOkBull and stOkBull
+            float pdPct   = (prevLowPrice - cp) / prevLowPrice * 100
+            float rsiDiff = cr - prevLowRsi
+            if pdPct >= i_minPriceDiff and rsiDiff >= i_minRsiDiff
+                bullDiv := true
+        prevLowPrice := cp
+        prevLowRsi   := cr
+
+    if not na(pricePivHigh)
+        float cp = high[i_pivotRight]
+        float cr = rsiVal[i_pivotRight]
+        if not na(prevHighPrice) and regOkBear and stOkBear
+            float pdPct   = (cp - prevHighPrice) / prevHighPrice * 100
+            float rsiDiff = prevHighRsi - cr
+            if pdPct >= i_minPriceDiff and rsiDiff >= i_minRsiDiff
+                bearDiv := true
+        prevHighPrice := cp
+        prevHighRsi   := cr
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL 2: VOLUME BREAKOUT
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool boLong  = false
+bool boShort = false
+
+if i_useBo and confirmed
+    bool adxStrong  = adxVal > i_boAdxMin
+    bool adxRising  = adxVal > adxVal[5] and adxVal > 15
+    bool atrExpand  = atrVal > atrSma50 * i_atrExpMult
+    bool stOkLong   = not i_useST or stBullish
+    bool stOkShort  = not i_useST or stBearish
+    boLong  := close > dcHigh and volSpike and adxStrong and adxRising and diPlus > diMinus and atrExpand and isTrending and stOkLong and (not i_useVbLongTrend or ema20 > ema50)
+    boShort := close < dcLow and volSpike and adxStrong and adxRising and diMinus > diPlus and atrExpand and isTrending and stOkShort
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL 3: MEAN REVERSION (Z-Score)
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool mrLong  = false
+bool mrShort = false
+
+if i_useMr and confirmed
+    bool volOK = volRatio >= i_mrVolMult
+    bool atrOK = atrRank <= i_mrAtrPct
+    float entryZ = volRatio < 1.0 ? i_mrLowVolZ : i_mrHighVolZ
+    bool zLong  = zscore < -entryZ and zscore > -i_mrStopZ
+    bool zShort = zscore >  entryZ and zscore <  i_mrStopZ
+    mrLong  := isSideways and zLong  and volOK and atrOK
+    mrShort := isSideways and zShort and volOK and atrOK
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL MERGER + COOLDOWN
+// ══════════════════════════════════════════════════════════════════════════════
+
+var int lastBoBullBar  = -9999
+var int lastBoBearBar  = -9999
+var int lastDivBullBar = -9999
+var int lastDivBearBar = -9999
+var int lastMrBullBar  = -9999
+var int lastMrBearBar  = -9999
+
+int  bullType  = 0
+int  bearType  = 0
+bool finalBull = false
+bool finalBear = false
+
+bool mrLongOk  = mrLong and bar_index - lastMrBullBar > i_mrCooldown
+bool mrShortOk = mrShort and bar_index - lastMrBearBar > i_mrCooldown
+if mrLongOk
+    finalBull := true
+    bullType  := 3
+    lastMrBullBar := bar_index
+if mrShortOk
+    finalBear := true
+    bearType  := 3
+    lastMrBearBar := bar_index
+
+bool boLongOk  = boLong and bar_index - lastBoBullBar > i_cooldown
+bool boShortOk = boShort and bar_index - lastBoBearBar > i_cooldown
+if boLongOk
+    finalBull := true
+    bullType  := 1
+    lastBoBullBar := bar_index
+if boShortOk
+    finalBear := true
+    bearType  := 1
+    lastBoBearBar := bar_index
+
+bool divLongOk  = bullDiv and bar_index - lastDivBullBar > i_cooldown
+bool divShortOk = bearDiv and bar_index - lastDivBearBar > i_cooldown
+if divLongOk
+    finalBull := true
+    bullType  := 2
+    lastDivBullBar := bar_index
+if divShortOk
+    finalBear := true
+    bearType  := 2
+    lastDivBearBar := bar_index
+
+if finalBull and finalBear
+    if bullType >= bearType
+        finalBear := false
+        bearType  := 0
+    else
+        finalBull := false
+        bullType  := 0
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VIRTUAL POSITION TRACKING (for flat-only entry)
+// ══════════════════════════════════════════════════════════════════════════════
+
+typeLabel(t) => t == 1 ? "VB" : t == 2 ? "DIV" : t == 3 ? "MR" : "?"
+tpMult(t)    => t == 1 ? i_boTp : t == 2 ? i_divTp : t == 3 ? i_mrTp : 2.0
+slMult(t)    => t == 1 ? i_boSl : t == 2 ? i_divSl : t == 3 ? i_mrSl : 2.0
+mrSlCapped(atr, price) =>
+    float rawSlPct = i_mrSl * atr / price * 100
+    float cappedMult = rawSlPct > i_mrSlMaxPct ? (i_mrSlMaxPct / 100 * price / atr) : i_mrSl
+    cappedMult
+slMultCapped(t, atr, price) => t == 3 ? mrSlCapped(atr, price) : slMult(t)
+
+var int   vPos       = 0
+var float vEntryPx   = 0.0
+var float vEntryAtr  = 0.0
+var int   vEntryBar  = -1
+var int   vPosType   = 0
+var int   vExitBar   = -1
+
+// Exit detection
+bool exitedTP = false
+bool exitedSL = false
+
+if confirmed and vPos != 0 and bar_index > vEntryBar
+    float tpPrice = na
+    float slPrice = na
+    int holdBars = bar_index - vEntryBar
+
+    if vPos == 1
+        tpPrice := vEntryPx + tpMult(vPosType) * vEntryAtr
+        slPrice := vEntryPx - slMultCapped(vPosType, vEntryAtr, vEntryPx) * vEntryAtr
+        bool tpHit = high >= tpPrice
+        bool slHit = low <= slPrice
+        bool timeout = holdBars > i_maxHoldBars
+        if tpHit and slHit
+            if math.abs(open - high) < math.abs(open - low)
+                exitedTP := true
+            else
+                exitedSL := true
+            vPos := 0
+            vExitBar := bar_index
+        else if tpHit
+            exitedTP := true
+            vPos := 0
+            vExitBar := bar_index
+        else if slHit or timeout
+            exitedSL := true
+            vPos := 0
+            vExitBar := bar_index
+
+    else if vPos == -1
+        tpPrice := vEntryPx - tpMult(vPosType) * vEntryAtr
+        slPrice := vEntryPx + slMultCapped(vPosType, vEntryAtr, vEntryPx) * vEntryAtr
+        bool tpHit = low <= tpPrice
+        bool slHit = high >= slPrice
+        bool timeout = holdBars > i_maxHoldBars
+        if tpHit and slHit
+            if math.abs(open - low) < math.abs(open - high)
+                exitedTP := true
+            else
+                exitedSL := true
+            vPos := 0
+            vExitBar := bar_index
+        else if tpHit
+            exitedTP := true
+            vPos := 0
+            vExitBar := bar_index
+        else if slHit or timeout
+            exitedSL := true
+            vPos := 0
+            vExitBar := bar_index
+
+// Entry detection
+bool enteredLong  = false
+bool enteredShort = false
+bool isFlat = vPos == 0
+bool notExitBar = bar_index != vExitBar
+
+if finalBull and isFlat and notExitBar
+    float expectedTpPct = tpMult(bullType) * atrVal / close * 100
+    bool tpPctOk = expectedTpPct >= i_minTpPct
+    bool vbRsiOk = not i_useVbRsiFilter or bullType != 1 or rsiVal <= i_vbRsiHigh
+    bool oiOk = not i_useOiFilter or bullType != 1 or na(oiVal) or oiTrend >= 0
+    if tpPctOk and vbRsiOk and oiOk
+        vPos      := 1
+        vEntryPx  := close
+        vEntryAtr := atrVal
+        vEntryBar := bar_index
+        vPosType  := bullType
+        enteredLong := true
+
+if finalBear and isFlat and notExitBar
+    float expectedTpPct = tpMult(bearType) * atrVal / close * 100
+    bool tpPctOk = expectedTpPct >= i_minTpPct
+    bool vbRsiOk = not i_useVbRsiFilter or bearType != 1 or rsiVal >= i_vbRsiLow
+    bool oiOk = not i_useOiFilter or bearType != 1 or na(oiVal) or oiTrend >= 0
+    if tpPctOk and vbRsiOk and oiOk
+        vPos      := -1
+        vEntryPx  := close
+        vEntryAtr := atrVal
+        vEntryBar := bar_index
+        vPosType  := bearType
+        enteredShort := true
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OUTPUT: adaptive label placement + barcolor
+// ══════════════════════════════════════════════════════════════════════════════
+
+float _gap = (high - low) * 0.5
+
+if enteredLong
+    label.new(bar_index, low - _gap, "L",
+         style=label.style_label_up, color=color.new(#c5c5c5, 89),
+         textcolor=color.new(#ffffff, 55), size=size.normal)
+    label.new(bar_index, close, "●",
+         style=label.style_none, textcolor=color.new(#ffffff, 0),
+         size=size.normal)
+
+if enteredShort
+    label.new(bar_index, high + _gap, "S",
+         style=label.style_label_down, color=color.new(#c5c5c5, 89),
+         textcolor=color.new(#ffffff, 55), size=size.normal)
+    label.new(bar_index, close, "●",
+         style=label.style_none, textcolor=color.new(#ffffff, 0),
+         size=size.normal)
+
+if exitedTP
+    label.new(bar_index, close, "●",
+         style=label.style_none, textcolor=color.new(#7bff7f, 0),
+         size=size.large)
+
+if exitedSL
+    label.new(bar_index, close, "●",
+         style=label.style_none, textcolor=color.new(#fd97c2, 0),
+         size=size.large)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+if enteredLong
+    alert('{"signal":"long","type":"' + typeLabel(vPosType) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+if enteredShort
+    alert('{"signal":"short","type":"' + typeLabel(vPosType) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + '}', alert.freq_once_per_bar_close)
+
+alertcondition(enteredLong,  "Long Signal",  "Long signal fired")
+alertcondition(enteredShort, "Short Signal", "Short signal fired")

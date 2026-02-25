@@ -1,0 +1,235 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © MarkitTick
+
+//@version=6
+indicator(title = "Accumulation/Distribution Oscillator [MarkitTick]", overlay = false)
+
+// -----------------------------------------------------------------------------
+// Constants & Inputs
+// -----------------------------------------------------------------------------
+
+string ma_type      = input.string("EMA", "Smoothing Type", options = ["ALMA", "EMA", "SMA", "RMA", "WMA"], group="Oscillator Settings")
+int   len_ma        = input.int(20, "Smoothing Length", minval=1, group="Oscillator Settings")
+
+float alma_offset   = input.float(0.85, "ALMA Offset", minval=0, maxval=1, step=0.05, tooltip="Only applies if Type is ALMA", group="Oscillator Settings")
+float alma_sigma    = input.float(6.0, "ALMA Sigma", minval=0, tooltip="Only applies if Type is ALMA", group="Oscillator Settings")
+
+int   rvol_len      = input.int(20, "RVOL Lookback", minval=1, group="Quant Filters")
+float rvol_mult     = input.float(1.5, "RVOL Multiplier", minval=1.0, step=0.1, tooltip="Weight multiplier when Vol > Avg Vol", group="Quant Filters")
+bool  use_clv_weight= input.bool(false, "Use Candle Strength Weighting", tooltip="Boosts weight if Close is near High/Low limits", group="Quant Filters")
+bool  use_vwap      = input.bool(false, "Use VWAP Confirmation", tooltip="Only allows BUY if Price > VWAP, SELL if Price < VWAP", group="Quant Filters")
+int   z_len         = input.int(100, "Z-Score Lookback", minval=2, tooltip="Period for statistical normalization", group="Quant Filters")
+
+bool  show_hist     = input.bool(false, "Show Histogram", group="Visuals")
+bool  show_line     = input.bool(true, "Show Line", group="Visuals")
+bool  show_bb       = input.bool(true, "Show Bollinger Bands", group="Visuals")
+float bb_dev        = input.float(2.0, "BB StdDev", group="Visuals")
+bool  filter_trend  = input.bool(false, "Trend Filter (200 EMA)", tooltip="Gray out counter-trend signals", group="Visuals")
+bool  show_div      = input.bool(true, "Show Divergences", group="Visuals")
+bool  show_div_price= input.bool(true, "Show Divergences on Price", group="Visuals") 
+
+bool  show_table    = input.bool(true, "Show MTF Dashboard", group="Dashboard")
+string tf1          = input.timeframe("60", "Timeframe 1", group="Dashboard")
+string tf2          = input.timeframe("240", "Timeframe 2", group="Dashboard")
+string tf3          = input.timeframe("D", "Timeframe 3", group="Dashboard")
+
+// -----------------------------------------------------------------------------
+// Calculations 
+// -----------------------------------------------------------------------------
+
+float mfm = (high == low) ? 0.0 : ((2 * close - low - high) / (high - low))
+
+float avg_vol = ta.sma(volume, rvol_len)
+
+float vol_rvol = volume > avg_vol ? volume * rvol_mult : volume
+
+float strength_factor = use_clv_weight ? (1.0 + math.abs(mfm)) : 1.0
+float final_vol = vol_rvol * strength_factor
+
+float ad_line = ta.cum(mfm * final_vol)
+
+float val_alma = ta.alma(ad_line, len_ma, alma_offset, alma_sigma)
+float val_ema  = ta.ema(ad_line, len_ma)
+float val_sma  = ta.sma(ad_line, len_ma)
+float val_rma  = ta.rma(ad_line, len_ma)
+float val_wma  = ta.wma(ad_line, len_ma)
+
+float ad_smooth = switch ma_type
+    "ALMA" => val_alma
+    "EMA"  => val_ema
+    "SMA"  => val_sma
+    "RMA"  => val_rma
+    "WMA"  => val_wma
+    => val_sma
+
+float osc_raw = ad_line - ad_smooth
+
+float osc_mean  = ta.sma(osc_raw, z_len)
+float osc_stdev = ta.stdev(osc_raw, z_len)
+float osc_z     = osc_stdev != 0 ? (osc_raw - osc_mean) / osc_stdev : 0.0
+
+float ema_trend = ta.ema(close, 200)
+
+float vwap_val = ta.vwap(close)
+
+bool bull_trend = close >= ema_trend
+bool bear_trend = close < ema_trend
+
+bool bull_vwap = close >= vwap_val
+bool bear_vwap = close < vwap_val
+
+float bb_basis = ta.sma(osc_z, 20)
+float bb_dev_val = ta.stdev(osc_z, 20) * bb_dev
+float bb_upper = bb_basis + bb_dev_val
+float bb_lower = bb_basis - bb_dev_val
+
+// -----------------------------------------------------------------------------
+// Visual Logic & Gradient
+// -----------------------------------------------------------------------------
+
+bool is_bull_valid = true
+if filter_trend
+    is_bull_valid := is_bull_valid and bull_trend
+if use_vwap
+    is_bull_valid := is_bull_valid and bull_vwap
+
+bool is_bear_valid = true
+if filter_trend
+    is_bear_valid := is_bear_valid and bear_trend
+if use_vwap
+    is_bear_valid := is_bear_valid and bear_vwap
+
+color c_hist = color.gray
+
+if osc_z >= 0
+    if is_bull_valid
+        c_hist := (osc_z[1] < osc_z ? #26A69A : #B2DFDB)
+    else
+        c_hist := color.new(color.gray, 50)
+else
+    if is_bear_valid
+        c_hist := (osc_z[1] < osc_z ? #FF5252 : #FFCDD2)
+    else
+        c_hist := color.new(color.gray, 50)
+
+color c_line = osc_z >= 0 ? #00897b : #d32f2f
+if osc_z >= 0 and not is_bull_valid
+    c_line := color.gray
+if osc_z < 0 and not is_bear_valid
+    c_line := color.gray
+
+// -----------------------------------------------------------------------------
+// Divergence Detection & Alerts
+// -----------------------------------------------------------------------------
+int div_lookback = 5
+float ph_series = ta.pivothigh(osc_z, div_lookback, div_lookback)
+float pl_series = ta.pivotlow(osc_z, div_lookback, div_lookback)
+float ph_osc = ph_series
+float pl_osc = pl_series
+
+if not na(ph_osc) and (show_div or show_div_price)
+    int prev_ph_bar = 0
+    float prev_ph_val = 0.0
+    bool found_ph = false
+    
+    for i = 1 to 50
+        if not na(ph_series[i])
+            prev_ph_bar := i
+            prev_ph_val := ph_series[i]
+            found_ph := true
+            break
+            
+    if found_ph
+        float price_h_curr = high[div_lookback]
+        float price_h_prev = high[div_lookback + prev_ph_bar]
+         
+        if price_h_curr > price_h_prev and ph_osc < prev_ph_val
+            if show_div
+                line.new(bar_index - div_lookback - prev_ph_bar, prev_ph_val, bar_index - div_lookback, ph_osc, color=color.red, width=1)
+                label.new(bar_index - div_lookback, ph_osc, "Bear Div", color=color.red, style=label.style_label_down, textcolor=color.white, size=size.tiny)
+            if show_div_price
+                line.new(bar_index - div_lookback - prev_ph_bar, price_h_prev, bar_index - div_lookback, price_h_curr, color=color.red, width=1, force_overlay=true)
+                label.new(bar_index - div_lookback, price_h_curr, "Bear Div", color=color.red, style=label.style_label_down, textcolor=color.white, size=size.tiny, force_overlay=true)
+            
+            float entry_bear = close
+            float sl_bear    = high + syminfo.mintick * 10
+            float risk_bear  = sl_bear - entry_bear
+            float tp_bear    = entry_bear - (risk_bear * 1.5)
+            
+            string json_bear = '{"action": "sell", "ticker": "' + syminfo.tickerid + '", "entry": ' + str.tostring(entry_bear, format.mintick) + ', "tp": ' + str.tostring(tp_bear, format.mintick) + ', "sl": ' + str.tostring(sl_bear, format.mintick) + ', "reason": "Bearish Divergence"}'
+            
+            alert(json_bear, alert.freq_once_per_bar_close)
+
+if not na(pl_osc) and (show_div or show_div_price)
+    int prev_pl_bar = 0
+    float prev_pl_val = 0.0
+    bool found_pl = false
+    
+    for i = 1 to 50
+        if not na(pl_series[i])
+            prev_pl_bar := i
+            prev_pl_val := pl_series[i]
+            found_pl := true
+            break
+            
+    if found_pl
+        float price_l_curr = low[div_lookback]
+        float price_l_prev = low[div_lookback + prev_pl_bar]
+         
+        if price_l_curr < price_l_prev and pl_osc > prev_pl_val
+            if show_div
+                line.new(bar_index - div_lookback - prev_pl_bar, prev_pl_val, bar_index - div_lookback, pl_osc, color=color.green, width=1)
+                label.new(bar_index - div_lookback, pl_osc, "Bull Div", color=color.green, style=label.style_label_up, textcolor=color.white, size=size.tiny)
+            if show_div_price
+                line.new(bar_index - div_lookback - prev_pl_bar, price_l_prev, bar_index - div_lookback, price_l_curr, color=color.green, width=1, force_overlay=true)
+                label.new(bar_index - div_lookback, price_l_curr, "Bull Div", color=color.green, style=label.style_label_up, textcolor=color.white, size=size.tiny, force_overlay=true)
+            
+            float entry_bull = close
+            float sl_bull    = low - syminfo.mintick * 10
+            float risk_bull  = entry_bull - sl_bull
+            float tp_bull    = entry_bull + (risk_bull * 1.5)
+            
+            string json_bull = '{"action": "buy", "ticker": "' + syminfo.tickerid + '", "entry": ' + str.tostring(entry_bull, format.mintick) + ', "tp": ' + str.tostring(tp_bull, format.mintick) + ', "sl": ' + str.tostring(sl_bull, format.mintick) + ', "reason": "Bullish Divergence"}'
+            
+            alert(json_bull, alert.freq_once_per_bar_close)
+
+// -----------------------------------------------------------------------------
+// Multi-Timeframe Dashboard
+// -----------------------------------------------------------------------------
+[mtf1_osc] = request.security(syminfo.tickerid, tf1, [osc_z], lookahead=barmerge.lookahead_off)
+[mtf2_osc] = request.security(syminfo.tickerid, tf2, [osc_z], lookahead=barmerge.lookahead_off)
+[mtf3_osc] = request.security(syminfo.tickerid, tf3, [osc_z], lookahead=barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
+// Plots & Output
+// -----------------------------------------------------------------------------
+
+plot(show_hist ? osc_z : na, "Histogram", color=c_hist, style=plot.style_columns, linewidth=1)
+
+plot(show_line ? osc_z : na, "Oscillator Line", color=c_line, style=plot.style_line, linewidth=2)
+
+hline(0, "Zero Line", color=color.new(color.gray, 50))
+
+p_upper = plot(show_bb ? bb_upper : na, "BB Upper", color=color.new(color.blue, 50))
+p_lower = plot(show_bb ? bb_lower : na, "BB Lower", color=color.new(color.blue, 50))
+fill(p_upper, p_lower, color=color.new(color.blue, 90), title="BB Background")
+
+var table dash = table.new(position.top_right, 4, 2, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+if show_table and barstate.islast
+    table.cell(dash, 0, 0, "MTF Momentum", text_color=color.white, bgcolor=color.black, text_size=size.small)
+    table.cell(dash, 1, 0, tf1, text_color=color.white, bgcolor=color.black, text_size=size.small)
+    table.cell(dash, 2, 0, tf2, text_color=color.white, bgcolor=color.black, text_size=size.small)
+    table.cell(dash, 3, 0, tf3, text_color=color.white, bgcolor=color.black, text_size=size.small)
+     
+    color c_tf1 = mtf1_osc > 0 ? color.new(#26A69A, 20) : color.new(#FF5252, 20)
+    table.cell(dash, 1, 1, mtf1_osc > 0 ? "BULL" : "BEAR", bgcolor=c_tf1, text_color=color.white, text_size=size.small)
+    color c_tf2 = mtf2_osc > 0 ? color.new(#26A69A, 20) : color.new(#FF5252, 20)
+    table.cell(dash, 2, 1, mtf2_osc > 0 ? "BULL" : "BEAR", bgcolor=c_tf2, text_color=color.white, text_size=size.small)
+    color c_tf3 = mtf3_osc > 0 ? color.new(#26A69A, 20) : color.new(#FF5252, 20)
+    table.cell(dash, 3, 1, mtf3_osc > 0 ? "BULL" : "BEAR", bgcolor=c_tf3, text_color=color.white, text_size=size.small)
+
+var float cumVol = 0.
+cumVol := cumVol + nz(volume)
+if barstate.islast and cumVol == 0
+    runtime.error("No volume is provided by the data vendor.")
